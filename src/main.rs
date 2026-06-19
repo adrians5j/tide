@@ -1523,6 +1523,7 @@ struct Storm {
 enum ProjectNav {
     Switch(usize),
     Open,
+    Remove(usize),
 }
 
 impl EventEmitter<ProjectNav> for Storm {}
@@ -3853,6 +3854,24 @@ impl Storm {
                                 .text_size(px(11.))
                                 .text_color(rgb(if sel { SEL_TEXT } else { MUTED }))
                                 .child(format!("⎇ {}", branch)),
+                        )
+                    })
+                    // close button (hidden when only one project is left)
+                    .when(self.ws_names.len() > 1, |d| {
+                        d.child(
+                            div()
+                                .id(("ws-proj-close", i))
+                                .px_1()
+                                .text_size(px(12.))
+                                .text_color(rgb(if sel { SEL_TEXT } else { MUTED }))
+                                .hover(|s| s.text_color(rgb(0xf7768e)))
+                                .cursor_pointer()
+                                .child("✕")
+                                .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
+                                .on_click(cx.listener(move |_this, _e, _w, cx| {
+                                    cx.emit(ProjectNav::Remove(idx));
+                                    cx.notify();
+                                })),
                         )
                     })
                     .on_click(cx.listener(move |this, _e, _w, cx| {
@@ -6464,10 +6483,27 @@ impl Workspace {
                 }
             }
             ProjectNav::Open => this.open_project(cx),
+            ProjectNav::Remove(i) => this.remove_project(*i, cx),
         })
         .detach();
         self.projects.push(storm);
         self.active = self.projects.len() - 1;
+        self.focus_pending = true;
+        cx.notify();
+    }
+
+    /// Close the workspace at `idx`. Keeps at least one open (the window would
+    /// be empty otherwise). Adjusts the active + switcher selection to stay valid.
+    fn remove_project(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if idx >= self.projects.len() || self.projects.len() <= 1 {
+            return;
+        }
+        self.projects.remove(idx);
+        // keep `active` pointing at a sensible project
+        if self.active > idx || self.active >= self.projects.len() {
+            self.active = self.active.saturating_sub(1);
+        }
+        self.switcher_sel = self.switcher_sel.min(self.projects.len() - 1);
         self.focus_pending = true;
         cx.notify();
     }
@@ -6520,6 +6556,20 @@ impl Workspace {
             return;
         }
         match key {
+            // x / delete / backspace closes the highlighted workspace (stays open
+            // so you can close several); closing the last one is a no-op
+            "x" | "delete" | "backspace" => {
+                self.remove_project(self.switcher_sel, cx);
+                if self.projects.len() <= 1 {
+                    self.switcher_open = false;
+                    self.focus_pending = true;
+                } else {
+                    // stay in the switcher; keep focus here (remove_project set
+                    // focus_pending, which would otherwise jump to a project)
+                    self.focus_pending = false;
+                }
+                cx.notify();
+            }
             "escape" => {
                 self.switcher_open = false;
                 self.focus_pending = true;
@@ -6620,7 +6670,7 @@ impl Render for Workspace {
                         .py_1()
                         .text_size(px(11.))
                         .text_color(rgb(MUTED))
-                        .child("Switch Project  ·  press a number"),
+                        .child("Switch Project  ·  press a number  ·  x to close"),
                 );
             for i in 0..self.projects.len() {
                 let p = &self.projects[i];
@@ -6683,6 +6733,23 @@ impl Render for Workspace {
                         )
                         .when(is_active, |d| {
                             d.child(div().text_size(px(11.)).text_color(rgb(ACCENT)).child("●"))
+                        })
+                        // close button (hidden when only one project is left)
+                        .when(self.projects.len() > 1, |d| {
+                            d.child(
+                                div()
+                                    .id(("ws-close", i))
+                                    .px_1()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(MUTED))
+                                    .hover(|s| s.text_color(rgb(0xf7768e)))
+                                    .cursor_pointer()
+                                    .child("✕")
+                                    .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
+                                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                                        this.remove_project(idx, cx);
+                                    })),
+                            )
                         })
                         .on_click(cx.listener(move |this, _e, _w, cx| {
                             this.switcher_open = false;
