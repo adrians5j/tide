@@ -330,15 +330,20 @@ fn read_loop(stdout: std::process::ChildStdout, pending: Pending) {
     }
 }
 
-/// Find a typescript-language-server binary: PATH, then the codestorm sibling.
+/// Find a typescript-language-server binary. Checks the `TIDE_TS_LSP` env
+/// override first (absolute path or command name), then `typescript-language-server`
+/// on `PATH`. Returns None if none works — the editor just runs without LSP.
 fn server_bin() -> Option<(String, Vec<String>)> {
-    let candidates = [
-        "typescript-language-server",
-        "/Users/adrian/dev/codestorm/node_modules/.bin/typescript-language-server",
-    ];
+    let mut candidates: Vec<String> = Vec::new();
+    if let Ok(p) = std::env::var("TIDE_TS_LSP") {
+        if !p.trim().is_empty() {
+            candidates.push(p);
+        }
+    }
+    candidates.push("typescript-language-server".to_string());
     for c in candidates {
-        if Command::new(c).arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
-            return Some((c.to_string(), vec!["--stdio".to_string()]));
+        if Command::new(&c).arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
+            return Some((c, vec!["--stdio".to_string()]));
         }
     }
     None

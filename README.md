@@ -10,6 +10,8 @@ of trying to be everything for everyone.
 > Not affiliated with JetBrains. The name is a wink at WebStorm — and at the
 > `IDE` hiding inside "t-IDE".
 
+![tide screenshot](docs/screenshot.png)
+
 ---
 
 ## Why it exists
@@ -65,6 +67,9 @@ GPUI is pulled straight from the Zed repo, with two patched forks
 - A recent **Rust** toolchain.
 - **`gh`** (GitHub CLI), authenticated — for the PR features.
 - **`rg`** (ripgrep) — for find-in-files.
+- **`typescript-language-server`** on your `PATH` for LSP features (optional —
+  the editor runs fine without it). Point at a specific binary with the
+  `TIDE_TS_LSP` env var if it's not on `PATH`.
 - A **Nerd Font** for terminal powerline/icon glyphs. The terminal expects
   `JetBrainsMono Nerd Font`:
   ```sh
@@ -91,3 +96,7 @@ Personal project / work in progress. Expect rough edges, hardcoded bits, and
 opinions baked in. Issues and PRs welcome but it's primarily built for me.
 See [`DEV_NOTES.md`](./DEV_NOTES.md) for architecture and the non-obvious
 decisions behind it.
+
+## License
+
+[MIT](./LICENSE) © Adrian Smijulj
