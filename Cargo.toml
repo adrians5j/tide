@@ -1,0 +1,40 @@
+[package]
+name = "tide"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "tide"
+path = "src/main.rs"
+
+[dependencies]
+alacritty_terminal = "0.26.0"
+futures = "0.3.32"
+gpui          = { git = "https://github.com/zed-industries/zed" }
+# font-kit enables the real MacTextSystem; without it GPUI uses NoopTextSystem
+# and no text renders at all (boxes/colors still work via the renderer).
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
+portable-pty = "0.9.0"
+serde_json = "1.0.150"
+similar = "3.1.1"
+syntect       = { version = "5", default-features = false, features = ["default-themes", "regex-fancy"] }
+two-face      = "0.4"
+
+# Optimize dependencies even in dev builds. Font shaping (gpui), the VT parser
+# (alacritty_terminal), and syntect are the hot paths; at opt-level 0 they make
+# the terminal and editor feel laggy. This keeps our own crate unoptimized for
+# fast incremental builds + debuggability, but compiles deps at full speed.
+[profile.dev.package."*"]
+opt-level = 3
+
+# Fastest, smallest binary for the build you actually run day-to-day.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+# Zed's patched forks — required to build gpui_macos
+[patch.crates-io]
+async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }
+async-task    = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }
