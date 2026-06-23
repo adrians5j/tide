@@ -443,13 +443,19 @@ impl Terminal {
                     .lock()
                     .map(|g| g.mode().contains(TermMode::BRACKETED_PASTE))
                     .unwrap_or(false);
+                // send the whole paste as ONE write — splitting the bracketed
+                // markers from the body across separate flushes can leave zsh's
+                // bracketed-paste widget mid-read, so it buffers the text without
+                // redrawing the line (paste looks invisible until the next key)
+                let mut buf = Vec::with_capacity(text.len() + 12);
                 if bracketed {
-                    self.write(b"\x1b[200~");
-                    self.write(text.as_bytes());
-                    self.write(b"\x1b[201~");
+                    buf.extend_from_slice(b"\x1b[200~");
+                    buf.extend_from_slice(text.as_bytes());
+                    buf.extend_from_slice(b"\x1b[201~");
                 } else {
-                    self.write(text.as_bytes());
+                    buf.extend_from_slice(text.as_bytes());
                 }
+                self.write(&buf);
             }
             return;
         }

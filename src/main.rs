@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod theme;
 use theme::*;
@@ -396,7 +396,15 @@ fn compute_diff(
 ) -> (Vec<DiffRow>, Vec<Vec<Run>>, Vec<Vec<Run>>) {
     let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
     let (old, new) = match base {
-        Some(b) => (git_show(root, b, &rel), git_show(root, "HEAD", &rel)),
+        // "old" is the file at the MERGE-BASE of origin/<base> and HEAD — the
+        // three-dot point GitHub diffs against — not the base branch tip. Diffing
+        // against the tip would fold in commits the base branch gained after this
+        // branch diverged, showing changes the PR didn't actually make.
+        Some(b) => {
+            let base_ref = resolve_base_ref(root, b.strip_prefix("origin/").unwrap_or(b));
+            let old_rev = git_merge_base(root, &base_ref).unwrap_or(base_ref);
+            (git_show(root, &old_rev, &rel), git_show(root, "HEAD", &rel))
+        }
         None => (git_show_head(root, &rel), std::fs::read_to_string(path).unwrap_or_default()),
     };
     // expand tabs up front so the rendered grid, syntax runs, and selection all
@@ -1029,6 +1037,20 @@ fn resolve_base_ref(root: &Path, base: &str) -> String {
     }
 }
 
+/// The merge-base of `base_ref` and HEAD (where the branch diverged), or None.
+/// This is the "old" side GitHub's PR diff compares against (three-dot).
+fn git_merge_base(root: &Path, base_ref: &str) -> Option<String> {
+    Command::new("git")
+        .args(["merge-base", base_ref, "HEAD"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// PR changes: files changed on this branch since it diverged from `base`,
 /// as (absolute path, status). Uses the three-dot (merge-base) diff, comparing
 /// against `origin/<base>` to match GitHub's "Files changed".
@@ -1515,8 +1537,18 @@ struct Storm {
     // workspace (multi-project) info, pushed down by the Workspace each render
     ws_names: Vec<String>,
     ws_branches: Vec<String>,
+    ws_idle: Vec<f32>,  // seconds since each project was last viewed/worked on
+    ws_pulse: Vec<f32>, // seconds since each project's last detected change (big if none)
     ws_active: usize,
     ws_open: bool, // project-switcher dropdown expanded
+    // idle tracking: reset while this project is the on-screen one. Drives the
+    // topbar icon's fade-to-red (a project you're not looking at slowly reddens).
+    last_active: Instant,
+    // change detection: when the fingerprint changes, `pulse_at` is stamped and
+    // the topbar icon plays a brief pulse animation. None until the first poll
+    // establishes a baseline (so loading a project doesn't fire a pulse).
+    prev_fp: Option<u64>,
+    pulse_at: Option<Instant>,
 }
 
 /// Navigation requests a project view sends up to the workspace.
@@ -1524,6 +1556,7 @@ enum ProjectNav {
     Switch(usize),
     Open,
     Remove(usize),
+    Activity, // a change was detected → workspace should pulse this icon
 }
 
 impl EventEmitter<ProjectNav> for Storm {}
@@ -1667,8 +1700,17 @@ impl Storm {
             palette_gen: 0,
             ws_names: Vec::new(),
             ws_branches: Vec::new(),
+            ws_idle: Vec::new(),
+            ws_pulse: Vec::new(),
             ws_active: 0,
             ws_open: false,
+            // start "idle" (colorless) — a workspace only goes green once it's
+            // actually viewed or sees a change, not just because it was opened
+            last_active: Instant::now()
+                .checked_sub(Duration::from_secs(ACTIVE_FADE_SECS as u64 + 1))
+                .unwrap_or_else(Instant::now),
+            prev_fp: None,
+            pulse_at: None,
         };
         s.rebuild();
         s.start_git_poll(cx);
@@ -1804,7 +1846,7 @@ impl Storm {
         cx.notify();
     }
 
-    /// Refresh git status, branch, and memory every 2s on a background thread.
+    /// Refresh git status, branch, and memory every 5s on a background thread.
     fn start_git_poll(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| loop {
             let Some((root, prev_pr_branch)) =
@@ -1839,16 +1881,54 @@ impl Storm {
                     // pick up external edits (e.g. from Claude Code) on any open
                     // tab whose buffer has no unsaved changes
                     let editors: Vec<_> = this.tabs.iter().map(|t| t.editor.clone()).collect();
-                    for ed in editors {
+                    for ed in &editors {
                         ed.update(cx, |e, cx| e.reload_if_changed(cx));
                     }
+                    // fingerprint mutable state (git working tree + open buffers);
+                    // if it changed since last tick, this project saw activity
+                    let mut fp: u64 = 0;
+                    for (p, s) in &this.git_status {
+                        let mut e: u64 = 0xcbf29ce484222325;
+                        for b in p.to_string_lossy().as_bytes() {
+                            e ^= *b as u64;
+                            e = e.wrapping_mul(0x100000001b3);
+                        }
+                        let code = match s {
+                            GitState::New => 1u64,
+                            GitState::Modified => 2,
+                            GitState::Deleted => 3,
+                        };
+                        // fold in the file's mtime so repeated edits to an
+                        // already-"modified" file (even if not open in a tab) count
+                        let mtime = std::fs::metadata(p)
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        fp ^= e.wrapping_add(code).wrapping_add(mtime.rotate_left(17)); // xor: order-independent
+                    }
+                    for ed in &editors {
+                        fp = fp.rotate_left(7) ^ ed.read(cx).content_hash();
+                    }
+                    // a change since the last poll → pulse this project's icon
+                    // (the first poll just records a baseline, no pulse)
+                    if this.prev_fp.is_some_and(|prev| prev != fp) {
+                        this.pulse_at = Some(Instant::now());
+                        // detected work also counts as freshness: a changing
+                        // workspace stays lit (not idle-faded) even unwatched,
+                        // so you can tell it's still doing something at a glance
+                        this.last_active = Instant::now();
+                        cx.emit(ProjectNav::Activity); // workspace animates the flash
+                    }
+                    this.prev_fp = Some(fp);
                     cx.notify();
                 })
                 .is_err()
             {
                 break;
             }
-            cx.background_executor().timer(Duration::from_secs(2)).await;
+            cx.background_executor().timer(Duration::from_secs(5)).await;
         })
         .detach();
     }
@@ -1944,6 +2024,17 @@ impl Storm {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "tide".into())
+    }
+
+    /// Seconds since this project was last viewed/worked on (for the idle fade).
+    fn idle_secs(&self) -> f32 {
+        self.last_active.elapsed().as_secs_f32()
+    }
+
+    /// Seconds since this project's last detected change, or a large number if
+    /// there hasn't been one (so it reads as "not pulsing").
+    fn pulse_secs(&self) -> f32 {
+        self.pulse_at.map(|t| t.elapsed().as_secs_f32()).unwrap_or(1e9)
     }
 
     /// Root-level key handling: escape closes any open popup. Fires for the
@@ -3482,11 +3573,12 @@ impl Storm {
             self.term_width = (self.win_width - f32::from(ev.position.x)).clamp(200., 1125.);
             cx.notify();
         } else if self.find_resizing {
-            // panel is centered, so its width grows symmetrically about the
-            // midline; height is anchored at the fixed top (40px)
-            let mid = self.win_width / 2.0;
-            self.find_w = ((f32::from(ev.position.x) - mid) * 2.0).clamp(420., (self.win_width - 80.0).max(420.0));
-            self.find_h = (f32::from(ev.position.y) - 80.0).clamp(300., (self.win_height - 120.0).max(300.0));
+            // panel is centered both ways, so width and height grow
+            // symmetrically about the window's center as you drag the grip
+            let midx = self.win_width / 2.0;
+            let midy = self.win_height / 2.0;
+            self.find_w = ((f32::from(ev.position.x) - midx) * 2.0).clamp(420., (self.win_width - 80.0).max(420.0));
+            self.find_h = ((f32::from(ev.position.y) - midy) * 2.0).clamp(300., (self.win_height - 120.0).max(300.0));
             cx.notify();
         }
     }
@@ -3741,9 +3833,10 @@ impl Storm {
             .bg(rgb(PANEL_BG))
             .border_b_1()
             .border_color(rgb(BORDER))
-            // left: project switcher + branch
+            // left: project switcher + branch (equal-grow side so the strip centers)
             .child(
                 div()
+                    .flex_1()
                     .flex()
                     .flex_row()
                     .items_center()
@@ -3799,6 +3892,63 @@ impl Storm {
                         )
                     }),
             );
+        // project quick-switch icons (2+ projects only), centered in the bar.
+        // Each icon rests colorless when idle and tints green as it sees activity.
+        if self.ws_names.len() > 1 {
+            let mut strip = div().flex().flex_row().items_center().gap_1();
+            for (i, name) in self.ws_names.iter().enumerate() {
+                let active = i == self.ws_active;
+                let idle = self.ws_idle.get(i).copied().unwrap_or(0.0);
+                // freshness: 1.0 right after activity, fading to 0 as it goes idle
+                let fresh = (1.0 - idle / ACTIVE_FADE_SECS).clamp(0.0, 1.0);
+                // the viewed project keeps its selected (blue) bg; others rest at
+                // the bar color (invisible when dead) and tint green when active
+                let base_bg = if active {
+                    ICON_SELECTED_BG
+                } else {
+                    lerp_rgb(PANEL_BG, ACTIVE_GREEN, fresh)
+                };
+                // change-pulse: a quick flash that decays over PULSE_SECS, layered
+                // over the base color (ease-out so it pops then fades)
+                let pulse = self.ws_pulse.get(i).copied().unwrap_or(1e9);
+                let pint = (1.0 - (pulse / PULSE_SECS)).clamp(0.0, 1.0);
+                let pint = pint * pint; // ease-out
+                let bg = lerp_rgb(base_bg, PULSE_COLOR, pint);
+                let ring_alpha = (pint * 255.0) as u32 & 0xff;
+                let text = if active || fresh > 0.4 || pint > 0.3 { SEL_TEXT } else { MUTED };
+                let label = project_icon_label(name);
+                let nm = name.clone();
+                let idx = i;
+                strip = strip.child(
+                    div()
+                        .id(("topbar-proj", i))
+                        .size(px(26.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_md()
+                        .text_size(px(10.))
+                        // 2px ring, always present but transparent when not pulsing
+                        // (keeps the box size stable — no layout jump on pulse)
+                        .border_2()
+                        .border_color(gpui::rgba((PULSE_COLOR << 8) | ring_alpha))
+                        .bg(rgb(bg))
+                        .text_color(rgb(text))
+                        .cursor_pointer()
+                        .child(label)
+                        .tooltip(move |_w, cx| cx.new(|_| TooltipView { text: nm.clone().into() }).into())
+                        .on_click(cx.listener(move |_this, _e, _w, cx| {
+                            cx.emit(ProjectNav::Switch(idx));
+                            cx.notify();
+                        })),
+                );
+            }
+            // strip in the middle + an equal-grow spacer on the right → centered
+            bar = bar.child(strip).child(div().flex_1());
+        } else {
+            // keep the left group left-aligned when there's no strip
+            bar = bar.child(div().flex_1());
+        }
         bar
     }
 
@@ -4119,7 +4269,7 @@ impl Storm {
                     .text_color(rgb(if running { ACCENT } else { MUTED }))
                     .child(if running { "running…" } else { "done" }),
             )
-            .child(div().flex_grow(1.0))
+            .child(div().flex_1())
             .child(btn("run-rerun", "↻").tooltip(tip("Re-run")).on_click(cx.listener(|this, _e, _w, cx| {
                 let c = this.run_cmd.clone();
                 if !c.is_empty() {
@@ -4996,8 +5146,8 @@ impl Storm {
     fn render_find(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let w = self.find_w.clamp(420.0, (self.win_width - 80.0).max(420.0));
         let left = ((self.win_width - w) / 2.0).max(0.);
-        let top = 80.0_f32; // sit just below the 44px topbar
         let h = self.find_h.clamp(300.0, (self.win_height - 120.0).max(300.0));
+        let top = ((self.win_height - h) / 2.0).max(40.); // vertically centered, like the other dialogs
         let scope_label = if self.find_scope == self.root {
             "Project".to_string()
         } else {
@@ -5132,7 +5282,7 @@ impl Storm {
             }
         }
 
-        div()
+        let panel = div()
             .absolute()
             .top(px(top))
             .left(px(left))
@@ -5173,7 +5323,27 @@ impl Storm {
                             cx.notify();
                         }),
                     ),
+            );
+
+        // full-screen overlay establishes the containing block so the panel
+        // centers reliably (a bare absolute child anchors to the wrong box)
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_start()
+            .justify_center()
+            .child(
+                div()
+                    .id("find-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .on_click(cx.listener(|this, _e, _w, cx| {
+                        this.find_open = false;
+                        cx.notify();
+                    })),
             )
+            .child(panel)
     }
 
     fn render_palette(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5523,7 +5693,7 @@ impl Storm {
                     )
                     .child(div().text_size(px(12.)).text_color(rgb(TEXT)).child("Push tags")),
             )
-            .child(div().flex_grow(1.0))
+            .child(div().flex_1())
             .child(
                 div().id("push-cancel").px_4().py_1().rounded_md().border_1().border_color(rgb(BORDER))
                     .text_color(rgb(TEXT)).cursor_pointer().hover(|s| s.bg(rgb(HOVER)))
@@ -5936,6 +6106,37 @@ impl Render for TooltipView {
 }
 
 /// Build a tooltip closure for a static label.
+/// Seconds since the last activity at which a project icon fades back to its
+/// resting (colorless) state. (1800.0 = 30 min; currently 5 min.)
+const ACTIVE_FADE_SECS: f32 = 300.0;
+/// The "active" color icons tint toward right after activity (fades as it idles).
+const ACTIVE_GREEN: u32 = 0x6aaf6a;
+/// How long a change-pulse animation lasts, and its flash color.
+const PULSE_SECS: f32 = 0.7;
+const PULSE_COLOR: u32 = 0x4ec9b0;
+
+/// Linear blend between two 0xRRGGBB colors (t clamped to 0..1).
+fn lerp_rgb(a: u32, b: u32, t: f32) -> u32 {
+    let t = t.clamp(0.0, 1.0);
+    let chan = |sh: u32| {
+        let ca = ((a >> sh) & 0xff) as f32;
+        let cb = ((b >> sh) & 0xff) as f32;
+        (ca + (cb - ca) * t).round() as u32
+    };
+    (chan(16) << 16) | (chan(8) << 8) | chan(0)
+}
+
+/// Two-letter badge for a project icon: first + last non-space char, uppercased
+/// (e.g. "wby-next1" → "W1", "wcp" → "WP", "a" → "A").
+fn project_icon_label(name: &str) -> String {
+    let chars: Vec<char> = name.chars().filter(|c| !c.is_whitespace()).collect();
+    match chars.as_slice() {
+        [] => "?".to_string(),
+        [only] => only.to_uppercase().to_string(),
+        [first, .., last] => format!("{}{}", first.to_uppercase(), last.to_uppercase()),
+    }
+}
+
 fn tip(text: &'static str) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
     move |_w, cx| cx.new(|_| TooltipView { text: text.into() }).into()
 }
@@ -6451,6 +6652,10 @@ struct Workspace {
     switcher_open: bool,
     switcher_sel: usize,
     switcher_focus: FocusHandle,
+    // idle reset: which project has been on-screen, and since when. Once the
+    // active project has been viewed ≥5s, its idle timer keeps resetting.
+    prev_active: usize,
+    active_since: Instant,
 }
 
 impl Workspace {
@@ -6463,13 +6668,40 @@ impl Workspace {
             switcher_open: false,
             switcher_sel: 0,
             switcher_focus: cx.focus_handle(),
+            prev_active: 0,
+            active_since: Instant::now(),
         };
         // open every passed root as its own workspace; first one is active
         for root in roots {
             ws.add_project(root, cx);
         }
         ws.active = 0;
+        // Slow repaint so the idle fade advances over time. Pulses are animated
+        // separately (event-driven, see pulse_anim) so they don't depend on this.
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(3)).await;
+            if this.update(cx, |_, cx| cx.notify()).is_err() {
+                break;
+            }
+        })
+        .detach();
         ws
+    }
+
+    /// Smoothly animate the topbar for the duration of a change-pulse: notify at
+    /// ~30fps for PULSE_SECS so the flash decays smoothly, then stop.
+    fn pulse_anim(&self, cx: &mut Context<Self>) {
+        cx.notify(); // show the peak immediately
+        cx.spawn(async move |this, cx| {
+            let frames = (PULSE_SECS * 30.0) as u32 + 2;
+            for _ in 0..frames {
+                cx.background_executor().timer(Duration::from_millis(33)).await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn add_project(&mut self, root: PathBuf, cx: &mut Context<Self>) {
@@ -6484,6 +6716,7 @@ impl Workspace {
             }
             ProjectNav::Open => this.open_project(cx),
             ProjectNav::Remove(i) => this.remove_project(*i, cx),
+            ProjectNav::Activity => this.pulse_anim(cx),
         })
         .detach();
         self.projects.push(storm);
@@ -6619,13 +6852,27 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let active = self.active;
+        // track how long the active project has been on screen; once it's been
+        // viewed ≥5s, keep resetting its idle timer so it stays "fresh"
+        if active != self.prev_active {
+            self.prev_active = active;
+            self.active_since = Instant::now();
+        }
+        if self.active_since.elapsed() >= Duration::from_secs(5) {
+            self.projects[active].update(cx, |s, _| s.last_active = Instant::now());
+        }
+
         // push the project list into the active view so its dropdown can show it
         let names: Vec<String> = self.projects.iter().map(|p| p.read(cx).project_name()).collect();
         let branches: Vec<String> = self.projects.iter().map(|p| p.read(cx).branch.clone()).collect();
-        let active = self.active;
+        let idle: Vec<f32> = self.projects.iter().map(|p| p.read(cx).idle_secs()).collect();
+        let pulse: Vec<f32> = self.projects.iter().map(|p| p.read(cx).pulse_secs()).collect();
         self.projects[active].update(cx, |s, _| {
             s.ws_names = names;
             s.ws_branches = branches;
+            s.ws_idle = idle;
+            s.ws_pulse = pulse;
             s.ws_active = active;
         });
         // focus the active project after a switch (render has the Window)
@@ -6775,6 +7022,8 @@ struct DiffWindow {
     focused: bool,
     left_scroll: ScrollHandle,
     right_scroll: ScrollHandle,
+    // set when the file (re)loads → next render scrolls to the first change
+    pending_scroll: bool,
     sel: Option<DiffSel>,
     dragging: bool,
     char_w: f32,
@@ -6833,6 +7082,7 @@ impl DiffWindow {
             focused: false,
             left_scroll: ScrollHandle::new(),
             right_scroll: ScrollHandle::new(),
+            pending_scroll: true,
             sel: None,
             dragging: false,
             char_w: 8.0,
@@ -6908,9 +7158,15 @@ impl DiffWindow {
             self.right_styles = rs;
             self.sel = None;
             self.caret = None;
+            self.pending_scroll = true; // jump to the first change in the new file
             self.recompute_matches();
             cx.notify();
         }
+    }
+
+    /// Row index of the first changed (non-Equal) line, if any.
+    fn first_change_row(&self) -> Option<usize> {
+        self.rows.iter().position(|r| r.kind != DiffKind::Equal)
     }
 
     /// Move to the next/previous search match and scroll it into view.
@@ -6996,6 +7252,28 @@ impl DiffWindow {
         Some(out.join("\n"))
     }
 
+    /// Map the diff's caret (or selection head) to a 1-based (line, col) in the
+    /// real file, so F4 can open the editor at the same spot. Prefers the side's
+    /// own line number, falling back to the other side for added/removed rows.
+    fn cursor_file_pos(&self) -> (usize, usize) {
+        let (side, row, col) = if let Some((s, r, c)) = self.caret {
+            (s, r, c)
+        } else if let Some(sel) = &self.sel {
+            (sel.side, sel.head.0, sel.head.1)
+        } else {
+            (DiffSide::Right, 0, 0)
+        };
+        let line = self
+            .rows
+            .get(row)
+            .and_then(|dr| match side {
+                DiffSide::Left => dr.left_no.or(dr.right_no),
+                DiffSide::Right => dr.right_no.or(dr.left_no),
+            })
+            .unwrap_or(1);
+        (line, col + 1)
+    }
+
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         // when the search input has focus, let search_key own the keystroke
@@ -7023,16 +7301,25 @@ impl DiffWindow {
             }
             return;
         }
-        // F4: close the diff and open the real file in the main app window
+        // F4: close the diff and open the real file in the main app window, at
+        // the same line/column the caret was on here (centered in view)
         if ks.key == "f4" {
             let path = self.files[self.idx].clone();
+            let (line, col) = self.cursor_file_pos();
             window.remove_window();
             if path.is_file() {
                 if let Some(handle) = self.main_window {
                     let storm = self.storm.clone();
                     cx.update_window(handle, move |_, window, cx| {
                         window.activate_window();
-                        storm.update(cx, |s, cx| s.open_file(path, window, cx)).ok();
+                        storm
+                            .update(cx, |s, cx| {
+                                s.open_file(path, window, cx);
+                                if let Some(tab) = s.tabs.get(s.active) {
+                                    tab.editor.update(cx, |e, cx| e.goto(line, col, cx));
+                                }
+                            })
+                            .ok();
                     })
                     .ok();
                 }
@@ -7207,7 +7494,7 @@ impl Render for DiffWindow {
                     .on_click(cx.listener(|_this, _e, window, _cx| window.remove_window())),
             );
 
-        div()
+        let col = div()
             .size_full()
             .flex()
             .flex_col()
@@ -7244,8 +7531,20 @@ impl Render for DiffWindow {
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _e, _w, _cx| this.dragging = false))
             .child(bar)
-            .when(self.search_open, |d| d.child(self.render_search_bar(cx)))
-            .child(diff_body(
+            .when(self.search_open, |d| d.child(self.render_search_bar(cx)));
+
+        // on (re)load, snap both panes to the first change with a little context
+        // above it, so the diff opens on the change instead of the file top
+        if self.pending_scroll {
+            self.pending_scroll = false;
+            if let Some(row) = self.first_change_row() {
+                let y = -(row.saturating_sub(3) as f32 * 18.0);
+                self.left_scroll.set_offset(gpui::point(px(0.), px(y)));
+                self.right_scroll.set_offset(gpui::point(px(0.), px(y)));
+            }
+        }
+
+        col.child(diff_body(
                 &self.rows,
                 &self.left_scroll,
                 &self.right_scroll,
