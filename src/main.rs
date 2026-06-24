@@ -62,7 +62,7 @@ actions!(
         CloseTab, CloseOthers, ToggleTerminal, OpenFinder, GotoLine, NewTerminal, CloseTerminalTab,
         CloseOtherTerminals, GotoCommit, ShowDiff, FindInFiles,
         GitPopup, CommandPalette, CopyReference, OpenOnGithub, NextProject, PrevProject, OpenProject,
-        ShowProjects, PushDialog, RunCommand
+        ShowProjects, PushDialog, RunCommand, NewProject, FetchRemotes, PullRemote
     ]
 );
 
@@ -113,11 +113,57 @@ const FIND_CAP: usize = 500;
 
 /// Full-text search across files under `scope`. Uses ripgrep when available
 /// (fast, parallel, respects .gitignore); falls back to a pure-Rust walk.
+/// Split a search query into (include, excludes). A `-word` token (dash + at
+/// least one non-space char) is an exclusion; everything else is the literal
+/// search term. E.g. `context. -context.container` → ("context.", ["context.container"]).
+fn parse_search_query(q: &str) -> (String, Vec<String>) {
+    let mut include = Vec::new();
+    let mut excludes = Vec::new();
+    for tok in q.split_whitespace() {
+        if tok.len() > 1 && tok.starts_with('-') {
+            excludes.push(tok[1..].to_string());
+        } else {
+            include.push(tok);
+        }
+    }
+    (include.join(" "), excludes)
+}
+
+/// Keep a result line unless every occurrence of `include` in it is the start
+/// of some `exclude` term (so `context.` matches but `context.container` doesn't).
+/// Case-insensitive, matching ripgrep's smart-case for all-lowercase queries.
+fn line_passes_excludes(text: &str, include: &str, excludes: &[String]) -> bool {
+    if excludes.is_empty() {
+        return true;
+    }
+    let t = text.to_lowercase();
+    let inc = include.to_lowercase();
+    let exs: Vec<String> = excludes.iter().map(|e| e.to_lowercase()).collect();
+    let mut found = false;
+    let mut start = 0;
+    while let Some(rel) = t[start..].find(&inc) {
+        let i = start + rel;
+        found = true;
+        if !exs.iter().any(|e| t[i..].starts_with(e.as_str())) {
+            return true; // a non-excluded occurrence → keep the line
+        }
+        start = i + inc.len().max(1);
+    }
+    // no visible occurrence (e.g. truncated) → can't judge, keep; else all excluded → drop
+    !found
+}
+
 fn search_files(query: &str, scope: &Path) -> Vec<FindResult> {
-    if query.len() < 2 {
+    let (include, excludes) = parse_search_query(query);
+    if include.len() < 2 {
         return Vec::new();
     }
-    search_ripgrep(query, scope).unwrap_or_else(|| search_rust(query, scope))
+    let mut results =
+        search_ripgrep(&include, scope).unwrap_or_else(|| search_rust(&include, scope));
+    if !excludes.is_empty() {
+        results.retain(|r| line_passes_excludes(&r.text, &include, &excludes));
+    }
+    results
 }
 
 /// Locate the ripgrep binary once (PATH may be minimal under a GUI launch).
@@ -387,24 +433,22 @@ fn check_box(checked: bool) -> Div {
 }
 
 /// Compute side-by-side diff rows + per-line syntax runs for each side.
-/// PR diff (base..HEAD) when `base` is Some, else working-tree diff.
+/// `old` Some → committed diff of `old` rev vs `new_rev` (defaulting to HEAD);
+/// `old` None → working-tree diff (HEAD vs the file on disk). Callers resolve
+/// the actual revs (merge-base, commit^, …) so this stays a plain git show.
 fn compute_diff(
     root: &Path,
     path: &Path,
-    base: &Option<String>,
+    old: &Option<String>,
+    new_rev: &Option<String>,
     hl: &Highlighter,
 ) -> (Vec<DiffRow>, Vec<Vec<Run>>, Vec<Vec<Run>>) {
     let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
-    let (old, new) = match base {
-        // "old" is the file at the MERGE-BASE of origin/<base> and HEAD — the
-        // three-dot point GitHub diffs against — not the base branch tip. Diffing
-        // against the tip would fold in commits the base branch gained after this
-        // branch diverged, showing changes the PR didn't actually make.
-        Some(b) => {
-            let base_ref = resolve_base_ref(root, b.strip_prefix("origin/").unwrap_or(b));
-            let old_rev = git_merge_base(root, &base_ref).unwrap_or(base_ref);
-            (git_show(root, &old_rev, &rel), git_show(root, "HEAD", &rel))
-        }
+    let (old, new) = match old {
+        Some(o) => (
+            git_show(root, o, &rel),
+            git_show(root, new_rev.as_deref().unwrap_or("HEAD"), &rel),
+        ),
         None => (git_show_head(root, &rel), std::fs::read_to_string(path).unwrap_or_default()),
     };
     // expand tabs up front so the rendered grid, syntax runs, and selection all
@@ -1051,6 +1095,43 @@ fn git_merge_base(root: &Path, base_ref: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// The rev a PR/push diff compares against: the merge-base of `origin/<base>`
+/// (or `<base>`) and HEAD — the three-dot point GitHub uses.
+fn diff_base_rev(root: &Path, base: &str) -> String {
+    let base_ref = resolve_base_ref(root, base.strip_prefix("origin/").unwrap_or(base));
+    git_merge_base(root, &base_ref).unwrap_or(base_ref)
+}
+
+/// Files changed by a single commit, as (absolute path, status).
+fn git_commit_files(root: &Path, sha: &str) -> Vec<(PathBuf, GitState)> {
+    let out = Command::new("git")
+        .args(["diff-tree", "--no-commit-id", "--name-status", "-M", "-r", sha])
+        .current_dir(root)
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut files = Vec::new();
+    for line in text.lines() {
+        let mut parts = line.split('\t');
+        let Some(status) = parts.next() else { continue };
+        let path = parts.last().unwrap_or("").trim();
+        if path.is_empty() {
+            continue;
+        }
+        let state = match status.chars().next() {
+            Some('A') => GitState::New,
+            Some('D') => GitState::Deleted,
+            _ => GitState::Modified,
+        };
+        files.push((root.join(path), state));
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files
+}
+
 /// PR changes: files changed on this branch since it diverged from `base`,
 /// as (absolute path, status). Uses the three-dot (merge-base) diff, comparing
 /// against `origin/<base>` to match GitHub's "Files changed".
@@ -1206,15 +1287,19 @@ enum GitItem {
 }
 
 /// Per-branch actions, shown in a submenu when you press enter on a branch in
-/// the git popup. Only Checkout for now; the table is structured to grow.
+/// the git popup.
 #[derive(Clone, Copy, PartialEq)]
 enum BranchAction {
     Checkout,
+    Merge,
 }
 
-/// (action, label, icon) — the submenu entries, in display order.
-const BRANCH_ACTIONS: &[(BranchAction, &'static str, &'static str)] =
-    &[(BranchAction::Checkout, "Checkout", IC_HOME)];
+/// (action, label, icon) — the submenu entries, in display order. The label is
+/// a fallback; render builds a dynamic one (e.g. "Merge 'x' into 'y'").
+const BRANCH_ACTIONS: &[(BranchAction, &'static str, &'static str)] = &[
+    (BranchAction::Checkout, "Checkout", IC_HOME),
+    (BranchAction::Merge, "Merge", IC_BRANCH),
+];
 
 /// Commands available in the command palette (cmd+shift+p).
 #[derive(Clone, Copy, PartialEq)]
@@ -1238,6 +1323,7 @@ enum Cmd {
     ShowDiff,
     MyPrs,
     ReleasePrs,
+    CopyBranch,
 }
 
 /// (command, label, icon glyph, shortcut hint)
@@ -1261,7 +1347,18 @@ const PALETTE: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::FindInFiles, "Find in Files", IC_SEARCH, "⌘⇧F"),
     (Cmd::GoToFile, "Go to File", IC_FILES, "⌘⇧O"),
     (Cmd::GoToLine, "Go to Line", IC_HOME, "⌘L"),
+    (Cmd::CopyBranch, "Copy Branch Name", IC_BRANCH, ""),
 ];
+
+/// Split a finder query into (path, line, col), peeling a trailing `:line` or
+/// `:line:col` so a pasted "src/x.ts:45" still matches the file and jumps there.
+fn split_finder_query(q: &str) -> (&str, Option<usize>, Option<usize>) {
+    let mut parts = q.splitn(3, ':');
+    let path = parts.next().unwrap_or("");
+    let line = parts.next().and_then(|s| s.trim().parse::<usize>().ok());
+    let col = parts.next().and_then(|s| s.trim().parse::<usize>().ok());
+    (path, line, col)
+}
 
 /// Current git branch name (empty if not a repo).
 fn git_branch(root: &Path) -> String {
@@ -1472,6 +1569,10 @@ struct Storm {
     runc_open: bool,
     runc_focus: FocusHandle,
     runc_query: Field,
+    // new-project dialog (cmd+shift+n): type or choose a folder path to open
+    newproj_open: bool,
+    newproj_focus: FocusHandle,
+    newproj_path: Field,
     // commit message
     commit_msg: Field,
     commit_focus: FocusHandle,
@@ -1494,6 +1595,9 @@ struct Storm {
     push_files: Vec<(PathBuf, GitState)>,
     push_collapsed: HashSet<PathBuf>,
     push_selected: Option<PathBuf>,
+    // when set, the file tree + diffs are scoped to this commit's changes;
+    // None shows the whole to-be-pushed range
+    push_commit_sel: Option<String>,
     push_tags: bool,
     // files checked for commit
     commit_checked: HashSet<PathBuf>,
@@ -1510,6 +1614,8 @@ struct Storm {
     find_scope: PathBuf,
     find_gen: u64,
     find_preview: Option<FindPreview>,
+    find_scroll: ScrollHandle, // keeps the selected result row in view
+
     // find-in-files panel size (resizable via the bottom-right grip)
     find_w: f32,
     find_h: f32,
@@ -1555,6 +1661,7 @@ struct Storm {
 enum ProjectNav {
     Switch(usize),
     Open,
+    OpenPath(PathBuf), // open a project at a specific folder path (from the new-project dialog)
     Remove(usize),
     Activity, // a change was detected → workspace should pulse this icon
 }
@@ -1651,6 +1758,9 @@ impl Storm {
             runc_open: false,
             runc_focus: cx.focus_handle(),
             runc_query: Field::default(),
+            newproj_open: false,
+            newproj_focus: cx.focus_handle(),
+            newproj_path: Field::default(),
             commit_msg: Field::default(),
             commit_focus: cx.focus_handle(),
             wip_id: random_id(),
@@ -1668,6 +1778,7 @@ impl Storm {
             push_files: Vec::new(),
             push_collapsed: HashSet::new(),
             push_selected: None,
+            push_commit_sel: None,
             push_tags: false,
             commit_checked: HashSet::new(),
             commit_collapsed: HashSet::new(),
@@ -1680,6 +1791,7 @@ impl Storm {
             find_scope: PathBuf::new(),
             find_gen: 0,
             find_preview: None,
+            find_scroll: ScrollHandle::new(),
             find_w: 760.,
             find_h: 460.,
             find_resizing: false,
@@ -1717,7 +1829,17 @@ impl Storm {
         s.start_caret_blink(cx);
         s.lsp = Lsp::new(&s.root);
         let root = s.root.clone();
-        s.terminals.push(cx.new(|cx| Terminal::new(root, cx)));
+        let term = cx.new(|cx| Terminal::new(root, cx));
+        // optional startup command run in the default terminal (e.g. set
+        // TIDE_TERM_CMD=z to auto-launch zellij). The shell reads this after
+        // sourcing its rc file, so aliases/functions like `z` are defined.
+        if let Ok(cmd) = std::env::var("TIDE_TERM_CMD") {
+            let cmd = cmd.trim();
+            if !cmd.is_empty() {
+                term.read(cx).send_text(&format!("{cmd}\n"));
+            }
+        }
+        s.terminals.push(term);
         s
     }
 
@@ -1729,6 +1851,7 @@ impl Storm {
             || self.br_open
             || self.prc_open
             || self.runc_open
+            || self.newproj_open
             || self.find_open
             || self.gitp_open
             || self.palette_open
@@ -2060,6 +2183,7 @@ impl Storm {
             || self.br_open
             || self.prc_open
             || self.runc_open
+            || self.newproj_open
             || self.find_open
             || self.gitp_open
             || self.ws_open;
@@ -2070,6 +2194,7 @@ impl Storm {
             self.br_open = false;
             self.prc_open = false;
             self.runc_open = false;
+            self.newproj_open = false;
             self.find_open = false;
             self.gitp_open = false;
             self.ws_open = false;
@@ -2564,10 +2689,12 @@ impl Storm {
     }
 
     fn update_finder(&mut self) {
-        let q = self.finder_query.text.clone();
+        let raw = self.finder_query.text.clone();
+        // peel a trailing ":line[:col]" so a pasted "path:45" still matches the file
+        let (path_q, _, _) = split_finder_query(&raw);
         // a trailing '/' switches the finder to listing folders
-        let dirs_mode = q.ends_with('/');
-        let query = if dirs_mode { q.trim_end_matches('/').to_string() } else { q };
+        let dirs_mode = path_q.ends_with('/');
+        let query = if dirs_mode { path_q.trim_end_matches('/').to_string() } else { path_q.to_string() };
         let root = self.root.clone();
         let source = if dirs_mode { &self.all_dirs } else { &self.all_files };
         let mut scored: Vec<(i32, PathBuf)> = source
@@ -2630,7 +2757,14 @@ impl Storm {
             }
             "enter" => {
                 if let Some(p) = self.finder_results.get(self.finder_selected).cloned() {
+                    // a ":line[:col]" suffix in the query jumps there after opening
+                    let (_, line, col) = split_finder_query(&self.finder_query.text);
                     self.open_finder_result(p, window, cx);
+                    if let Some(line) = line {
+                        if let Some(tab) = self.tabs.get(self.active) {
+                            tab.editor.update(cx, |e, cx| e.goto(line, col.unwrap_or(1), cx));
+                        }
+                    }
                 }
             }
             "up" => self.finder_selected = self.finder_selected.saturating_sub(1),
@@ -2777,6 +2911,89 @@ impl Storm {
         cx.notify();
     }
 
+    /// opt+f: fetch all remotes (quick shortcut for the palette's Fetch command).
+    fn act_fetch(&mut self, _: &FetchRemotes, _window: &mut Window, cx: &mut Context<Self>) {
+        self.run_command("git fetch --all --prune".into(), cx);
+    }
+
+    /// opt+l: pull the current branch (quick shortcut for the palette's Pull).
+    fn act_pull(&mut self, _: &PullRemote, _window: &mut Window, cx: &mut Context<Self>) {
+        self.run_command("git pull".into(), cx);
+    }
+
+    /// cmd+shift+n: open the "New Project" dialog (type a folder path or pick one).
+    fn act_new_project(&mut self, _: &NewProject, window: &mut Window, cx: &mut Context<Self>) {
+        self.newproj_open = true;
+        self.newproj_path.clear();
+        window.focus(&self.newproj_focus, cx);
+        cx.notify();
+    }
+
+    fn newproj_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        match ks.key.as_str() {
+            "escape" => {
+                self.newproj_open = false;
+                self.focus_active(window, cx);
+            }
+            "enter" => self.newproj_submit(cx),
+            _ => {
+                Self::field_input(&mut self.newproj_path, ks, cx, |_| true);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Open the project at the dialog's typed path (if it's an existing folder).
+    fn newproj_submit(&mut self, cx: &mut Context<Self>) {
+        let raw = self.newproj_path.text.trim();
+        if raw.is_empty() {
+            return;
+        }
+        // expand a leading ~ to the home directory for convenience
+        let expanded = if let Some(rest) = raw.strip_prefix("~/") {
+            std::env::var("HOME").map(|h| format!("{h}/{rest}")).unwrap_or_else(|_| raw.to_string())
+        } else {
+            raw.to_string()
+        };
+        let path = PathBuf::from(&expanded);
+        if path.is_dir() {
+            self.newproj_open = false;
+            cx.emit(ProjectNav::OpenPath(path));
+        }
+        // not a folder → leave the dialog open so the user can fix the path
+    }
+
+    /// "Choose…" button: open the native macOS folder picker and fill the field.
+    fn newproj_choose(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let path = cx
+                .background_executor()
+                .spawn(async {
+                    let out = Command::new("osascript")
+                        .arg("-e")
+                        .arg("POSIX path of (choose folder with prompt \"Choose Project Folder\")")
+                        .output()
+                        .ok()?;
+                    if !out.status.success() {
+                        return None;
+                    }
+                    let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    (!p.is_empty()).then_some(p)
+                })
+                .await;
+            if let Some(p) = path {
+                this.update(cx, |this, cx| {
+                    // strip the trailing slash AppleScript adds to folder paths
+                    this.newproj_path.set(p.trim_end_matches('/').to_string());
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
     fn commit_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         match ks.key.as_str() {
@@ -2854,6 +3071,15 @@ impl Storm {
     // ── diff ────────────────────────────────────────────────────────────────
 
     fn act_show_diff(&mut self, _: &ShowDiff, _window: &mut Window, cx: &mut Context<Self>) {
+        // in the Push dialog, cmd+d shows the selected file's diff for the
+        // about-to-be-pushed range (the global keybinding fires before the
+        // dialog's own key handler, so route it here)
+        if self.push_open {
+            if let Some(p) = self.push_selected.clone() {
+                self.push_open_diff(p, cx);
+            }
+            return;
+        }
         // in the PR pane, cmd+d shows the selected file's PR diff (base..HEAD)
         if self.left_view == LeftView::PullRequest {
             if let Some(p) = self.pr_selected.clone() {
@@ -2880,16 +3106,17 @@ impl Storm {
             return;
         }
         let idx = focus.and_then(|p| files.iter().position(|f| f == &p)).unwrap_or(0);
-        self.open_diff_window(files, idx, None, cx);
+        self.open_diff_window(files, idx, None, None, cx);
     }
 
-    /// Open a diff in its own window. `base` Some → PR diff (base..HEAD),
-    /// None → working-tree diff (HEAD vs disk).
+    /// Open a diff in its own window. `old` Some → committed diff of `old` vs
+    /// `new_rev` (default HEAD); `old` None → working-tree diff (HEAD vs disk).
     fn open_diff_window(
         &mut self,
         files: Vec<PathBuf>,
         idx: usize,
-        base: Option<String>,
+        old: Option<String>,
+        new_rev: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let root = self.root.clone();
@@ -2906,7 +3133,7 @@ impl Storm {
                 focus: true,
                 ..Default::default()
             },
-            move |_, cx| cx.new(|cx| DiffWindow::new(root, files, idx, base, storm, main, cx)),
+            move |_, cx| cx.new(|cx| DiffWindow::new(root, files, idx, old, new_rev, storm, main, cx)),
         )
         .ok();
     }
@@ -3019,8 +3246,8 @@ impl Storm {
     fn open_pr_diff(&mut self, path: PathBuf, _window: &mut Window, cx: &mut Context<Self>) {
         let files: Vec<PathBuf> = self.pr_files.iter().map(|(p, _)| p.clone()).collect();
         let Some(idx) = files.iter().position(|p| p == &path) else { return };
-        let base = Some(self.pr_base.clone());
-        self.open_diff_window(files, idx, base, cx);
+        let old = Some(diff_base_rev(&self.root, &self.pr_base));
+        self.open_diff_window(files, idx, old, None, cx);
     }
 
     /// PR pane keys: F4 opens the selected file in a tab, Enter shows its diff,
@@ -3124,12 +3351,28 @@ impl Storm {
         self.push_base_ref = base_ref;
         self.push_collapsed.clear();
         self.push_selected = None;
+        self.push_commit_sel = None;
         self.push_open = true;
         window.focus(&self.push_focus, cx);
         cx.notify();
     }
 
-    /// Open the upstream..HEAD diff for a file selected in the push dialog.
+    /// Click a commit in the push dialog: scope the file tree to that commit's
+    /// changes (click again, or the branch header, to show the whole range).
+    fn push_select_commit(&mut self, sha: Option<String>, cx: &mut Context<Self>) {
+        // toggle off if the same commit is clicked again
+        self.push_commit_sel = if self.push_commit_sel == sha { None } else { sha };
+        self.push_files = match &self.push_commit_sel {
+            Some(s) => git_commit_files(&self.root, s),
+            None => git_range_files(&self.root, &format!("{}..HEAD", self.push_base_ref)),
+        };
+        self.push_selected = None;
+        cx.notify();
+    }
+
+    /// Open the diff for a file selected in the push dialog. When a single
+    /// commit is selected, show just that commit's change (sha^..sha);
+    /// otherwise the whole to-be-pushed range (base..HEAD).
     fn push_open_diff(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let mut files: Vec<PathBuf> = self.push_files.iter().map(|(p, _)| p.clone()).collect();
         if files.is_empty() {
@@ -3139,7 +3382,11 @@ impl Storm {
             files.push(path.clone());
         }
         let idx = files.iter().position(|f| f == &path).unwrap_or(0);
-        self.open_diff_window(files, idx, Some(self.push_base_ref.clone()), cx);
+        let (old, new_rev) = match &self.push_commit_sel {
+            Some(sha) => (Some(format!("{sha}^")), Some(sha.clone())),
+            None => (Some(diff_base_rev(&self.root, &self.push_base_ref)), None),
+        };
+        self.open_diff_window(files, idx, old, new_rev, cx);
     }
 
     fn do_push(&mut self, cx: &mut Context<Self>) {
@@ -3163,11 +3410,8 @@ impl Storm {
                     self.do_push(cx);
                 }
             }
-            "d" if ks.modifiers.platform => {
-                if let Some(p) = self.push_selected.clone() {
-                    self.push_open_diff(p, cx);
-                }
-            }
+            // cmd+d is handled by the global ShowDiff action (act_show_diff),
+            // which routes to the selected file while this dialog is open
             _ => {}
         }
     }
@@ -3244,11 +3488,10 @@ impl Storm {
     ) {
         let Some(branch) = self.gitp_action_branch.take() else { return };
         self.gitp_open = false;
+        let _ = window;
         match action {
-            BranchAction::Checkout => {
-                let _ = window;
-                self.run_command(format!("git checkout {}", branch), cx)
-            }
+            BranchAction::Checkout => self.run_command(format!("git checkout {}", branch), cx),
+            BranchAction::Merge => self.run_command(format!("git merge {}", branch), cx),
         }
     }
 
@@ -3443,6 +3686,12 @@ impl Storm {
                 let url = "https://github.com/webiny/webiny-js/pulls?q=sort%3Aupdated-desc+is%3Apr+state%3Aopen+head%3Arelease";
                 let _ = Command::new("open").arg(url).spawn();
             }
+            Cmd::CopyBranch => {
+                if !self.branch.is_empty() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(self.branch.clone()));
+                    self.show_flash("Branch name copied", cx);
+                }
+            }
         }
     }
 
@@ -3523,9 +3772,13 @@ impl Storm {
             }
             "down" => {
                 self.find_selected =
-                    (self.find_selected + 1).min(self.find_results.len().saturating_sub(1))
+                    (self.find_selected + 1).min(self.find_results.len().saturating_sub(1));
+                self.find_scroll_into_view();
             }
-            "up" => self.find_selected = self.find_selected.saturating_sub(1),
+            "up" => {
+                self.find_selected = self.find_selected.saturating_sub(1);
+                self.find_scroll_into_view();
+            }
             _ => {
                 if Self::field_input(&mut self.find_query, ks, cx, |_| true) == Edit::Changed {
                     self.run_find_search(cx);
@@ -3533,6 +3786,19 @@ impl Storm {
             }
         }
         cx.notify();
+    }
+
+    /// Keep the selected result row visible as you arrow through the list.
+    fn find_scroll_into_view(&self) {
+        let row_h = 20.0_f32; // matches the result row height
+        let vh = f32::from(self.find_scroll.bounds().size.height).max(1.0);
+        let y = self.find_selected as f32 * row_h;
+        let top = -f32::from(self.find_scroll.offset().y);
+        if y < top {
+            self.find_scroll.set_offset(gpui::point(px(0.), px(-y)));
+        } else if y + row_h > top + vh {
+            self.find_scroll.set_offset(gpui::point(px(0.), px(-(y + row_h - vh))));
+        }
     }
 
     fn do_commit(&mut self, push: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -3573,8 +3839,8 @@ impl Storm {
             self.term_width = (self.win_width - f32::from(ev.position.x)).clamp(200., 1125.);
             cx.notify();
         } else if self.find_resizing {
-            // panel is centered both ways, so width and height grow
-            // symmetrically about the window's center as you drag the grip
+            // panel is centered both ways, so width/height grow symmetrically
+            // about the window center as you drag the grip
             let midx = self.win_width / 2.0;
             let midy = self.win_height / 2.0;
             self.find_w = ((f32::from(ev.position.x) - midx) * 2.0).clamp(420., (self.win_width - 80.0).max(420.0));
@@ -3725,6 +3991,9 @@ impl Render for Storm {
             .on_action(cx.listener(Self::act_open_on_github))
             .on_action(cx.listener(Self::act_push_dialog))
             .on_action(cx.listener(Self::act_run_command))
+            .on_action(cx.listener(Self::act_new_project))
+            .on_action(cx.listener(Self::act_fetch))
+            .on_action(cx.listener(Self::act_pull))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .child(topbar)
@@ -3746,6 +4015,9 @@ impl Render for Storm {
         }
         if self.runc_open {
             root = root.child(self.render_run_prompt(cx));
+        }
+        if self.newproj_open {
+            root = root.child(self.render_new_project(cx));
         }
         if self.find_open {
             root = root.child(self.render_find(cx));
@@ -5144,16 +5416,18 @@ impl Storm {
     }
 
     fn render_find(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        // bare centered panel — same pattern as the command palette / finder
         let w = self.find_w.clamp(420.0, (self.win_width - 80.0).max(420.0));
         let left = ((self.win_width - w) / 2.0).max(0.);
         let h = self.find_h.clamp(300.0, (self.win_height - 120.0).max(300.0));
-        let top = ((self.win_height - h) / 2.0).max(40.); // vertically centered, like the other dialogs
+        let top = ((self.win_height - h) / 2.0).max(40.);
         let scope_label = if self.find_scope == self.root {
             "Project".to_string()
         } else {
             self.rel(&self.find_scope)
         };
         let count = self.find_results.len();
+        let (_, excludes) = parse_search_query(&self.find_query.text);
 
         // ── search input row ──
         let header = div()
@@ -5180,8 +5454,30 @@ impl Storm {
                 div()
                     .text_size(px(11.))
                     .text_color(rgb(MUTED))
-                    .child(format!("{} · {} matches", scope_label, count)),
+                    .child(format!("{} matches", count)),
             );
+
+        // ── scope + refinements row: shows where the search runs and any excludes ──
+        let scope_row = div()
+            .h(px(22.))
+            .px_3()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .text_size(px(11.))
+            .child(div().font_family(ICON_FONT).text_color(rgb(FOLDER_ICON)).child(IC_FOLDER))
+            .child(div().text_color(rgb(MUTED)).truncate().child(format!("in {}", scope_label)))
+            .when(!excludes.is_empty(), |d| {
+                d.child(
+                    div()
+                        .text_color(rgb(GIT_DELETED))
+                        .truncate()
+                        .child(format!("· excluding {}", excludes.join(", "))),
+                )
+            });
 
         // ── results list ──
         let mut results = div()
@@ -5190,6 +5486,7 @@ impl Storm {
             .flex_col()
             .h(px((h * 0.42).max(120.)))
             .overflow_y_scroll()
+            .track_scroll(&self.find_scroll)
             .border_b_1()
             .border_color(rgb(BORDER));
 
@@ -5282,7 +5579,7 @@ impl Storm {
             }
         }
 
-        let panel = div()
+        div()
             .absolute()
             .top(px(top))
             .left(px(left))
@@ -5295,10 +5592,10 @@ impl Storm {
             .shadow_lg()
             .flex()
             .flex_col()
-            .relative()
             .track_focus(&self.find_focus)
             .on_key_down(cx.listener(Self::find_key))
             .child(header)
+            .child(scope_row)
             .child(results)
             .child(preview)
             // bottom-right grip: drag to resize the panel
@@ -5323,27 +5620,7 @@ impl Storm {
                             cx.notify();
                         }),
                     ),
-            );
-
-        // full-screen overlay establishes the containing block so the panel
-        // centers reliably (a bare absolute child anchors to the wrong box)
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_start()
-            .justify_center()
-            .child(
-                div()
-                    .id("find-backdrop")
-                    .absolute()
-                    .inset_0()
-                    .on_click(cx.listener(|this, _e, _w, cx| {
-                        this.find_open = false;
-                        cx.notify();
-                    })),
             )
-            .child(panel)
     }
 
     fn render_palette(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5516,7 +5793,7 @@ impl Storm {
         let branch = self.gitp_action_branch.clone().unwrap_or_default();
         let main_w = 440.0_f32;
         let main_left = ((self.win_width - main_w) / 2.0).max(0.);
-        let subw = 220.0_f32;
+        let subw = 320.0_f32;
         let mut sub_left = main_left + main_w + 6.0;
         if sub_left + subw > self.win_width {
             sub_left = (main_left - subw - 6.0).max(0.);
@@ -5547,11 +5824,16 @@ impl Storm {
                     .border_b_1()
                     .border_color(rgb(BORDER))
                     .child(div().font_family(ICON_FONT).text_color(rgb(MUTED)).child(IC_BRANCH))
-                    .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(branch)),
+                    .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(branch.clone())),
             );
 
         for (i, &(action, label, icon)) in BRANCH_ACTIONS.iter().enumerate() {
             let sel = i == self.gitp_action_sel;
+            // dynamic, WebStorm-style label (e.g. "Merge 'next' into 'mine'")
+            let display = match action {
+                BranchAction::Merge => format!("Merge '{}' into '{}'", branch, self.branch),
+                _ => label.to_string(),
+            };
             panel = panel.child(
                 div()
                     .id(("gitp-action", i))
@@ -5571,7 +5853,7 @@ impl Storm {
                             .text_color(rgb(if sel { SEL_TEXT } else { MUTED }))
                             .child(icon),
                     )
-                    .child(div().text_color(rgb(if sel { SEL_TEXT } else { TEXT })).child(label))
+                    .child(div().min_w(px(0.)).truncate().text_color(rgb(if sel { SEL_TEXT } else { TEXT })).child(display))
                     .on_click(cx.listener(move |this, _ev, window, cx| {
                         this.gitp_run_branch_action(action, window, cx);
                     })),
@@ -5602,18 +5884,28 @@ impl Storm {
         let file_count = self.push_files.len();
 
         // ── left: branch + commits ───────────────────────────────────────
+        let all_sel = self.push_commit_sel.is_none();
         let mut commits = div().id("push-commits").flex().flex_col().w(px(280.)).flex_shrink_0().min_h(px(0.)).overflow_y_scroll()
             .border_r_1().border_color(rgb(BORDER))
             .child(
-                div().flex().flex_row().items_center().gap_2().h(px(26.)).px_3()
+                // branch header doubles as "show all commits" (clears the filter)
+                div().id("push-branch").flex().flex_row().items_center().gap_2().h(px(26.)).px_3().cursor_pointer()
+                    .when(all_sel, |d| d.bg(rgb(SELECTED_BG)))
+                    .when(!all_sel, |d| d.hover(|s| s.bg(rgb(HOVER))))
+                    .on_click(cx.listener(|this, _e, _w, cx| this.push_select_commit(None, cx)))
                     .child(div().font_family(ICON_FONT).text_size(px(12.)).text_color(rgb(ACCENT)).child(IC_BRANCH))
-                    .child(div().text_size(px(12.)).text_color(rgb(TEXT)).truncate().child(self.push_branch.clone())),
+                    .child(div().text_size(px(12.)).text_color(rgb(if all_sel { SEL_TEXT } else { TEXT })).truncate().child(self.push_branch.clone())),
             );
-        for (hash, subject) in &self.push_commits {
+        for (i, (hash, subject)) in self.push_commits.iter().enumerate() {
+            let sel = self.push_commit_sel.as_deref() == Some(hash.as_str());
+            let sha = hash.clone();
             commits = commits.child(
-                div().flex().flex_row().items_center().gap_2().h(px(22.)).pl(px(28.)).pr_3()
-                    .child(div().flex_grow(1.0).text_size(px(12.)).text_color(rgb(TEXT)).truncate().child(subject.clone()))
-                    .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(hash.clone())),
+                div().id(("push-commit", i)).flex().flex_row().items_center().gap_2().h(px(22.)).pl(px(28.)).pr_3().cursor_pointer()
+                    .when(sel, |d| d.bg(rgb(SELECTED_BG)))
+                    .when(!sel, |d| d.hover(|s| s.bg(rgb(HOVER))))
+                    .on_click(cx.listener(move |this, _e, _w, cx| this.push_select_commit(Some(sha.clone()), cx)))
+                    .child(div().flex_grow(1.0).text_size(px(12.)).text_color(rgb(if sel { SEL_TEXT } else { TEXT })).truncate().child(subject.clone()))
+                    .child(div().text_size(px(11.)).text_color(rgb(if sel { SEL_TEXT } else { MUTED })).child(hash.clone())),
             );
         }
         if self.push_commits.is_empty() {
@@ -5719,6 +6011,8 @@ impl Storm {
                     .flex().flex_col()
                     .track_focus(&self.push_focus)
                     .on_key_down(cx.listener(Self::push_key))
+                    // clicking inside the panel must not reach the dismiss backdrop
+                    .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
                     .child(
                         div().flex().items_center().justify_center().h(px(38.)).flex_shrink_0()
                             .border_b_1().border_color(rgb(BORDER))
@@ -6081,6 +6375,114 @@ impl Storm {
                     } else {
                         div().child(self.runc_query.render(self.caret(), SELECTION))
                     }),
+            )
+    }
+
+    fn render_new_project(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let w = 560.0_f32;
+        let left = ((self.win_width - w) / 2.0).max(0.);
+        // the typed path is valid when it points at an existing folder
+        let raw = self.newproj_path.text.trim();
+        let valid = !raw.is_empty()
+            && PathBuf::from(if let Some(r) = raw.strip_prefix("~/") {
+                std::env::var("HOME").map(|h| format!("{h}/{r}")).unwrap_or_else(|_| raw.to_string())
+            } else {
+                raw.to_string()
+            })
+            .is_dir();
+
+        // text input + "Choose…" button on one row
+        let input_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .mx_3()
+            .child(
+                div()
+                    .flex_grow(1.0)
+                    .px_2()
+                    .py_1()
+                    .bg(rgb(BG))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .rounded_md()
+                    .font_family("Menlo")
+                    .text_size(px(12.))
+                    .text_color(rgb(TEXT))
+                    .child(if self.newproj_path.is_empty() {
+                        div().text_color(rgb(MUTED)).child(format!("{}/path/to/folder", self.caret()))
+                    } else {
+                        div().child(self.newproj_path.render(self.caret(), SELECTION))
+                    }),
+            )
+            .child(
+                div()
+                    .id("newproj-choose")
+                    .px_3()
+                    .py_1()
+                    .flex_shrink_0()
+                    .bg(rgb(PANEL_BG))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .rounded_md()
+                    .text_size(px(12.))
+                    .text_color(rgb(TEXT))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(HOVER)))
+                    .child("Choose…")
+                    .on_click(cx.listener(|this, _e, _w, cx| this.newproj_choose(cx))),
+            );
+
+        // Open button (enabled only when the path is an existing folder)
+        let open_btn = div()
+            .id("newproj-open")
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .text_size(px(12.))
+            .border_1()
+            .border_color(rgb(if valid { ACCENT } else { BORDER }))
+            .text_color(rgb(if valid { SEL_TEXT } else { MUTED }))
+            .when(valid, |d| {
+                d.bg(rgb(ACCENT)).cursor_pointer().hover(|s| s.bg(rgb(ACCENT))).on_click(
+                    cx.listener(|this, _e, _w, cx| this.newproj_submit(cx)),
+                )
+            })
+            .child("Open");
+
+        div()
+            .absolute()
+            .top(px(120.))
+            .left(px(left))
+            .w(px(w))
+            .bg(rgb(PANEL_BG))
+            .border_1()
+            .border_color(rgb(ACCENT))
+            .rounded_md()
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .track_focus(&self.newproj_focus)
+            .on_key_down(cx.listener(Self::newproj_key))
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .child("Open Project — folder path"),
+            )
+            .child(input_row)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap_2()
+                    .px_3()
+                    .py_3()
+                    .child(open_btn),
             )
     }
 }
@@ -6715,6 +7117,7 @@ impl Workspace {
                 }
             }
             ProjectNav::Open => this.open_project(cx),
+            ProjectNav::OpenPath(p) => this.add_project(p.clone(), cx),
             ProjectNav::Remove(i) => this.remove_project(*i, cx),
             ProjectNav::Activity => this.pulse_anim(cx),
         })
@@ -7016,7 +7419,9 @@ struct DiffWindow {
     root: PathBuf,
     files: Vec<PathBuf>,
     idx: usize,
-    base: Option<String>,
+    // diff sources: `old` rev (None = working diff vs disk), `new_rev` (None = HEAD)
+    old: Option<String>,
+    new_rev: Option<String>,
     rows: Vec<DiffRow>,
     focus: FocusHandle,
     focused: bool,
@@ -7049,13 +7454,14 @@ impl DiffWindow {
         root: PathBuf,
         files: Vec<PathBuf>,
         idx: usize,
-        base: Option<String>,
+        old: Option<String>,
+        new_rev: Option<String>,
         storm: WeakEntity<Storm>,
         main_window: Option<AnyWindowHandle>,
         cx: &mut Context<Self>,
     ) -> Self {
         let hl = Highlighter::new();
-        let (rows, left_styles, right_styles) = compute_diff(&root, &files[idx], &base, &hl);
+        let (rows, left_styles, right_styles) = compute_diff(&root, &files[idx], &old, &new_rev, &hl);
         // blink the text caret
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_millis(530)).await;
@@ -7076,7 +7482,8 @@ impl DiffWindow {
             root,
             files,
             idx,
-            base,
+            old,
+            new_rev,
             rows,
             focus: cx.focus_handle(),
             focused: false,
@@ -7152,7 +7559,7 @@ impl DiffWindow {
     fn goto(&mut self, idx: usize, cx: &mut Context<Self>) {
         if idx < self.files.len() {
             self.idx = idx;
-            let (rows, ls, rs) = compute_diff(&self.root, &self.files[idx], &self.base, &self.hl);
+            let (rows, ls, rs) = compute_diff(&self.root, &self.files[idx], &self.old, &self.new_rev, &self.hl);
             self.rows = rows;
             self.left_styles = ls;
             self.right_styles = rs;
@@ -7292,6 +7699,22 @@ impl DiffWindow {
         if ks.modifiers.platform && ks.key == "g" {
             self.step_match(!ks.modifiers.shift);
             cx.notify();
+            return;
+        }
+        // cmd+a selects all text on the active side (left or right)
+        if ks.modifiers.platform && ks.key == "a" {
+            if !self.rows.is_empty() {
+                // pick the side you're working in (caret → selection → right)
+                let side = self
+                    .caret
+                    .map(|(s, _, _)| s)
+                    .or(self.sel.as_ref().map(|s| s.side))
+                    .unwrap_or(DiffSide::Right);
+                let last = self.rows.len() - 1;
+                let last_len = diff_side_text(&self.rows[last], side).chars().count();
+                self.sel = Some(DiffSel { side, anchor: (0, 0), head: (last, last_len) });
+                cx.notify();
+            }
             return;
         }
         // cmd+c copies the current selection
@@ -7654,13 +8077,15 @@ fn main() {
             KeyBinding::new("cmd-shift-f", FindInFiles, None),
             // git branches/actions popup (global)
             KeyBinding::new("alt-b", GitPopup, None),
+            KeyBinding::new("alt-f", FetchRemotes, None),
+            KeyBinding::new("alt-l", PullRemote, None),
             // command palette (global)
             KeyBinding::new("cmd-shift-p", CommandPalette, None),
             KeyBinding::new("cmd-shift-h", OpenOnGithub, None),
             // multi-project workspace (global)
             KeyBinding::new("alt-tab", NextProject, None),
             KeyBinding::new("alt-shift-tab", PrevProject, None),
-            KeyBinding::new("cmd-shift-n", OpenProject, None),
+            KeyBinding::new("cmd-shift-n", NewProject, None),
             KeyBinding::new("cmd-e", ShowProjects, None),
             // diff (opens in its own window)
             KeyBinding::new("cmd-d", ShowDiff, None),
