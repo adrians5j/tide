@@ -52,6 +52,7 @@ const IC_CHEVRON_LEFT: &str = "\u{eab5}";
 const IC_CHEVRON_RIGHT: &str = "\u{eab6}";
 const IC_CLOSE: &str = "\u{ea76}";
 const IC_FOLDER: &str = "\u{ea83}";
+const IC_COPY: &str = "\u{ebcc}";
 // The codicon font is renamed to "Segoe Fluent Icons" because GPUI refuses to
 // load any font lacking an 'm' glyph — except that one specially-cased name.
 const ICON_FONT: &str = "Segoe Fluent Icons";
@@ -1375,12 +1376,65 @@ fn git_branch(root: &Path) -> String {
 /// The open PR for `branch`, as (number, url), via `gh`. None if there's no PR
 /// (or `gh` is unavailable). Runs on a background thread, so the network call
 /// never blocks the UI.
-fn fetch_pr_link(root: &Path, branch: &str) -> Option<(u64, String)> {
+/// CI/checks rollup status for a PR, shown as a colored dot by the PR link.
+#[derive(Clone, Copy, PartialEq)]
+enum PrStatus {
+    Passing, // all checks green
+    Pending, // something still running / queued
+    Failing, // at least one check failed
+    None,    // no checks reported
+}
+
+impl PrStatus {
+    fn color(self) -> u32 {
+        match self {
+            PrStatus::Passing => 0x6aaf6a, // green
+            PrStatus::Pending => 0xd9a23b, // orange
+            PrStatus::Failing => 0xe04141, // red
+            PrStatus::None => MUTED,
+        }
+    }
+}
+
+/// Aggregate a PR's `statusCheckRollup` array into a single status.
+fn rollup_status(v: &serde_json::Value) -> PrStatus {
+    let Some(arr) = v.get("statusCheckRollup").and_then(|x| x.as_array()).filter(|a| !a.is_empty())
+    else {
+        return PrStatus::None;
+    };
+    let mut pending = false;
+    for c in arr {
+        // CheckRun reports `status` (+ `conclusion`); StatusContext reports `state`
+        if let Some(status) = c.get("status").and_then(|s| s.as_str()) {
+            if status != "COMPLETED" {
+                pending = true;
+                continue;
+            }
+        }
+        let outcome = c
+            .get("conclusion")
+            .and_then(|s| s.as_str())
+            .or_else(|| c.get("state").and_then(|s| s.as_str()))
+            .unwrap_or("");
+        match outcome.to_uppercase().as_str() {
+            "SUCCESS" | "NEUTRAL" | "SKIPPED" => {}
+            "" | "PENDING" | "EXPECTED" | "IN_PROGRESS" | "QUEUED" | "WAITING" => pending = true,
+            _ => return PrStatus::Failing, // FAILURE, ERROR, CANCELLED, TIMED_OUT, ACTION_REQUIRED…
+        }
+    }
+    if pending {
+        PrStatus::Pending
+    } else {
+        PrStatus::Passing
+    }
+}
+
+fn fetch_pr_link(root: &Path, branch: &str) -> Option<(u64, String, PrStatus)> {
     if branch.is_empty() {
         return None;
     }
     let out = Command::new("gh")
-        .args(["pr", "view", branch, "--json", "number,url"])
+        .args(["pr", "view", branch, "--json", "number,url,statusCheckRollup"])
         .current_dir(root)
         .output()
         .ok()?;
@@ -1390,7 +1444,7 @@ fn fetch_pr_link(root: &Path, branch: &str) -> Option<(u64, String)> {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
     let number = v.get("number")?.as_u64()?;
     let url = v.get("url")?.as_str()?.to_string();
-    Some((number, url))
+    Some((number, url, rollup_status(&v)))
 }
 
 /// The `https://github.com/org/repo` base URL for the repo's `origin` remote,
@@ -1552,7 +1606,7 @@ struct Storm {
     branch: String,
     // open PR for the current branch, if any: (number, url). Refetched when the
     // branch changes; `pr_link_branch` is the branch it was last queried for.
-    pr_link: Option<(u64, String)>,
+    pr_link: Option<(u64, String, PrStatus)>,
     pr_link_branch: String,
     mem_mb: u64,
     left_view: LeftView,
@@ -4136,13 +4190,41 @@ impl Storm {
                     .when(!self.branch.is_empty(), |d| {
                         d.child(
                             div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
                                 .text_color(rgb(MUTED))
                                 .text_size(px(12.))
-                                .child(format!("⎇ {}", self.branch)),
+                                .child(format!("⎇ {}", self.branch))
+                                // copy-to-clipboard button for the branch name
+                                .child(
+                                    div()
+                                        .id("copy-branch")
+                                        .font_family(ICON_FONT)
+                                        .text_size(px(11.))
+                                        .px_1()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .text_color(rgb(MUTED))
+                                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                        .child(IC_COPY)
+                                        .tooltip(|_w, cx| {
+                                            cx.new(|_| TooltipView { text: "Copy branch name".into() }).into()
+                                        })
+                                        .on_click(cx.listener(|this, _e, _w, cx| {
+                                            if !this.branch.is_empty() {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                                    this.branch.clone(),
+                                                ));
+                                                this.show_flash("Branch name copied", cx);
+                                            }
+                                        })),
+                                ),
                         )
                     })
                     // PR link for the current branch, if one exists → opens it
-                    .when_some(self.pr_link.clone(), |d, (num, url)| {
+                    .when_some(self.pr_link.clone(), |d, (num, url, status)| {
                         d.child(
                             div()
                                 .id("pr-link")
@@ -4156,6 +4238,13 @@ impl Storm {
                                 .hover(|s| s.bg(rgb(HOVER)))
                                 .text_color(rgb(ACCENT))
                                 .text_size(px(12.))
+                                // status dot: green = checks pass, orange = pending, red = failing
+                                .child(
+                                    div()
+                                        .size(px(8.))
+                                        .rounded_full()
+                                        .bg(rgb(status.color())),
+                                )
                                 .child(div().font_family(ICON_FONT).text_size(px(11.)).child(IC_PR))
                                 .child(format!("#{}", num))
                                 .on_click(cx.listener(move |_this, _e, _w, _cx| {
