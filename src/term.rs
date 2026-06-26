@@ -467,15 +467,18 @@ impl Terminal {
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle, cx);
+        // text selection is free in a plain shell; in a mouse-reporting app
+        // (zellij, vim, …) hold Option to select instead of feeding the app
+        let select_mode = !self.mouse_reporting() || ev.modifiers.alt;
         // double-click selects the word under the cursor (like the editor)
-        if ev.button == MouseButton::Left && ev.click_count >= 2 {
+        if ev.button == MouseButton::Left && ev.click_count >= 2 && select_mode {
             self.select_word_at(ev.position);
             self.selecting = false;
             cx.notify();
             return;
         }
-        // left-press with no mouse-reporting app: begin a drag text-selection
-        if ev.button == MouseButton::Left && !self.mouse_reporting() {
+        // left-press begins a drag text-selection
+        if ev.button == MouseButton::Left && select_mode {
             if let Some(cell) = self.sel_cell(ev.position) {
                 self.selection = Some(Sel { anchor: cell, head: cell });
                 self.selecting = true;
@@ -500,10 +503,13 @@ impl Terminal {
 
     fn on_mouse_up(&mut self, ev: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let _ = cx;
-        // Drag-selection end is handled by the window-level listener (see the
-        // element's `paint`); here we only forward releases to a mouse-reporting
-        // app — and selection never starts while reporting is on, so there's no
-        // overlap.
+        // an active/just-made selection (incl. Option-drag over a reporting app)
+        // is finalized by the window-level listener — don't also forward the
+        // release to the app
+        if self.selecting || self.selection.is_some() {
+            return;
+        }
+        // otherwise only forward releases to a mouse-reporting app
         if !self.mouse_reporting() {
             return;
         }

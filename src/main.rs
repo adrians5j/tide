@@ -88,29 +88,18 @@ fn highlighter() -> &'static syntax::Highlighter {
     H.get_or_init(syntax::Highlighter::new)
 }
 
-/// Build a syntax-highlighted line element from cached (len, color) runs.
-fn highlighted_line(line: &str, styles: Option<&Vec<syntax::Run>>) -> AnyElement {
-    if let Some(styles) = styles {
-        let total: usize = styles.iter().map(|(l, _)| *l).sum();
-        if total == line.len() && !styles.is_empty() {
-            let runs: Vec<TextRun> = styles
-                .iter()
-                .map(|(len, color)| TextRun {
-                    len: *len,
-                    font: font("Menlo"),
-                    color: rgb(*color).into(),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                })
-                .collect();
-            return StyledText::new(line.to_string()).with_runs(runs).into_any_element();
-        }
-    }
-    div().text_color(rgb(TEXT)).child(line.to_string()).into_any_element()
-}
-
 const FIND_CAP: usize = 500;
+/// Height above the find dialog's results: title 24 + search 42 + scope 22.
+const FIND_HEAD_H: f32 = 88.0;
+
+/// Which edges a find-dialog resize drag is moving (for window-style resizing).
+#[derive(Clone, Copy, Default)]
+struct ResizeEdges {
+    l: bool,
+    r: bool,
+    t: bool,
+    b: bool,
+}
 
 /// Full-text search across files under `scope`. Uses ripgrep when available
 /// (fast, parallel, respects .gitignore); falls back to a pure-Rust walk.
@@ -132,14 +121,15 @@ fn parse_search_query(q: &str) -> (String, Vec<String>) {
 
 /// Keep a result line unless every occurrence of `include` in it is the start
 /// of some `exclude` term (so `context.` matches but `context.container` doesn't).
-/// Case-insensitive, matching ripgrep's smart-case for all-lowercase queries.
-fn line_passes_excludes(text: &str, include: &str, excludes: &[String]) -> bool {
+/// Honors the case-sensitivity toggle so excludes match the search.
+fn line_passes_excludes(text: &str, include: &str, excludes: &[String], case_sensitive: bool) -> bool {
     if excludes.is_empty() {
         return true;
     }
-    let t = text.to_lowercase();
-    let inc = include.to_lowercase();
-    let exs: Vec<String> = excludes.iter().map(|e| e.to_lowercase()).collect();
+    let fold = |s: &str| if case_sensitive { s.to_string() } else { s.to_lowercase() };
+    let t = fold(text);
+    let inc = fold(include);
+    let exs: Vec<String> = excludes.iter().map(|e| fold(e)).collect();
     let mut found = false;
     let mut start = 0;
     while let Some(rel) = t[start..].find(&inc) {
@@ -154,15 +144,15 @@ fn line_passes_excludes(text: &str, include: &str, excludes: &[String]) -> bool 
     !found
 }
 
-fn search_files(query: &str, scope: &Path) -> Vec<FindResult> {
+fn search_files(query: &str, scopes: &[PathBuf], case_sensitive: bool) -> Vec<FindResult> {
     let (include, excludes) = parse_search_query(query);
-    if include.len() < 2 {
+    if include.len() < 2 || scopes.is_empty() {
         return Vec::new();
     }
-    let mut results =
-        search_ripgrep(&include, scope).unwrap_or_else(|| search_rust(&include, scope));
+    let mut results = search_ripgrep(&include, scopes, case_sensitive)
+        .unwrap_or_else(|| search_rust(&include, scopes, case_sensitive));
     if !excludes.is_empty() {
-        results.retain(|r| line_passes_excludes(&r.text, &include, &excludes));
+        results.retain(|r| line_passes_excludes(&r.text, &include, &excludes, case_sensitive));
     }
     results
 }
@@ -182,20 +172,22 @@ fn rg_bin() -> Option<&'static str> {
 }
 
 /// Run `rg` and parse `path:line:text`. Returns None if rg isn't available.
-fn search_ripgrep(query: &str, scope: &Path) -> Option<Vec<FindResult>> {
+fn search_ripgrep(query: &str, scopes: &[PathBuf], case_sensitive: bool) -> Option<Vec<FindResult>> {
     let bin = rg_bin()?;
-    let out = Command::new(bin)
-        .arg("--line-number")
+    let mut cmd = Command::new(bin);
+    cmd.arg("--line-number")
         .arg("--no-heading")
         .arg("--color=never")
-        .arg("--smart-case")
+        // case-sensitive on demand; otherwise smart-case (insensitive if all-lowercase)
+        .arg(if case_sensitive { "--case-sensitive" } else { "--smart-case" })
         .arg("--max-count=50") // per-file cap
         .arg("--fixed-strings") // literal, not regex
         .arg("--")
-        .arg(query)
-        .arg(scope)
-        .output()
-        .ok()?;
+        .arg(query);
+    for s in scopes {
+        cmd.arg(s);
+    }
+    let out = cmd.output().ok()?;
     if !out.status.success() && out.stdout.is_empty() {
         // rg exits 1 when no matches — that's a valid empty result, but a
         // missing binary errors differently; treat spawn failure as None above.
@@ -224,17 +216,27 @@ fn search_ripgrep(query: &str, scope: &Path) -> Option<Vec<FindResult>> {
     Some(results)
 }
 
-/// Pure-Rust fallback: case-insensitive substring over a manual walk.
-fn search_rust(query: &str, scope: &Path) -> Vec<FindResult> {
+/// Pure-Rust fallback: substring over a manual walk (case-sensitive on demand).
+fn search_rust(query: &str, scopes: &[PathBuf], case_sensitive: bool) -> Vec<FindResult> {
     let mut out = Vec::new();
-    let ql = query.to_lowercase();
-    for path in collect_paths(scope).0 {
+    let ql = if case_sensitive { query.to_string() } else { query.to_lowercase() };
+    // gather candidate files across every scope (a scope may be a file or a dir)
+    let mut files = Vec::new();
+    for scope in scopes {
+        if scope.is_file() {
+            files.push(scope.clone());
+        } else {
+            files.extend(collect_paths(scope).0);
+        }
+    }
+    for path in files {
         if out.len() >= FIND_CAP {
             break;
         }
         let Ok(content) = fs::read_to_string(&path) else { continue };
         for (i, line) in content.lines().enumerate() {
-            if line.to_lowercase().contains(&ql) {
+            let hay = if case_sensitive { line.to_string() } else { line.to_lowercase() };
+            if hay.contains(&ql) {
                 out.push(FindResult {
                     path: path.clone(),
                     line: i + 1,
@@ -1250,17 +1252,15 @@ fn git_branches(root: &Path) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for line in text.lines() {
+        // locals shown bare ("next"), remotes shown full ("origin/next") so both
+        // appear and can be merged/checked-out independently
         let name = if let Some(b) = line.strip_prefix("refs/heads/") {
             b.to_string()
         } else if let Some(r) = line.strip_prefix("refs/remotes/") {
             if r.ends_with("/HEAD") {
                 continue; // skip origin/HEAD pointer
             }
-            // strip the remote name (first path segment), e.g. "origin/feat" → "feat"
-            match r.split_once('/') {
-                Some((_remote, branch)) => branch.to_string(),
-                None => continue,
-            }
+            r.to_string()
         } else {
             continue;
         };
@@ -1350,6 +1350,25 @@ const PALETTE: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::GoToLine, "Go to Line", IC_HOME, "⌘L"),
     (Cmd::CopyBranch, "Copy Branch Name", IC_BRANCH, ""),
 ];
+
+/// The [start, end) char range of the word at `col` in `line` (alphanumeric +
+/// underscore run); an empty range if `col` isn't on a word char.
+fn word_range(line: &str, col: usize) -> (usize, usize) {
+    let ch: Vec<char> = line.chars().collect();
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    if col >= ch.len() || !is_word(ch[col]) {
+        return (col, col);
+    }
+    let mut s = col;
+    while s > 0 && is_word(ch[s - 1]) {
+        s -= 1;
+    }
+    let mut e = col;
+    while e < ch.len() && is_word(ch[e]) {
+        e += 1;
+    }
+    (s, e)
+}
 
 /// Split a finder query into (path, line, col), peeling a trailing `:line` or
 /// `:line:col` so a pasted "src/x.ts:45" still matches the file and jumps there.
@@ -1476,6 +1495,7 @@ struct Entry {
     path: PathBuf,
     is_dir: bool,
     depth: usize,
+    ignored: bool, // git-ignored (or under an ignored dir) → shown dimmed
 }
 
 /// Run `git status --porcelain` in `root` and map each path to its state.
@@ -1566,6 +1586,10 @@ struct Storm {
     // editor right-click context menu, anchored at the (x, y) click position
     editor_ctx: Option<(f32, f32)>,
     editor_ctx_focus: FocusHandle,
+    // dir-tree right-click menu: anchor position + the entry it targets
+    tree_ctx: Option<(f32, f32)>,
+    tree_ctx_path: Option<PathBuf>,
+    tree_ctx_focus: FocusHandle,
     git_status: HashMap<PathBuf, GitState>,
     // pull-request review
     pr_files: Vec<(PathBuf, GitState)>,
@@ -1659,21 +1683,41 @@ struct Storm {
     commit_collapsed: HashSet<PathBuf>,
     // tree selection (for scoping find-in-files)
     tree_selected: Option<PathBuf>,
+    // shift-click multi-selection; when non-empty it's the full selected set
+    tree_multi: HashSet<PathBuf>,
+    // git-ignored paths (dirs collapsed), hidden from the tree; refreshed by the poll
+    ignored: HashSet<PathBuf>,
     // find in files
     find_open: bool,
     find_focus: FocusHandle,
     find_query: Field,
     find_results: Vec<FindResult>,
     find_selected: usize,
-    find_scope: PathBuf,
+    find_scope: Vec<PathBuf>,
     find_gen: u64,
     find_preview: Option<FindPreview>,
     find_scroll: ScrollHandle, // keeps the selected result row in view
+    // text selection in the preview pane: (anchor_row, anchor_col, head_row, head_col)
+    // in file-line/char coords; plus drag state, scroll handle and measured char width
+    find_psel: Option<(usize, usize, usize, usize)>,
+    find_pdragging: bool,
+    find_pscroll: ScrollHandle,
+    find_char_w: f32,
 
-    // find-in-files panel size (resizable via the bottom-right grip)
+    // find-in-files panel position (top-left, set centered on open) + size
+    // (resizable via the bottom-right grip, which anchors the top-left corner)
+    find_left: f32,
+    find_top: f32,
     find_w: f32,
     find_h: f32,
-    find_resizing: bool,
+    find_resize: Option<ResizeEdges>, // which edges an active resize drag moves
+    find_moving: bool,                // dragging the title bar to reposition
+    find_move_dx: f32,                // cursor offset from top-left at move start
+    find_move_dy: f32,
+    // fraction of the results+preview area the results pane takes (drag divider)
+    find_split: f32,
+    find_split_dragging: bool,
+    find_case_sensitive: bool,
     // blinking caret for chrome inputs (finder/goto/branch/find/commit)
     caret_on: bool,
     // language server (shared across editors)
@@ -1722,7 +1766,32 @@ enum ProjectNav {
 
 impl EventEmitter<ProjectNav> for Storm {}
 
+// directories never walked by the finder / search-fallback index (heavy/noise)
 const IGNORED: &[&str] = &["node_modules", ".git", ".DS_Store", "target", "dist", "build"];
+// the tree only hides git internals + macOS noise; everything else shows, with
+// git-ignored entries dimmed (not hidden)
+const TREE_HIDDEN: &[&str] = &[".git", ".DS_Store"];
+
+/// Absolute paths git ignores under `root` (whole dirs collapsed), so the tree
+/// can hide them. Untracked + ignored, via `git ls-files`; empty if not a repo.
+fn git_ignored_paths(root: &Path) -> HashSet<PathBuf> {
+    let out = Command::new("git")
+        .args(["ls-files", "--others", "--ignored", "--exclude-standard", "--directory"])
+        .current_dir(root)
+        .output();
+    let mut set = HashSet::new();
+    if let Ok(out) = out {
+        if out.status.success() {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let rel = line.trim().trim_end_matches('/');
+                if !rel.is_empty() {
+                    set.insert(root.join(rel));
+                }
+            }
+        }
+    }
+    set
+}
 
 impl Storm {
     fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
@@ -1782,6 +1851,9 @@ impl Storm {
             win_height: 800.,
             editor_ctx: None,
             editor_ctx_focus: cx.focus_handle(),
+            tree_ctx: None,
+            tree_ctx_path: None,
+            tree_ctx_focus: cx.focus_handle(),
             git_status: HashMap::new(),
             finder_open: false,
             finder_focus: cx.focus_handle(),
@@ -1837,18 +1909,32 @@ impl Storm {
             commit_checked: HashSet::new(),
             commit_collapsed: HashSet::new(),
             tree_selected: None,
+            tree_multi: HashSet::new(),
+            ignored: HashSet::new(),
             find_open: false,
             find_focus: cx.focus_handle(),
             find_query: Field::default(),
             find_results: Vec::new(),
             find_selected: 0,
-            find_scope: PathBuf::new(),
+            find_scope: Vec::new(),
             find_gen: 0,
             find_preview: None,
             find_scroll: ScrollHandle::new(),
+            find_psel: None,
+            find_pdragging: false,
+            find_pscroll: ScrollHandle::new(),
+            find_char_w: 8.0,
+            find_left: 0.,
+            find_top: 40.,
             find_w: 760.,
             find_h: 460.,
-            find_resizing: false,
+            find_resize: None,
+            find_moving: false,
+            find_move_dx: 0.,
+            find_move_dy: 0.,
+            find_split: 0.42,
+            find_split_dragging: false,
+            find_case_sensitive: false,
             caret_on: true,
             lsp: None,
             gitp_open: false,
@@ -1878,6 +1964,7 @@ impl Storm {
             prev_fp: None,
             pulse_at: None,
         };
+        s.ignored = git_ignored_paths(&s.root); // hide git-ignored paths from the tree
         s.rebuild();
         s.start_git_poll(cx);
         s.start_caret_blink(cx);
@@ -2032,10 +2119,10 @@ impl Storm {
                 break;
             };
             let root2 = root.clone();
-            let (status, branch, mem) = cx
+            let (status, branch, mem, ignored) = cx
                 .background_executor()
                 .spawn(async move {
-                    (compute_git(&root2), git_branch(&root2), process_mem_mb())
+                    (compute_git(&root2), git_branch(&root2), process_mem_mb(), git_ignored_paths(&root2))
                 })
                 .await;
             // refetch the PR link only when the branch actually changed — the
@@ -2051,6 +2138,11 @@ impl Storm {
                     this.git_status = status;
                     this.branch = branch.clone();
                     this.mem_mb = mem;
+                    // refresh the git-ignored set; rebuild the tree if it changed
+                    if ignored != this.ignored {
+                        this.ignored = ignored;
+                        this.rebuild();
+                    }
                     if let Some(link) = pr_update {
                         this.pr_link = link;
                         this.pr_link_branch = branch;
@@ -2115,27 +2207,27 @@ impl Storm {
         let root = self.root.clone();
         let query = self.tree_filter.text.trim().to_string();
         if query.is_empty() {
-            self.walk(&root, 0, &mut out);
+            self.walk(&root, 0, false, &mut out);
             self.tree_total = out.len();
         } else {
             // filtered view: scan the whole tree (ignoring the expanded set),
             // keeping matching entries plus the ancestor dirs that reach them.
             let mut total = 0;
-            self.walk_filtered(&root, 0, &query, &mut out, &mut total);
+            self.walk_filtered(&root, 0, false, &query, &mut out, &mut total);
             self.tree_total = total;
         }
         self.entries = out;
     }
 
     /// Read + sort a directory's children (dirs first, then case-insensitive by
-    /// name), skipping ignored names. Shared by both tree walks.
+    /// name), hiding only git internals + macOS noise. Shared by both tree walks.
     fn read_children(dir: &Path) -> Vec<(String, PathBuf, bool)> {
         let Ok(rd) = fs::read_dir(dir) else { return Vec::new() };
         let mut items: Vec<(String, PathBuf, bool)> = rd
             .filter_map(|e| e.ok())
             .filter_map(|e| {
                 let name = e.file_name().to_string_lossy().to_string();
-                if IGNORED.contains(&name.as_str()) {
+                if TREE_HIDDEN.contains(&name.as_str()) {
                     return None;
                 }
                 let path = e.path();
@@ -2151,11 +2243,12 @@ impl Storm {
         items
     }
 
-    fn walk(&self, dir: &Path, depth: usize, out: &mut Vec<Entry>) {
+    fn walk(&self, dir: &Path, depth: usize, ignored_ancestor: bool, out: &mut Vec<Entry>) {
         for (name, path, is_dir) in Self::read_children(dir) {
-            out.push(Entry { name, path: path.clone(), is_dir, depth });
+            let ignored = ignored_ancestor || self.ignored.contains(&path);
+            out.push(Entry { name, path: path.clone(), is_dir, depth, ignored });
             if is_dir && self.expanded.contains(&path) {
-                self.walk(&path, depth + 1, out);
+                self.walk(&path, depth + 1, ignored, out);
             }
         }
     }
@@ -2168,6 +2261,7 @@ impl Storm {
         &self,
         dir: &Path,
         depth: usize,
+        ignored_ancestor: bool,
         query: &str,
         out: &mut Vec<Entry>,
         total: &mut usize,
@@ -2175,17 +2269,18 @@ impl Storm {
         let mut any = false;
         for (name, path, is_dir) in Self::read_children(dir) {
             *total += 1;
+            let ignored = ignored_ancestor || self.ignored.contains(&path);
             if is_dir {
                 let mark = out.len();
-                out.push(Entry { name: name.clone(), path: path.clone(), is_dir: true, depth });
-                let child = self.walk_filtered(&path, depth + 1, query, out, total);
+                out.push(Entry { name: name.clone(), path: path.clone(), is_dir: true, depth, ignored });
+                let child = self.walk_filtered(&path, depth + 1, ignored, query, out, total);
                 if child || fuzzy_score(query, &name).is_some() {
                     any = true;
                 } else {
                     out.truncate(mark); // no match under (or in) this dir → drop it
                 }
             } else if fuzzy_score(query, &name).is_some() {
-                out.push(Entry { name, path, is_dir: false, depth });
+                out.push(Entry { name, path, is_dir: false, depth, ignored });
                 any = true;
             }
         }
@@ -2268,11 +2363,46 @@ impl Storm {
         }
     }
 
-    /// Single click in the tree: just select (highlight) the entry.
-    fn select_entry(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if let Some(entry) = self.entries.get(ix) {
-            self.tree_selected = Some(entry.path.clone());
-            cx.notify();
+    /// Click in the tree. Plain = single select; shift = contiguous range from
+    /// the anchor to here; cmd = cherry-pick toggle. Multi-selection scopes
+    /// find-in-files to several paths.
+    fn select_entry(&mut self, ix: usize, shift: bool, cmd: bool, cx: &mut Context<Self>) {
+        let Some(entry) = self.entries.get(ix) else { return };
+        let path = entry.path.clone();
+        if shift {
+            // range from the anchor (last plain/cmd selection) to the clicked row
+            let anchor_ix = self
+                .tree_selected
+                .as_ref()
+                .and_then(|a| self.entries.iter().position(|e| &e.path == a))
+                .unwrap_or(ix);
+            let (lo, hi) = (anchor_ix.min(ix), anchor_ix.max(ix));
+            self.tree_multi = self.entries[lo..=hi].iter().map(|e| e.path.clone()).collect();
+            // keep the anchor so re-shift-clicking re-ranges from the same start
+        } else if cmd {
+            // cherry-pick: seed with the anchor, then toggle this entry
+            if self.tree_multi.is_empty() {
+                if let Some(a) = self.tree_selected.clone() {
+                    self.tree_multi.insert(a);
+                }
+            }
+            if !self.tree_multi.remove(&path) {
+                self.tree_multi.insert(path.clone());
+            }
+            self.tree_selected = Some(path);
+        } else {
+            self.tree_multi.clear();
+            self.tree_selected = Some(path);
+        }
+        cx.notify();
+    }
+
+    /// True if a tree path is part of the current selection (multi when active).
+    fn is_tree_selected(&self, path: &Path) -> bool {
+        if self.tree_multi.is_empty() {
+            self.tree_selected.as_deref() == Some(path)
+        } else {
+            self.tree_multi.contains(path)
         }
     }
 
@@ -3375,15 +3505,39 @@ impl Storm {
 
     fn act_find_in_files(&mut self, _: &FindInFiles, window: &mut Window, cx: &mut Context<Self>) {
         self.save_tab(self.active, cx);
-        // scope to the selected tree folder, else the project root
-        self.find_scope = match &self.tree_selected {
-            Some(p) if p.is_dir() => p.clone(),
-            _ => self.root.clone(),
+        // scope to the shift-selected paths, else the single selected folder,
+        // else the whole project
+        self.find_scope = if !self.tree_multi.is_empty() {
+            let mut v: Vec<PathBuf> = self.tree_multi.iter().cloned().collect();
+            v.sort();
+            v
+        } else {
+            match &self.tree_selected {
+                Some(p) if p.is_dir() => vec![p.clone()],
+                _ => vec![self.root.clone()],
+            }
         };
         self.find_open = true;
         self.find_query.clear();
         self.find_results.clear();
         self.find_selected = 0;
+        self.find_psel = None;
+        // measure the monospace advance for preview text selection (Menlo 13px)
+        let run = TextRun {
+            len: 1,
+            font: font("Menlo"),
+            color: rgb(TEXT).into(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        self.find_char_w =
+            f32::from(window.text_system().shape_line("0".into(), px(13.), &[run], None).width);
+        // open centered; resizing then anchors this top-left corner
+        let w = self.find_w.clamp(420.0, (self.win_width - 80.0).max(420.0));
+        let h = self.find_h.clamp(300.0, (self.win_height - 120.0).max(300.0));
+        self.find_left = ((self.win_width - w) / 2.0).max(0.);
+        self.find_top = ((self.win_height - h) / 2.0).max(40.);
         window.focus(&self.find_focus, cx);
         cx.notify();
     }
@@ -3496,12 +3650,24 @@ impl Storm {
             (GitAction::NewBranch, "New Branch", IC_BRANCH),
         ];
         for (a, label, icon) in actions {
-            if q.is_empty() || label.to_lowercase().contains(&q) {
+            if q.is_empty() || fuzzy_score(&q, &label.to_lowercase()).is_some() {
                 items.push(GitItem::Action(a, label, icon));
             }
         }
-        for b in &self.gitp_branches {
-            if q.is_empty() || b.to_lowercase().contains(&q) {
+        // branches: fuzzy-filtered (so "orinext" finds "origin/next"), best
+        // matches first; committerdate order when there's no query
+        if q.is_empty() {
+            for b in &self.gitp_branches {
+                items.push(GitItem::Branch(b.clone()));
+            }
+        } else {
+            let mut scored: Vec<(i32, &String)> = self
+                .gitp_branches
+                .iter()
+                .filter_map(|b| fuzzy_score(&q, &b.to_lowercase()).map(|s| (s, b)))
+                .collect();
+            scored.sort_by(|a, b| b.0.cmp(&a.0)); // stable → committerdate order on ties
+            for (_, b) in scored {
                 items.push(GitItem::Branch(b.clone()));
             }
         }
@@ -3779,11 +3945,12 @@ impl Storm {
         self.find_gen += 1;
         let gen = self.find_gen;
         let query = self.find_query.text.clone();
-        let scope = self.find_scope.clone();
+        let scopes = self.find_scope.clone();
+        let case_sensitive = self.find_case_sensitive;
         cx.spawn(async move |this, cx| {
             let results = cx
                 .background_executor()
-                .spawn(async move { search_files(&query, &scope) })
+                .spawn(async move { search_files(&query, &scopes, case_sensitive) })
                 .await;
             this.update(cx, |this, cx| {
                 if this.find_gen == gen {
@@ -3813,28 +3980,45 @@ impl Storm {
                     }
                 }
             }
-            // F4 opens the result in the editor but keeps the panel open, so you
-            // can keep arrowing through matches and previewing each in place
+            // F4 opens the result in the editor and closes the find panel
             "f4" => {
                 if let Some(r) = self.find_results.get(self.find_selected).cloned() {
+                    self.find_open = false;
                     self.open_file(r.path, window, cx);
                     if let Some(tab) = self.tabs.get(self.active) {
                         tab.editor.update(cx, |e, cx| e.goto(r.line, 1, cx));
                     }
-                    window.focus(&self.find_focus, cx); // keep keys going to find
                 }
             }
             "down" => {
                 self.find_selected =
                     (self.find_selected + 1).min(self.find_results.len().saturating_sub(1));
+                self.find_psel = None; // different file → drop the preview selection
                 self.find_scroll_into_view();
             }
             "up" => {
                 self.find_selected = self.find_selected.saturating_sub(1);
+                self.find_psel = None;
                 self.find_scroll_into_view();
+            }
+            // cmd+a selects all of the preview code; cmd+c copies the selection
+            "a" if ks.modifiers.platform => {
+                if let Some(pv) = &self.find_preview {
+                    if !pv.lines.is_empty() {
+                        let last = pv.lines.len() - 1;
+                        let last_len = pv.lines[last].chars().count();
+                        self.find_psel = Some((0, 0, last, last_len));
+                    }
+                }
+            }
+            "c" if ks.modifiers.platform => {
+                if let Some(text) = self.find_selected_text() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
             }
             _ => {
                 if Self::field_input(&mut self.find_query, ks, cx, |_| true) == Edit::Changed {
+                    self.find_psel = None;
                     self.run_find_search(cx);
                 }
             }
@@ -3853,6 +4037,49 @@ impl Storm {
         } else if y + row_h > top + vh {
             self.find_scroll.set_offset(gpui::point(px(0.), px(-(y + row_h - vh))));
         }
+    }
+
+    /// File line index of the first row rendered in the preview (matches the
+    /// `start` used when rendering: 6 lines of context above the match).
+    fn find_preview_start(&self) -> Option<usize> {
+        self.find_results.get(self.find_selected).map(|r| r.line.saturating_sub(6))
+    }
+
+    /// Map a mouse position over the preview to a (file-line, char-col) cell.
+    fn find_cell_at(&self, pos: gpui::Point<gpui::Pixels>) -> Option<(usize, usize)> {
+        let pv = self.find_preview.as_ref()?;
+        let b = self.find_pscroll.bounds();
+        let off = self.find_pscroll.offset();
+        let gutter = 48.0 + 8.0; // line-number cell + code left padding
+        let lx = f32::from(pos.x) - f32::from(b.left()) - f32::from(off.x);
+        let ly = f32::from(pos.y) - f32::from(b.top()) - f32::from(off.y);
+        if lx < 0.0 || ly < 0.0 {
+            return None;
+        }
+        let line = self.find_preview_start()? + (ly / 18.0).floor() as usize;
+        if line >= pv.lines.len() {
+            return None;
+        }
+        let len = pv.lines[line].chars().count();
+        let col = (((lx - gutter) / self.find_char_w).floor()).max(0.0) as usize;
+        Some((line, col.min(len)))
+    }
+
+    /// The preview's current selection as text (newline-joined), if any.
+    fn find_selected_text(&self) -> Option<String> {
+        let (ar, ac, hr, hc) = self.find_psel?;
+        let pv = self.find_preview.as_ref()?;
+        let ((sr, sc), (er, ec)) =
+            if (ar, ac) <= (hr, hc) { ((ar, ac), (hr, hc)) } else { ((hr, hc), (ar, ac)) };
+        let mut out = Vec::new();
+        for r in sr..=er {
+            let ch: Vec<char> = pv.lines.get(r).map(|s| s.as_str()).unwrap_or("").chars().collect();
+            let n = ch.len();
+            let cs = if r == sr { sc } else { 0 }.min(n);
+            let ce = if r == er { ec } else { n }.min(n);
+            out.push(ch[cs..ce].iter().collect::<String>());
+        }
+        Some(out.join("\n"))
     }
 
     fn do_commit(&mut self, push: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -3892,22 +4119,60 @@ impl Storm {
         } else if self.resizing_term {
             self.term_width = (self.win_width - f32::from(ev.position.x)).clamp(200., 1125.);
             cx.notify();
-        } else if self.find_resizing {
-            // panel is centered both ways, so width/height grow symmetrically
-            // about the window center as you drag the grip
-            let midx = self.win_width / 2.0;
-            let midy = self.win_height / 2.0;
-            self.find_w = ((f32::from(ev.position.x) - midx) * 2.0).clamp(420., (self.win_width - 80.0).max(420.0));
-            self.find_h = ((f32::from(ev.position.y) - midy) * 2.0).clamp(300., (self.win_height - 120.0).max(300.0));
+        } else if let Some(e) = self.find_resize {
+            // window-style resize: drag any edge/corner; the opposite edge stays
+            let (mx, my) = (f32::from(ev.position.x), f32::from(ev.position.y));
+            let (min_w, min_h) = (420.0_f32, 300.0_f32);
+            let right = self.find_left + self.find_w;
+            let bottom = self.find_top + self.find_h;
+            if e.r {
+                self.find_w = (mx - self.find_left).clamp(min_w, (self.win_width - self.find_left).max(min_w));
+            }
+            if e.b {
+                self.find_h = (my - self.find_top).clamp(min_h, (self.win_height - self.find_top).max(min_h));
+            }
+            if e.l {
+                let nl = mx.clamp(0.0, right - min_w);
+                self.find_left = nl;
+                self.find_w = right - nl;
+            }
+            if e.t {
+                let nt = my.clamp(40.0, bottom - min_h);
+                self.find_top = nt;
+                self.find_h = bottom - nt;
+            }
+            cx.notify();
+        } else if self.find_moving {
+            // drag the title bar to reposition (keep the grab offset constant)
+            let (mx, my) = (f32::from(ev.position.x), f32::from(ev.position.y));
+            self.find_left = (mx - self.find_move_dx).clamp(0.0, (self.win_width - self.find_w).max(0.0));
+            self.find_top = (my - self.find_move_dy).clamp(40.0, (self.win_height - self.find_h).max(40.0));
+            cx.notify();
+        } else if self.find_split_dragging {
+            // drag the divider between results (top) and preview (bottom):
+            // down → bigger results, up → bigger preview
+            let h = self.find_h.clamp(300.0, (self.win_height - 120.0).max(300.0));
+            let top = self.find_top.clamp(40.0, (self.win_height - h).max(40.0));
+            let content_h = (h - FIND_HEAD_H).max(160.0); // area below header+scope
+            let results_h =
+                (f32::from(ev.position.y) - top - FIND_HEAD_H).clamp(80.0, content_h - 80.0);
+            self.find_split = results_h / content_h;
             cx.notify();
         }
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.resizing || self.resizing_term || self.find_resizing {
+        if self.resizing
+            || self.resizing_term
+            || self.find_resize.is_some()
+            || self.find_moving
+            || self.find_split_dragging
+        {
             self.resizing = false;
             self.resizing_term = false;
-            self.find_resizing = false;
+            self.find_resize = None;
+            self.find_moving = false;
+            self.find_split_dragging = false;
             for t in &self.terminals {
                 t.update(cx, |t, _| t.defer_resize = false);
             }
@@ -3977,7 +4242,9 @@ impl Render for Storm {
         // middle row: [activity-left] [panel] [divider] [center] [term] [activity-right]
         let mut middle = div().flex().flex_row().flex_grow(1.0).min_h(px(0.)).child(act_left);
         if let Some(panel) = left_panel {
-            middle = middle.child(panel);
+            // flex_shrink_0 wrapper → the tree keeps its dragged width regardless
+            // of how wide the editor tab bar gets
+            middle = middle.child(div().flex_shrink_0().h_full().child(panel));
             if let Some(d) = left_divider {
                 middle = middle.child(d);
             }
@@ -3992,6 +4259,7 @@ impl Render for Storm {
                     div()
                         .w(px(4.))
                         .h_full()
+                        .flex_shrink_0()
                         .bg(rgb(if self.resizing_term { ACCENT } else { BORDER }))
                         .cursor(CursorStyle::ResizeLeftRight)
                         .on_mouse_down(
@@ -4009,6 +4277,7 @@ impl Render for Storm {
                     div()
                         .w(px(self.term_width))
                         .h_full()
+                        .flex_shrink_0()
                         .flex()
                         .flex_col()
                         .bg(rgb(PANEL_BG))
@@ -4087,6 +4356,9 @@ impl Render for Storm {
         }
         if let Some(pos) = self.editor_ctx {
             root = root.child(self.render_editor_ctx_menu(pos, cx));
+        }
+        if let Some(pos) = self.tree_ctx {
+            root = root.child(self.render_tree_ctx_menu(pos, cx));
         }
         if self.palette_open {
             root = root.child(self.render_palette(cx));
@@ -5504,16 +5776,34 @@ impl Storm {
             .child(progress)
     }
 
+    /// A transparent resize handle for the find dialog; caller positions/sizes it.
+    fn find_resize_handle(
+        &self,
+        id: &'static str,
+        edges: ResizeEdges,
+        cursor: CursorStyle,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div().id(id).absolute().cursor(cursor).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _e, _w, cx| {
+                this.find_resize = Some(edges);
+                cx.notify();
+            }),
+        )
+    }
+
     fn render_find(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        // bare centered panel — same pattern as the command palette / finder
+        // positioned at its stored top-left (centered on open); resizing the
+        // bottom-right grip keeps this corner fixed, like a macOS window
         let w = self.find_w.clamp(420.0, (self.win_width - 80.0).max(420.0));
-        let left = ((self.win_width - w) / 2.0).max(0.);
         let h = self.find_h.clamp(300.0, (self.win_height - 120.0).max(300.0));
-        let top = ((self.win_height - h) / 2.0).max(40.);
-        let scope_label = if self.find_scope == self.root {
-            "Project".to_string()
-        } else {
-            self.rel(&self.find_scope)
+        let left = self.find_left.clamp(0.0, (self.win_width - w).max(0.0));
+        let top = self.find_top.clamp(40.0, (self.win_height - h).max(40.0));
+        let scope_label = match self.find_scope.as_slice() {
+            [one] if *one == self.root => "Project".to_string(),
+            [one] => self.rel(one),
+            many => format!("{} locations", many.len()),
         };
         let count = self.find_results.len();
         let (_, excludes) = parse_search_query(&self.find_query.text);
@@ -5539,6 +5829,27 @@ impl Storm {
                         div().child(self.find_query.render(self.caret(), SELECTION))
                     }),
             )
+            // case-sensitivity toggle (highlighted when on)
+            .child({
+                let on = self.find_case_sensitive;
+                div()
+                    .id("find-case")
+                    .px_1()
+                    .rounded_md()
+                    .text_size(px(12.))
+                    .cursor_pointer()
+                    .when(on, |d| d.bg(rgb(ACCENT)).text_color(rgb(SEL_TEXT)))
+                    .when(!on, |d| d.text_color(rgb(MUTED)).hover(|s| s.bg(rgb(HOVER))))
+                    .child("Aa")
+                    .tooltip(|_w, cx| {
+                        cx.new(|_| TooltipView { text: "Match case".into() }).into()
+                    })
+                    .on_click(cx.listener(|this, _e, _w, cx| {
+                        this.find_case_sensitive = !this.find_case_sensitive;
+                        this.run_find_search(cx);
+                        cx.notify();
+                    }))
+            })
             .child(
                 div()
                     .text_size(px(11.))
@@ -5568,16 +5879,18 @@ impl Storm {
                 )
             });
 
-        // ── results list ──
+        // ── results list (height = draggable split fraction of the area below
+        //    the header; the rest goes to the preview) ──
+        let content_h = (h - FIND_HEAD_H).max(160.0);
+        let results_h = (self.find_split * content_h).clamp(80.0, content_h - 80.0);
         let mut results = div()
             .id("find-results")
             .flex()
             .flex_col()
-            .h(px((h * 0.42).max(120.)))
+            .h(px(results_h))
+            .flex_shrink_0()
             .overflow_y_scroll()
-            .track_scroll(&self.find_scroll)
-            .border_b_1()
-            .border_color(rgb(BORDER));
+            .track_scroll(&self.find_scroll);
 
         for (i, r) in self.find_results.iter().enumerate() {
             let selected = i == self.find_selected;
@@ -5626,15 +5939,66 @@ impl Storm {
                 self.find_preview = Some(FindPreview { path: r.path.clone(), lines, styles });
             }
         }
+        // breadcrumb of the selected file (name + its directory), shown above
+        // the preview like WebStorm's Find in Files
+        let sel_loc = sel.as_ref().map(|r| {
+            let name = r.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let dir = r.path.parent().map(|d| self.rel(&d.to_path_buf())).unwrap_or_default();
+            (name, dir)
+        });
 
+        // normalized selection (start, end) in file-line/char coords
+        let psel = self.find_psel.map(|(ar, ac, hr, hc)| {
+            if (ar, ac) <= (hr, hc) { ((ar, ac), (hr, hc)) } else { ((hr, hc), (ar, ac)) }
+        });
+        // blinking caret sits at the selection head (where the cursor is)
+        let caret_head = self.find_psel.map(|(_, _, hr, hc)| (hr, hc));
+        let caret_on = self.caret_on;
+        let char_w = self.find_char_w;
         let mut preview = div()
             .id("find-preview")
             .flex()
             .flex_col()
             .flex_grow(1.0)
             .overflow_y_scroll()
+            .track_scroll(&self.find_pscroll)
             .font_family("Menlo")
-            .bg(rgb(BG));
+            .text_size(px(13.))
+            .bg(rgb(BG))
+            // text selection: click-drag, double-click word, visible as you drag
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
+                    if let Some((line, col)) = this.find_cell_at(ev.position) {
+                        if ev.click_count >= 2 {
+                            let l = this
+                                .find_preview
+                                .as_ref()
+                                .and_then(|pv| pv.lines.get(line))
+                                .cloned()
+                                .unwrap_or_default();
+                            let (s, e) = word_range(&l, col);
+                            this.find_psel = Some((line, s, line, e));
+                            this.find_pdragging = false;
+                        } else {
+                            this.find_psel = Some((line, col, line, col));
+                            this.find_pdragging = true;
+                        }
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
+                if this.find_pdragging {
+                    if let Some((line, col)) = this.find_cell_at(ev.position) {
+                        if let Some((ar, ac, _, _)) = this.find_psel {
+                            this.find_psel = Some((ar, ac, line, col));
+                            cx.notify();
+                        }
+                    }
+                }
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _e, _w, _cx| this.find_pdragging = false));
 
         if let (Some(r), Some(pv)) = (&sel, &self.find_preview) {
             let start = r.line.saturating_sub(6);
@@ -5643,12 +6007,40 @@ impl Storm {
                 let no = i + 1;
                 let is_match = no == r.line;
                 let line = pv.lines.get(i).map(|s| s.as_str()).unwrap_or("");
+                // selection highlight span for this line, if any
+                let span: Vec<(usize, usize, u32)> = psel
+                    .and_then(|((sr, sc), (er, ec))| {
+                        if i < sr || i > er {
+                            return None;
+                        }
+                        let len = line.chars().count();
+                        let cs = if i == sr { sc } else { 0 }.min(len);
+                        let ce = if i == er { ec } else { len }.min(len);
+                        (cs < ce).then_some((cs, ce, SELECTION))
+                    })
+                    .into_iter()
+                    .collect();
+                let runs = diff_line_runs(line, pv.styles.get(i), &span);
+                let caret_col = caret_head.filter(|(r, _)| *r == i).map(|(_, c)| c);
                 preview = preview.child(
                     div()
+                        .relative()
                         .flex()
                         .flex_row()
                         .h(px(18.))
-                        .when(is_match, |d| d.bg(rgb(SEARCH_CURRENT_BG)))
+                        .when(is_match && span.is_empty(), |d| d.bg(rgb(SEARCH_CURRENT_BG)))
+                        // blinking text caret at the cursor position
+                        .when_some(caret_col.filter(|_| caret_on), |d, c| {
+                            d.child(
+                                div()
+                                    .absolute()
+                                    .top(px(0.))
+                                    .left(px(48.0 + 8.0 + c as f32 * char_w))
+                                    .w(px(1.5))
+                                    .h(px(18.))
+                                    .bg(rgb(CURSOR)),
+                            )
+                        })
                         .child(
                             div()
                                 .w(px(48.))
@@ -5662,7 +6054,7 @@ impl Storm {
                             div()
                                 .flex_grow(1.0)
                                 .px_2()
-                                .child(highlighted_line(line, pv.styles.get(i))),
+                                .child(StyledText::new(line.to_string()).with_runs(runs)),
                         ),
                 );
             }
@@ -5683,9 +6075,71 @@ impl Storm {
             .flex_col()
             .track_focus(&self.find_focus)
             .on_key_down(cx.listener(Self::find_key))
+            // title bar: drag to move the dialog (like a window)
+            .child(
+                div()
+                    .id("find-title")
+                    .h(px(24.))
+                    .px_3()
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(PANEL_BG))
+                    .cursor(CursorStyle::OpenHand)
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .child("Find in Files")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
+                            this.find_moving = true;
+                            this.find_move_dx = f32::from(ev.position.x) - this.find_left;
+                            this.find_move_dy = f32::from(ev.position.y) - this.find_top;
+                            cx.notify();
+                        }),
+                    ),
+            )
             .child(header)
             .child(scope_row)
             .child(results)
+            // draggable divider: drag down → bigger results, up → bigger preview
+            .child(
+                div()
+                    .id("find-split")
+                    .h(px(4.))
+                    .flex_shrink_0()
+                    .bg(rgb(if self.find_split_dragging { ACCENT } else { BORDER }))
+                    .cursor(CursorStyle::ResizeUpDown)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _e, _w, cx| {
+                            this.find_split_dragging = true;
+                            cx.notify();
+                        }),
+                    ),
+            )
+            // breadcrumb: the selected result's file name + its directory
+            .when_some(sel_loc, |d, (name, dir)| {
+                d.child(
+                    div()
+                        .h(px(22.))
+                        .px_3()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .flex_shrink_0()
+                        .border_b_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(PANEL_BG))
+                        .text_size(px(11.))
+                        .child(div().text_color(rgb(TEXT)).child(name))
+                        .child(div().text_color(rgb(MUTED)).truncate().child(dir)),
+                )
+            })
             .child(preview)
             // bottom-right grip: drag to resize the panel
             .child(
@@ -5705,10 +6159,39 @@ impl Storm {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _e, _w, cx| {
-                            this.find_resizing = true;
+                            this.find_resize = Some(ResizeEdges { r: true, b: true, ..Default::default() });
                             cx.notify();
                         }),
                     ),
+            )
+            // window-style resize handles on every edge + the other corners
+            .child(
+                self.find_resize_handle("find-rs-l", ResizeEdges { l: true, ..Default::default() }, CursorStyle::ResizeLeftRight, cx)
+                    .top(px(8.)).bottom(px(8.)).left(px(0.)).w(px(5.)),
+            )
+            .child(
+                self.find_resize_handle("find-rs-r", ResizeEdges { r: true, ..Default::default() }, CursorStyle::ResizeLeftRight, cx)
+                    .top(px(8.)).bottom(px(8.)).right(px(0.)).w(px(5.)),
+            )
+            .child(
+                self.find_resize_handle("find-rs-t", ResizeEdges { t: true, ..Default::default() }, CursorStyle::ResizeUpDown, cx)
+                    .left(px(8.)).right(px(8.)).top(px(0.)).h(px(5.)),
+            )
+            .child(
+                self.find_resize_handle("find-rs-b", ResizeEdges { b: true, ..Default::default() }, CursorStyle::ResizeUpDown, cx)
+                    .left(px(8.)).right(px(8.)).bottom(px(0.)).h(px(5.)),
+            )
+            .child(
+                self.find_resize_handle("find-rs-tl", ResizeEdges { t: true, l: true, ..Default::default() }, CursorStyle::ResizeUpLeftDownRight, cx)
+                    .top(px(0.)).left(px(0.)).size(px(10.)),
+            )
+            .child(
+                self.find_resize_handle("find-rs-tr", ResizeEdges { t: true, r: true, ..Default::default() }, CursorStyle::ResizeUpRightDownLeft, cx)
+                    .top(px(0.)).right(px(0.)).size(px(10.)),
+            )
+            .child(
+                self.find_resize_handle("find-rs-bl", ResizeEdges { b: true, l: true, ..Default::default() }, CursorStyle::ResizeUpRightDownLeft, cx)
+                    .bottom(px(0.)).left(px(0.)).size(px(10.)),
             )
     }
 
@@ -6229,6 +6712,115 @@ impl Storm {
                 MouseButton::Right,
                 cx.listener(|this, _e, _w, cx| {
                     this.editor_ctx = None;
+                    cx.notify();
+                }),
+            )
+            .child(menu)
+    }
+
+    /// Dir-tree right-click actions. Operate on `tree_ctx_path`.
+    fn tree_ctx_actions() -> [(&'static str, fn(&mut Self, &mut Window, &mut Context<Self>)); 1] {
+        [("Refresh", |this, _w, _cx| {
+            // re-read the filesystem so created/deleted files show up; expand the
+            // targeted folder so its current contents are visible
+            if let Some(p) = this.tree_ctx_path.clone() {
+                if p.is_dir() {
+                    this.expanded.insert(p);
+                }
+            }
+            this.rebuild();
+        })]
+    }
+
+    fn tree_ctx_run(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let actions = Self::tree_ctx_actions();
+        if let Some((_, run)) = actions.get(idx) {
+            run(self, window, cx);
+            self.tree_ctx = None;
+            self.tree_ctx_path = None;
+            cx.notify();
+        }
+    }
+
+    fn tree_ctx_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let key = ev.keystroke.key.as_str();
+        if key == "escape" {
+            self.tree_ctx = None;
+            self.tree_ctx_path = None;
+            cx.notify();
+            return;
+        }
+        if let Ok(n) = key.parse::<usize>() {
+            if n >= 1 {
+                self.tree_ctx_run(n - 1, _window, cx);
+            }
+        }
+    }
+
+    fn render_tree_ctx_menu(&self, pos: (f32, f32), cx: &mut Context<Self>) -> impl IntoElement {
+        let actions = Self::tree_ctx_actions();
+        let menu_w = 200.0_f32;
+        let row_h = 28.0_f32;
+        let menu_h = actions.len() as f32 * row_h + 10.0;
+        let left = pos.0.min((self.win_width - menu_w - 8.0).max(0.));
+        let top = pos.1.min((self.win_height - menu_h - 8.0).max(0.));
+
+        let mut menu = div()
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(menu_w))
+            .py_1()
+            .bg(rgb(PANEL_BG))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .rounded_md()
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation());
+        for (i, (label, _)) in actions.into_iter().enumerate() {
+            menu = menu.child(
+                div()
+                    .id(("tree-ctx", i))
+                    .h(px(row_h))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(12.))
+                    .text_color(rgb(TEXT))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(HOVER)))
+                    .child(div().w(px(12.)).text_color(rgb(MUTED)).child(format!("{}", i + 1)))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _e, window, cx| {
+                        this.tree_ctx_run(i, window, cx);
+                    })),
+            );
+        }
+
+        div()
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .w(px(self.win_width))
+            .h(px(self.win_height))
+            .track_focus(&self.tree_ctx_focus)
+            .on_key_down(cx.listener(Self::tree_ctx_key))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _e, _w, cx| {
+                    this.tree_ctx = None;
+                    this.tree_ctx_path = None;
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _e, _w, cx| {
+                    this.tree_ctx = None;
+                    this.tree_ctx_path = None;
                     cx.notify();
                 }),
             )
@@ -6862,6 +7454,7 @@ impl Storm {
         div()
             .w(px(4.))
             .h_full()
+            .flex_shrink_0()
             .bg(rgb(if self.resizing { ACCENT } else { BORDER }))
             .cursor(CursorStyle::ResizeLeftRight)
             .on_mouse_down(
@@ -6906,56 +7499,47 @@ impl Storm {
                     .text_size(px(12.))
                     .child(format!("{}  ", root_name.to_uppercase())),
             )
-            // type-to-filter bar: typing while the tree is focused fills this
-            .child(
-                div()
-                    .id("tree-filter")
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .h(px(28.))
-                    .px_3()
-                    .border_b_1()
-                    .border_color(rgb(BORDER))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _e, window, cx| {
-                            window.focus(&this.tree_focus, cx);
-                            cx.notify();
-                        }),
-                    )
-                    .child(div().font_family(ICON_FONT).text_size(px(12.)).text_color(rgb(MUTED)).child(IC_SEARCH))
-                    .child(if self.tree_filter.is_empty() {
-                        div()
-                            .flex_grow(1.0)
-                            .text_size(px(12.))
-                            .text_color(rgb(MUTED))
-                            .child(format!("Filter files…{}", self.caret_if(focused)))
-                    } else {
-                        div()
-                            .flex_grow(1.0)
-                            .text_size(px(12.))
-                            .text_color(rgb(TEXT))
-                            .child(self.tree_filter.render(self.caret_if(focused), SELECTION))
-                    })
-                    .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(count_label)),
-            )
+            // type-to-filter bar: only shown while a filter is active (typing in
+            // the focused tree), so the empty bar doesn't take up space
+            .when(filtering, |d| {
+                d.child(
+                    div()
+                        .id("tree-filter")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .h(px(28.))
+                        .px_3()
+                        .border_b_1()
+                        .border_color(rgb(BORDER))
+                        .child(div().font_family(ICON_FONT).text_size(px(12.)).text_color(rgb(MUTED)).child(IC_SEARCH))
+                        .child(
+                            div()
+                                .flex_grow(1.0)
+                                .text_size(px(12.))
+                                .text_color(rgb(TEXT))
+                                .child(self.tree_filter.render(self.caret_if(focused), SELECTION)),
+                        )
+                        .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(count_label)),
+                )
+            })
             .child(
                 uniform_list(
                     "tree",
                     count,
                     cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
-                        let selected_path = this.tree_selected.clone();
                         range
                             .map(|ix| {
                                 let entry = &this.entries[ix];
                                 let indent = (entry.depth as f32) * 14.;
                                 let is_dir = entry.is_dir;
                                 let expanded = this.expanded.contains(&entry.path);
-                                let is_open = selected_path.as_ref() == Some(&entry.path);
+                                let is_open = this.is_tree_selected(&entry.path);
                                 let git = this.git_status.get(&entry.path).copied();
                                 let name = entry.name.clone();
+                                let dimmed = entry.ignored; // git-ignored → faded
+                                let ctx_path = entry.path.clone(); // for the right-click menu
                                 let fg = if is_open {
                                     rgb(SEL_TEXT)
                                 } else if is_dir {
@@ -6994,6 +7578,7 @@ impl Storm {
                                     .pr_2()
                                     .when(is_open, |d| d.bg(rgb(SELECTED_BG)))
                                     .when(!is_open, |d| d.hover(|s| s.bg(rgb(HOVER))))
+                                    .when(dimmed, |d| d.opacity(0.5)) // git-ignored → faded
                                     .cursor_pointer()
                                     .child(
                                         div()
@@ -7020,9 +7605,20 @@ impl Storm {
                                         if ev.click_count() >= 2 {
                                             this.on_entry(ix, window, cx);
                                         } else {
-                                            this.select_entry(ix, cx);
+                                            let m = ev.modifiers();
+                                            this.select_entry(ix, m.shift, m.platform, cx);
                                         }
                                     }))
+                                    // right-click → context menu (Refresh, …)
+                                    .on_mouse_down(
+                                        MouseButton::Right,
+                                        cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                                            this.tree_ctx = Some((f32::from(ev.position.x), f32::from(ev.position.y)));
+                                            this.tree_ctx_path = Some(ctx_path.clone());
+                                            window.focus(&this.tree_ctx_focus, cx);
+                                            cx.notify();
+                                        }),
+                                    )
                             })
                             .collect()
                     }),
