@@ -386,6 +386,11 @@ impl Terminal {
         let _ = self._child.kill();
     }
 
+    /// PID of the shell this terminal spawned (root of its process subtree).
+    pub fn child_pid(&self) -> Option<u32> {
+        self._child.process_id()
+    }
+
     fn resize(&mut self, cols: usize, rows: usize) {
         if cols == self.cols && rows == self.rows {
             return;

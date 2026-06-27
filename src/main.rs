@@ -251,6 +251,33 @@ fn search_rust(query: &str, scopes: &[PathBuf], case_sensitive: bool) -> Vec<Fin
     out
 }
 
+/// File holding the recent-projects list (most-recent first, one path per line).
+fn recents_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".config/tide/recent-projects.txt"))
+}
+
+/// Recently-opened project paths, most recent first; only existing dirs.
+fn load_recent_projects() -> Vec<PathBuf> {
+    let Some(file) = recents_path() else { return Vec::new() };
+    let Ok(text) = std::fs::read_to_string(&file) else { return Vec::new() };
+    text.lines().map(|l| PathBuf::from(l.trim())).filter(|p| p.is_dir()).collect()
+}
+
+/// Record `root` as the most-recently-opened project (dedup, cap 20).
+fn push_recent_project(root: &Path) {
+    let Some(file) = recents_path() else { return };
+    let mut list = load_recent_projects();
+    list.retain(|p| p != root);
+    list.insert(0, root.to_path_buf());
+    list.truncate(20);
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let body = list.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>().join("\n");
+    let _ = std::fs::write(&file, body);
+}
+
 /// Recursively collect all files under `root`, skipping ignored and hidden
 /// directories (.git, .webiny, node_modules, target, …). Caps total count so a
 /// pathological tree can't hang the finder.
@@ -1325,6 +1352,7 @@ enum Cmd {
     MyPrs,
     ReleasePrs,
     CopyBranch,
+    ProcessManager,
 }
 
 /// (command, label, icon glyph, shortcut hint)
@@ -1349,7 +1377,64 @@ const PALETTE: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::GoToFile, "Go to File", IC_FILES, "⌘⇧O"),
     (Cmd::GoToLine, "Go to Line", IC_HOME, "⌘L"),
     (Cmd::CopyBranch, "Copy Branch Name", IC_BRANCH, ""),
+    (Cmd::ProcessManager, "Process Manager", IC_TOOLS, ""),
 ];
+
+/// A running process row for the Process Manager dialog.
+#[derive(Clone)]
+struct Proc {
+    pid: u32,
+    ppid: u32,      // parent pid (to find tide's descendant tree)
+    name: String,   // basename of the executable
+    comm: String,   // full command path (used for filtering)
+    rss_kb: u64,    // resident memory in KB
+    user: String,
+}
+
+/// List running processes via `ps`, sorted by memory (largest first).
+fn list_processes() -> Vec<Proc> {
+    let Some(out) = Command::new("ps")
+        .args(["-axo", "pid=,ppid=,rss=,user=,comm="])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+    else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut procs = Vec::new();
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(pid), Some(ppid), Some(rss), Some(user)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let comm = parts.collect::<Vec<_>>().join(" ");
+        let (Ok(pid), Ok(ppid), Ok(rss_kb)) =
+            (pid.parse::<u32>(), ppid.parse::<u32>(), rss.parse::<u64>())
+        else {
+            continue;
+        };
+        if comm.is_empty() {
+            continue;
+        }
+        let name = comm.rsplit('/').next().unwrap_or(&comm).to_string();
+        procs.push(Proc { pid, ppid, name, comm, rss_kb, user: user.to_string() });
+    }
+    procs.sort_by(|a, b| b.rss_kb.cmp(&a.rss_kb));
+    procs
+}
+
+/// Human-readable memory size from KB (MB, or GB above 1 GB).
+fn fmt_mem(kb: u64) -> String {
+    let mb = kb as f64 / 1024.0;
+    if mb >= 1024.0 {
+        format!("{:.2} GB", mb / 1024.0)
+    } else {
+        format!("{:.1} MB", mb)
+    }
+}
 
 /// The [start, end) char range of the word at `col` in `line` (alphanumeric +
 /// underscore run); an empty range if `col` isn't on a word char.
@@ -1651,6 +1736,7 @@ struct Storm {
     newproj_open: bool,
     newproj_focus: FocusHandle,
     newproj_path: Field,
+    newproj_recents: Vec<PathBuf>, // recent projects, loaded when the dialog opens
     // commit message
     commit_msg: Field,
     commit_focus: FocusHandle,
@@ -1738,6 +1824,16 @@ struct Storm {
     palette_sel: usize,
     palette_results: Vec<(Cmd, &'static str, &'static str, &'static str)>,
     palette_gen: u64,
+    // process manager dialog
+    proc_open: bool,
+    proc_focus: FocusHandle,
+    proc_filter: Field,
+    proc_list: Vec<Proc>,
+    proc_selected: HashSet<u32>,
+    proc_anchor: Option<usize>, // shift-range anchor (index in the filtered list)
+    proc_only_tide: bool,       // show only processes in tide's descendant tree
+    proc_workspace_only: bool,  // narrow further to this workspace's terminals
+    proc_ws_pids: Vec<u32>,     // this workspace's terminal shell pids (load-time snapshot)
     // workspace (multi-project) info, pushed down by the Workspace each render
     ws_names: Vec<String>,
     ws_branches: Vec<String>,
@@ -1887,6 +1983,7 @@ impl Storm {
             newproj_open: false,
             newproj_focus: cx.focus_handle(),
             newproj_path: Field::default(),
+            newproj_recents: Vec::new(),
             commit_msg: Field::default(),
             commit_focus: cx.focus_handle(),
             wip_id: random_id(),
@@ -1950,6 +2047,15 @@ impl Storm {
             palette_sel: 0,
             palette_results: Vec::new(),
             palette_gen: 0,
+            proc_open: false,
+            proc_focus: cx.focus_handle(),
+            proc_filter: Field::default(),
+            proc_list: Vec::new(),
+            proc_selected: HashSet::new(),
+            proc_anchor: None,
+            proc_only_tide: true,
+            proc_workspace_only: true,
+            proc_ws_pids: Vec::new(),
             ws_names: Vec::new(),
             ws_branches: Vec::new(),
             ws_idle: Vec::new(),
@@ -1965,6 +2071,7 @@ impl Storm {
             pulse_at: None,
         };
         s.ignored = git_ignored_paths(&s.root); // hide git-ignored paths from the tree
+        s.expanded.insert(s.root.clone()); // the root node starts expanded
         s.rebuild();
         s.start_git_poll(cx);
         s.start_caret_blink(cx);
@@ -1996,6 +2103,7 @@ impl Storm {
             || self.find_open
             || self.gitp_open
             || self.palette_open
+            || self.proc_open
             || (self.show_left && self.left_view == LeftView::Changes)
     }
 
@@ -2205,15 +2313,22 @@ impl Storm {
     fn rebuild(&mut self) {
         let mut out = Vec::new();
         let root = self.root.clone();
+        // the project root itself is the first node (like WebStorm); selecting it
+        // scopes find-in-files to the whole project. Its children sit at depth 1.
+        let root_name =
+            root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "project".into());
+        out.push(Entry { name: root_name, path: root.clone(), is_dir: true, depth: 0, ignored: false });
         let query = self.tree_filter.text.trim().to_string();
         if query.is_empty() {
-            self.walk(&root, 0, false, &mut out);
+            if self.expanded.contains(&root) {
+                self.walk(&root, 1, false, &mut out);
+            }
             self.tree_total = out.len();
         } else {
             // filtered view: scan the whole tree (ignoring the expanded set),
             // keeping matching entries plus the ancestor dirs that reach them.
             let mut total = 0;
-            self.walk_filtered(&root, 0, false, &query, &mut out, &mut total);
+            self.walk_filtered(&root, 1, false, &query, &mut out, &mut total);
             self.tree_total = total;
         }
         self.entries = out;
@@ -2538,6 +2653,9 @@ impl Storm {
             self.expanded.remove(&path);
             if self.tree_selected.as_ref() == Some(&path) {
                 self.tree_selected = None;
+            }
+            if self.commit_selected.as_ref() == Some(&path) {
+                self.commit_selected = None;
             }
             if self.tree_clipboard.as_ref() == Some(&path) {
                 self.tree_clipboard = None;
@@ -3109,6 +3227,7 @@ impl Storm {
     fn act_new_project(&mut self, _: &NewProject, window: &mut Window, cx: &mut Context<Self>) {
         self.newproj_open = true;
         self.newproj_path.clear();
+        self.newproj_recents = load_recent_projects();
         window.focus(&self.newproj_focus, cx);
         cx.notify();
     }
@@ -3800,7 +3919,7 @@ impl Storm {
     }
 
     /// Commit-pane list keys: cmd+shift+c copies the selected file/folder ref.
-    fn changes_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn changes_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         if ks.modifiers.platform && ks.modifiers.shift && ks.key == "c" {
             if let Some(p) = self.commit_selected.clone() {
@@ -3814,6 +3933,16 @@ impl Storm {
         if ks.key == "escape" {
             if !self.commit_filter.is_empty() {
                 self.commit_filter.clear();
+                cx.notify();
+            }
+            return;
+        }
+        // delete the selected file/folder (backspace only when the filter is
+        // empty, so it can still edit the filter text); forward-delete always
+        if (ks.key == "backspace" && self.commit_filter.is_empty()) || ks.key == "delete" {
+            if let Some(p) = self.commit_selected.clone() {
+                self.confirm_delete = Some(p);
+                window.focus(&self.confirm_focus, cx);
                 cx.notify();
             }
             return;
@@ -3912,7 +4041,131 @@ impl Storm {
                     self.show_flash("Branch name copied", cx);
                 }
             }
+            Cmd::ProcessManager => self.open_process_manager(window, cx),
         }
+    }
+
+    // ── process manager ───────────────────────────────────────────────────────
+
+    fn open_process_manager(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.proc_open = true;
+        self.proc_filter.clear();
+        self.proc_selected.clear();
+        self.proc_anchor = None;
+        self.reload_processes(cx);
+        window.focus(&self.proc_focus, cx);
+        cx.notify();
+    }
+
+    /// `roots` plus all their descendant pids (from the ppid tree in proc_list).
+    fn descendants_of(&self, roots: &[u32]) -> HashSet<u32> {
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        for p in &self.proc_list {
+            children.entry(p.ppid).or_default().push(p.pid);
+        }
+        let mut set: HashSet<u32> = roots.iter().copied().collect();
+        let mut stack: Vec<u32> = roots.to_vec();
+        while let Some(pid) = stack.pop() {
+            if let Some(kids) = children.get(&pid) {
+                for &k in kids {
+                    if set.insert(k) {
+                        stack.push(k);
+                    }
+                }
+            }
+        }
+        set
+    }
+
+    /// Reload the process list + this workspace's terminal shell pids.
+    fn reload_processes(&mut self, cx: &mut Context<Self>) {
+        self.proc_list = list_processes();
+        self.proc_ws_pids = self.terminals.iter().filter_map(|t| t.read(cx).child_pid()).collect();
+    }
+
+    /// Filtered + sorted process rows. Scope: this workspace's terminals →
+    /// all of tide → all system, per the two toggles.
+    fn proc_rows(&self) -> Vec<Proc> {
+        let q = self.proc_filter.text.to_lowercase();
+        let own = std::process::id();
+        let scope: Option<HashSet<u32>> = if self.proc_workspace_only {
+            Some(self.descendants_of(&self.proc_ws_pids))
+        } else if self.proc_only_tide {
+            Some(self.descendants_of(&[own]))
+        } else {
+            None
+        };
+        self.proc_list
+            .iter()
+            .filter(|p| p.pid != own) // never list tide itself
+            .filter(|p| scope.as_ref().map_or(true, |set| set.contains(&p.pid)))
+            .filter(|p| q.is_empty() || p.comm.to_lowercase().contains(&q) || p.user.to_lowercase().contains(&q))
+            .cloned()
+            .collect()
+    }
+
+    /// Click a process row: plain = single select, cmd = toggle, shift = range.
+    fn proc_select(&mut self, ix: usize, shift: bool, cmd: bool, cx: &mut Context<Self>) {
+        let rows = self.proc_rows();
+        let Some(row) = rows.get(ix) else { return };
+        let pid = row.pid;
+        if shift {
+            let anchor = self.proc_anchor.unwrap_or(ix);
+            let (lo, hi) = (anchor.min(ix), anchor.max(ix));
+            self.proc_selected = rows[lo..=hi].iter().map(|p| p.pid).collect();
+        } else if cmd {
+            if !self.proc_selected.remove(&pid) {
+                self.proc_selected.insert(pid);
+            }
+            self.proc_anchor = Some(ix);
+        } else {
+            self.proc_selected.clear();
+            self.proc_selected.insert(pid);
+            self.proc_anchor = Some(ix);
+        }
+        cx.notify();
+    }
+
+    /// Kill the given pids (SIGTERM), then reload the list.
+    fn proc_kill(&mut self, pids: Vec<u32>, cx: &mut Context<Self>) {
+        for pid in pids {
+            let _ = Command::new("kill").arg(pid.to_string()).output();
+        }
+        self.proc_selected.clear();
+        self.proc_anchor = None;
+        self.reload_processes(cx);
+        cx.notify();
+    }
+
+    fn proc_kill_selected(&mut self, cx: &mut Context<Self>) {
+        let pids: Vec<u32> = self.proc_selected.iter().copied().collect();
+        self.proc_kill(pids, cx);
+    }
+
+    /// Kill every process currently shown (after the filter + TIDE filter).
+    fn proc_kill_all(&mut self, cx: &mut Context<Self>) {
+        let pids: Vec<u32> = self.proc_rows().iter().map(|p| p.pid).collect();
+        self.proc_kill(pids, cx);
+    }
+
+    fn proc_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        match ks.key.as_str() {
+            "escape" => {
+                self.proc_open = false;
+                self.focus_active(window, cx);
+            }
+            // cmd+backspace kills the selected processes (plain backspace edits filter)
+            "backspace" if ks.modifiers.platform => self.proc_kill_selected(cx),
+            // cmd+r reloads the list
+            "r" if ks.modifiers.platform => self.reload_processes(cx),
+            _ => {
+                if Self::field_input(&mut self.proc_filter, ks, cx, |_| true) == Edit::Changed {
+                    self.proc_anchor = None;
+                }
+            }
+        }
+        cx.notify();
     }
 
     fn palette_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -3932,6 +4185,19 @@ impl Storm {
                 self.palette_sel = (self.palette_sel + 1).min(n.saturating_sub(1));
             }
             "up" => self.palette_sel = self.palette_sel.saturating_sub(1),
+            // 1-9 instantly run the Nth listed command (no typing needed)
+            d if d.len() == 1
+                && d.as_bytes()[0].is_ascii_digit()
+                && !ks.modifiers.platform
+                && !ks.modifiers.control
+                && !ks.modifiers.alt =>
+            {
+                if let Some(n) = d.parse::<usize>().ok().filter(|n| (1..=9).contains(n)) {
+                    if let Some(&(cmd, ..)) = self.palette_results.get(n - 1) {
+                        self.palette_execute(cmd, window, cx);
+                    }
+                }
+            }
             _ => {
                 if Self::field_input(&mut self.palette_query, ks, cx, |_| true) == Edit::Changed {
                     self.schedule_palette(cx); // debounced re-filter
@@ -4366,6 +4632,9 @@ impl Render for Storm {
         if self.push_open {
             root = root.child(self.render_push_dialog(cx));
         }
+        if self.proc_open {
+            root = root.child(self.render_process_manager(cx));
+        }
         if self.ws_open {
             root = root.child(self.render_project_dropdown(cx));
         }
@@ -4522,6 +4791,25 @@ impl Storm {
                                 .on_click(cx.listener(move |_this, _e, _w, _cx| {
                                     let _ = Command::new("open").arg(&url).spawn();
                                 })),
+                        )
+                    })
+                    // refresh the PR link + checks status (otherwise only updates
+                    // on branch change / cmd+R)
+                    .when(!self.branch.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .id("pr-refresh")
+                                .px_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .text_size(px(12.))
+                                .text_color(rgb(MUTED))
+                                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                .child("↻")
+                                .tooltip(|_w, cx| {
+                                    cx.new(|_| TooltipView { text: "Refresh PR status".into() }).into()
+                                })
+                                .on_click(cx.listener(|this, _e, _w, cx| this.refresh_pr_link(cx))),
                         )
                     }),
             );
@@ -5092,6 +5380,7 @@ impl Storm {
                     let dir_abs = self.root.join(&key);
                     let is_dir_sel = self.commit_selected.as_ref() == Some(&dir_abs);
                     let dir_select = dir_abs.clone();
+                    let dir_ctx = dir_abs.clone();
                     list = list.child(
                         div()
                             .flex()
@@ -5103,6 +5392,17 @@ impl Storm {
                             .pr_2()
                             .when(is_dir_sel, |d| d.bg(rgb(SELECTED_BG)))
                             .when(!is_dir_sel, |d| d.hover(|s| s.bg(rgb(HOVER))))
+                            // right-click → context menu (Refresh / Delete)
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                                    this.tree_ctx = Some((f32::from(ev.position.x), f32::from(ev.position.y)));
+                                    this.tree_ctx_path = Some(dir_ctx.clone());
+                                    this.commit_selected = Some(dir_ctx.clone());
+                                    window.focus(&this.tree_ctx_focus, cx);
+                                    cx.notify();
+                                }),
+                            )
                             .child(
                                 div()
                                     .id(("cdir-chev", i))
@@ -5159,6 +5459,7 @@ impl Storm {
                     let (badge, badge_color) = ext_badge(&path);
                     let path_open = path.clone();
                     let path_check = path.clone();
+                    let path_ctx = path.clone();
                     list = list.child(
                         div()
                             .flex()
@@ -5170,6 +5471,17 @@ impl Storm {
                             .pr_2()
                             .when(is_open, |d| d.bg(rgb(SELECTED_BG)))
                             .when(!is_open, |d| d.hover(|s| s.bg(rgb(HOVER))))
+                            // right-click → context menu (Refresh / Delete)
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                                    this.tree_ctx = Some((f32::from(ev.position.x), f32::from(ev.position.y)));
+                                    this.tree_ctx_path = Some(path_ctx.clone());
+                                    this.commit_selected = Some(path_ctx.clone());
+                                    window.focus(&this.tree_ctx_focus, cx);
+                                    cx.notify();
+                                }),
+                            )
                             .child(div().w(px(16.))) // chevron spacer
                             .child(
                                 div()
@@ -6222,6 +6534,14 @@ impl Storm {
                     .when(sel, |d| d.bg(rgb(SELECTED_BG)))
                     .when(!sel, |d| d.hover(|s| s.bg(rgb(HOVER))))
                     .cursor_pointer()
+                    // 1-9 shortcut number for the first nine commands
+                    .child(
+                        div()
+                            .w(px(12.))
+                            .text_size(px(11.))
+                            .text_color(rgb(if sel { SEL_TEXT } else { MUTED }))
+                            .child(if i < 9 { format!("{}", i + 1) } else { String::new() }),
+                    )
                     .child(
                         div()
                             .w(px(20.))
@@ -6432,6 +6752,220 @@ impl Storm {
             );
         }
         panel
+    }
+
+    /// Process Manager dialog: filterable list of running processes with
+    /// multi-select (cmd/shift-click) and kill.
+    fn render_process_manager(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let w = 760.0_f32;
+        let h = 560.0_f32;
+        let left = ((self.win_width - w) / 2.0).max(0.);
+        let top = ((self.win_height - h) / 2.0).max(40.);
+        let rows = self.proc_rows();
+        let total = rows.len();
+        let sel_count = self.proc_selected.len();
+
+        // search row
+        let header = div()
+            .h(px(40.))
+            .px_3()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .child(div().font_family(ICON_FONT).text_color(rgb(MUTED)).child(IC_SEARCH))
+            .child(
+                div().flex_grow(1.0).text_size(px(13.)).text_color(rgb(TEXT)).child(
+                    if self.proc_filter.is_empty() {
+                        div().text_color(rgb(MUTED)).child(format!("Filter processes…{}", self.caret()))
+                    } else {
+                        div().child(self.proc_filter.render(self.caret(), SELECTION))
+                    },
+                ),
+            )
+            // scope toggles: this workspace ⊂ all TIDE ⊂ all system
+            .child({
+                let on = self.proc_workspace_only;
+                div()
+                    .id("proc-ws")
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_size(px(11.))
+                    .cursor_pointer()
+                    .when(on, |d| d.bg(rgb(ACCENT)).text_color(rgb(SEL_TEXT)))
+                    .when(!on, |d| d.text_color(rgb(MUTED)).hover(|s| s.bg(rgb(HOVER))))
+                    .child("This workspace")
+                    .on_click(cx.listener(|this, _e, _w, cx| {
+                        this.proc_workspace_only = !this.proc_workspace_only;
+                        this.proc_anchor = None;
+                        cx.notify();
+                    }))
+            })
+            // "TIDE only" (ignored while "This workspace" is on, which is narrower)
+            .child({
+                let on = self.proc_only_tide;
+                let dimmed = self.proc_workspace_only;
+                div()
+                    .id("proc-tide")
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_size(px(11.))
+                    .cursor_pointer()
+                    .when(on && !dimmed, |d| d.bg(rgb(ACCENT)).text_color(rgb(SEL_TEXT)))
+                    .when(!(on && !dimmed), |d| d.text_color(rgb(MUTED)).hover(|s| s.bg(rgb(HOVER))))
+                    .child("TIDE only")
+                    .on_click(cx.listener(|this, _e, _w, cx| {
+                        this.proc_only_tide = !this.proc_only_tide;
+                        this.proc_anchor = None;
+                        cx.notify();
+                    }))
+            })
+            .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(if sel_count > 0 {
+                format!("{} selected · {} processes", sel_count, total)
+            } else {
+                format!("{} processes", total)
+            }));
+
+        // column header
+        let col_head = div()
+            .h(px(24.))
+            .px_3()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .text_size(px(11.))
+            .text_color(rgb(MUTED))
+            .child(div().flex_grow(1.0).child("Process"))
+            .child(div().w(px(90.)).flex().justify_end().child("Memory"))
+            .child(div().w(px(64.)).flex().justify_end().child("PID"))
+            .child(div().w(px(90.)).child("User"));
+
+        let mut list = div().id("proc-list").flex().flex_col().flex_grow(1.0).min_h(px(0.)).overflow_y_scroll();
+        for (i, p) in rows.iter().enumerate().take(800) {
+            let selected = self.proc_selected.contains(&p.pid);
+            let text = if selected { SEL_TEXT } else { TEXT };
+            let mem = fmt_mem(p.rss_kb);
+            list = list.child(
+                div()
+                    .id(("proc", i))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .h(px(24.))
+                    .px_3()
+                    .when(selected, |d| d.bg(rgb(SELECTED_BG)))
+                    .when(!selected, |d| d.hover(|s| s.bg(rgb(HOVER))))
+                    .cursor_pointer()
+                    .text_size(px(12.))
+                    .child(div().flex_grow(1.0).truncate().text_color(rgb(text)).child(p.name.clone()))
+                    .child(div().w(px(90.)).flex().justify_end().text_color(rgb(if selected { SEL_TEXT } else { MUTED })).child(mem))
+                    .child(div().w(px(64.)).flex().justify_end().text_color(rgb(if selected { SEL_TEXT } else { MUTED })).child(p.pid.to_string()))
+                    .child(div().w(px(90.)).truncate().text_color(rgb(if selected { SEL_TEXT } else { MUTED })).child(p.user.clone()))
+                    .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, _w, cx| {
+                        let m = ev.modifiers();
+                        this.proc_select(i, m.shift, m.platform, cx);
+                    })),
+            );
+        }
+
+        // footer: Kill button + shortcuts hint
+        let footer = div()
+            .h(px(46.))
+            .px_3()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .flex_shrink_0()
+            .border_t_1()
+            .border_color(rgb(BORDER))
+            .child(div().flex_grow(1.0).text_size(px(11.)).text_color(rgb(MUTED)).child("⌘/⇧-click multi-select  ·  ⌘R refresh  ·  ⌘⌫ kill"))
+            // Kill All: kills every process currently shown (after the filters)
+            .child({
+                let mut b = div()
+                    .id("proc-kill-all")
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .text_size(px(12.))
+                    .border_1()
+                    .border_color(rgb(if total > 0 { GIT_DELETED } else { BORDER }))
+                    .text_color(rgb(if total > 0 { GIT_DELETED } else { MUTED }))
+                    .child(format!("Kill All ({total})"));
+                if total > 0 {
+                    b = b.cursor_pointer().hover(|s| s.bg(rgb(HOVER))).on_click(
+                        cx.listener(|this, _e, _w, cx| this.proc_kill_all(cx)),
+                    );
+                }
+                b
+            })
+            .child({
+                let kill_label = if sel_count > 0 { format!("Kill ({})", sel_count) } else { "Kill".to_string() };
+                let mut b = div()
+                    .id("proc-kill")
+                    .px_4()
+                    .py_1()
+                    .rounded_md()
+                    .text_size(px(12.))
+                    .border_1()
+                    .border_color(rgb(if sel_count > 0 { GIT_DELETED } else { BORDER }))
+                    .text_color(rgb(if sel_count > 0 { SEL_TEXT } else { MUTED }))
+                    .child(kill_label);
+                if sel_count > 0 {
+                    b = b.bg(rgb(GIT_DELETED)).cursor_pointer().on_click(
+                        cx.listener(|this, _e, _w, cx| this.proc_kill_selected(cx)),
+                    );
+                }
+                b
+            });
+
+        // backdrop + centered panel
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_start()
+            .justify_center()
+            .child(
+                div().absolute().inset_0().bg(rgba(0x00000088)).id("proc-backdrop").on_click(
+                    cx.listener(|this, _e, _w, cx| {
+                        this.proc_open = false;
+                        cx.notify();
+                    }),
+                ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(left))
+                    .top(px(top))
+                    .w(px(w))
+                    .h(px(h))
+                    .bg(rgb(PANEL_BG))
+                    .border_1()
+                    .border_color(rgb(ACCENT))
+                    .rounded_lg()
+                    .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .track_focus(&self.proc_focus)
+                    .on_key_down(cx.listener(Self::proc_key))
+                    .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
+                    .child(header)
+                    .child(col_head)
+                    .child(list)
+                    .child(footer),
+            )
     }
 
     /// Confirmation dialog before deleting a file/folder from the project tree.
@@ -6719,17 +7253,25 @@ impl Storm {
     }
 
     /// Dir-tree right-click actions. Operate on `tree_ctx_path`.
-    fn tree_ctx_actions() -> [(&'static str, fn(&mut Self, &mut Window, &mut Context<Self>)); 1] {
-        [("Refresh", |this, _w, _cx| {
-            // re-read the filesystem so created/deleted files show up; expand the
-            // targeted folder so its current contents are visible
-            if let Some(p) = this.tree_ctx_path.clone() {
-                if p.is_dir() {
-                    this.expanded.insert(p);
+    fn tree_ctx_actions() -> [(&'static str, fn(&mut Self, &mut Window, &mut Context<Self>)); 2] {
+        [
+            ("Refresh", |this, _w, _cx| {
+                // re-read the filesystem so created/deleted files show up; expand
+                // the targeted folder so its current contents are visible
+                if let Some(p) = this.tree_ctx_path.clone() {
+                    if p.is_dir() {
+                        this.expanded.insert(p);
+                    }
                 }
-            }
-            this.rebuild();
-        })]
+                this.rebuild();
+            }),
+            ("Delete", |this, window, cx| {
+                if let Some(p) = this.tree_ctx_path.clone() {
+                    this.confirm_delete = Some(p);
+                    window.focus(&this.confirm_focus, cx);
+                }
+            }),
+        ]
     }
 
     fn tree_ctx_run(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -7132,6 +7674,46 @@ impl Storm {
             })
             .child("Open");
 
+        // recent projects (most recent first) — click to open
+        let mut recents = div().id("newproj-recents").flex().flex_col().max_h(px(280.)).overflow_y_scroll().pb_2();
+        if !self.newproj_recents.is_empty() {
+            recents = recents.child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .border_t_1()
+                    .border_color(rgb(BORDER))
+                    .child("Recent"),
+            );
+            for (i, p) in self.newproj_recents.iter().take(10).enumerate() {
+                let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                let dir = p.parent().map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
+                let path = p.clone();
+                recents = recents.child(
+                    div()
+                        .id(("newproj-recent", i))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .h(px(26.))
+                        .px_3()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(HOVER)))
+                        .child(div().font_family(ICON_FONT).text_size(px(12.)).text_color(rgb(FOLDER_ICON)).child(IC_FOLDER))
+                        .child(div().flex_shrink_0().text_size(px(12.)).text_color(rgb(TEXT)).child(name))
+                        .child(div().flex_grow(1.0).text_size(px(11.)).text_color(rgb(MUTED)).truncate().child(dir))
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            this.newproj_open = false;
+                            cx.emit(ProjectNav::OpenPath(path.clone()));
+                            cx.notify();
+                        })),
+                );
+            }
+        }
+
         div()
             .absolute()
             .top(px(120.))
@@ -7165,6 +7747,7 @@ impl Storm {
                     .py_3()
                     .child(open_btn),
             )
+            .child(recents)
     }
 }
 
@@ -7474,11 +8057,6 @@ impl Storm {
         // "5/N" while filtering, just the visible row count otherwise
         let count_label =
             if filtering { format!("{}/{}", count, self.tree_total) } else { format!("{}", count) };
-        let root_name = self
-            .root
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "tide".into());
 
         div()
             .flex()
@@ -7497,7 +8075,7 @@ impl Storm {
                     .items_center()
                     .text_color(rgb(ACCENT))
                     .text_size(px(12.))
-                    .child(format!("{}  ", root_name.to_uppercase())),
+                    .child("PROJECT"),
             )
             // type-to-filter bar: only shown while a filter is active (typing in
             // the focused tree), so the empty bar doesn't take up space
@@ -7792,6 +8370,7 @@ impl Workspace {
     }
 
     fn add_project(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        push_recent_project(&root); // remember it for the New Project dialog
         let storm = cx.new(|cx| Storm::new(root, cx));
         cx.subscribe(&storm, |this, _s, ev: &ProjectNav, cx| match ev {
             ProjectNav::Switch(i) => {
@@ -8549,6 +9128,19 @@ impl Render for DiffWindow {
         let pos = format!("{}/{}", self.idx + 1, self.files.len());
         let has_prev = self.idx > 0;
         let has_next = self.idx + 1 < self.files.len();
+        // count changed hunks (contiguous non-Equal runs), shown like WebStorm
+        let diffs = {
+            let mut n = 0usize;
+            let mut in_hunk = false;
+            for row in &self.rows {
+                let changed = row.kind != DiffKind::Equal;
+                if changed && !in_hunk {
+                    n += 1;
+                }
+                in_hunk = changed;
+            }
+            n
+        };
 
         let bar = div()
             .h(px(34.))
@@ -8591,6 +9183,12 @@ impl Render for DiffWindow {
             )
             .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(pos))
             .child(div().flex_grow(1.0).text_color(rgb(TEXT)).text_size(px(12.)).child(rel))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .child(format!("{} difference{}", diffs, if diffs == 1 { "" } else { "s" })),
+            )
             .child(
                 div()
                     .id("dw-close")
