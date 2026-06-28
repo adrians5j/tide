@@ -1,6 +1,6 @@
 //! Shared single-line text-input buffer with caret, selection, undo/redo and
 //! the standard editing keys. Used by every chrome input and the editor search.
-use gpui::{div, prelude::*, px, rgb, Div, Keystroke};
+use gpui::{div, prelude::*, rgb, Div, Keystroke};
 
 fn is_word_sep(c: char) -> bool {
     c.is_whitespace() || matches!(c, '/' | '.' | '_' | '-')

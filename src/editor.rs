@@ -59,6 +59,9 @@ pub struct Editor {
     scroll_x: Pixels,
     hl: Highlighter,
     dirty: bool,
+    read_only: bool, // when true, all edits are blocked (nav/select/copy still work)
+    ro_hint: bool,   // briefly show a "read-only" hint at the cursor on a blocked edit
+    ro_hint_gen: u64,
     blink_on: bool,
     blink_epoch: usize,
     undo_stack: Vec<Snapshot>,
@@ -132,6 +135,9 @@ impl Editor {
             scroll_x: px(0.),
             hl: Highlighter::new(),
             dirty: false,
+            read_only: true, // read-only by default; the workspace sets it per editor
+            ro_hint: false,
+            ro_hint_gen: 0,
             blink_on: true,
             blink_epoch: 0,
             undo_stack: Vec::new(),
@@ -240,10 +246,6 @@ impl Editor {
         self.reload_from(content, Some(disk), &path, cx);
     }
 
-    pub fn has_conflict(&self) -> bool {
-        self.conflict
-    }
-
     /// Conflict resolution: discard local edits and take the on-disk version.
     pub fn force_reload(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.path.clone() else { return };
@@ -262,6 +264,32 @@ impl Editor {
 
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    pub fn set_read_only(&mut self, ro: bool) {
+        self.read_only = ro;
+        if !ro {
+            self.ro_hint = false;
+        }
+    }
+
+    /// Flash a "read-only" hint at the cursor (when a blocked edit is attempted).
+    fn show_ro_hint(&mut self, cx: &mut Context<Self>) {
+        self.ro_hint = true;
+        self.ro_hint_gen = self.ro_hint_gen.wrapping_add(1);
+        let gen = self.ro_hint_gen;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(1600)).await;
+            this.update(cx, |this, cx| {
+                if this.ro_hint_gen == gen {
+                    this.ro_hint = false;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
     }
 
     /// FNV-1a hash of the buffer — cheap change-detection for idle tracking.
@@ -524,6 +552,10 @@ impl Editor {
 
     /// Replace the whole buffer (one undo step) and place the cursor.
     fn set_content(&mut self, new_content: String, cursor: usize, cx: &mut Context<Self>) {
+        if self.read_only {
+            self.show_ro_hint(cx);
+            return;
+        }
         self.undo_stack.push(Snapshot {
             content: self.content.clone(),
             cursor: self.cursor_offset(),
@@ -769,6 +801,10 @@ impl Editor {
     }
 
     fn replace(&mut self, range: Option<Range<usize>>, text: &str, cx: &mut Context<Self>) {
+        if self.read_only {
+            self.show_ro_hint(cx);
+            return;
+        }
         let range = range.unwrap_or_else(|| self.selected_range.clone());
 
         // Coalesce a run of plain single-char typing into one undo step:
@@ -1865,6 +1901,9 @@ impl Render for Editor {
         if let Some((text, x, y)) = &self.hover {
             el = el.child(self.render_hover(text, *x, *y));
         }
+        if self.ro_hint {
+            el = el.child(self.render_ro_hint());
+        }
         el
     }
 }
@@ -1986,6 +2025,30 @@ impl Editor {
 }
 
 impl Editor {
+    /// Small "read-only" badge floated just below the cursor (mirrors the
+    /// completion-popup placement) when a hand edit is attempted while locked.
+    fn render_ro_hint(&self) -> impl IntoElement {
+        let (row, col) = self.offset_to_pos(self.cursor_offset());
+        let cw = f32::from(self.last_char_width);
+        let gw = f32::from(self.last_gutter_width);
+        let x = gw + (col as f32) * cw - f32::from(self.scroll_x);
+        let y = ((row + 1) as f32) * LINE_HEIGHT - f32::from(self.scroll_y);
+        div()
+            .absolute()
+            .left(px(x))
+            .top(px(y + 2.0))
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(POPUP_BG))
+            .border_1()
+            .border_color(rgb(GIT_MODIFIED))
+            .shadow_lg()
+            .text_size(px(11.))
+            .text_color(rgb(GIT_MODIFIED))
+            .child("🔒 Read-only — toggle EDIT to type")
+    }
+
     fn render_completion(&self) -> impl IntoElement {
         let (row, col) = self.offset_to_pos(self.cursor_offset());
         let cw = f32::from(self.last_char_width);

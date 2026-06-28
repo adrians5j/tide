@@ -4,7 +4,7 @@ use gpui::{
     KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ScrollStrategy, SharedString,
     StyledText, TextRun, Window, WindowBounds, WindowOptions, actions, div, font, prelude::*, px,
-    relative, rgb, rgba, size, uniform_list, ScrollHandle, UniformListScrollHandle,
+    rgb, rgba, size, uniform_list, ScrollHandle, UniformListScrollHandle,
 };
 use gpui_platform::application;
 use std::collections::{HashMap, HashSet};
@@ -48,9 +48,6 @@ const IC_FILES: &str = "\u{eaf0}";
 const IC_SCM: &str = "\u{ea68}";
 const IC_TERMINAL: &str = "\u{ea85}";
 const IC_RUN: &str = "\u{eb2c}"; // play
-const IC_CHEVRON_LEFT: &str = "\u{eab5}";
-const IC_CHEVRON_RIGHT: &str = "\u{eab6}";
-const IC_CLOSE: &str = "\u{ea76}";
 const IC_FOLDER: &str = "\u{ea83}";
 const IC_COPY: &str = "\u{ebcc}";
 // The codicon font is renamed to "Segoe Fluent Icons" because GPUI refuses to
@@ -1353,6 +1350,7 @@ enum Cmd {
     ReleasePrs,
     CopyBranch,
     ProcessManager,
+    ToggleReadOnly,
 }
 
 /// (command, label, icon glyph, shortcut hint)
@@ -1378,6 +1376,7 @@ const PALETTE: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::GoToLine, "Go to Line", IC_HOME, "⌘L"),
     (Cmd::CopyBranch, "Copy Branch Name", IC_BRANCH, ""),
     (Cmd::ProcessManager, "Process Manager", IC_TOOLS, ""),
+    (Cmd::ToggleReadOnly, "Toggle Read-Only / Edit Mode", IC_HOME, ""),
 ];
 
 /// A running process row for the Process Manager dialog.
@@ -1634,11 +1633,6 @@ struct Storm {
     resizing: bool,
     tree_scroll: UniformListScrollHandle,
     tree_focus: FocusHandle,
-    // type-to-filter buffer for the dir tree; typing while the tree is focused
-    // fuzzy-filters the entries (nvim-explorer style)
-    tree_filter: Field,
-    // total file/dir count scanned for the current filter (the "/N" in "5/N")
-    tree_total: usize,
     // path copied with cmd+c in the tree, to be pasted with cmd+v
     tree_clipboard: Option<PathBuf>,
     // pending delete confirmation: the tree path awaiting yes/no
@@ -1718,6 +1712,7 @@ struct Storm {
     pr_link: Option<(u64, String, PrStatus)>,
     pr_link_branch: String,
     mem_mb: u64,
+    read_only: bool, // when on, editors block manual edits (nav/select/copy still work)
     left_view: LeftView,
     show_left: bool,
     // branch-name prompt (for the `br` alias)
@@ -1755,6 +1750,8 @@ struct Storm {
     push_branch: String,
     push_target: String,
     push_base_ref: String,
+    // a push was rejected (remote ahead) → offer merge/rebase before retrying
+    push_ahead: bool,
     push_commits: Vec<(String, String)>,
     push_files: Vec<(PathBuf, GitState)>,
     push_collapsed: HashSet<PathBuf>,
@@ -1903,8 +1900,6 @@ impl Storm {
             resizing: false,
             tree_scroll: UniformListScrollHandle::new(),
             tree_focus: cx.focus_handle(),
-            tree_filter: Field::default(),
-            tree_total: 0,
             tree_clipboard: None,
             confirm_delete: None,
             confirm_focus: cx.focus_handle(),
@@ -1969,6 +1964,7 @@ impl Storm {
             pr_link: None,
             pr_link_branch: String::new(),
             mem_mb: 0,
+            read_only: true, // read-only by default
             left_view: LeftView::Files,
             show_left: true,
             br_open: false,
@@ -1997,6 +1993,7 @@ impl Storm {
             push_branch: String::new(),
             push_target: String::new(),
             push_base_ref: String::new(),
+            push_ahead: false,
             push_commits: Vec::new(),
             push_files: Vec::new(),
             push_collapsed: HashSet::new(),
@@ -2318,18 +2315,8 @@ impl Storm {
         let root_name =
             root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "project".into());
         out.push(Entry { name: root_name, path: root.clone(), is_dir: true, depth: 0, ignored: false });
-        let query = self.tree_filter.text.trim().to_string();
-        if query.is_empty() {
-            if self.expanded.contains(&root) {
-                self.walk(&root, 1, false, &mut out);
-            }
-            self.tree_total = out.len();
-        } else {
-            // filtered view: scan the whole tree (ignoring the expanded set),
-            // keeping matching entries plus the ancestor dirs that reach them.
-            let mut total = 0;
-            self.walk_filtered(&root, 1, false, &query, &mut out, &mut total);
-            self.tree_total = total;
+        if self.expanded.contains(&root) {
+            self.walk(&root, 1, false, &mut out);
         }
         self.entries = out;
     }
@@ -2366,40 +2353,6 @@ impl Storm {
                 self.walk(&path, depth + 1, ignored, out);
             }
         }
-    }
-
-    /// Walk the entire tree keeping only entries whose name fuzzy-matches
-    /// `query`, plus the ancestor directories needed to reach them. Bumps
-    /// `total` for every file/dir visited so the caller can show a matched/total
-    /// count. Returns true if anything at or under `dir` matched.
-    fn walk_filtered(
-        &self,
-        dir: &Path,
-        depth: usize,
-        ignored_ancestor: bool,
-        query: &str,
-        out: &mut Vec<Entry>,
-        total: &mut usize,
-    ) -> bool {
-        let mut any = false;
-        for (name, path, is_dir) in Self::read_children(dir) {
-            *total += 1;
-            let ignored = ignored_ancestor || self.ignored.contains(&path);
-            if is_dir {
-                let mark = out.len();
-                out.push(Entry { name: name.clone(), path: path.clone(), is_dir: true, depth, ignored });
-                let child = self.walk_filtered(&path, depth + 1, ignored, query, out, total);
-                if child || fuzzy_score(query, &name).is_some() {
-                    any = true;
-                } else {
-                    out.truncate(mark); // no match under (or in) this dir → drop it
-                }
-            } else if fuzzy_score(query, &name).is_some() {
-                out.push(Entry { name, path, is_dir: false, depth, ignored });
-                any = true;
-            }
-        }
-        any
     }
 
     fn active_path(&self) -> Option<&PathBuf> {
@@ -2555,15 +2508,6 @@ impl Storm {
             }
             return;
         }
-        // escape clears an active filter
-        if ks.key == "escape" {
-            if !self.tree_filter.is_empty() {
-                self.tree_filter.clear();
-                self.rebuild();
-                cx.notify();
-            }
-            return;
-        }
         // enter opens the selected file, else the first matching file
         if ks.key == "enter" {
             let target = self
@@ -2577,8 +2521,8 @@ impl Storm {
             }
             return;
         }
-        // backspace with an empty filter falls back to delete-selected-entry
-        if ks.key == "backspace" && self.tree_filter.is_empty() {
+        // backspace deletes the selected entry
+        if ks.key == "backspace" {
             if let Some(p) = self.tree_selected.clone() {
                 self.confirm_delete = Some(p);
                 window.focus(&self.confirm_focus, cx);
@@ -2586,13 +2530,8 @@ impl Storm {
             }
             return;
         }
-        // anything else feeds the type-to-filter buffer
-        if Self::field_input(&mut self.tree_filter, ks, cx, |_| true) == Edit::Changed {
-            self.rebuild();
-            if !self.entries.is_empty() {
-                self.tree_scroll.scroll_to_item(0, ScrollStrategy::Top);
-            }
-        }
+        // any other key is ignored — type-to-filter was removed because it
+        // scanned the whole repo (incl. node_modules) on the main thread and hung
         cx.notify();
     }
 
@@ -2785,9 +2724,20 @@ impl Storm {
                             })
                             .detach();
                         } else {
-                            // surface the console on error; replace the toast
-                            this.run_open = true;
-                            this.run_active = false;
+                            // a push rejected because the remote is ahead → offer
+                            // merge/rebase instead of just dumping the error
+                            let rejected = this.run_lines.iter().any(|l| {
+                                let s = l.to_lowercase();
+                                s.contains("rejected") || s.contains("fetch first")
+                            });
+                            if rejected {
+                                this.push_ahead = true;
+                                this.run_active = false;
+                            } else {
+                                // surface the console on error; replace the toast
+                                this.run_open = true;
+                                this.run_active = false;
+                            }
                         }
                         cx.notify();
                         return false;
@@ -2820,8 +2770,12 @@ impl Storm {
             ed.update(cx, |e, cx| e.reload_if_changed(cx));
         } else {
             let lsp = self.lsp.clone();
+            let ro = self.read_only;
             let editor = cx.new(|cx| Editor::new(lsp, cx));
-            editor.update(cx, |e, cx| e.load(path.clone(), cx));
+            editor.update(cx, |e, cx| {
+                e.set_read_only(ro);
+                e.load(path.clone(), cx);
+            });
             // go-to-definition: open the target file at the position
             cx.subscribe_in(&editor, window, |this, _ed, ev: &OpenLocation, window, cx| {
                 this.open_file(ev.path.clone(), window, cx);
@@ -2859,10 +2813,6 @@ impl Storm {
     }
 
     fn reveal_in_tree(&mut self, path: &Path) {
-        // a live type-to-filter would hide the target, so drop it first
-        if !self.tree_filter.is_empty() {
-            self.tree_filter.clear();
-        }
         let mut dir = path.parent();
         while let Some(d) = dir {
             self.expanded.insert(d.to_path_buf());
@@ -3218,9 +3168,22 @@ impl Storm {
         self.run_command("git fetch --all --prune".into(), cx);
     }
 
-    /// opt+l: pull the current branch (quick shortcut for the palette's Pull).
+    /// opt+l: pull the current branch, merging when local+remote have diverged
+    /// (--no-rebase) so it never errors asking how to reconcile.
     fn act_pull(&mut self, _: &PullRemote, _window: &mut Window, cx: &mut Context<Self>) {
-        self.run_command("git pull".into(), cx);
+        self.run_command("git pull --no-rebase".into(), cx);
+    }
+
+    /// Flip read-only mode and apply it to every open editor.
+    fn toggle_read_only(&mut self, cx: &mut Context<Self>) {
+        self.read_only = !self.read_only;
+        let ro = self.read_only;
+        for tab in &self.tabs {
+            tab.editor.update(cx, |e, _| e.set_read_only(ro));
+        }
+        let msg = if ro { "Read-only mode" } else { "Edit mode" };
+        self.show_flash(msg, cx);
+        cx.notify();
     }
 
     /// cmd+shift+n: open the "New Project" dialog (type a folder path or pick one).
@@ -3919,6 +3882,13 @@ impl Storm {
     }
 
     /// Commit-pane list keys: cmd+shift+c copies the selected file/folder ref.
+    /// Open a file picked in the changes pane and collapse the pane (so the
+    /// editor takes the space), like dismissing a dialog.
+    fn open_commit_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_left = false;
+        self.open_file(path, window, cx);
+    }
+
     fn changes_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         if ks.modifiers.platform && ks.modifiers.shift && ks.key == "c" {
@@ -3934,6 +3904,15 @@ impl Storm {
             if !self.commit_filter.is_empty() {
                 self.commit_filter.clear();
                 cx.notify();
+            }
+            return;
+        }
+        // F4 / enter opens the selected file and closes the changes pane
+        if (ks.key == "f4" || ks.key == "enter") && !ks.modifiers.shift {
+            if let Some(p) = self.commit_selected.clone() {
+                if p.is_file() {
+                    self.open_commit_file(p, window, cx);
+                }
             }
             return;
         }
@@ -4016,7 +3995,7 @@ impl Storm {
             Cmd::CreatePr => self.open_pr_create_prompt(window, cx),
             Cmd::Build => self.run_command("yyb".into(), cx),
             Cmd::GitAdd => self.run_command("gaa".into(), cx),
-            Cmd::Pull => self.run_command("git pull".into(), cx),
+            Cmd::Pull => self.run_command("git pull --no-rebase".into(), cx),
             Cmd::Fetch => self.run_command("git fetch --all --prune".into(), cx),
             Cmd::CheckoutNext => self.run_command("next".into(), cx),
             Cmd::NewBranch => self.open_branch_prompt(window, cx),
@@ -4042,6 +4021,7 @@ impl Storm {
                 }
             }
             Cmd::ProcessManager => self.open_process_manager(window, cx),
+            Cmd::ToggleReadOnly => self.toggle_read_only(cx),
         }
     }
 
@@ -4635,6 +4615,9 @@ impl Render for Storm {
         if self.proc_open {
             root = root.child(self.render_process_manager(cx));
         }
+        if self.push_ahead {
+            root = root.child(self.render_push_ahead(cx));
+        }
         if self.ws_open {
             root = root.child(self.render_project_dropdown(cx));
         }
@@ -4742,9 +4725,13 @@ impl Storm {
                                 .child(
                                     div()
                                         .id("copy-branch")
-                                        .font_family(ICON_FONT)
-                                        .text_size(px(11.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .h(px(18.))
                                         .px_1()
+                                        .font_family(ICON_FONT)
+                                        .text_size(px(12.))
                                         .rounded_md()
                                         .cursor_pointer()
                                         .text_color(rgb(MUTED))
@@ -4793,12 +4780,22 @@ impl Storm {
                                 })),
                         )
                     })
+                    // no PR for this branch yet → say so, so the refresh icon reads clearly
+                    .when(self.pr_link.is_none() && !self.branch.is_empty(), |d| {
+                        d.child(div().text_size(px(12.)).text_color(rgb(MUTED)).child("No PR"))
+                    })
                     // refresh the PR link + checks status (otherwise only updates
                     // on branch change / cmd+R)
                     .when(!self.branch.is_empty(), |d| {
+                        let tip: &'static str =
+                            if self.pr_link.is_some() { "Refresh PR status" } else { "Check for a PR" };
                         d.child(
                             div()
                                 .id("pr-refresh")
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .h(px(18.))
                                 .px_1()
                                 .rounded_md()
                                 .cursor_pointer()
@@ -4806,8 +4803,8 @@ impl Storm {
                                 .text_color(rgb(MUTED))
                                 .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
                                 .child("↻")
-                                .tooltip(|_w, cx| {
-                                    cx.new(|_| TooltipView { text: "Refresh PR status".into() }).into()
+                                .tooltip(move |_w, cx| {
+                                    cx.new(|_| TooltipView { text: tip.into() }).into()
                                 })
                                 .on_click(cx.listener(|this, _e, _w, cx| this.refresh_pr_link(cx))),
                         )
@@ -5234,8 +5231,9 @@ impl Storm {
             .child(list)
     }
 
-    fn render_bottom(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_bottom(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let path = self.active_path().map(|p| self.rel(p)).unwrap_or_default();
+        let ro = self.read_only;
         div()
             .h(px(24.))
             .w_full()
@@ -5249,7 +5247,31 @@ impl Storm {
             .border_color(rgb(BORDER))
             .text_size(px(12.))
             .child(div().text_color(rgb(MUTED)).child(path))
-            .child(div().text_color(rgb(MUTED)).child(format!("{} MB", self.mem_mb)))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    // read-only / edit toggle: click to switch
+                    .child(
+                        div()
+                            .id("ro-toggle")
+                            .px_1p5()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_size(px(11.))
+                            // colored pill: blue when read-only (locked), amber when editing
+                            .bg(rgb(if ro { ACCENT } else { GIT_MODIFIED }))
+                            .text_color(rgb(if ro { SEL_TEXT } else { BG }))
+                            .child(if ro { "🔒 READ-ONLY" } else { "✎ EDIT" })
+                            .tooltip(|_w, cx| {
+                                cx.new(|_| TooltipView { text: "Toggle read-only / edit mode".into() }).into()
+                            })
+                            .on_click(cx.listener(|this, _e, _w, cx| this.toggle_read_only(cx))),
+                    )
+                    .child(div().text_color(rgb(MUTED)).child(format!("{} MB", self.mem_mb))),
+            )
     }
 
     fn render_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5449,7 +5471,9 @@ impl Storm {
                     );
                 }
                 CommitRow::File { depth, path, name, state } => {
-                    let is_open = active_path.as_ref() == Some(&path);
+                    // highlight the open tab or the currently-selected row
+                    let is_open = active_path.as_ref() == Some(&path)
+                        || self.commit_selected.as_ref() == Some(&path);
                     let checked = self.commit_checked.contains(&path);
                     let color = match state {
                         GitState::New => GIT_NEW,
@@ -5508,8 +5532,14 @@ impl Storm {
                                     .cursor_pointer()
                                     .text_color(rgb(if is_open { SEL_TEXT } else { color }))
                                     .child(name)
-                                    .on_click(cx.listener(move |this, _e, window, cx| {
-                                        this.open_file(path_open.clone(), window, cx);
+                                    // single-click selects; double-click opens + closes the pane
+                                    .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
+                                        this.commit_selected = Some(path_open.clone());
+                                        if ev.click_count() >= 2 {
+                                            this.open_commit_file(path_open.clone(), window, cx);
+                                        } else {
+                                            window.focus(&this.changes_focus, cx);
+                                        }
                                         cx.notify();
                                     })),
                             ),
@@ -6233,8 +6263,18 @@ impl Storm {
                             .text_color(rgb(MUTED))
                             .child(format!("{}:{}", rel, line)),
                     )
-                    .on_click(cx.listener(move |this, _ev, _w, cx| {
+                    .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
                         this.find_selected = i;
+                        // double-click opens the result and closes the dialog (like F4)
+                        if ev.click_count() >= 2 {
+                            if let Some(r) = this.find_results.get(i).cloned() {
+                                this.find_open = false;
+                                this.open_file(r.path, window, cx);
+                                if let Some(tab) = this.tabs.get(this.active) {
+                                    tab.editor.update(cx, |e, cx| e.goto(r.line, 1, cx));
+                                }
+                            }
+                        }
                         cx.notify();
                     })),
             );
@@ -6752,6 +6792,99 @@ impl Storm {
             );
         }
         panel
+    }
+
+    /// "Push rejected — remote is ahead" prompt: merge or rebase, then push.
+    fn render_push_ahead(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let w = 440.0_f32;
+        let left = ((self.win_width - w) / 2.0).max(0.);
+        let btn = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .px_4()
+                .py_1()
+                .rounded_md()
+                .text_size(px(12.))
+                .cursor_pointer()
+                .border_1()
+                .border_color(rgb(if primary { ACCENT } else { BORDER }))
+                .when(primary, |d| d.bg(rgb(ACCENT)).text_color(rgb(SEL_TEXT)))
+                .when(!primary, |d| d.text_color(rgb(TEXT)).hover(|s| s.bg(rgb(HOVER))))
+                .child(label)
+        };
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_start()
+            .justify_center()
+            .child(
+                div().absolute().inset_0().bg(rgba(0x00000088)).id("pa-backdrop").on_click(
+                    cx.listener(|this, _e, _w, cx| {
+                        this.push_ahead = false;
+                        cx.notify();
+                    }),
+                ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(left))
+                    .top(px(160.))
+                    .w(px(w))
+                    .bg(rgb(PANEL_BG))
+                    .border_1()
+                    .border_color(rgb(ACCENT))
+                    .rounded_lg()
+                    .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .px_4()
+                            .pt_4()
+                            .pb_1()
+                            .text_size(px(13.))
+                            .text_color(rgb(TEXT))
+                            .child("Push rejected — the remote has commits you don't have."),
+                    )
+                    .child(
+                        div()
+                            .px_4()
+                            .pb_3()
+                            .text_size(px(12.))
+                            .text_color(rgb(MUTED))
+                            .child("Integrate the remote changes, then push again."),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_end()
+                            .gap_2()
+                            .px_4()
+                            .pb_4()
+                            .child(btn("pa-cancel", "Cancel", false).on_click(cx.listener(
+                                |this, _e, _w, cx| {
+                                    this.push_ahead = false;
+                                    cx.notify();
+                                },
+                            )))
+                            .child(btn("pa-rebase", "Rebase & Push", false).on_click(cx.listener(
+                                |this, _e, _w, cx| {
+                                    this.push_ahead = false;
+                                    this.run_command("git pull --rebase && git push".into(), cx);
+                                },
+                            )))
+                            .child(btn("pa-merge", "Merge & Push", true).on_click(cx.listener(
+                                |this, _e, _w, cx| {
+                                    this.push_ahead = false;
+                                    this.run_command("git pull --no-rebase && git push".into(), cx);
+                                },
+                            ))),
+                    ),
+            )
     }
 
     /// Process Manager dialog: filterable list of running processes with
@@ -7807,30 +7940,6 @@ fn tip(text: &'static str) -> impl Fn(&mut Window, &mut App) -> AnyView + 'stati
     move |_w, cx| cx.new(|_| TooltipView { text: text.into() }).into()
 }
 
-/// A centered icon button (top bar) rendered with the Codicon font.
-fn toolbar_btn(
-    id: &'static str,
-    glyph: &'static str,
-    tooltip: &'static str,
-    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    div()
-        .id(id)
-        .size(px(32.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded_md()
-        .font_family(ICON_FONT)
-        .text_size(px(16.))
-        .text_color(rgb(MUTED))
-        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-        .cursor_pointer()
-        .child(glyph)
-        .tooltip(tip(tooltip))
-        .on_click(on_click)
-}
-
 /// A vertical-activity-bar icon button.
 fn activity_icon(
     id: &'static str,
@@ -8049,14 +8158,9 @@ impl Storm {
             )
     }
 
-    fn render_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_tree(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let count = self.entries.len();
         let width = px(self.tree_width);
-        let focused = self.tree_focus.is_focused(window);
-        let filtering = !self.tree_filter.is_empty();
-        // "5/N" while filtering, just the visible row count otherwise
-        let count_label =
-            if filtering { format!("{}/{}", count, self.tree_total) } else { format!("{}", count) };
 
         div()
             .flex()
@@ -8077,31 +8181,6 @@ impl Storm {
                     .text_size(px(12.))
                     .child("PROJECT"),
             )
-            // type-to-filter bar: only shown while a filter is active (typing in
-            // the focused tree), so the empty bar doesn't take up space
-            .when(filtering, |d| {
-                d.child(
-                    div()
-                        .id("tree-filter")
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .h(px(28.))
-                        .px_3()
-                        .border_b_1()
-                        .border_color(rgb(BORDER))
-                        .child(div().font_family(ICON_FONT).text_size(px(12.)).text_color(rgb(MUTED)).child(IC_SEARCH))
-                        .child(
-                            div()
-                                .flex_grow(1.0)
-                                .text_size(px(12.))
-                                .text_color(rgb(TEXT))
-                                .child(self.tree_filter.render(self.caret_if(focused), SELECTION)),
-                        )
-                        .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(count_label)),
-                )
-            })
             .child(
                 uniform_list(
                     "tree",

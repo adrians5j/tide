@@ -12,9 +12,7 @@ pub const CURSOR: u32 = 0xced0d6;
 
 // ── UI chrome (sidebar, panels, tabs, bars) ────────────────────────────────
 pub const PANEL_BG: u32 = 0x222426; // sidebar / top + bottom bar / tab bar
-pub const TAB_INACTIVE: u32 = 0x1f2122;
 pub const BORDER: u32 = 0x2b2d30; // subtle separators
-pub const SPLIT_BORDER: u32 = 0x1e1f21;
 pub const MUTED: u32 = 0x7a7e85; // muted text
 pub const ICON: u32 = 0xa9adb5; // sidebar/activity icons (resting + active)
 pub const DIR: u32 = 0xbcbec4; // folder names render as default text
@@ -30,7 +28,6 @@ pub const SEL_TEXT: u32 = 0xffffff; // text on a selected row
 // ── popups / autocomplete ──────────────────────────────────────────────────
 pub const POPUP_BG: u32 = 0x2b2d30;
 pub const POPUP_FG: u32 = 0xbcbec4;
-pub const POPUP_SELECTED: u32 = 0x2e436e;
 
 // ── git / diff ─────────────────────────────────────────────────────────────
 pub const GIT_NEW: u32 = 0x6aaf6a; // added / untracked
