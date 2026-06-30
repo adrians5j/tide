@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 mod theme;
 use theme::*;
@@ -1447,6 +1447,7 @@ enum Cmd {
     MyPrs,
     ReleasePrs,
     CopyBranch,
+    CopyRenameSession,
     ProcessManager,
     ToggleReadOnly,
 }
@@ -1473,6 +1474,7 @@ const PALETTE: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::GoToFile, "Go to File", IC_FILES, "⌘⇧O"),
     (Cmd::GoToLine, "Go to Line", IC_HOME, "⌘L"),
     (Cmd::CopyBranch, "Copy Branch Name", IC_BRANCH, ""),
+    (Cmd::CopyRenameSession, "Copy Claude /rename Command", IC_COPY, ""),
     (Cmd::ProcessManager, "Process Manager", IC_TOOLS, ""),
     (Cmd::ToggleReadOnly, "Toggle Read-Only / Edit Mode", IC_HOME, ""),
 ];
@@ -1964,18 +1966,12 @@ struct Storm {
     // workspace (multi-project) info, pushed down by the Workspace each render
     ws_names: Vec<String>,
     ws_branches: Vec<String>,
-    ws_idle: Vec<f32>,  // seconds since each project was last viewed/worked on
-    ws_pulse: Vec<f32>, // seconds since each project's last detected change (big if none)
+    ws_attention: Vec<bool>, // per-project: a terminal rang the bell, awaiting you
     ws_active: usize,
     ws_open: bool, // project-switcher dropdown expanded
-    // idle tracking: reset while this project is the on-screen one. Drives the
-    // topbar icon's fade-to-red (a project you're not looking at slowly reddens).
-    last_active: Instant,
-    // change detection: when the fingerprint changes, `pulse_at` is stamped and
-    // the topbar icon plays a brief pulse animation. None until the first poll
-    // establishes a baseline (so loading a project doesn't fire a pulse).
-    prev_fp: Option<u64>,
-    pulse_at: Option<Instant>,
+    // raised when one of this project's terminals rings the bell (Claude Code's
+    // "awaiting input" signal); cleared once you switch to / view this project.
+    needs_attention: bool,
 }
 
 /// Navigation requests a project view sends up to the workspace.
@@ -1984,7 +1980,7 @@ enum ProjectNav {
     Open,
     OpenPath(PathBuf), // open a project at a specific folder path (from the new-project dialog)
     Remove(usize),
-    Activity, // a change was detected → workspace should pulse this icon
+    Attention, // a terminal rang the bell → workspace should raise the red dot
 }
 
 impl EventEmitter<ProjectNav> for Storm {}
@@ -2188,22 +2184,16 @@ impl Storm {
             proc_ws_pids: Vec::new(),
             ws_names: Vec::new(),
             ws_branches: Vec::new(),
-            ws_idle: Vec::new(),
-            ws_pulse: Vec::new(),
+            ws_attention: Vec::new(),
             ws_active: 0,
             ws_open: false,
-            // start "idle" (colorless) — a workspace only goes green once it's
-            // actually viewed or sees a change, not just because it was opened
-            last_active: Instant::now()
-                .checked_sub(Duration::from_secs(ACTIVE_FADE_SECS as u64 + 1))
-                .unwrap_or_else(Instant::now),
-            prev_fp: None,
-            pulse_at: None,
+            needs_attention: false,
         };
         s.ignored = git_ignored_paths(&s.root); // hide git-ignored paths from the tree
         s.expanded.insert(s.root.clone()); // the root node starts expanded
         s.rebuild();
         s.start_git_poll(cx);
+        s.start_bell_poll(cx);
         s.start_caret_blink(cx);
         s.lsp = Lsp::new(&s.root);
         let root = s.root.clone();
@@ -2391,44 +2381,6 @@ impl Storm {
                     for ed in &editors {
                         ed.update(cx, |e, cx| e.reload_if_changed(cx));
                     }
-                    // fingerprint mutable state (git working tree + open buffers);
-                    // if it changed since last tick, this project saw activity
-                    let mut fp: u64 = 0;
-                    for (p, s) in &this.git_status {
-                        let mut e: u64 = 0xcbf29ce484222325;
-                        for b in p.to_string_lossy().as_bytes() {
-                            e ^= *b as u64;
-                            e = e.wrapping_mul(0x100000001b3);
-                        }
-                        let code = match s {
-                            GitState::New => 1u64,
-                            GitState::Modified => 2,
-                            GitState::Deleted => 3,
-                        };
-                        // fold in the file's mtime so repeated edits to an
-                        // already-"modified" file (even if not open in a tab) count
-                        let mtime = std::fs::metadata(p)
-                            .ok()
-                            .and_then(|m| m.modified().ok())
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
-                        fp ^= e.wrapping_add(code).wrapping_add(mtime.rotate_left(17)); // xor: order-independent
-                    }
-                    for ed in &editors {
-                        fp = fp.rotate_left(7) ^ ed.read(cx).content_hash();
-                    }
-                    // a change since the last poll → pulse this project's icon
-                    // (the first poll just records a baseline, no pulse)
-                    if this.prev_fp.is_some_and(|prev| prev != fp) {
-                        this.pulse_at = Some(Instant::now());
-                        // detected work also counts as freshness: a changing
-                        // workspace stays lit (not idle-faded) even unwatched,
-                        // so you can tell it's still doing something at a glance
-                        this.last_active = Instant::now();
-                        cx.emit(ProjectNav::Activity); // workspace animates the flash
-                    }
-                    this.prev_fp = Some(fp);
                     cx.notify();
                 })
                 .is_err()
@@ -2436,6 +2388,36 @@ impl Storm {
                 break;
             }
             cx.background_executor().timer(Duration::from_secs(5)).await;
+        })
+        .detach();
+    }
+
+    /// Poll this project's terminals for a bell (Claude Code's "awaiting input"
+    /// signal). On a ring, raise `needs_attention` and nudge the workspace so the
+    /// red dot appears on this project's topbar icon.
+    fn start_bell_poll(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_millis(400)).await;
+            if this
+                .update(cx, |this, cx| {
+                    // drain every terminal's bell flag (don't short-circuit, so a
+                    // ring on a background terminal still clears its own flag)
+                    let mut rang = false;
+                    for t in &this.terminals {
+                        if t.read(cx).take_bell() {
+                            rang = true;
+                        }
+                    }
+                    if rang && !this.needs_attention {
+                        this.needs_attention = true;
+                        cx.emit(ProjectNav::Attention);
+                        cx.notify();
+                    }
+                })
+                .is_err()
+            {
+                break;
+            }
         })
         .detach();
     }
@@ -2497,17 +2479,6 @@ impl Storm {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "tide".into())
-    }
-
-    /// Seconds since this project was last viewed/worked on (for the idle fade).
-    fn idle_secs(&self) -> f32 {
-        self.last_active.elapsed().as_secs_f32()
-    }
-
-    /// Seconds since this project's last detected change, or a large number if
-    /// there hasn't been one (so it reads as "not pulsing").
-    fn pulse_secs(&self) -> f32 {
-        self.pulse_at.map(|t| t.elapsed().as_secs_f32()).unwrap_or(1e9)
     }
 
     /// Root-level key handling: escape closes any open popup. Fires for the
@@ -4214,6 +4185,13 @@ impl Storm {
                     self.show_flash("Branch name copied", cx);
                 }
             }
+            // copy a ready-to-paste Claude Code slash command that renames the
+            // session to "⭐ <branch>" — paste it straight into Claude
+            Cmd::CopyRenameSession => {
+                let branch = if self.branch.is_empty() { "session" } else { &self.branch };
+                cx.write_to_clipboard(ClipboardItem::new_string(format!("/rename ⭐ {branch}")));
+                self.show_flash("/rename command copied", cx);
+            }
             Cmd::ProcessManager => self.open_process_manager(window, cx),
             Cmd::ToggleReadOnly => self.toggle_read_only(cx),
         }
@@ -5010,50 +4988,58 @@ impl Storm {
                     }),
             );
         // project quick-switch icons (2+ projects only), centered in the bar.
-        // Each icon rests colorless when idle and tints green as it sees activity.
+        // Icons rest colorless; a red dot flags a workspace whose terminal rang
+        // the bell (Claude Code awaiting your input) until you switch to it.
         if self.ws_names.len() > 1 {
             let mut strip = div().flex().flex_row().items_center().gap_1();
             for (i, name) in self.ws_names.iter().enumerate() {
                 let active = i == self.ws_active;
-                let idle = self.ws_idle.get(i).copied().unwrap_or(0.0);
-                // freshness: 1.0 right after activity, fading to 0 as it goes idle
-                let fresh = (1.0 - idle / ACTIVE_FADE_SECS).clamp(0.0, 1.0);
-                // the viewed project keeps its selected (blue) bg; others rest at
-                // the bar color (invisible when dead) and tint green when active
-                let base_bg = if active {
-                    ICON_SELECTED_BG
-                } else {
-                    lerp_rgb(PANEL_BG, ACTIVE_GREEN, fresh)
-                };
-                // change-pulse: a quick flash that decays over PULSE_SECS, layered
-                // over the base color (ease-out so it pops then fades)
-                let pulse = self.ws_pulse.get(i).copied().unwrap_or(1e9);
-                let pint = (1.0 - (pulse / PULSE_SECS)).clamp(0.0, 1.0);
-                let pint = pint * pint; // ease-out
-                let bg = lerp_rgb(base_bg, PULSE_COLOR, pint);
-                let ring_alpha = (pint * 255.0) as u32 & 0xff;
-                let text = if active || fresh > 0.4 || pint > 0.3 { SEL_TEXT } else { MUTED };
+                let attention = self.ws_attention.get(i).copied().unwrap_or(false);
+                // viewed project keeps the selected (blue) bg; others rest at the
+                // bar color (invisible until you hover)
+                let bg = if active { ICON_SELECTED_BG } else { PANEL_BG };
+                let text = if active { SEL_TEXT } else { MUTED };
                 let label = project_icon_label(name);
                 let nm = name.clone();
                 let idx = i;
                 strip = strip.child(
                     div()
                         .id(("topbar-proj", i))
+                        // wrapper is relative so the red dot can sit at the corner
+                        .relative()
                         .size(px(26.))
                         .flex()
                         .items_center()
                         .justify_center()
                         .rounded_md()
                         .text_size(px(10.))
-                        // 2px ring, always present but transparent when not pulsing
-                        // (keeps the box size stable — no layout jump on pulse)
-                        .border_2()
-                        .border_color(gpui::rgba((PULSE_COLOR << 8) | ring_alpha))
                         .bg(rgb(bg))
                         .text_color(rgb(text))
                         .cursor_pointer()
+                        .when(!active, |d| d.hover(|s| s.bg(rgb(HOVER))))
                         .child(label)
-                        .tooltip(move |_w, cx| cx.new(|_| TooltipView { text: nm.clone().into() }).into())
+                        // red "needs you" dot, top-right corner
+                        .when(attention, |d| {
+                            d.child(
+                                div()
+                                    .absolute()
+                                    .top(px(-2.))
+                                    .right(px(-2.))
+                                    .size(px(9.))
+                                    .rounded_full()
+                                    .bg(rgb(ATTENTION_RED))
+                                    .border_2()
+                                    .border_color(rgb(PANEL_BG)),
+                            )
+                        })
+                        .tooltip(move |_w, cx| {
+                            let t = if attention {
+                                format!("{nm} — needs your attention")
+                            } else {
+                                nm.clone()
+                            };
+                            cx.new(|_| TooltipView { text: t.into() }).into()
+                        })
                         .on_click(cx.listener(move |_this, _e, _w, cx| {
                             cx.emit(ProjectNav::Switch(idx));
                             cx.notify();
@@ -8189,26 +8175,9 @@ impl Render for TooltipView {
     }
 }
 
-/// Build a tooltip closure for a static label.
-/// Seconds since the last activity at which a project icon fades back to its
-/// resting (colorless) state. (1800.0 = 30 min; currently 5 min.)
-const ACTIVE_FADE_SECS: f32 = 300.0;
-/// The "active" color icons tint toward right after activity (fades as it idles).
-const ACTIVE_GREEN: u32 = 0x6aaf6a;
-/// How long a change-pulse animation lasts, and its flash color.
-const PULSE_SECS: f32 = 0.7;
-const PULSE_COLOR: u32 = 0x4ec9b0;
-
-/// Linear blend between two 0xRRGGBB colors (t clamped to 0..1).
-fn lerp_rgb(a: u32, b: u32, t: f32) -> u32 {
-    let t = t.clamp(0.0, 1.0);
-    let chan = |sh: u32| {
-        let ca = ((a >> sh) & 0xff) as f32;
-        let cb = ((b >> sh) & 0xff) as f32;
-        (ca + (cb - ca) * t).round() as u32
-    };
-    (chan(16) << 16) | (chan(8) << 8) | chan(0)
-}
+/// Color of the "needs your attention" dot on a workspace icon (a terminal in
+/// that project rang the bell — Claude Code awaiting input).
+const ATTENTION_RED: u32 = 0xe5484d;
 
 /// Two-letter badge for a project icon: first + last non-space char, uppercased
 /// (e.g. "wby-next1" → "W1", "wcp" → "WP", "a" → "A").
@@ -8681,10 +8650,6 @@ struct Workspace {
     switcher_open: bool,
     switcher_sel: usize,
     switcher_focus: FocusHandle,
-    // idle reset: which project has been on-screen, and since when. Once the
-    // active project has been viewed ≥5s, its idle timer keeps resetting.
-    prev_active: usize,
-    active_since: Instant,
 }
 
 impl Workspace {
@@ -8697,16 +8662,14 @@ impl Workspace {
             switcher_open: false,
             switcher_sel: 0,
             switcher_focus: cx.focus_handle(),
-            prev_active: 0,
-            active_since: Instant::now(),
         };
         // open every passed root as its own workspace; first one is active
         for root in roots {
             ws.add_project(root, cx);
         }
         ws.active = 0;
-        // Slow repaint so the idle fade advances over time. Pulses are animated
-        // separately (event-driven, see pulse_anim) so they don't depend on this.
+        // Slow repaint so per-project topbar state (branch names, attention dots)
+        // pushed up from the child views stays current.
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_secs(3)).await;
             if this.update(cx, |_, cx| cx.notify()).is_err() {
@@ -8717,22 +8680,6 @@ impl Workspace {
         ws
     }
 
-    /// Smoothly animate the topbar for the duration of a change-pulse: notify at
-    /// ~30fps for PULSE_SECS so the flash decays smoothly, then stop.
-    fn pulse_anim(&self, cx: &mut Context<Self>) {
-        cx.notify(); // show the peak immediately
-        cx.spawn(async move |this, cx| {
-            let frames = (PULSE_SECS * 30.0) as u32 + 2;
-            for _ in 0..frames {
-                cx.background_executor().timer(Duration::from_millis(33)).await;
-                if this.update(cx, |_, cx| cx.notify()).is_err() {
-                    break;
-                }
-            }
-        })
-        .detach();
-    }
-
     fn add_project(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         push_recent_project(&root); // remember it for the New Project dialog
         let storm = cx.new(|cx| Storm::new(root, cx));
@@ -8741,13 +8688,15 @@ impl Workspace {
                 if *i < this.projects.len() {
                     this.active = *i;
                     this.focus_pending = true;
+                    // switching to a project counts as attending it → clear its dot
+                    this.projects[*i].update(cx, |s, _| s.needs_attention = false);
                     cx.notify();
                 }
             }
             ProjectNav::Open => this.open_project(cx),
             ProjectNav::OpenPath(p) => this.add_project(p.clone(), cx),
             ProjectNav::Remove(i) => this.remove_project(*i, cx),
-            ProjectNav::Activity => this.pulse_anim(cx),
+            ProjectNav::Attention => cx.notify(), // raise the red dot promptly
         })
         .detach();
         self.projects.push(storm);
@@ -8884,26 +8833,17 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.active;
-        // track how long the active project has been on screen; once it's been
-        // viewed ≥5s, keep resetting its idle timer so it stays "fresh"
-        if active != self.prev_active {
-            self.prev_active = active;
-            self.active_since = Instant::now();
-        }
-        if self.active_since.elapsed() >= Duration::from_secs(5) {
-            self.projects[active].update(cx, |s, _| s.last_active = Instant::now());
-        }
+        // viewing a project counts as attending it → keep its dot clear
+        self.projects[active].update(cx, |s, _| s.needs_attention = false);
 
-        // push the project list into the active view so its dropdown can show it
+        // push the project list into the active view so its topbar can show it
         let names: Vec<String> = self.projects.iter().map(|p| p.read(cx).project_name()).collect();
         let branches: Vec<String> = self.projects.iter().map(|p| p.read(cx).branch.clone()).collect();
-        let idle: Vec<f32> = self.projects.iter().map(|p| p.read(cx).idle_secs()).collect();
-        let pulse: Vec<f32> = self.projects.iter().map(|p| p.read(cx).pulse_secs()).collect();
+        let attention: Vec<bool> = self.projects.iter().map(|p| p.read(cx).needs_attention).collect();
         self.projects[active].update(cx, |s, _| {
             s.ws_names = names;
             s.ws_branches = branches;
-            s.ws_idle = idle;
-            s.ws_pulse = pulse;
+            s.ws_attention = attention;
             s.ws_active = active;
         });
         // focus the active project after a switch (render has the Window)
