@@ -50,6 +50,7 @@ const IC_TERMINAL: &str = "\u{ea85}";
 const IC_RUN: &str = "\u{eb2c}"; // play
 const IC_FOLDER: &str = "\u{ea83}";
 const IC_COPY: &str = "\u{ebcc}";
+const IC_CHECK: &str = "\u{eab2}";
 // The codicon font is renamed to "Segoe Fluent Icons" because GPUI refuses to
 // load any font lacking an 'm' glyph — except that one specially-cased name.
 const ICON_FONT: &str = "Segoe Fluent Icons";
@@ -103,17 +104,65 @@ struct ResizeEdges {
 /// Split a search query into (include, excludes). A `-word` token (dash + at
 /// least one non-space char) is an exclusion; everything else is the literal
 /// search term. E.g. `context. -context.container` → ("context.", ["context.container"]).
-fn parse_search_query(q: &str) -> (String, Vec<String>) {
+/// Split the query box into the literal search term, `-exclude` terms, and file
+/// globs. A token containing `*` or `?` is a filename pattern (`*.ts`, `src/**`)
+/// rather than search text; `-*.ts` negates a glob, `-foo` excludes a substring.
+fn parse_search_query(q: &str) -> SearchQuery {
+    let is_glob = |s: &str| s.contains('*') || s.contains('?');
     let mut include = Vec::new();
     let mut excludes = Vec::new();
+    let mut globs = Vec::new();
     for tok in q.split_whitespace() {
         if tok.len() > 1 && tok.starts_with('-') {
-            excludes.push(tok[1..].to_string());
+            let inner = &tok[1..];
+            if is_glob(inner) {
+                globs.push(format!("!{inner}"));
+            } else {
+                excludes.push(inner.to_string());
+            }
+        } else if is_glob(tok) {
+            globs.push(tok.to_string());
         } else {
             include.push(tok);
         }
     }
-    (include.join(" "), excludes)
+    SearchQuery { include: include.join(" "), excludes, globs }
+}
+
+/// Parsed pieces of the find-in-files query box.
+struct SearchQuery {
+    include: String,
+    excludes: Vec<String>,
+    globs: Vec<String>,
+}
+
+/// Match a `*`/`?` glob against `text` (used by the pure-Rust search fallback;
+/// ripgrep handles globbing natively). Patterns without `/` match the file name;
+/// otherwise the whole relative path.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let (p, t): (Vec<char>, Vec<char>) = (pattern.chars().collect(), text.chars().collect());
+    // classic two-pointer wildcard match with backtracking on the last '*'
+    let (mut pi, mut ti, mut star, mut mark) = (0usize, 0usize, None, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// Keep a result line unless every occurrence of `include` in it is the start
@@ -142,12 +191,12 @@ fn line_passes_excludes(text: &str, include: &str, excludes: &[String], case_sen
 }
 
 fn search_files(query: &str, scopes: &[PathBuf], case_sensitive: bool) -> Vec<FindResult> {
-    let (include, excludes) = parse_search_query(query);
+    let SearchQuery { include, excludes, globs } = parse_search_query(query);
     if include.len() < 2 || scopes.is_empty() {
         return Vec::new();
     }
-    let mut results = search_ripgrep(&include, scopes, case_sensitive)
-        .unwrap_or_else(|| search_rust(&include, scopes, case_sensitive));
+    let mut results = search_ripgrep(&include, scopes, case_sensitive, &globs)
+        .unwrap_or_else(|| search_rust(&include, scopes, case_sensitive, &globs));
     if !excludes.is_empty() {
         results.retain(|r| line_passes_excludes(&r.text, &include, &excludes, case_sensitive));
     }
@@ -169,7 +218,7 @@ fn rg_bin() -> Option<&'static str> {
 }
 
 /// Run `rg` and parse `path:line:text`. Returns None if rg isn't available.
-fn search_ripgrep(query: &str, scopes: &[PathBuf], case_sensitive: bool) -> Option<Vec<FindResult>> {
+fn search_ripgrep(query: &str, scopes: &[PathBuf], case_sensitive: bool, globs: &[String]) -> Option<Vec<FindResult>> {
     let bin = rg_bin()?;
     let mut cmd = Command::new(bin);
     cmd.arg("--line-number")
@@ -178,9 +227,11 @@ fn search_ripgrep(query: &str, scopes: &[PathBuf], case_sensitive: bool) -> Opti
         // case-sensitive on demand; otherwise smart-case (insensitive if all-lowercase)
         .arg(if case_sensitive { "--case-sensitive" } else { "--smart-case" })
         .arg("--max-count=50") // per-file cap
-        .arg("--fixed-strings") // literal, not regex
-        .arg("--")
-        .arg(query);
+        .arg("--fixed-strings"); // literal, not regex
+    for g in globs {
+        cmd.arg("--glob").arg(g);
+    }
+    cmd.arg("--").arg(query);
     for s in scopes {
         cmd.arg(s);
     }
@@ -214,7 +265,7 @@ fn search_ripgrep(query: &str, scopes: &[PathBuf], case_sensitive: bool) -> Opti
 }
 
 /// Pure-Rust fallback: substring over a manual walk (case-sensitive on demand).
-fn search_rust(query: &str, scopes: &[PathBuf], case_sensitive: bool) -> Vec<FindResult> {
+fn search_rust(query: &str, scopes: &[PathBuf], case_sensitive: bool, globs: &[String]) -> Vec<FindResult> {
     let mut out = Vec::new();
     let ql = if case_sensitive { query.to_string() } else { query.to_lowercase() };
     // gather candidate files across every scope (a scope may be a file or a dir)
@@ -225,6 +276,10 @@ fn search_rust(query: &str, scopes: &[PathBuf], case_sensitive: bool) -> Vec<Fin
         } else {
             files.extend(collect_paths(scope).0);
         }
+    }
+    // apply filename globs: a file must pass every positive glob and no `!` negation
+    if !globs.is_empty() {
+        files.retain(|p| file_matches_globs(p, globs));
     }
     for path in files {
         if out.len() >= FIND_CAP {
@@ -246,6 +301,30 @@ fn search_rust(query: &str, scopes: &[PathBuf], case_sensitive: bool) -> Vec<Fin
         }
     }
     out
+}
+
+/// Does `path` satisfy the glob set? Positive globs are OR'd (file passes if it
+/// matches any), `!`-prefixed globs are exclusions (file fails if it matches any).
+/// A pattern with `/` matches the path tail; otherwise just the file name.
+fn file_matches_globs(path: &Path, globs: &[String]) -> bool {
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let full = path.to_string_lossy().to_string();
+    let target = |g: &str| if g.contains('/') { full.as_str() } else { name.as_str() };
+    let mut positives = false;
+    let mut matched_positive = false;
+    for g in globs {
+        if let Some(neg) = g.strip_prefix('!') {
+            if glob_match(neg, target(neg)) {
+                return false;
+            }
+        } else {
+            positives = true;
+            if glob_match(g, target(g)) {
+                matched_positive = true;
+            }
+        }
+    }
+    !positives || matched_positive
 }
 
 /// File holding the recent-projects list (most-recent first, one path per line).
@@ -1569,6 +1648,35 @@ fn fetch_pr_link(root: &Path, branch: &str) -> Option<(u64, String, PrStatus)> {
     Some((number, url, rollup_status(&v)))
 }
 
+/// Open milestone titles for the repo, newest first (via `gh api`). Empty when
+/// gh isn't available, there are none, or the repo isn't on GitHub.
+fn gh_milestones(root: &Path) -> Vec<String> {
+    let out = Command::new("gh")
+        .args([
+            "api",
+            "repos/{owner}/{repo}/milestones",
+            "--method",
+            "GET",
+            "-f",
+            "state=open",
+            "-f",
+            "sort=due_on",
+            "--jq",
+            ".[].title",
+        ])
+        .current_dir(root)
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
 /// The `https://github.com/org/repo` base URL for the repo's `origin` remote,
 /// normalized from either SSH or HTTPS remote forms. None if not a GitHub repo.
 fn github_base_url(root: &Path) -> Option<String> {
@@ -1738,10 +1846,13 @@ struct Storm {
     br_open: bool,
     br_focus: FocusHandle,
     br_query: Field,
+    br_make_pr: bool, // checkbox: also create a PR after the branch
     // create-PR prompt: optional milestone for `gh pr create`
     prc_open: bool,
     prc_focus: FocusHandle,
     prc_milestone: Field,
+    prc_milestones: Vec<String>, // open milestone titles, fetched from gh on open
+    prc_sel: usize,              // highlighted autocomplete suggestion
     // run-arbitrary-command prompt (cmd+shift+t)
     runc_open: bool,
     runc_focus: FocusHandle,
@@ -1989,9 +2100,12 @@ impl Storm {
             br_open: false,
             br_focus: cx.focus_handle(),
             br_query: Field::default(),
+            br_make_pr: false,
             prc_open: false,
             prc_focus: cx.focus_handle(),
             prc_milestone: Field::default(),
+            prc_milestones: Vec::new(),
+            prc_sel: 0,
             runc_open: false,
             runc_focus: cx.focus_handle(),
             runc_query: Field::default(),
@@ -3095,6 +3209,7 @@ impl Storm {
     fn open_branch_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.br_open = true;
         self.br_query.clear();
+        self.br_make_pr = false;
         window.focus(&self.br_focus, cx);
         cx.notify();
     }
@@ -3106,11 +3221,18 @@ impl Storm {
                 self.br_open = false;
                 self.focus_active(window, cx);
             }
+            // Tab toggles the "also create a PR" checkbox
+            "tab" => {
+                self.br_make_pr = !self.br_make_pr;
+            }
             "enter" => {
                 let name = self.br_query.text.trim().to_string();
+                let make_pr = self.br_make_pr;
                 self.br_open = false;
                 if !name.is_empty() {
-                    self.run_command(format!("br {}", name), cx);
+                    // chain the PR after the branch lands so it targets the new branch
+                    let cmd = if make_pr { format!("br {} && pr", name) } else { format!("br {}", name) };
+                    self.run_command(cmd, cx);
                 }
             }
             _ => {
@@ -3121,22 +3243,68 @@ impl Storm {
     }
 
     /// Open the create-PR prompt: an optional milestone, then `gh pr create`.
+    /// Milestones are fetched from GitHub in the background to drive autocomplete.
     fn open_pr_create_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.prc_open = true;
         self.prc_milestone.clear();
+        self.prc_milestones.clear();
+        self.prc_sel = 0;
         window.focus(&self.prc_focus, cx);
+        let root = self.root.clone();
+        cx.spawn(async move |this, cx| {
+            let list = cx.background_executor().spawn(async move { gh_milestones(&root) }).await;
+            this.update(cx, |this, cx| {
+                if this.prc_open {
+                    this.prc_milestones = list;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
         cx.notify();
+    }
+
+    /// Milestone titles matching what's typed (case-insensitive substring); the
+    /// full list when the field is empty.
+    fn prc_suggestions(&self) -> Vec<String> {
+        let q = self.prc_milestone.text.trim().to_lowercase();
+        self.prc_milestones
+            .iter()
+            .filter(|m| q.is_empty() || m.to_lowercase().contains(&q))
+            .cloned()
+            .collect()
     }
 
     fn prc_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
+        let sugg = self.prc_suggestions();
         match ks.key.as_str() {
             "escape" => {
                 self.prc_open = false;
                 self.focus_active(window, cx);
             }
+            "down" => {
+                if !sugg.is_empty() {
+                    self.prc_sel = (self.prc_sel + 1).min(sugg.len() - 1);
+                }
+            }
+            "up" => {
+                self.prc_sel = self.prc_sel.saturating_sub(1);
+            }
+            // Tab fills the field with the highlighted suggestion (keeps editing)
+            "tab" => {
+                if let Some(m) = sugg.get(self.prc_sel) {
+                    self.prc_milestone.set(m.clone());
+                }
+            }
             "enter" => {
-                let milestone = self.prc_milestone.text.trim().to_string();
+                // a highlighted suggestion wins over the raw typed text
+                let milestone = sugg
+                    .get(self.prc_sel)
+                    .cloned()
+                    .unwrap_or_else(|| self.prc_milestone.text.trim().to_string());
+                let milestone = milestone.trim().to_string();
                 self.prc_open = false;
                 // runs the `pr` zsh function; milestone is optional (--ms <ver>)
                 let cmd = if milestone.is_empty() {
@@ -3147,7 +3315,9 @@ impl Storm {
                 self.run_command(cmd, cx);
             }
             _ => {
-                Self::field_input(&mut self.prc_milestone, ks, cx, |_| true);
+                if Self::field_input(&mut self.prc_milestone, ks, cx, |_| true) == Edit::Changed {
+                    self.prc_sel = 0; // re-filtered list → reset highlight
+                }
             }
         }
         cx.notify();
@@ -6177,7 +6347,7 @@ impl Storm {
             many => format!("{} locations", many.len()),
         };
         let count = self.find_results.len();
-        let (_, excludes) = parse_search_query(&self.find_query.text);
+        let SearchQuery { excludes, globs, .. } = parse_search_query(&self.find_query.text);
 
         // ── search input row ──
         let header = div()
@@ -6195,7 +6365,7 @@ impl Storm {
                     .flex_grow(1.0)
                     .text_color(rgb(TEXT))
                     .child(if self.find_query.is_empty() {
-                        div().text_color(rgb(MUTED)).child(format!("Search in files…{}", self.caret()))
+                        div().text_color(rgb(MUTED)).child(format!("Search in files…  (add *.ts to filter by file){}", self.caret()))
                     } else {
                         div().child(self.find_query.render(self.caret(), SELECTION))
                     }),
@@ -6241,6 +6411,14 @@ impl Storm {
             .text_size(px(11.))
             .child(div().font_family(ICON_FONT).text_color(rgb(FOLDER_ICON)).child(IC_FOLDER))
             .child(div().text_color(rgb(MUTED)).truncate().child(format!("in {}", scope_label)))
+            .when(!globs.is_empty(), |d| {
+                d.child(
+                    div()
+                        .text_color(rgb(ACCENT))
+                        .truncate()
+                        .child(format!("· files {}", globs.join(", "))),
+                )
+            })
             .when(!excludes.is_empty(), |d| {
                 d.child(
                     div()
@@ -7648,7 +7826,7 @@ impl Storm {
             .child(
                 div()
                     .mx_3()
-                    .mb_3()
+                    .mb_2()
                     .px_2()
                     .py_1()
                     .bg(rgb(BG))
@@ -7657,6 +7835,52 @@ impl Storm {
                     .rounded_md()
                     .text_color(rgb(TEXT))
                     .child(self.br_query.render(self.caret(), SELECTION)),
+            )
+            // "also create a PR" checkbox (Tab toggles, or click)
+            .child({
+                let on = self.br_make_pr;
+                div()
+                    .id("br-make-pr")
+                    .mx_3()
+                    .mb_3()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _e, _w, cx| {
+                        this.br_make_pr = !this.br_make_pr;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .w(px(14.))
+                            .h(px(14.))
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(if on { ACCENT } else { MUTED }))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(on, |d| d.bg(rgb(ACCENT)))
+                            .when(on, |d| {
+                                d.child(div().font_family(ICON_FONT).text_size(px(10.)).text_color(rgb(SEL_TEXT)).child(IC_CHECK))
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(if on { TEXT } else { MUTED }))
+                            .child("Create a pull request too"),
+                    )
+            })
+            .child(
+                div()
+                    .px_3()
+                    .pb_2()
+                    .text_size(px(10.))
+                    .text_color(rgb(MUTED))
+                    .child("Enter to create · Tab toggles PR · Esc to cancel"),
             )
     }
 
@@ -7707,13 +7931,45 @@ impl Storm {
                             .child(self.prc_milestone.render(self.caret(), SELECTION))
                     }),
             )
+            .children({
+                // autocomplete list of matching open milestones
+                let sugg = self.prc_suggestions();
+                (!sugg.is_empty()).then(|| {
+                    let mut list = div().id("prc-ms").mx_3().mb_1().flex().flex_col().max_h(px(160.)).overflow_y_scroll();
+                    for (i, m) in sugg.iter().enumerate().take(50) {
+                        let selected = i == self.prc_sel;
+                        let title = m.clone();
+                        list = list.child(
+                            div()
+                                .id(("prc-ms-row", i))
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .text_size(px(12.))
+                                .cursor_pointer()
+                                .when(selected, |d| d.bg(rgb(SELECTED_BG)).text_color(rgb(SEL_TEXT)))
+                                .when(!selected, |d| d.text_color(rgb(TEXT)).hover(|s| s.bg(rgb(HOVER))))
+                                .child(title.clone())
+                                .on_click(cx.listener(move |this, _e, _w, cx| {
+                                    this.prc_open = false;
+                                    this.run_command(format!("pr --ms {}", title), cx);
+                                })),
+                        );
+                    }
+                    list
+                })
+            })
             .child(
                 div()
                     .px_3()
                     .pb_2()
                     .text_size(px(10.))
                     .text_color(rgb(MUTED))
-                    .child("Enter to create · Esc to cancel"),
+                    .child(if self.prc_milestones.is_empty() {
+                        "Enter to create · Esc to cancel"
+                    } else {
+                        "↑↓ to pick · Tab to fill · Enter to create · Esc to cancel"
+                    }),
             )
     }
 
