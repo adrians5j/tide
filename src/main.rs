@@ -408,6 +408,25 @@ fn fuzzy_score(query: &str, candidate: &str) -> Option<i32> {
     }
 }
 
+/// Score a file-finder candidate against `query`, ranking by relevance:
+/// a contiguous substring in the file *name* beats a fuzzy name match, which
+/// beats a fuzzy match anywhere in the path. Higher = better. None = no match.
+fn finder_score(query: &str, rel: &str) -> Option<i32> {
+    let q = query.to_lowercase();
+    let name = rel.rsplit('/').next().unwrap_or(rel).to_lowercase();
+    // best: the query appears verbatim in the filename (prefix is even better)
+    if let Some(pos) = name.find(&q) {
+        let prefix = if pos == 0 { 5_000 } else { 0 };
+        return Some(100_000 + prefix - (pos as i32) * 50 - name.len() as i32);
+    }
+    // good: fuzzy subsequence within the filename
+    if let Some(sc) = fuzzy_score(&q, &name) {
+        return Some(50_000 + sc - name.len() as i32);
+    }
+    // weak: fuzzy subsequence anywhere in the path
+    fuzzy_score(&q, rel).map(|sc| sc - rel.len() as i32)
+}
+
 // ── state ────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq)]
@@ -2953,7 +2972,7 @@ impl Storm {
             .iter()
             .filter_map(|p| {
                 let rel = p.strip_prefix(&root).unwrap_or(p).to_string_lossy().to_string();
-                fuzzy_score(&query, &rel).map(|sc| (sc, p.clone()))
+                finder_score(&query, &rel).map(|sc| (sc, p.clone()))
             })
             .collect();
         scored.sort_by(|a, b| {
@@ -3681,7 +3700,12 @@ impl Storm {
 
     fn do_push(&mut self, cx: &mut Context<Self>) {
         self.push_open = false;
-        let cmd = if self.push_tags { "git push --tags && git push" } else { "git push" };
+        // -u origin HEAD so a brand-new branch (no upstream yet) pushes + tracks
+        let cmd = if self.push_tags {
+            "git push --tags && git push -u origin HEAD"
+        } else {
+            "git push -u origin HEAD"
+        };
         self.run_command(cmd.into(), cx);
         cx.notify();
     }
@@ -3773,7 +3797,7 @@ impl Storm {
                 window.focus(&self.commit_focus, cx);
                 cx.notify();
             }
-            GitItem::Action(GitAction::Push, ..) => self.run_command("git push".into(), cx),
+            GitItem::Action(GitAction::Push, ..) => self.run_command("git push -u origin HEAD".into(), cx),
             GitItem::Action(GitAction::Pr, ..) => self.run_command("pro".into(), cx),
             GitItem::Action(GitAction::CreatePr, ..) => self.open_pr_create_prompt(window, cx),
             GitItem::Action(GitAction::NewBranch, ..) => self.open_branch_prompt(window, cx),
@@ -4247,14 +4271,19 @@ impl Storm {
                 self.find_psel = None;
                 self.find_scroll_into_view();
             }
-            // cmd+a selects all of the preview code; cmd+c copies the selection
+            // cmd+a: select the search text by default; once you're selecting in
+            // the preview pane, select all of its code instead
             "a" if ks.modifiers.platform => {
-                if let Some(pv) = &self.find_preview {
-                    if !pv.lines.is_empty() {
-                        let last = pv.lines.len() - 1;
-                        let last_len = pv.lines[last].chars().count();
-                        self.find_psel = Some((0, 0, last, last_len));
+                if self.find_psel.is_some() {
+                    if let Some(pv) = &self.find_preview {
+                        if !pv.lines.is_empty() {
+                            let last = pv.lines.len() - 1;
+                            let last_len = pv.lines[last].chars().count();
+                            self.find_psel = Some((0, 0, last, last_len));
+                        }
                     }
+                } else {
+                    Self::field_input(&mut self.find_query, ks, cx, |_| true);
                 }
             }
             "c" if ks.modifiers.platform => {
@@ -4347,7 +4376,7 @@ impl Storm {
             format!("git add {}", paths.join(" "))
         };
         let cmd = if push {
-            format!("{} && git commit -m \"{}\" && git push", add, safe)
+            format!("{} && git commit -m \"{}\" && git push -u origin HEAD", add, safe)
         } else {
             format!("{} && git commit -m \"{}\"", add, safe)
         };
@@ -6874,13 +6903,13 @@ impl Storm {
                             .child(btn("pa-rebase", "Rebase & Push", false).on_click(cx.listener(
                                 |this, _e, _w, cx| {
                                     this.push_ahead = false;
-                                    this.run_command("git pull --rebase && git push".into(), cx);
+                                    this.run_command("git pull --rebase && git push -u origin HEAD".into(), cx);
                                 },
                             )))
                             .child(btn("pa-merge", "Merge & Push", true).on_click(cx.listener(
                                 |this, _e, _w, cx| {
                                     this.push_ahead = false;
-                                    this.run_command("git pull --no-rebase && git push".into(), cx);
+                                    this.run_command("git pull --no-rebase && git push -u origin HEAD".into(), cx);
                                 },
                             ))),
                     ),

@@ -1736,7 +1736,11 @@ impl Editor {
         };
         let rel_x = f32::from(pos.x - bounds.left() - self.last_gutter_width) + f32::from(self.scroll_x);
         let col = (rel_x / f32::from(self.last_char_width)).round().max(0.) as usize;
-        Some((line_start + col).min(line_end))
+        // `col` is a char column; map it to a real byte offset (multi-byte chars
+        // like '─' mean byte != column), landing on a char boundary
+        let line = &self.content[line_start..line_end];
+        let byte_in_line = line.char_indices().nth(col).map(|(b, _)| b).unwrap_or(line.len());
+        Some(line_start + byte_in_line)
     }
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1774,7 +1778,10 @@ impl Editor {
         if len == 0 {
             return 0..0;
         }
-        let off = offset.min(len);
+        let mut off = offset.min(len);
+        while off > 0 && !self.content.is_char_boundary(off) {
+            off -= 1; // snap to a char boundary so slicing never panics
+        }
         let class = |c: char| {
             if c.is_whitespace() {
                 0
