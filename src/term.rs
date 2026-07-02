@@ -95,6 +95,21 @@ impl EventListener for EventProxy {
     }
 }
 
+/// Scroll dampening factor (lines emitted per line-height of trackpad travel).
+/// 1.0 keeps the raw speed; lower is calmer. Set `TIDE_SCROLL_SPEED` to tune
+/// without a rebuild; defaults to a gentler-than-native 0.4.
+fn scroll_speed() -> f32 {
+    use std::sync::OnceLock;
+    static SPEED: OnceLock<f32> = OnceLock::new();
+    *SPEED.get_or_init(|| {
+        std::env::var("TIDE_SCROLL_SPEED")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| *v > 0.0)
+            .unwrap_or(0.4)
+    })
+}
+
 // ── Terminal entity ────────────────────────────────────────────────────────
 
 pub struct Terminal {
@@ -114,6 +129,9 @@ pub struct Terminal {
     /// apps like zellij redraw fully and flood output) — resize once on release
     pub defer_resize: bool,
     cursor_on: bool,
+    /// fractional scroll lines banked between wheel events, so trackpad
+    /// pixel-deltas emit whole lines at the damped speed (see on_scroll)
+    scroll_accum: f32,
     /// current text selection (word, drag, or select-all), in grid cells
     selection: Option<Sel>,
     /// true while a left-drag selection is in progress
@@ -212,6 +230,7 @@ impl Terminal {
             rows,
             shaped_cache: Vec::new(),
             cursor_on: true,
+            scroll_accum: 0.0,
             last_bounds: None,
             last_char_width: px(8.),
             defer_resize: false,
@@ -542,24 +561,29 @@ impl Terminal {
     fn on_scroll(&mut self, ev: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let report = self.term.lock().map(|g| g.mode().intersects(TermMode::MOUSE_MODE)).unwrap_or(false);
         let dy = f32::from(ev.delta.pixel_delta(px(LINE_HEIGHT)).y);
+        // Bank fractional lines and apply a speed factor so a macOS trackpad's
+        // large, momentum-driven pixel deltas don't overscroll. TIDE_SCROLL_SPEED
+        // tunes it (1.0 = one line per line-height of travel; lower = calmer).
+        self.scroll_accum += (dy / LINE_HEIGHT) * scroll_speed();
+        let lines = self.scroll_accum.trunc() as i32;
+        if lines == 0 {
+            return; // keep banking until a whole line accrues
+        }
+        self.scroll_accum -= lines as f32;
         // a mouse-reporting app (vim, claude code, …) wants the wheel itself
         if report {
-            let button = if dy > 0.0 { 64 } else { 65 };
-            let steps = (dy.abs() / LINE_HEIGHT).ceil().max(1.0) as usize;
-            for _ in 0..steps.min(5) {
+            let button = if lines > 0 { 64 } else { 65 };
+            for _ in 0..lines.unsigned_abs().min(5) {
                 self.forward_mouse(button, true, ev.position);
             }
             return;
         }
         // otherwise scroll our own scrollback buffer (positive dy = up = history)
-        let lines = (dy / LINE_HEIGHT).round() as i32;
-        if lines != 0 {
-            if let Ok(mut g) = self.term.lock() {
-                g.scroll_display(Scroll::Delta(lines));
-            }
-            self.dirty.store(true, Ordering::Relaxed);
-            cx.notify();
+        if let Ok(mut g) = self.term.lock() {
+            g.scroll_display(Scroll::Delta(lines));
         }
+        self.dirty.store(true, Ordering::Relaxed);
+        cx.notify();
     }
 
     /// Snap the viewport back to the prompt (used when the user types).

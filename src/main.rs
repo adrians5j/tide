@@ -2481,14 +2481,37 @@ impl Storm {
             .unwrap_or_else(|| "tide".into())
     }
 
-    /// Root-level key handling: escape closes any open popup. Fires for the
-    /// whole focus path, so it works even if the popup didn't grab focus.
+    /// Root-level key handling: escape closes any open popup, and the right-click
+    /// context menus respond to Esc / number keys here. Fires for the whole focus
+    /// path, so it works even when the menu overlay didn't grab keyboard focus
+    /// (e.g. the tree menu, opened from a virtualized uniform_list row).
     fn on_root_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if ev.keystroke.key != "escape" {
+        let key = ev.keystroke.key.as_str();
+        // context menus: Esc closes, 1-9 invokes an action
+        if self.editor_ctx.is_some() {
+            if key == "escape" {
+                self.editor_ctx = None;
+                cx.notify();
+            } else if let Ok(n) = key.parse::<usize>() {
+                if n >= 1 {
+                    self.editor_ctx_run(n - 1, window, cx);
+                }
+            }
             return;
         }
-        if self.editor_ctx.take().is_some() {
-            cx.notify();
+        if self.tree_ctx.is_some() {
+            if key == "escape" {
+                self.tree_ctx = None;
+                self.tree_ctx_path = None;
+                cx.notify();
+            } else if let Ok(n) = key.parse::<usize>() {
+                if n >= 1 {
+                    self.tree_ctx_run(n - 1, window, cx);
+                }
+            }
+            return;
+        }
+        if key != "escape" {
             return;
         }
         // escape inside the per-branch submenu backs out to the branch list,
