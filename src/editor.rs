@@ -27,7 +27,8 @@ actions!(
         Backspace, Delete, MoveLeft, MoveRight, MoveUp, MoveDown, Home, End, Newline, Indent, Save,
         SelectLeft, SelectRight, SelectUp, SelectDown, SelectHome, SelectEnd, SelectAll, Copy,
         Paste, Cut, WordLeft, WordRight, SelectWordLeft, SelectWordRight, Undo, Redo, DeleteLine,
-        MoveLineUp, MoveLineDown, CompTrigger, CompDismiss, GotoDef, SearchOpen
+        MoveLineUp, MoveLineDown, CompTrigger, CompDismiss, GotoDef, SearchOpen,
+        DeleteWordLeft, DeleteWordRight
     ]
 );
 
@@ -528,6 +529,8 @@ impl Editor {
     fn act_word_right(&mut self, _: &WordRight, w: &mut Window, cx: &mut Context<Self>) { self.on_key("word-right", w, cx); }
     fn act_sel_word_left(&mut self, _: &SelectWordLeft, w: &mut Window, cx: &mut Context<Self>) { self.on_key("select-word-left", w, cx); }
     fn act_sel_word_right(&mut self, _: &SelectWordRight, w: &mut Window, cx: &mut Context<Self>) { self.on_key("select-word-right", w, cx); }
+    fn act_delete_word_left(&mut self, _: &DeleteWordLeft, w: &mut Window, cx: &mut Context<Self>) { self.on_key("delete-word-left", w, cx); }
+    fn act_delete_word_right(&mut self, _: &DeleteWordRight, w: &mut Window, cx: &mut Context<Self>) { self.on_key("delete-word-right", w, cx); }
     fn act_undo(&mut self, _: &Undo, _w: &mut Window, cx: &mut Context<Self>) { self.undo(cx); }
     fn act_redo(&mut self, _: &Redo, _w: &mut Window, cx: &mut Context<Self>) { self.redo(cx); }
     fn act_delete_line(&mut self, _: &DeleteLine, _w: &mut Window, cx: &mut Context<Self>) { self.delete_line(cx); }
@@ -755,6 +758,28 @@ impl Editor {
                         return;
                     }
                     self.selected_range = prev..self.cursor_offset();
+                }
+                self.replace(None, "", cx);
+            }
+            // opt+backspace / opt+delete: remove the whole word to the side (no-op
+            // when a selection exists → falls through to a normal range delete)
+            "delete-word-left" => {
+                if self.selected_range.is_empty() {
+                    let p = self.prev_word(self.cursor_offset());
+                    if p == self.cursor_offset() {
+                        return;
+                    }
+                    self.selected_range = p..self.cursor_offset();
+                }
+                self.replace(None, "", cx);
+            }
+            "delete-word-right" => {
+                if self.selected_range.is_empty() {
+                    let n = self.next_word(self.cursor_offset());
+                    if n == self.cursor_offset() {
+                        return;
+                    }
+                    self.selected_range = self.cursor_offset()..n;
                 }
                 self.replace(None, "", cx);
             }
@@ -1891,6 +1916,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::act_word_right))
             .on_action(cx.listener(Self::act_sel_word_left))
             .on_action(cx.listener(Self::act_sel_word_right))
+            .on_action(cx.listener(Self::act_delete_word_left))
+            .on_action(cx.listener(Self::act_delete_word_right))
             .on_action(cx.listener(Self::act_comp_trigger))
             .on_action(cx.listener(Self::act_comp_dismiss))
             .on_action(cx.listener(Self::act_goto_def))

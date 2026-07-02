@@ -29,10 +29,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use term::Terminal;
 use editor::{
-    Backspace, CompDismiss, CompTrigger, Copy, Cut, Delete, DeleteLine, Editor, End, GotoDef, Home,
-    Indent, MoveDown, MoveLeft, MoveLineDown, MoveLineUp, MoveRight, MoveUp, Newline, OpenLocation,
-    Paste, Redo, Save, SearchOpen, SelectAll, SelectDown, SelectEnd, SelectHome, SelectLeft,
-    SelectRight, SelectUp, SelectWordLeft, SelectWordRight, Undo, WordLeft, WordRight,
+    Backspace, CompDismiss, CompTrigger, Copy, Cut, Delete, DeleteLine, DeleteWordLeft,
+    DeleteWordRight, Editor, End, GotoDef, Home, Indent, MoveDown, MoveLeft, MoveLineDown,
+    MoveLineUp, MoveRight, MoveUp, Newline, OpenLocation, Paste, Redo, Save, SearchOpen, SelectAll,
+    SelectDown, SelectEnd, SelectHome, SelectLeft, SelectRight, SelectUp, SelectWordLeft,
+    SelectWordRight, Undo, WordLeft, WordRight,
 };
 
 // Codicon (VS Code icon font) glyphs — rendered with font_family("codicon").
@@ -4087,12 +4088,33 @@ impl Storm {
         self.open_file(path, window, cx);
     }
 
+    /// Re-scan git working-tree status off the main thread and refresh the
+    /// Changes pane (and the file-tree's git colors). Bound to cmd+r there.
+    fn refresh_changes(&mut self, cx: &mut Context<Self>) {
+        let root = self.root.clone();
+        cx.spawn(async move |this, cx| {
+            let status = cx.background_executor().spawn(async move { compute_git(&root) }).await;
+            this.update(cx, |this, cx| {
+                this.git_status = status;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        self.show_flash("Refreshed changes", cx);
+    }
+
     fn changes_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         if ks.modifiers.platform && ks.modifiers.shift && ks.key == "c" {
             if let Some(p) = self.commit_selected.clone() {
                 self.copy_reference(&p, cx);
             }
+            return;
+        }
+        // cmd+r: re-scan git status (like the PR pane's refresh)
+        if ks.modifiers.platform && ks.key == "r" {
+            self.refresh_changes(cx);
             return;
         }
         if ks.modifiers.platform {
@@ -5844,10 +5866,11 @@ impl Storm {
                     )
                     .child(div().font_family(ICON_FONT).text_size(px(12.)).text_color(rgb(MUTED)).child(IC_SEARCH))
                     .child(if self.commit_filter.is_empty() {
-                        div().text_size(px(12.)).text_color(rgb(MUTED)).child(format!("Filter files…{}", self.caret_if(filter_focused)))
+                        div().flex_grow(1.0).text_size(px(12.)).text_color(rgb(MUTED)).child(format!("Filter files…{}", self.caret_if(filter_focused)))
                     } else {
-                        div().text_size(px(12.)).text_color(rgb(TEXT)).child(self.commit_filter.render(self.caret_if(filter_focused), SELECTION))
-                    }),
+                        div().flex_grow(1.0).text_size(px(12.)).text_color(rgb(TEXT)).child(self.commit_filter.render(self.caret_if(filter_focused), SELECTION))
+                    })
+                    .child(self.collapse_left_btn(cx)),
             )
             // checked-state segmented control
             .child(
@@ -6313,7 +6336,9 @@ impl Storm {
                         "PULL REQUEST".to_string()
                     } else {
                         format!("PULL REQUEST  ·  vs {}", self.pr_base)
-                    }),
+                    })
+                    .child(div().flex_grow(1.0))
+                    .child(self.collapse_left_btn(cx)),
             )
             // filter bar
             .child(
@@ -8499,6 +8524,26 @@ impl Storm {
             )
     }
 
+    /// Small "collapse" button for a left-panel header — hides the whole left
+    /// sidebar (same as toggling its activity-bar icon off).
+    fn collapse_left_btn(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("panel-collapse")
+            .px_1()
+            .flex_shrink_0()
+            .cursor_pointer()
+            .text_size(px(15.))
+            .text_color(rgb(MUTED))
+            .hover(|s| s.text_color(rgb(TEXT)))
+            .child("–")
+            .tooltip(|_w, cx| cx.new(|_| TooltipView { text: "Collapse panel".into() }).into())
+            .on_click(cx.listener(|this, _e, window, cx| {
+                this.show_left = false;
+                this.focus_active(window, cx);
+                cx.notify();
+            }))
+    }
+
     fn render_tree(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let count = self.entries.len();
         let width = px(self.tree_width);
@@ -8520,7 +8565,9 @@ impl Storm {
                     .items_center()
                     .text_color(rgb(ACCENT))
                     .text_size(px(12.))
-                    .child("PROJECT"),
+                    .child("PROJECT")
+                    .child(div().flex_grow(1.0))
+                    .child(self.collapse_left_btn(cx)),
             )
             .child(
                 uniform_list(
@@ -10028,6 +10075,8 @@ fn main() {
             KeyBinding::new("alt-right", WordRight, Some("Editor")),
             KeyBinding::new("alt-shift-left", SelectWordLeft, Some("Editor")),
             KeyBinding::new("alt-shift-right", SelectWordRight, Some("Editor")),
+            KeyBinding::new("alt-backspace", DeleteWordLeft, Some("Editor")),
+            KeyBinding::new("alt-delete", DeleteWordRight, Some("Editor")),
             // undo / redo
             KeyBinding::new("cmd-z", Undo, Some("Editor")),
             KeyBinding::new("cmd-shift-z", Redo, Some("Editor")),
