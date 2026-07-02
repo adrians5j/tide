@@ -848,31 +848,6 @@ fn diff_pane(
         .child(h_scrollbar(handle))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn diff_body<'a>(
-    rows: &[DiffRow],
-    left_sb: &ScrollHandle,
-    right_sb: &ScrollHandle,
-    char_w: f32,
-    sel: Option<&DiffSel>,
-    left_styles: &'a [Vec<Run>],
-    right_styles: &'a [Vec<Run>],
-    matches: &[DiffMatch],
-    cur_match: usize,
-    caret: Option<(DiffSide, usize, usize)>,
-    caret_on: bool,
-) -> impl IntoElement {
-    // two independent 2D-scroll panes (wheel = vertical, shift+wheel = horizontal)
-    div()
-        .flex()
-        .flex_row()
-        .flex_grow(1.0)
-        .min_h(px(0.))
-        .child(diff_pane(rows, DiffSide::Left, left_sb, char_w, sel, left_styles, matches, cur_match, caret, caret_on))
-        .child(div().w(px(1.)).h_full().bg(rgb(BORDER)))
-        .child(diff_pane(rows, DiffSide::Right, right_sb, char_w, sel, right_styles, matches, cur_match, caret, caret_on))
-}
-
 /// Progress-bar color interpolated red (0%) → yellow → green (100%).
 fn progress_color(pct: usize) -> u32 {
     let h = (pct.min(100) as f32 / 100.0) * 120.0; // hue 0=red .. 120=green
@@ -3560,9 +3535,15 @@ impl Storm {
             }
             return;
         }
-        // otherwise: working-tree diff of the changed files, in a separate window
-        let active = self.active_path().cloned();
-        self.open_working_diff(active, cx);
+        // otherwise: working-tree diff of the changed files, in a separate window.
+        // Prefer the file selected in the Changes (git) panel; fall back to the
+        // active editor tab.
+        let focus = self
+            .commit_selected
+            .clone()
+            .filter(|p| p.is_file())
+            .or_else(|| self.active_path().cloned());
+        self.open_working_diff(focus, cx);
     }
 
     /// Open a working-tree diff window over all changed files, focused on
@@ -9152,6 +9133,22 @@ struct DiffWindow {
     // the main app window + entity, so F4 can open the file there
     storm: WeakEntity<Storm>,
     main_window: Option<AnyWindowHandle>,
+    // collapsed directories in the file tree sidebar (relative dir paths)
+    tree_collapsed: HashSet<PathBuf>,
+    // sidebar file filter (substring over each file's relative path)
+    filter: Field,
+    filter_focus: FocusHandle,
+    // fraction of the diff area given to the left pane (draggable divider)
+    pane_split: f32,
+    resizing_pane: bool,
+}
+
+/// One visible row in the Diff window's file-tree sidebar.
+struct DiffTreeRow {
+    depth: usize,
+    label: String,
+    dir: Option<PathBuf>,   // Some → a directory row (its relative path), toggles collapse
+    file_idx: Option<usize>, // Some → a file row (index into `files`)
 }
 
 impl DiffWindow {
@@ -9210,7 +9207,84 @@ impl DiffWindow {
             cur_match: 0,
             storm,
             main_window,
+            tree_collapsed: HashSet::new(),
+            filter: Field::default(),
+            filter_focus: cx.focus_handle(),
+            pane_split: 0.5,
+            resizing_pane: false,
         }
+    }
+
+    /// Flatten `files` into a directory tree (respecting collapsed dirs) for the
+    /// sidebar — dirs first then files at each level, both alphabetical.
+    fn tree_rows(&self) -> Vec<DiffTreeRow> {
+        #[derive(Default)]
+        struct Node {
+            dirs: std::collections::BTreeMap<String, Node>,
+            files: std::collections::BTreeMap<String, usize>,
+        }
+        let q = self.filter.text.trim().to_lowercase();
+        let filtering = !q.is_empty();
+        let mut root = Node::default();
+        for (i, f) in self.files.iter().enumerate() {
+            let rel = f.strip_prefix(&self.root).unwrap_or(f);
+            // filter on the whole relative path so "core/req" or ".test" both work
+            if filtering && !rel.to_string_lossy().to_lowercase().contains(&q) {
+                continue;
+            }
+            let comps: Vec<String> =
+                rel.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect();
+            let mut node = &mut root;
+            for c in &comps[..comps.len().saturating_sub(1)] {
+                node = node.dirs.entry(c.clone()).or_default();
+            }
+            if let Some(name) = comps.last() {
+                node.files.insert(name.clone(), i);
+            }
+        }
+        let mut out = Vec::new();
+        // while filtering, ignore collapse state so every match is visible
+        fn walk(node: &Node, depth: usize, prefix: &Path, collapsed: &HashSet<PathBuf>, filtering: bool, out: &mut Vec<DiffTreeRow>) {
+            for (name, child) in &node.dirs {
+                let path = prefix.join(name);
+                out.push(DiffTreeRow { depth, label: name.clone(), dir: Some(path.clone()), file_idx: None });
+                if filtering || !collapsed.contains(&path) {
+                    walk(child, depth + 1, &path, collapsed, filtering, out);
+                }
+            }
+            for (name, idx) in &node.files {
+                out.push(DiffTreeRow { depth, label: name.clone(), dir: None, file_idx: Some(*idx) });
+            }
+        }
+        walk(&root, 0, Path::new(""), &self.tree_collapsed, filtering, &mut out);
+        out
+    }
+
+    /// Keystrokes while the sidebar filter input is focused. Esc clears/close,
+    /// Enter jumps to the first matching file.
+    fn filter_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        if ks.key == "escape" {
+            if self.filter.is_empty() {
+                window.focus(&self.focus, cx); // nothing to clear → hand focus back to the diff
+            } else {
+                self.filter.clear();
+            }
+            cx.notify();
+            return;
+        }
+        if ks.key == "enter" {
+            if let Some(idx) = self.tree_rows().iter().find_map(|r| r.file_idx) {
+                self.goto(idx, cx);
+            }
+            return;
+        }
+        let clip = cx.read_from_clipboard().and_then(|c| c.text());
+        self.filter.key(ks, clip, |_| true);
+        if let Some(text) = self.filter.take_copy() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+        cx.notify();
     }
 
     /// Recompute search matches across both sides for the current query.
@@ -9388,9 +9462,11 @@ impl DiffWindow {
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
-        // when the search input has focus, let search_key own the keystroke
-        // (events bubble up to this root handler otherwise)
-        if self.search_open && self.search_focus.is_focused(window) {
+        // when the search or sidebar-filter input has focus, let its own key
+        // handler own the keystroke (events bubble up to this root otherwise)
+        if (self.search_open && self.search_focus.is_focused(window))
+            || self.filter_focus.is_focused(window)
+        {
             return;
         }
         // cmd+f opens the search bar
@@ -9664,7 +9740,17 @@ impl Render for DiffWindow {
                     }
                 }),
             )
-            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
+                if this.resizing_pane {
+                    // drag the divider: split = cursor x within the diff area
+                    // (which starts after the sidebar, when one is shown)
+                    let sidebar_w = if this.files.len() > 1 { 260.0 } else { 0.0 };
+                    let area_w = (f32::from(window.viewport_size().width) - sidebar_w).max(1.0);
+                    let x = f32::from(ev.position.x) - sidebar_w;
+                    this.pane_split = (x / area_w).clamp(0.15, 0.85);
+                    cx.notify();
+                    return;
+                }
                 if this.dragging {
                     if let Some((side, r, c)) = this.cell_at(ev.position) {
                         if let Some(s) = &mut this.sel {
@@ -9676,7 +9762,13 @@ impl Render for DiffWindow {
                     }
                 }
             }))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _e, _w, _cx| this.dragging = false))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _e, _w, cx| {
+                this.dragging = false;
+                if this.resizing_pane {
+                    this.resizing_pane = false;
+                    cx.notify();
+                }
+            }))
             .child(bar)
             .when(self.search_open, |d| d.child(self.render_search_bar(cx)));
 
@@ -9691,19 +9783,156 @@ impl Render for DiffWindow {
             }
         }
 
-        col.child(diff_body(
-                &self.rows,
-                &self.left_scroll,
-                &self.right_scroll,
-                self.char_w,
-                self.sel.as_ref(),
-                &self.left_styles,
-                &self.right_styles,
-                &self.matches,
-                self.cur_match,
-                self.caret,
-                self.caret_on,
-            ))
+        // two panes with a draggable divider between them (pane_split = left share)
+        let split = self.pane_split;
+        let left_pane = diff_pane(&self.rows, DiffSide::Left, &self.left_scroll, self.char_w, self.sel.as_ref(), &self.left_styles, &self.matches, self.cur_match, self.caret, self.caret_on);
+        let right_pane = diff_pane(&self.rows, DiffSide::Right, &self.right_scroll, self.char_w, self.sel.as_ref(), &self.right_styles, &self.matches, self.cur_match, self.caret, self.caret_on);
+        let divider = div()
+            .w(px(4.))
+            .h_full()
+            .flex_shrink_0()
+            .bg(rgb(if self.resizing_pane { ACCENT } else { BORDER }))
+            .cursor(CursorStyle::ResizeLeftRight)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _e: &MouseDownEvent, _w, cx| {
+                    this.resizing_pane = true;
+                    cx.stop_propagation(); // don't also start a text selection
+                    cx.notify();
+                }),
+            );
+        let body = div()
+            .flex()
+            .flex_row()
+            .flex_grow(1.0)
+            .min_h(px(0.))
+            .child(div().flex().flex_grow(split).flex_basis(px(0.)).min_w(px(0.)).min_h(px(0.)).child(left_pane))
+            .child(divider)
+            .child(div().flex().flex_grow(1.0 - split).flex_basis(px(0.)).min_w(px(0.)).min_h(px(0.)).child(right_pane));
+
+        // file-tree sidebar (only for a multi-file diff): collapsible directories,
+        // click a file to jump to it, current file highlighted
+        if self.files.len() > 1 {
+            let mut tree = div()
+                .id("dw-files")
+                .w(px(260.))
+                .flex_shrink_0()
+                .h_full()
+                .flex()
+                .flex_col()
+                .overflow_y_scroll()
+                .bg(rgb(PANEL_BG))
+                .border_r_1()
+                .border_color(rgb(BORDER))
+                // don't let clicks in the sidebar start a text selection in the diff
+                .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
+                // filter input (type to narrow the tree by path substring)
+                .child(
+                    div()
+                        .id("dw-filter")
+                        .h(px(28.))
+                        .px_3()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .flex_shrink_0()
+                        .border_b_1()
+                        .border_color(rgb(BORDER))
+                        .track_focus(&self.filter_focus)
+                        .on_key_down(cx.listener(Self::filter_key))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _e, window, cx| {
+                                window.focus(&this.filter_focus, cx);
+                                cx.notify();
+                            }),
+                        )
+                        .child(div().font_family(ICON_FONT).text_size(px(12.)).text_color(rgb(MUTED)).child(IC_SEARCH))
+                        .child(if self.filter.is_empty() {
+                            div().text_size(px(12.)).text_color(rgb(MUTED)).child("Filter files…")
+                        } else {
+                            div().text_size(px(12.)).text_color(rgb(TEXT)).child(self.filter.render("▏", SELECTION))
+                        }),
+                );
+            for (ri, row) in self.tree_rows().into_iter().enumerate() {
+                let indent = 8.0 + row.depth as f32 * 14.0;
+                let sel = row.file_idx == Some(self.idx);
+                let is_dir = row.dir.is_some();
+                let collapsed = row.dir.as_ref().is_some_and(|p| self.tree_collapsed.contains(p));
+                let dir_path = row.dir.clone();
+                let file_idx = row.file_idx;
+                tree = tree.child(
+                    div()
+                        .id(("dw-row", ri))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .h(px(22.))
+                        .pl(px(indent))
+                        .pr_2()
+                        .flex_shrink_0()
+                        .cursor_pointer()
+                        .when(sel, |d| d.bg(rgb(SELECTED_BG)))
+                        .when(!sel, |d| d.hover(|s| s.bg(rgb(HOVER))))
+                        .child(
+                            div()
+                                .w(px(12.))
+                                .flex()
+                                .justify_center()
+                                .text_size(px(11.))
+                                .text_color(rgb(DIR))
+                                .child(if is_dir { if collapsed { "▸" } else { "▾" } } else { "" }),
+                        )
+                        .when(is_dir, |d| {
+                            d.child(
+                                div()
+                                    .font_family(ICON_FONT)
+                                    .text_size(px(12.))
+                                    .text_color(rgb(FOLDER_ICON))
+                                    .child(IC_FOLDER),
+                            )
+                        })
+                        .child(
+                            div()
+                                .flex_grow(1.0)
+                                .truncate()
+                                .text_size(px(13.))
+                                .text_color(rgb(if sel {
+                                    SEL_TEXT
+                                } else if is_dir {
+                                    DIR
+                                } else {
+                                    TEXT
+                                }))
+                                .child(row.label),
+                        )
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            if let Some(p) = &dir_path {
+                                if !this.tree_collapsed.remove(p) {
+                                    this.tree_collapsed.insert(p.clone());
+                                }
+                                cx.notify();
+                            } else if let Some(i) = file_idx {
+                                this.goto(i, cx);
+                            }
+                        })),
+                );
+            }
+            // body added directly as a flex child so it keeps a bounded height
+            // (scroll panes need that); a non-flex wrapper here breaks scrolling
+            let content = div()
+                .flex()
+                .flex_row()
+                .flex_grow(1.0)
+                .min_h(px(0.))
+                .child(tree)
+                .child(body);
+            col.child(content)
+        } else {
+            col.child(body)
+        }
     }
 }
 
