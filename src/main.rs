@@ -1981,9 +1981,33 @@ enum ProjectNav {
     OpenPath(PathBuf), // open a project at a specific folder path (from the new-project dialog)
     Remove(usize),
     Attention, // a terminal rang the bell → workspace should raise the red dot
+    Reorder { from: usize, to: usize }, // drag-reorder a topbar chip before `to`
 }
 
 impl EventEmitter<ProjectNav> for Storm {}
+
+/// Drag payload for reordering topbar workspace chips (the dragged project's index).
+struct DraggedProject(usize);
+
+/// The little chip rendered under the cursor while dragging a workspace icon.
+struct DragChip {
+    label: String,
+}
+impl Render for DragChip {
+    fn render(&mut self, _w: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size(px(26.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .text_size(px(10.))
+            .bg(rgb(ICON_SELECTED_BG))
+            .text_color(rgb(SEL_TEXT))
+            .shadow_lg()
+            .child(self.label.clone())
+    }
+}
 
 // directories never walked by the finder / search-fallback index (heavy/noise)
 const IGNORED: &[&str] = &["node_modules", ".git", ".DS_Store", "target", "dist", "build"];
@@ -5015,6 +5039,19 @@ impl Storm {
         // the bell (Claude Code awaiting your input) until you switch to it.
         if self.ws_names.len() > 1 {
             let mut strip = div().flex().flex_row().items_center().gap_1();
+            // leading drop zone → drop here to move a chip to the far left (index 0)
+            strip = strip.child(
+                div()
+                    .id("ws-drop-lead")
+                    .w(px(8.))
+                    .h(px(22.))
+                    .rounded_sm()
+                    .drag_over::<DraggedProject>(|s, _, _, _| s.bg(rgb(ACCENT)))
+                    .on_drop(cx.listener(|_this, d: &DraggedProject, _w, cx| {
+                        cx.emit(ProjectNav::Reorder { from: d.0, to: 0 });
+                        cx.notify();
+                    })),
+            );
             for (i, name) in self.ws_names.iter().enumerate() {
                 let active = i == self.ws_active;
                 let attention = self.ws_attention.get(i).copied().unwrap_or(false);
@@ -5023,6 +5060,7 @@ impl Storm {
                 let bg = if active { ICON_SELECTED_BG } else { PANEL_BG };
                 let text = if active { SEL_TEXT } else { MUTED };
                 let label = project_icon_label(name);
+                let label_drag = label.clone();
                 let nm = name.clone();
                 let idx = i;
                 strip = strip.child(
@@ -5040,6 +5078,16 @@ impl Storm {
                         .text_color(rgb(text))
                         .cursor_pointer()
                         .when(!active, |d| d.hover(|s| s.bg(rgb(HOVER))))
+                        // drag to reorder: start a drag carrying this chip's index,
+                        // drop onto another chip to move this one before it
+                        .on_drag(DraggedProject(i), move |_, _, _, cx| {
+                            cx.new(|_| DragChip { label: label_drag.clone() })
+                        })
+                        .drag_over::<DraggedProject>(|s, _, _, _| s.bg(rgb(ACCENT)))
+                        .on_drop(cx.listener(move |_this, dragged: &DraggedProject, _w, cx| {
+                            cx.emit(ProjectNav::Reorder { from: dragged.0, to: idx });
+                            cx.notify();
+                        }))
                         .child(label)
                         // red "needs you" dot, top-right corner
                         .when(attention, |d| {
@@ -5069,8 +5117,20 @@ impl Storm {
                         })),
                 );
             }
-            // strip in the middle + an equal-grow spacer on the right → centered
-            bar = bar.child(strip).child(div().flex_1());
+            // strip in the middle; the right spacer doubles as a big drop zone →
+            // drop anywhere to its right to move a chip to the far right (append)
+            let end = self.ws_names.len();
+            bar = bar.child(strip).child(
+                div()
+                    .id("ws-drop-trail")
+                    .flex_1()
+                    .h(px(22.))
+                    .drag_over::<DraggedProject>(|s, _, _, _| s.bg(rgb(HOVER)))
+                    .on_drop(cx.listener(move |_this, d: &DraggedProject, _w, cx| {
+                        cx.emit(ProjectNav::Reorder { from: d.0, to: end });
+                        cx.notify();
+                    })),
+            );
         } else {
             // keep the left group left-aligned when there's no strip
             bar = bar.child(div().flex_1());
@@ -8664,6 +8724,9 @@ impl Storm {
 
 /// Holds every open project as a live `Storm` view and renders the active one.
 /// Background projects keep their editors and running terminals alive.
+/// Columns in the project-switcher grid (3x3 for the first 9 projects).
+const SWITCHER_COLS: usize = 3;
+
 struct Workspace {
     projects: Vec<Entity<Storm>>,
     active: usize,
@@ -8720,6 +8783,7 @@ impl Workspace {
             ProjectNav::OpenPath(p) => this.add_project(p.clone(), cx),
             ProjectNav::Remove(i) => this.remove_project(*i, cx),
             ProjectNav::Attention => cx.notify(), // raise the red dot promptly
+            ProjectNav::Reorder { from, to } => this.reorder_projects(*from, *to, cx),
         })
         .detach();
         self.projects.push(storm);
@@ -8741,6 +8805,28 @@ impl Workspace {
         }
         self.switcher_sel = self.switcher_sel.min(self.projects.len() - 1);
         self.focus_pending = true;
+        cx.notify();
+    }
+
+    /// Move the project at `from` to sit just before `to` (drag-reorder from the
+    /// topbar). Keeps `active` pointing at the same project across the shuffle.
+    fn reorder_projects(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        let n = self.projects.len();
+        // `to` may equal n (drop past the last chip → append)
+        if from >= n || to > n || from == to {
+            return;
+        }
+        let active_id = self.projects[self.active].entity_id();
+        let item = self.projects.remove(from);
+        // removing `from` shifts everything after it left by one
+        let dst = if from < to { to - 1 } else { to };
+        self.projects.insert(dst, item);
+        self.active = self
+            .projects
+            .iter()
+            .position(|p| p.entity_id() == active_id)
+            .unwrap_or(0);
+        self.switcher_sel = self.switcher_sel.min(n - 1);
         cx.notify();
     }
 
@@ -8811,12 +8897,23 @@ impl Workspace {
                 self.focus_pending = true;
                 cx.notify();
             }
-            "down" => {
+            // grid navigation: left/right step by one, up/down by a row
+            "right" => {
                 self.switcher_sel = (self.switcher_sel + 1).min(n.saturating_sub(1));
                 cx.notify();
             }
-            "up" => {
+            "left" => {
                 self.switcher_sel = self.switcher_sel.saturating_sub(1);
+                cx.notify();
+            }
+            "down" => {
+                self.switcher_sel = (self.switcher_sel + SWITCHER_COLS).min(n.saturating_sub(1));
+                cx.notify();
+            }
+            "up" => {
+                if self.switcher_sel >= SWITCHER_COLS {
+                    self.switcher_sel -= SWITCHER_COLS;
+                }
                 cx.notify();
             }
             "enter" => {
@@ -8888,9 +8985,110 @@ impl Render for Workspace {
 
         if self.switcher_open {
             let win = window.viewport_size();
-            let w = 560.0_f32;
+            // width holds SWITCHER_COLS cards (168px) + gaps + padding
+            const CARD_W: f32 = 168.0;
+            let w = SWITCHER_COLS as f32 * CARD_W + (SWITCHER_COLS as f32 + 1.0) * 8.0 + 8.0;
             let left = ((f32::from(win.width) - w) / 2.0).max(0.);
-            let mut panel = div()
+            let mut grid = div().flex().flex_row().flex_wrap().gap_2().px_2().pb_2();
+            for i in 0..self.projects.len() {
+                let (name, branch) = {
+                    let s = self.projects[i].read(cx);
+                    (s.project_name(), s.branch.clone())
+                };
+                let sel = i == self.switcher_sel;
+                let is_active = i == active;
+                let multi = self.projects.len() > 1;
+                let idx = i;
+                grid = grid.child(
+                    div()
+                        .id(("ws-switch", i))
+                        .relative()
+                        .w(px(CARD_W))
+                        .h(px(76.))
+                        .p_2()
+                        .flex()
+                        .flex_col()
+                        .justify_between()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(if sel { ACCENT } else { BORDER }))
+                        .when(sel, |d| d.bg(rgb(SELECTED_BG)))
+                        .when(!sel, |d| d.hover(|s| s.bg(rgb(HOVER))))
+                        .cursor_pointer()
+                        // top row: number badge + folder icon + active dot
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(rgb(if sel { SEL_TEXT } else { MUTED }))
+                                        .child(format!("{}", i + 1)),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(ICON_FONT)
+                                        .text_size(px(12.))
+                                        .text_color(rgb(if sel { SEL_TEXT } else { FOLDER_ICON }))
+                                        .child(IC_FOLDER),
+                                )
+                                .child(div().flex_grow(1.0))
+                                .when(is_active, |d| {
+                                    d.child(div().text_size(px(10.)).text_color(rgb(ACCENT)).child("●"))
+                                }),
+                        )
+                        // name + branch
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .truncate()
+                                        .text_color(rgb(if sel { SEL_TEXT } else { TEXT }))
+                                        .child(name),
+                                )
+                                .when(!branch.is_empty(), |d| {
+                                    d.child(
+                                        div()
+                                            .text_size(px(10.))
+                                            .truncate()
+                                            .text_color(rgb(if sel { SEL_TEXT } else { MUTED }))
+                                            .child(format!("⎇ {}", branch)),
+                                    )
+                                }),
+                        )
+                        // close button, top-right corner (hidden with one project left)
+                        .when(multi, |d| {
+                            d.child(
+                                div()
+                                    .id(("ws-close", i))
+                                    .absolute()
+                                    .top(px(2.))
+                                    .right(px(4.))
+                                    .px_1()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(MUTED))
+                                    .hover(|s| s.text_color(rgb(0xf7768e)))
+                                    .cursor_pointer()
+                                    .child("✕")
+                                    .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
+                                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                                        this.remove_project(idx, cx);
+                                    })),
+                            )
+                        })
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            this.switcher_open = false;
+                            this.switch_to(idx, cx);
+                        })),
+                );
+            }
+            let panel = div()
                 .absolute()
                 .top(px(120.))
                 .left(px(left))
@@ -8911,93 +9109,9 @@ impl Render for Workspace {
                         .py_1()
                         .text_size(px(11.))
                         .text_color(rgb(MUTED))
-                        .child("Switch Project  ·  press a number  ·  x to close"),
-                );
-            for i in 0..self.projects.len() {
-                let p = &self.projects[i];
-                let (name, branch) = {
-                    let s = p.read(cx);
-                    (s.project_name(), s.branch.clone())
-                };
-                let sel = i == self.switcher_sel;
-                let is_active = i == active;
-                let idx = i;
-                panel = panel.child(
-                    div()
-                        .id(("ws-switch", i))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .h(px(46.))
-                        .px_3()
-                        // number shortcut badge
-                        .child(
-                            div()
-                                .w(px(18.))
-                                .flex()
-                                .justify_center()
-                                .text_size(px(12.))
-                                .text_color(rgb(if sel { SEL_TEXT } else { MUTED }))
-                                .child(format!("{}", i + 1)),
-                        )
-                        .cursor_pointer()
-                        .when(sel, |d| d.bg(rgb(SELECTED_BG)))
-                        .when(!sel, |d| d.hover(|s| s.bg(rgb(HOVER))))
-                        .child(
-                            div()
-                                .w(px(14.))
-                                .font_family(ICON_FONT)
-                                .text_size(px(13.))
-                                .text_color(rgb(if sel { SEL_TEXT } else { FOLDER_ICON }))
-                                .child(IC_FOLDER),
-                        )
-                        .child(
-                            // name + branch stacked
-                            div()
-                                .flex()
-                                .flex_col()
-                                .flex_grow(1.0)
-                                .child(
-                                    div()
-                                        .text_color(rgb(if sel { SEL_TEXT } else { TEXT }))
-                                        .child(name),
-                                )
-                                .when(!branch.is_empty(), |d| {
-                                    d.child(
-                                        div()
-                                            .text_size(px(11.))
-                                            .text_color(rgb(if sel { SEL_TEXT } else { MUTED }))
-                                            .child(format!("⎇ {}", branch)),
-                                    )
-                                }),
-                        )
-                        .when(is_active, |d| {
-                            d.child(div().text_size(px(11.)).text_color(rgb(ACCENT)).child("●"))
-                        })
-                        // close button (hidden when only one project is left)
-                        .when(self.projects.len() > 1, |d| {
-                            d.child(
-                                div()
-                                    .id(("ws-close", i))
-                                    .px_1()
-                                    .text_size(px(12.))
-                                    .text_color(rgb(MUTED))
-                                    .hover(|s| s.text_color(rgb(0xf7768e)))
-                                    .cursor_pointer()
-                                    .child("✕")
-                                    .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
-                                    .on_click(cx.listener(move |this, _e, _w, cx| {
-                                        this.remove_project(idx, cx);
-                                    })),
-                            )
-                        })
-                        .on_click(cx.listener(move |this, _e, _w, cx| {
-                            this.switcher_open = false;
-                            this.switch_to(idx, cx);
-                        })),
-                );
-            }
+                        .child("Switch Project  ·  arrows to move  ·  enter to open  ·  number to jump  ·  x to close"),
+                )
+                .child(grid);
             root = root.child(panel);
         }
 
