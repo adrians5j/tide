@@ -227,6 +227,7 @@ fn search_ripgrep(query: &str, scopes: &[PathBuf], case_sensitive: bool, globs: 
         // case-sensitive on demand; otherwise smart-case (insensitive if all-lowercase)
         .arg(if case_sensitive { "--case-sensitive" } else { "--smart-case" })
         .arg("--max-count=50") // per-file cap
+        .arg("--max-filesize=1M") // skip huge committed bundles (minified .cjs, etc.)
         .arg("--fixed-strings"); // literal, not regex
     for g in globs {
         cmd.arg("--glob").arg(g);
@@ -284,6 +285,10 @@ fn search_rust(query: &str, scopes: &[PathBuf], case_sensitive: bool, globs: &[S
     for path in files {
         if out.len() >= FIND_CAP {
             break;
+        }
+        // skip huge bundles (minified .cjs, etc.) — matches rg's --max-filesize
+        if fs::metadata(&path).map(|m| m.len() > 1024 * 1024).unwrap_or(false) {
+            continue;
         }
         let Ok(content) = fs::read_to_string(&path) else { continue };
         for (i, line) in content.lines().enumerate() {
@@ -6543,8 +6548,26 @@ impl Storm {
             let stale = self.find_preview.as_ref().map(|p| p.path != r.path).unwrap_or(true);
             if stale {
                 let content = std::fs::read_to_string(&r.path).unwrap_or_default();
-                let styles = highlighter().highlight(&content, &r.path);
-                let lines = content.split('\n').map(|s| s.to_string()).collect();
+                // Guard against minified bundles / huge files: highlighting the
+                // whole file and shaping 100k-char lines runs in render and would
+                // freeze the UI. For such files skip highlighting and hard-truncate
+                // each line before it's ever shaped.
+                const MAX_LINE: usize = 2000;
+                let big = content.len() > 512 * 1024
+                    || content.split('\n').take(4000).any(|l| l.len() > MAX_LINE);
+                let styles = if big { Vec::new() } else { highlighter().highlight(&content, &r.path) };
+                let lines = content
+                    .split('\n')
+                    .map(|s| {
+                        if big && s.len() > MAX_LINE {
+                            let mut t: String = s.chars().take(MAX_LINE).collect();
+                            t.push('…');
+                            t
+                        } else {
+                            s.to_string()
+                        }
+                    })
+                    .collect();
                 self.find_preview = Some(FindPreview { path: r.path.clone(), lines, styles });
             }
         }

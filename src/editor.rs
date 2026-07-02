@@ -154,7 +154,7 @@ impl Editor {
 
     pub fn load(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let content = std::fs::read_to_string(&path).unwrap_or_default();
-        self.styles = self.hl.highlight(&content, &path);
+        self.styles = highlight_guarded(&self.hl, &content, &path);
         // close the previously-open document on the server
         if let Some(lsp) = &self.lsp {
             if !self.uri.is_empty() {
@@ -203,7 +203,7 @@ impl Editor {
     /// Replace the buffer with `content` and resync highlighting + the LSP.
     fn reload_from(&mut self, content: String, disk: Option<SystemTime>, path: &Path, cx: &mut Context<Self>) {
         self.content = content;
-        self.styles = self.hl.highlight(&self.content, path);
+        self.styles = highlight_guarded(&self.hl, &self.content, path);
         // keep the cursor in range; drop selection/undo from the old contents
         let caret = self.cursor_offset().min(self.content.len());
         self.selected_range = caret..caret;
@@ -299,7 +299,7 @@ impl Editor {
 
     fn rehighlight(&mut self) {
         if let Some(path) = &self.path {
-            self.styles = self.hl.highlight(&self.content, path);
+            self.styles = highlight_guarded(&self.hl, &self.content, path);
         }
     }
 
@@ -1370,9 +1370,19 @@ impl Element for EditorElement {
             let num_line = text_sys.shape_line(num.into(), font_size, &[num_run], None);
             gutter.push((y, num_line));
 
-            // code line with syntect runs
-            let runs = build_runs(line, styles.get(row));
-            let shaped = text_sys.shape_line(SharedString::from(line.to_string()), font_size, &runs, None);
+            // code line with syntect runs. Cap the shaped length so a single
+            // absurdly long line (minified bundle) can't freeze layout — normal
+            // source lines are far under this, so this only bites huge files.
+            const MAX_SHAPE: usize = 4000;
+            let disp: String = if line.len() > MAX_SHAPE {
+                let mut s: String = line.chars().take(MAX_SHAPE).collect();
+                s.push('…');
+                s
+            } else {
+                line.to_string()
+            };
+            let runs = build_runs(&disp, styles.get(row));
+            let shaped = text_sys.shape_line(SharedString::from(disp), font_size, &runs, None);
 
             // selection highlight on this row
             let row_start = line_starts[row];
@@ -1605,6 +1615,19 @@ fn resolve_import(dir: &Path, spec: &str) -> Option<PathBuf> {
         }
     }
     cands.into_iter().find(|p| p.is_file())
+}
+
+/// Syntax-highlight `content`, but skip the work for large/minified files
+/// (multi-MB, or any line over ~2000 chars) — running syntect over a bundle in
+/// the load path would freeze the UI. Such files render unhighlighted.
+fn highlight_guarded(hl: &Highlighter, content: &str, path: &Path) -> Vec<Vec<(usize, u32)>> {
+    let big = content.len() > 512 * 1024
+        || content.split('\n').take(4000).any(|l| l.len() > 2000);
+    if big {
+        Vec::new()
+    } else {
+        hl.highlight(content, path)
+    }
 }
 
 fn build_runs(line: &str, styles: Option<&Vec<(usize, u32)>>) -> Vec<TextRun> {
