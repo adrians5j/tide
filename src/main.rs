@@ -8852,6 +8852,14 @@ impl Render for Workspace {
             self.focus_pending = false;
             let storm = self.projects[active].clone();
             storm.update(cx, |s, cx| s.focus_active(window, cx));
+        } else if window.focused(cx).is_none() || self.focus.is_focused(window) {
+            // Self-heal focus: when nothing is focused (e.g. after a dialog closes
+            // or the window regains focus) or it landed on the bare workspace root,
+            // global shortcuts like cmd+shift+p wouldn't route (they're handled in
+            // the project view). Push focus back into the active project so they
+            // work without first clicking the editor.
+            let storm = self.projects[active].clone();
+            storm.update(cx, |s, cx| s.focus_active(window, cx));
         }
 
         let mut root = div()
