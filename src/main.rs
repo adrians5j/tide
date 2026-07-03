@@ -5715,7 +5715,9 @@ impl Storm {
                     .items_center()
                     .text_color(rgb(MUTED))
                     .text_size(px(12.))
-                    .child(format!("COMMIT  ·  {} changed", count)),
+                    .child(format!("COMMIT  ·  {} changed", count))
+                    .child(div().flex_grow(1.0))
+                    .child(self.collapse_left_btn(cx)),
             )
             // filter bar
             .child(
@@ -5740,11 +5742,10 @@ impl Storm {
                     )
                     .child(div().font_family(ICON_FONT).text_size(px(12.)).text_color(rgb(MUTED)).child(IC_SEARCH))
                     .child(if self.commit_filter.is_empty() {
-                        div().flex_grow(1.0).text_size(px(12.)).text_color(rgb(MUTED)).child(format!("Filter files…{}", self.caret_if(filter_focused)))
+                        div().text_size(px(12.)).text_color(rgb(MUTED)).child(format!("Filter files…{}", self.caret_if(filter_focused)))
                     } else {
-                        div().flex_grow(1.0).text_size(px(12.)).text_color(rgb(TEXT)).child(self.commit_filter.render(self.caret_if(filter_focused), SELECTION))
-                    })
-                    .child(self.collapse_left_btn(cx)),
+                        div().text_size(px(12.)).text_color(rgb(TEXT)).child(self.commit_filter.render(self.caret_if(filter_focused), SELECTION))
+                    }),
             )
             // checked-state segmented control
             .child(
