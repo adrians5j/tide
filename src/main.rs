@@ -844,9 +844,11 @@ fn diff_pane(
             .child(div().flex_grow(1.0).px_2().child(StyledText::new(text).with_runs(runs))),
         );
     }
+    // fill the (already split-sized) wrapper — the 50/50 vs custom split is set
+    // by the flex_grow on the wrappers in DiffWindow::render, not here
     div()
         .relative()
-        .w_1_2()
+        .w_full()
         .h_full()
         .overflow_hidden()
         .child(area)
