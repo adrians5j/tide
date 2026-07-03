@@ -70,9 +70,6 @@ impl Sel {
 pub struct EventProxy {
     writer: Writer,
     dirty: Arc<AtomicBool>,
-    // set when the child rings the terminal bell (Claude Code's "awaiting input"
-    // notification); consumed by the workspace to raise the red attention dot
-    bell: Arc<AtomicBool>,
 }
 
 impl EventListener for EventProxy {
@@ -82,10 +79,6 @@ impl EventListener for EventProxy {
                 if let Ok(mut w) = self.writer.lock() {
                     let _ = w.write_all(s.as_bytes());
                 }
-            }
-            Event::Bell => {
-                self.bell.store(true, Ordering::Relaxed);
-                self.dirty.store(true, Ordering::Relaxed);
             }
             Event::Wakeup | Event::MouseCursorDirty => {
                 self.dirty.store(true, Ordering::Relaxed);
@@ -138,9 +131,6 @@ pub struct Terminal {
     selecting: bool,
     /// text of the current selection, for cmd+c
     sel_text: Option<String>,
-    /// raised by the event proxy when the child rings the bell; polled + cleared
-    /// by the workspace to drive the "needs your attention" dot
-    bell: Arc<AtomicBool>,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
 }
 
@@ -168,8 +158,7 @@ impl Terminal {
 
         let writer: Writer = Arc::new(Mutex::new(pair.master.take_writer().expect("writer")));
         let dirty = Arc::new(AtomicBool::new(true));
-        let bell = Arc::new(AtomicBool::new(false));
-        let proxy = EventProxy { writer: writer.clone(), dirty: dirty.clone(), bell: bell.clone() };
+        let proxy = EventProxy { writer: writer.clone(), dirty: dirty.clone() };
 
         let term = Term::new(Config::default(), &TermDims { columns: cols, screen_lines: rows }, proxy);
         let term: SharedTerm = Arc::new(Mutex::new(term));
@@ -237,15 +226,8 @@ impl Terminal {
             selection: None,
             selecting: false,
             sel_text: None,
-            bell,
             _child: child,
         }
-    }
-
-    /// Consume a pending bell (the child's "awaiting input" signal). Returns
-    /// true once per ring; the workspace polls this to raise the attention dot.
-    pub fn take_bell(&self) -> bool {
-        self.bell.swap(false, Ordering::Relaxed)
     }
 
     /// Map a window-space position to a 0-based (col, row) display cell.

@@ -1950,12 +1950,8 @@ struct Storm {
     // workspace (multi-project) info, pushed down by the Workspace each render
     ws_names: Vec<String>,
     ws_branches: Vec<String>,
-    ws_attention: Vec<bool>, // per-project: a terminal rang the bell, awaiting you
     ws_active: usize,
     ws_open: bool, // project-switcher dropdown expanded
-    // raised when one of this project's terminals rings the bell (Claude Code's
-    // "awaiting input" signal); cleared once you switch to / view this project.
-    needs_attention: bool,
 }
 
 /// Navigation requests a project view sends up to the workspace.
@@ -1964,34 +1960,9 @@ enum ProjectNav {
     Open,
     OpenPath(PathBuf), // open a project at a specific folder path (from the new-project dialog)
     Remove(usize),
-    Attention, // a terminal rang the bell → workspace should raise the red dot
-    Reorder { from: usize, to: usize }, // drag-reorder a topbar chip before `to`
 }
 
 impl EventEmitter<ProjectNav> for Storm {}
-
-/// Drag payload for reordering topbar workspace chips (the dragged project's index).
-struct DraggedProject(usize);
-
-/// The little chip rendered under the cursor while dragging a workspace icon.
-struct DragChip {
-    label: String,
-}
-impl Render for DragChip {
-    fn render(&mut self, _w: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .size(px(26.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_md()
-            .text_size(px(10.))
-            .bg(rgb(ICON_SELECTED_BG))
-            .text_color(rgb(SEL_TEXT))
-            .shadow_lg()
-            .child(self.label.clone())
-    }
-}
 
 // directories never walked by the finder / search-fallback index (heavy/noise)
 const IGNORED: &[&str] = &["node_modules", ".git", ".DS_Store", "target", "dist", "build"];
@@ -2192,16 +2163,13 @@ impl Storm {
             proc_ws_pids: Vec::new(),
             ws_names: Vec::new(),
             ws_branches: Vec::new(),
-            ws_attention: Vec::new(),
             ws_active: 0,
             ws_open: false,
-            needs_attention: false,
         };
         s.ignored = git_ignored_paths(&s.root); // hide git-ignored paths from the tree
         s.expanded.insert(s.root.clone()); // the root node starts expanded
         s.rebuild();
         s.start_git_poll(cx);
-        s.start_bell_poll(cx);
         s.start_caret_blink(cx);
         s.lsp = Lsp::new(&s.root);
         let root = s.root.clone();
@@ -2396,36 +2364,6 @@ impl Storm {
                 break;
             }
             cx.background_executor().timer(Duration::from_secs(5)).await;
-        })
-        .detach();
-    }
-
-    /// Poll this project's terminals for a bell (Claude Code's "awaiting input"
-    /// signal). On a ring, raise `needs_attention` and nudge the workspace so the
-    /// red dot appears on this project's topbar icon.
-    fn start_bell_poll(&self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor().timer(Duration::from_millis(400)).await;
-            if this
-                .update(cx, |this, cx| {
-                    // drain every terminal's bell flag (don't short-circuit, so a
-                    // ring on a background terminal still clears its own flag)
-                    let mut rang = false;
-                    for t in &this.terminals {
-                        if t.read(cx).take_bell() {
-                            rang = true;
-                        }
-                    }
-                    if rang && !this.needs_attention {
-                        this.needs_attention = true;
-                        cx.emit(ProjectNav::Attention);
-                        cx.notify();
-                    }
-                })
-                .is_err()
-            {
-                break;
-            }
         })
         .detach();
     }
@@ -5045,107 +4983,9 @@ impl Storm {
                         )
                     }),
             );
-        // project quick-switch icons (2+ projects only), centered in the bar.
-        // Icons rest colorless; a red dot flags a workspace whose terminal rang
-        // the bell (Claude Code awaiting your input) until you switch to it.
-        if self.ws_names.len() > 1 {
-            let mut strip = div().flex().flex_row().items_center().gap_1();
-            // leading drop zone → drop here to move a chip to the far left (index 0)
-            strip = strip.child(
-                div()
-                    .id("ws-drop-lead")
-                    .w(px(8.))
-                    .h(px(22.))
-                    .rounded_sm()
-                    .drag_over::<DraggedProject>(|s, _, _, _| s.bg(rgb(ACCENT)))
-                    .on_drop(cx.listener(|_this, d: &DraggedProject, _w, cx| {
-                        cx.emit(ProjectNav::Reorder { from: d.0, to: 0 });
-                        cx.notify();
-                    })),
-            );
-            for (i, name) in self.ws_names.iter().enumerate() {
-                let active = i == self.ws_active;
-                let attention = self.ws_attention.get(i).copied().unwrap_or(false);
-                // viewed project keeps the selected (blue) bg; others rest at the
-                // bar color (invisible until you hover)
-                let bg = if active { ICON_SELECTED_BG } else { PANEL_BG };
-                let text = if active { SEL_TEXT } else { MUTED };
-                let label = project_icon_label(name);
-                let label_drag = label.clone();
-                let nm = name.clone();
-                let idx = i;
-                strip = strip.child(
-                    div()
-                        .id(("topbar-proj", i))
-                        // wrapper is relative so the red dot can sit at the corner
-                        .relative()
-                        .size(px(26.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_md()
-                        .text_size(px(10.))
-                        .bg(rgb(bg))
-                        .text_color(rgb(text))
-                        .cursor_pointer()
-                        .when(!active, |d| d.hover(|s| s.bg(rgb(HOVER))))
-                        // drag to reorder: start a drag carrying this chip's index,
-                        // drop onto another chip to move this one before it
-                        .on_drag(DraggedProject(i), move |_, _, _, cx| {
-                            cx.new(|_| DragChip { label: label_drag.clone() })
-                        })
-                        .drag_over::<DraggedProject>(|s, _, _, _| s.bg(rgb(ACCENT)))
-                        .on_drop(cx.listener(move |_this, dragged: &DraggedProject, _w, cx| {
-                            cx.emit(ProjectNav::Reorder { from: dragged.0, to: idx });
-                            cx.notify();
-                        }))
-                        .child(label)
-                        // red "needs you" dot, top-right corner
-                        .when(attention, |d| {
-                            d.child(
-                                div()
-                                    .absolute()
-                                    .top(px(-2.))
-                                    .right(px(-2.))
-                                    .size(px(9.))
-                                    .rounded_full()
-                                    .bg(rgb(ATTENTION_RED))
-                                    .border_2()
-                                    .border_color(rgb(PANEL_BG)),
-                            )
-                        })
-                        .tooltip(move |_w, cx| {
-                            let t = if attention {
-                                format!("{nm} — needs your attention")
-                            } else {
-                                nm.clone()
-                            };
-                            cx.new(|_| TooltipView { text: t.into() }).into()
-                        })
-                        .on_click(cx.listener(move |_this, _e, _w, cx| {
-                            cx.emit(ProjectNav::Switch(idx));
-                            cx.notify();
-                        })),
-                );
-            }
-            // strip in the middle; the right spacer doubles as a big drop zone →
-            // drop anywhere to its right to move a chip to the far right (append)
-            let end = self.ws_names.len();
-            bar = bar.child(strip).child(
-                div()
-                    .id("ws-drop-trail")
-                    .flex_1()
-                    .h(px(22.))
-                    .drag_over::<DraggedProject>(|s, _, _, _| s.bg(rgb(HOVER)))
-                    .on_drop(cx.listener(move |_this, d: &DraggedProject, _w, cx| {
-                        cx.emit(ProjectNav::Reorder { from: d.0, to: end });
-                        cx.notify();
-                    })),
-            );
-        } else {
-            // keep the left group left-aligned when there's no strip
-            bar = bar.child(div().flex_1());
-        }
+        // (workspace quick-switch chips removed — switch projects via cmd+e or the
+        // project-name dropdown; the spacer keeps the left group left-aligned)
+        bar = bar.child(div().flex_1());
         bar
     }
 
@@ -8290,21 +8130,6 @@ impl Render for TooltipView {
     }
 }
 
-/// Color of the "needs your attention" dot on a workspace icon (a terminal in
-/// that project rang the bell — Claude Code awaiting input).
-const ATTENTION_RED: u32 = 0xe5484d;
-
-/// Two-letter badge for a project icon: first + last non-space char, uppercased
-/// (e.g. "wby-next1" → "W1", "wcp" → "WP", "a" → "A").
-fn project_icon_label(name: &str) -> String {
-    let chars: Vec<char> = name.chars().filter(|c| !c.is_whitespace()).collect();
-    match chars.as_slice() {
-        [] => "?".to_string(),
-        [only] => only.to_uppercase().to_string(),
-        [first, .., last] => format!("{}{}", first.to_uppercase(), last.to_uppercase()),
-    }
-}
-
 fn tip(text: &'static str) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
     move |_w, cx| cx.new(|_| TooltipView { text: text.into() }).into()
 }
@@ -8828,16 +8653,12 @@ impl Workspace {
                 if *i < this.projects.len() {
                     this.active = *i;
                     this.focus_pending = true;
-                    // switching to a project counts as attending it → clear its dot
-                    this.projects[*i].update(cx, |s, _| s.needs_attention = false);
                     cx.notify();
                 }
             }
             ProjectNav::Open => this.open_project(cx),
             ProjectNav::OpenPath(p) => this.add_project(p.clone(), cx),
             ProjectNav::Remove(i) => this.remove_project(*i, cx),
-            ProjectNav::Attention => cx.notify(), // raise the red dot promptly
-            ProjectNav::Reorder { from, to } => this.reorder_projects(*from, *to, cx),
         })
         .detach();
         self.projects.push(storm);
@@ -8859,28 +8680,6 @@ impl Workspace {
         }
         self.switcher_sel = self.switcher_sel.min(self.projects.len() - 1);
         self.focus_pending = true;
-        cx.notify();
-    }
-
-    /// Move the project at `from` to sit just before `to` (drag-reorder from the
-    /// topbar). Keeps `active` pointing at the same project across the shuffle.
-    fn reorder_projects(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
-        let n = self.projects.len();
-        // `to` may equal n (drop past the last chip → append)
-        if from >= n || to > n || from == to {
-            return;
-        }
-        let active_id = self.projects[self.active].entity_id();
-        let item = self.projects.remove(from);
-        // removing `from` shifts everything after it left by one
-        let dst = if from < to { to - 1 } else { to };
-        self.projects.insert(dst, item);
-        self.active = self
-            .projects
-            .iter()
-            .position(|p| p.entity_id() == active_id)
-            .unwrap_or(0);
-        self.switcher_sel = self.switcher_sel.min(n - 1);
         cx.notify();
     }
 
@@ -9007,17 +8806,12 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.active;
-        // viewing a project counts as attending it → keep its dot clear
-        self.projects[active].update(cx, |s, _| s.needs_attention = false);
-
-        // push the project list into the active view so its topbar can show it
+        // push the project list into the active view so its dropdown can show it
         let names: Vec<String> = self.projects.iter().map(|p| p.read(cx).project_name()).collect();
         let branches: Vec<String> = self.projects.iter().map(|p| p.read(cx).branch.clone()).collect();
-        let attention: Vec<bool> = self.projects.iter().map(|p| p.read(cx).needs_attention).collect();
         self.projects[active].update(cx, |s, _| {
             s.ws_names = names;
             s.ws_branches = branches;
-            s.ws_attention = attention;
             s.ws_active = active;
         });
         // focus the active project after a switch (render has the Window)
