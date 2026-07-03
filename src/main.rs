@@ -5302,6 +5302,8 @@ impl Storm {
     /// The read-only Run console: a bottom dock streaming command output.
     fn render_run(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let running = self.run_running;
+        // last run exited non-zero → tint the console red so failures are obvious
+        let failed = self.run_failed && !running;
         let btn = |id: &'static str, glyph: &'static str| {
             div()
                 .id(id)
@@ -5322,20 +5324,20 @@ impl Storm {
             .px_3()
             .bg(rgb(PANEL_BG))
             .border_b_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(if failed { GIT_DELETED } else { BORDER }))
             .child(
                 div()
                     .font_family(ICON_FONT)
                     .text_size(px(12.))
-                    .text_color(rgb(if running { ACCENT } else { MUTED }))
+                    .text_color(rgb(if running { ACCENT } else if failed { GIT_DELETED } else { MUTED }))
                     .child(IC_RUN),
             )
             .child(div().text_size(px(12.)).text_color(rgb(TEXT)).child(self.run_cmd.clone()))
             .child(
                 div()
                     .text_size(px(11.))
-                    .text_color(rgb(if running { ACCENT } else { MUTED }))
-                    .child(if running { "running…" } else { "done" }),
+                    .text_color(rgb(if running { ACCENT } else if failed { GIT_DELETED } else { MUTED }))
+                    .child(if running { "running…" } else if failed { "failed" } else { "done" }),
             )
             .child(div().flex_1())
             .child(btn("run-rerun", "↻").tooltip(tip("Re-run")).on_click(cx.listener(|this, _e, _w, cx| {
@@ -5376,7 +5378,7 @@ impl Storm {
             .flex_col()
             .bg(rgb(BG))
             .border_t_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(if failed { GIT_DELETED } else { BORDER }))
             .child(header)
             .child(list)
     }
