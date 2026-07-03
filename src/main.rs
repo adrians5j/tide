@@ -225,8 +225,9 @@ fn search_ripgrep(query: &str, scopes: &[PathBuf], case_sensitive: bool, globs: 
     cmd.arg("--line-number")
         .arg("--no-heading")
         .arg("--color=never")
-        // case-sensitive on demand; otherwise smart-case (insensitive if all-lowercase)
-        .arg(if case_sensitive { "--case-sensitive" } else { "--smart-case" })
+        // truly case-insensitive unless the "match case" toggle is on (smart-case
+        // would flip to case-sensitive whenever the query has any uppercase)
+        .arg(if case_sensitive { "--case-sensitive" } else { "--ignore-case" })
         .arg("--max-count=50") // per-file cap
         .arg("--max-filesize=1M") // skip huge committed bundles (minified .cjs, etc.)
         .arg("--fixed-strings"); // literal, not regex
