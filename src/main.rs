@@ -347,6 +347,32 @@ fn load_recent_projects() -> Vec<PathBuf> {
     text.lines().map(|l| PathBuf::from(l.trim())).filter(|p| p.is_dir()).collect()
 }
 
+/// File storing the last milestone used for Create PR (pre-filled next time).
+fn milestone_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".config/tide/last-milestone.txt"))
+}
+
+/// The milestone chosen last time Create PR ran, if any.
+fn load_last_milestone() -> Option<String> {
+    let text = std::fs::read_to_string(milestone_path()?).ok()?;
+    let t = text.trim().to_string();
+    (!t.is_empty()).then_some(t)
+}
+
+/// Remember `m` as the milestone to pre-fill next time Create PR opens.
+fn save_last_milestone(m: &str) {
+    let m = m.trim();
+    if m.is_empty() {
+        return;
+    }
+    let Some(file) = milestone_path() else { return };
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&file, m);
+}
+
 /// Record `root` as the most-recently-opened project (dedup, cap 20).
 fn push_recent_project(root: &Path) {
     let Some(file) = recents_path() else { return };
@@ -3186,7 +3212,11 @@ impl Storm {
     /// Milestones are fetched from GitHub in the background to drive autocomplete.
     fn open_pr_create_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.prc_open = true;
-        self.prc_milestone.clear();
+        // pre-fill (and auto-select via the suggestion list) the last milestone used
+        match load_last_milestone() {
+            Some(m) => self.prc_milestone.set(m),
+            None => self.prc_milestone.clear(),
+        }
         self.prc_milestones.clear();
         self.prc_sel = 0;
         window.focus(&self.prc_focus, cx);
@@ -3250,6 +3280,7 @@ impl Storm {
                 let cmd = if milestone.is_empty() {
                     "pr".to_string()
                 } else {
+                    save_last_milestone(&milestone); // remember for next time
                     format!("pr --ms {}", milestone)
                 };
                 self.run_command(cmd, cx);
@@ -7893,6 +7924,7 @@ impl Storm {
                                 .child(title.clone())
                                 .on_click(cx.listener(move |this, _e, _w, cx| {
                                     this.prc_open = false;
+                                    save_last_milestone(&title); // remember for next time
                                     this.run_command(format!("pr --ms {}", title), cx);
                                 })),
                         );
