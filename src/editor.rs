@@ -1244,6 +1244,7 @@ pub struct EditorPrepaint {
     selections: Vec<PaintQuad>,
     link: Option<PaintQuad>,
     search: Vec<PaintQuad>,
+    word: Vec<PaintQuad>, // same-text occurrence highlights
 }
 
 impl IntoElement for EditorElement {
@@ -1298,6 +1299,13 @@ impl Element for EditorElement {
         let link_range = editor.link.clone();
         let search_matches = editor.search_matches.clone();
         let search_idx = editor.search_idx;
+        // same-word highlight: when a whole identifier is selected, faintly mark
+        // every occurrence of it in the file (clears when the selection empties).
+        // Skipped on huge files to stay off the freeze path.
+        let word_hi: Vec<Range<usize>> = match content.get(selected.clone()) {
+            Some(t) if content.len() < 512 * 1024 && is_word_token(t) => word_occurrences(&content, t),
+            _ => Vec::new(),
+        };
 
         let line_height = px(LINE_HEIGHT);
         let font_size = px(FONT_SIZE);
@@ -1377,6 +1385,7 @@ impl Element for EditorElement {
         let mut cursor = None;
         let mut link = None;
         let mut search = Vec::new();
+        let mut word = Vec::new();
 
         for row in first..last {
             let y = bounds.top() + line_height * (row as f32) - scroll_y;
@@ -1450,6 +1459,20 @@ impl Element for EditorElement {
                 }
             }
 
+            // same-word occurrence highlights (skip the active selection itself)
+            for m in &word_hi {
+                if *m != selected && m.start >= row_start && m.end <= row_end {
+                    let s0 = m.start - row_start;
+                    let s1 = m.end - row_start;
+                    let x0 = code_x + shaped.x_for_index(s0) - scroll_x;
+                    let x1 = code_x + shaped.x_for_index(s1) - scroll_x;
+                    word.push(fill(
+                        Bounds::from_corners(point(x0, y), point(x1, y + line_height)),
+                        rgb(WORD_MATCH_BG),
+                    ));
+                }
+            }
+
             // cmd-hover link underline on this row
             if let Some((lrow, c0, c1)) = link_pos {
                 if row == lrow && c1 <= line.len() {
@@ -1481,6 +1504,7 @@ impl Element for EditorElement {
             selections,
             link,
             search,
+            word,
         }
     }
 
@@ -1521,6 +1545,9 @@ impl Element for EditorElement {
         };
         let focused = focus_handle.is_focused(window);
         window.with_content_mask(Some(code_mask), |window| {
+            for w in prepaint.word.drain(..) {
+                window.paint_quad(w);
+            }
             for s in prepaint.search.drain(..) {
                 window.paint_quad(s);
             }
@@ -1653,6 +1680,38 @@ fn highlight_guarded(hl: &Highlighter, content: &str, path: &Path) -> Vec<Vec<(u
     } else {
         hl.highlight(content, path)
     }
+}
+
+/// Is `t` a single identifier token (non-empty, only word chars)? Gates the
+/// same-word highlight so selecting arbitrary spans doesn't paint noise.
+fn is_word_token(t: &str) -> bool {
+    !t.is_empty() && t.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Whole-word occurrences of `word` in `content` (byte ranges), capped.
+fn word_occurrences(content: &str, word: &str) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let bytes = content.as_bytes();
+    let wlen = word.len();
+    let mut start = 0;
+    while let Some(rel) = content[start..].find(word) {
+        let i = start + rel;
+        let end = i + wlen;
+        let before_ok = i == 0 || !is_word_byte(bytes[i - 1]);
+        let after_ok = end >= content.len() || !is_word_byte(bytes[end]);
+        if before_ok && after_ok {
+            out.push(i..end);
+            if out.len() >= 1000 {
+                break;
+            }
+        }
+        start = end.max(i + 1);
+    }
+    out
 }
 
 fn build_runs(line: &str, styles: Option<&Vec<(usize, u32)>>) -> Vec<TextRun> {

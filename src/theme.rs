@@ -37,3 +37,6 @@ pub const DIFF_ADD_BG: u32 = 0x26331f;
 pub const DIFF_REMOVE_BG: u32 = 0x3a2526;
 pub const SEARCH_MATCH_BG: u32 = 0x4d4023;
 pub const SEARCH_CURRENT_BG: u32 = 0x3a4768;
+
+// ── same-word occurrence highlight (selecting a word marks its twins) ────────
+pub const WORD_MATCH_BG: u32 = 0x33414d;
