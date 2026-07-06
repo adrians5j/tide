@@ -5273,25 +5273,38 @@ impl Storm {
         } else {
             ("✓".to_string(), GIT_NEW, format!("{} done", self.run_cmd))
         };
+        let label = if self.run_running { "RUNNING" } else if self.run_failed { "FAILED" } else { "DONE" };
         div()
             .id("run-toast")
             .absolute()
-            .bottom(px(34.))
-            .right(px(16.))
+            .bottom(px(56.))
+            .right(px(28.))
+            .min_w(px(340.))
+            .max_w(px(560.))
             .flex()
             .flex_row()
             .items_center()
-            .gap_2()
-            .px_3()
-            .py_2()
+            .gap_3()
+            .pl_3()
+            .pr_4()
+            .py_3()
             .bg(rgb(POPUP_BG))
             .border_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(color))
+            .border_l_4()
             .rounded_md()
             .shadow_lg()
             .cursor_pointer()
-            .child(div().text_color(rgb(color)).child(glyph))
-            .child(div().text_size(px(12.)).text_color(rgb(TEXT)).child(msg))
+            // big state glyph
+            .child(div().text_size(px(20.)).text_color(rgb(color)).child(glyph))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_size(px(11.)).text_color(rgb(color)).child(label))
+                    .child(div().text_size(px(14.)).text_color(rgb(TEXT)).truncate().child(msg)),
+            )
             .on_click(cx.listener(|this, _e, _w, cx| {
                 this.run_open = true;
                 this.run_active = false;
