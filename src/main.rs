@@ -9724,14 +9724,21 @@ impl Render for DiffWindow {
                     cx.notify();
                 }),
             );
+        // explicit pixel widths (flex_grow split was unreliable — a pane's content
+        // min-width leaked through and skewed the ratio). Compute from the window:
+        let win_w = f32::from(window.viewport_size().width);
+        let sidebar_w = if self.files.len() > 1 { 260.0 } else { 0.0 };
+        let avail = (win_w - sidebar_w - 4.0).max(2.0); // minus the 4px divider
+        let lw = (avail * split).max(1.0);
+        let rw = (avail - lw).max(1.0);
         let body = div()
             .flex()
             .flex_row()
             .flex_grow(1.0)
             .min_h(px(0.))
-            .child(div().flex().flex_grow(split).flex_basis(px(0.)).min_w(px(0.)).min_h(px(0.)).child(left_pane))
+            .child(div().w(px(lw)).h_full().flex_shrink_0().overflow_hidden().child(left_pane))
             .child(divider)
-            .child(div().flex().flex_grow(1.0 - split).flex_basis(px(0.)).min_w(px(0.)).min_h(px(0.)).child(right_pane));
+            .child(div().w(px(rw)).h_full().flex_shrink_0().overflow_hidden().child(right_pane));
 
         // file-tree sidebar (only for a multi-file diff): collapsible directories,
         // click a file to jump to it, current file highlighted
