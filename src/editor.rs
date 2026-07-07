@@ -2145,6 +2145,7 @@ impl Editor {
         let x = gw + (col as f32) * cw - f32::from(self.scroll_x);
         let y = ((row + 1) as f32) * LINE_HEIGHT - f32::from(self.scroll_y);
         div()
+            .id("ro-hint")
             .absolute()
             .left(px(x))
             .top(px(y + 2.0))
@@ -2160,6 +2161,9 @@ impl Editor {
             .flex()
             .flex_row()
             .gap_1()
+            // capture the click so the editor underneath doesn't move the cursor
+            // (which was re-anchoring the hint and eating the link click)
+            .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
             .child("🔒 Read-only —")
             // clickable link → workspace flips to edit mode
             .child(
