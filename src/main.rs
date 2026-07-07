@@ -1666,12 +1666,12 @@ fn rollup_status(v: &serde_json::Value) -> PrStatus {
     }
 }
 
-fn fetch_pr_link(root: &Path, branch: &str) -> Option<(u64, String, PrStatus)> {
+fn fetch_pr_link(root: &Path, branch: &str) -> Option<(u64, String, PrStatus, String)> {
     if branch.is_empty() {
         return None;
     }
     let out = Command::new("gh")
-        .args(["pr", "view", branch, "--json", "number,url,statusCheckRollup"])
+        .args(["pr", "view", branch, "--json", "number,url,statusCheckRollup,baseRefName"])
         .current_dir(root)
         .output()
         .ok()?;
@@ -1681,7 +1681,8 @@ fn fetch_pr_link(root: &Path, branch: &str) -> Option<(u64, String, PrStatus)> {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
     let number = v.get("number")?.as_u64()?;
     let url = v.get("url")?.as_str()?.to_string();
-    Some((number, url, rollup_status(&v)))
+    let base = v.get("baseRefName").and_then(|b| b.as_str()).unwrap_or("").to_string();
+    Some((number, url, rollup_status(&v), base))
 }
 
 /// Open milestone titles for the repo, newest first (via `gh api`). Empty when
@@ -1873,7 +1874,7 @@ struct Storm {
     branch_parent: Option<String>, // branch this one was created from (reflog, best-effort)
     // open PR for the current branch, if any: (number, url). Refetched when the
     // branch changes; `pr_link_branch` is the branch it was last queried for.
-    pr_link: Option<(u64, String, PrStatus)>,
+    pr_link: Option<(u64, String, PrStatus, String)>, // (number, url, status, base branch)
     pr_link_branch: String,
     mem_mb: u64,
     read_only: bool, // when on, editors block manual edits (nav/select/copy still work)
@@ -4971,15 +4972,23 @@ impl Storm {
                                 .text_color(rgb(MUTED))
                                 .text_size(px(12.))
                                 .child(format!("⎇ {}", self.branch))
-                                // parent branch this was forked from (best-effort, reflog)
-                                .when_some(self.branch_parent.clone(), |d, parent| {
-                                    d.child(
-                                        div()
-                                            .text_size(px(11.))
-                                            .text_color(rgb(LINE_NUMBER))
-                                            .child(format!("from {}", parent)),
-                                    )
-                                })
+                                // target/parent: the PR's base branch if there's a PR
+                                // (authoritative), else the reflog "created from" guess
+                                .when_some(
+                                    self.pr_link
+                                        .as_ref()
+                                        .map(|(_, _, _, b)| b.clone())
+                                        .filter(|b| !b.is_empty())
+                                        .or_else(|| self.branch_parent.clone()),
+                                    |d, target| {
+                                        d.child(
+                                            div()
+                                                .text_size(px(11.))
+                                                .text_color(rgb(LINE_NUMBER))
+                                                .child(format!("→ {}", target)),
+                                        )
+                                    },
+                                )
                                 // copy-to-clipboard button for the branch name
                                 .child(
                                     div()
@@ -5011,7 +5020,7 @@ impl Storm {
                         )
                     })
                     // PR link for the current branch, if one exists → opens it
-                    .when_some(self.pr_link.clone(), |d, (num, url, status)| {
+                    .when_some(self.pr_link.clone(), |d, (num, url, status, _base)| {
                         d.child(
                             div()
                                 .id("pr-link")
