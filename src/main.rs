@@ -1576,52 +1576,14 @@ fn split_finder_query(q: &str) -> (&str, Option<usize>, Option<usize>) {
 
 /// Current git branch name (empty if not a repo).
 fn git_branch(root: &Path) -> String {
-    let b = Command::new("git")
+    Command::new("git")
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .current_dir(root)
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    if b != "HEAD" {
-        return b;
-    }
-    // detached HEAD: resolve a branch name pointing at HEAD (e.g. after checking
-    // out origin/release/x). Prefer a local branch, else a remote branch with
-    // the remote prefix stripped; fall back to the short SHA.
-    let refs = Command::new("git")
-        .args(["for-each-ref", "--points-at", "HEAD", "--format=%(refname)", "refs/heads", "refs/remotes"])
-        .current_dir(root)
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
-    let mut remote_name: Option<String> = None;
-    for r in refs.lines() {
-        if let Some(local) = r.strip_prefix("refs/heads/") {
-            return local.to_string(); // local branch at HEAD wins
-        }
-        if let Some(rem) = r.strip_prefix("refs/remotes/") {
-            // rem = "<remote>/<branch...>"; drop the remote segment, skip HEAD alias
-            if let Some((_, name)) = rem.split_once('/') {
-                if name != "HEAD" && remote_name.is_none() {
-                    remote_name = Some(name.to_string());
-                }
-            }
-        }
-    }
-    if let Some(name) = remote_name {
-        return name;
-    }
-    Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .current_dir(root)
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| format!("{} (detached)", s.trim()))
-        .unwrap_or_else(|| "HEAD".to_string())
+        .unwrap_or_default()
 }
 
 /// Best-effort parent branch `branch` was created from, read from the reflog's
@@ -1704,12 +1666,12 @@ fn rollup_status(v: &serde_json::Value) -> PrStatus {
     }
 }
 
-fn fetch_pr_link(root: &Path, branch: &str) -> Option<(u64, String, PrStatus, String)> {
+fn fetch_pr_link(root: &Path, branch: &str) -> Option<(u64, String, PrStatus, String, String)> {
     if branch.is_empty() {
         return None;
     }
     let out = Command::new("gh")
-        .args(["pr", "view", branch, "--json", "number,url,statusCheckRollup,baseRefName"])
+        .args(["pr", "view", branch, "--json", "number,url,statusCheckRollup,baseRefName,headRefName"])
         .current_dir(root)
         .output()
         .ok()?;
@@ -1720,7 +1682,8 @@ fn fetch_pr_link(root: &Path, branch: &str) -> Option<(u64, String, PrStatus, St
     let number = v.get("number")?.as_u64()?;
     let url = v.get("url")?.as_str()?.to_string();
     let base = v.get("baseRefName").and_then(|b| b.as_str()).unwrap_or("").to_string();
-    Some((number, url, rollup_status(&v), base))
+    let head = v.get("headRefName").and_then(|b| b.as_str()).unwrap_or("").to_string();
+    Some((number, url, rollup_status(&v), base, head))
 }
 
 /// Open milestone titles for the repo, newest first (via `gh api`). Empty when
@@ -1912,7 +1875,7 @@ struct Storm {
     branch_parent: Option<String>, // branch this one was created from (reflog, best-effort)
     // open PR for the current branch, if any: (number, url). Refetched when the
     // branch changes; `pr_link_branch` is the branch it was last queried for.
-    pr_link: Option<(u64, String, PrStatus, String)>, // (number, url, status, base branch)
+    pr_link: Option<(u64, String, PrStatus, String, String)>, // (number, url, status, base, head)
     pr_link_branch: String,
     mem_mb: u64,
     read_only: bool, // when on, editors block manual edits (nav/select/copy still work)
@@ -4959,6 +4922,19 @@ impl Storm {
             .child(editor)
     }
 
+    /// Branch name for the topbar. In detached HEAD, fall back to the PR's head
+    /// branch (the real branch name) instead of the useless literal "HEAD".
+    fn branch_label(&self) -> String {
+        if self.branch == "HEAD" {
+            if let Some((_, _, _, _, head)) = &self.pr_link {
+                if !head.is_empty() {
+                    return head.clone();
+                }
+            }
+        }
+        self.branch.clone()
+    }
+
     fn render_topbar(&self, project: String, cx: &mut Context<Self>) -> impl IntoElement {
         let mut bar = div()
             .h(px(44.)) // match the activity-bar width
@@ -5009,13 +4985,13 @@ impl Storm {
                                 .gap_1()
                                 .text_color(rgb(MUTED))
                                 .text_size(px(12.))
-                                .child(format!("⎇ {}", self.branch))
+                                .child(format!("⎇ {}", self.branch_label()))
                                 // target/parent: the PR's base branch if there's a PR
                                 // (authoritative), else the reflog "created from" guess
                                 .when_some(
                                     self.pr_link
                                         .as_ref()
-                                        .map(|(_, _, _, b)| b.clone())
+                                        .map(|(_, _, _, b, _)| b.clone())
                                         .filter(|b| !b.is_empty())
                                         .or_else(|| self.branch_parent.clone()),
                                     |d, target| {
@@ -5058,7 +5034,7 @@ impl Storm {
                         )
                     })
                     // PR link for the current branch, if one exists → opens it
-                    .when_some(self.pr_link.clone(), |d, (num, url, status, _base)| {
+                    .when_some(self.pr_link.clone(), |d, (num, url, status, _base, _head)| {
                         d.child(
                             div()
                                 .id("pr-link")
