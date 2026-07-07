@@ -1576,14 +1576,31 @@ fn split_finder_query(q: &str) -> (&str, Option<usize>, Option<usize>) {
 
 /// Current git branch name (empty if not a repo).
 fn git_branch(root: &Path) -> String {
-    Command::new("git")
+    let b = Command::new("git")
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .current_dir(root)
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if b != "HEAD" {
+        return b;
+    }
+    // detached HEAD: "HEAD" is useless — show the short SHA + a marker so it's
+    // clear you're not on a branch (e.g. after checking out a remote ref/tag)
+    let sha = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    match sha {
+        Some(s) => format!("{s} (detached)"),
+        None => "HEAD".to_string(),
+    }
 }
 
 /// Best-effort parent branch `branch` was created from, read from the reflog's
