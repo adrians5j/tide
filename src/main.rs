@@ -1605,7 +1605,7 @@ fn git_branch_parent(root: &Path, branch: &str) -> Option<String> {
         .lines()
         .rev()
         .find_map(|l| l.split_once("Created from ").map(|(_, p)| p.trim().to_string()))
-        .filter(|p| !p.is_empty() && p != branch)?;
+        .filter(|p| !p.is_empty() && p != branch && p != "HEAD")?;
     // tidy display: drop a leading remote prefix (origin/next -> next)
     Some(parent.strip_prefix("origin/").unwrap_or(&parent).to_string())
 }
