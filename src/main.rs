@@ -1587,20 +1587,41 @@ fn git_branch(root: &Path) -> String {
     if b != "HEAD" {
         return b;
     }
-    // detached HEAD: "HEAD" is useless — show the short SHA + a marker so it's
-    // clear you're not on a branch (e.g. after checking out a remote ref/tag)
-    let sha = Command::new("git")
+    // detached HEAD: resolve a branch name pointing at HEAD (e.g. after checking
+    // out origin/release/x). Prefer a local branch, else a remote branch with
+    // the remote prefix stripped; fall back to the short SHA.
+    let refs = Command::new("git")
+        .args(["for-each-ref", "--points-at", "HEAD", "--format=%(refname)", "refs/heads", "refs/remotes"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    let mut remote_name: Option<String> = None;
+    for r in refs.lines() {
+        if let Some(local) = r.strip_prefix("refs/heads/") {
+            return local.to_string(); // local branch at HEAD wins
+        }
+        if let Some(rem) = r.strip_prefix("refs/remotes/") {
+            // rem = "<remote>/<branch...>"; drop the remote segment, skip HEAD alias
+            if let Some((_, name)) = rem.split_once('/') {
+                if name != "HEAD" && remote_name.is_none() {
+                    remote_name = Some(name.to_string());
+                }
+            }
+        }
+    }
+    if let Some(name) = remote_name {
+        return name;
+    }
+    Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .current_dir(root)
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    match sha {
-        Some(s) => format!("{s} (detached)"),
-        None => "HEAD".to_string(),
-    }
+        .map(|s| format!("{} (detached)", s.trim()))
+        .unwrap_or_else(|| "HEAD".to_string())
 }
 
 /// Best-effort parent branch `branch` was created from, read from the reflog's
