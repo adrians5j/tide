@@ -33,7 +33,7 @@ use editor::{
     DeleteWordRight, Editor, End, GotoDef, Home, Indent, MoveDown, MoveLeft, MoveLineDown,
     MoveLineUp, MoveRight, MoveUp, Newline, OpenLocation, Paste, Redo, Save, SearchOpen, SelectAll,
     SelectDown, SelectEnd, SelectHome, SelectLeft, SelectRight, SelectUp, SelectWordLeft,
-    SelectWordRight, Undo, WordLeft, WordRight,
+    SelectWordRight, ToggleReadOnly, Undo, WordLeft, WordRight,
 };
 
 // Codicon (VS Code icon font) glyphs — rendered with font_family("codicon").
@@ -62,7 +62,7 @@ actions!(
         CloseTab, CloseOthers, ToggleTerminal, OpenFinder, GotoLine, NewTerminal, CloseTerminalTab,
         CloseOtherTerminals, GotoCommit, ShowDiff, FindInFiles,
         GitPopup, CommandPalette, CopyReference, OpenOnGithub, NextProject, PrevProject, OpenProject,
-        ShowProjects, PushDialog, RunCommand, NewProject, FetchRemotes, PullRemote
+        ShowProjects, PushDialog, RunCommand, NewProject, FetchRemotes, PullRemote, WipPush
     ]
 );
 
@@ -2884,6 +2884,13 @@ impl Storm {
                 }
             })
             .detach();
+            // clicking the read-only hint's "enable EDIT" link flips edit mode
+            cx.subscribe(&editor, |this, _ed, _ev: &ToggleReadOnly, cx| {
+                if this.read_only {
+                    this.toggle_read_only(cx);
+                }
+            })
+            .detach();
             self.tabs.push(Tab { path: path.clone(), editor });
             self.active = self.tabs.len() - 1;
         }
@@ -3326,6 +3333,11 @@ impl Storm {
     /// opt+f: fetch all remotes (quick shortcut for the palette's Fetch command).
     fn act_fetch(&mut self, _: &FetchRemotes, _window: &mut Window, cx: &mut Context<Self>) {
         self.run_command("git fetch --all --prune".into(), cx);
+    }
+
+    /// cmd+shift+m: WIP commit + push (`wipp`).
+    fn act_wip_push(&mut self, _: &WipPush, _window: &mut Window, cx: &mut Context<Self>) {
+        self.run_command("wipp".into(), cx);
     }
 
     /// opt+l: pull the current branch, merging when local+remote have diverged
@@ -4766,6 +4778,7 @@ impl Render for Storm {
             .on_action(cx.listener(Self::act_run_command))
             .on_action(cx.listener(Self::act_new_project))
             .on_action(cx.listener(Self::act_fetch))
+            .on_action(cx.listener(Self::act_wip_push))
             .on_action(cx.listener(Self::act_pull))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -9963,6 +9976,7 @@ fn main() {
             // git branches/actions popup (global)
             KeyBinding::new("alt-b", GitPopup, None),
             KeyBinding::new("alt-f", FetchRemotes, None),
+            KeyBinding::new("cmd-shift-m", WipPush, None),
             KeyBinding::new("alt-l", PullRemote, None),
             // command palette (global)
             KeyBinding::new("cmd-shift-p", CommandPalette, None),

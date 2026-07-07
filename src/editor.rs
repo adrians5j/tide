@@ -42,6 +42,11 @@ pub struct OpenLocation {
 
 impl gpui::EventEmitter<OpenLocation> for Editor {}
 
+/// Emitted when the user clicks the read-only hint to switch to edit mode.
+/// The workspace flips read-only for all editors (same as the bottom-bar pill).
+pub struct ToggleReadOnly;
+impl gpui::EventEmitter<ToggleReadOnly> for Editor {}
+
 const FONT: &str = "Menlo";
 const FONT_SIZE: f32 = 13.0;
 const LINE_HEIGHT: f32 = 20.0;
@@ -2008,7 +2013,7 @@ impl Render for Editor {
             el = el.child(self.render_hover(text, *x, *y));
         }
         if self.ro_hint {
-            el = el.child(self.render_ro_hint());
+            el = el.child(self.render_ro_hint(cx));
         }
         el
     }
@@ -2133,7 +2138,7 @@ impl Editor {
 impl Editor {
     /// Small "read-only" badge floated just below the cursor (mirrors the
     /// completion-popup placement) when a hand edit is attempted while locked.
-    fn render_ro_hint(&self) -> impl IntoElement {
+    fn render_ro_hint(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (row, col) = self.offset_to_pos(self.cursor_offset());
         let cw = f32::from(self.last_char_width);
         let gw = f32::from(self.last_gutter_width);
@@ -2152,7 +2157,20 @@ impl Editor {
             .shadow_lg()
             .text_size(px(11.))
             .text_color(rgb(GIT_MODIFIED))
-            .child("🔒 Read-only — toggle EDIT to type")
+            .flex()
+            .flex_row()
+            .gap_1()
+            .child("🔒 Read-only —")
+            // clickable link → workspace flips to edit mode
+            .child(
+                div()
+                    .id("ro-hint-edit")
+                    .cursor_pointer()
+                    .underline()
+                    .text_color(rgb(ACCENT))
+                    .child("enable EDIT")
+                    .on_click(cx.listener(|_this, _e, _w, cx| cx.emit(ToggleReadOnly))),
+            )
     }
 
     fn render_completion(&self) -> impl IntoElement {
