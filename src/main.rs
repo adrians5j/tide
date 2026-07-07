@@ -1586,6 +1586,30 @@ fn git_branch(root: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Best-effort parent branch `branch` was created from, read from the reflog's
+/// creation entry ("branch: Created from <ref>"). None if the reflog was pruned,
+/// the branch wasn't created locally, or it forked from a bare commit.
+fn git_branch_parent(root: &Path, branch: &str) -> Option<String> {
+    if branch.is_empty() {
+        return None;
+    }
+    // reflog subjects, oldest last; the creation entry is the last one
+    let out = Command::new("git")
+        .args(["reflog", "show", "--format=%gs", branch])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let parent = text
+        .lines()
+        .rev()
+        .find_map(|l| l.split_once("Created from ").map(|(_, p)| p.trim().to_string()))
+        .filter(|p| !p.is_empty() && p != branch)?;
+    // tidy display: drop a leading remote prefix (origin/next -> next)
+    Some(parent.strip_prefix("origin/").unwrap_or(&parent).to_string())
+}
+
 /// The open PR for `branch`, as (number, url), via `gh`. None if there's no PR
 /// (or `gh` is unavailable). Runs on a background thread, so the network call
 /// never blocks the UI.
@@ -1846,6 +1870,7 @@ struct Storm {
     inited: bool,
     // chrome
     branch: String,
+    branch_parent: Option<String>, // branch this one was created from (reflog, best-effort)
     // open PR for the current branch, if any: (number, url). Refetched when the
     // branch changes; `pr_link_branch` is the branch it was last queried for.
     pr_link: Option<(u64, String, PrStatus)>,
@@ -2092,6 +2117,7 @@ impl Storm {
             focus: cx.focus_handle(),
             inited: false,
             branch: String::new(),
+            branch_parent: None,
             pr_link: None,
             pr_link_branch: String::new(),
             mem_mb: 0,
@@ -2357,17 +2383,24 @@ impl Storm {
                 .await;
             // refetch the PR link only when the branch actually changed — the
             // gh call hits the network, so we don't want it on every 2s tick
-            let pr_update = if branch != prev_pr_branch {
+            let (pr_update, parent_update) = if branch != prev_pr_branch {
                 let (root3, br) = (root.clone(), branch.clone());
-                Some(cx.background_executor().spawn(async move { fetch_pr_link(&root3, &br) }).await)
+                let (pr, parent) = cx
+                    .background_executor()
+                    .spawn(async move { (fetch_pr_link(&root3, &br), git_branch_parent(&root3, &br)) })
+                    .await;
+                (Some(pr), Some(parent))
             } else {
-                None
+                (None, None)
             };
             if this
                 .update(cx, |this, cx| {
                     this.git_status = status;
                     this.branch = branch.clone();
                     this.mem_mb = mem;
+                    if let Some(parent) = parent_update {
+                        this.branch_parent = parent;
+                    }
                     // refresh the git-ignored set; rebuild the tree if it changed
                     if ignored != this.ignored {
                         this.ignored = ignored;
@@ -4938,6 +4971,15 @@ impl Storm {
                                 .text_color(rgb(MUTED))
                                 .text_size(px(12.))
                                 .child(format!("⎇ {}", self.branch))
+                                // parent branch this was forked from (best-effort, reflog)
+                                .when_some(self.branch_parent.clone(), |d, parent| {
+                                    d.child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(rgb(LINE_NUMBER))
+                                            .child(format!("from {}", parent)),
+                                    )
+                                })
                                 // copy-to-clipboard button for the branch name
                                 .child(
                                     div()
