@@ -279,6 +279,28 @@ impl Editor {
         }
     }
 
+    /// Replace the buffer with plain log text (no highlight/LSP/undo). Used by
+    /// the read-only Run console so its output is selectable/copyable. Tails to
+    /// the bottom unless the user scrolled up to read.
+    pub fn set_log(&mut self, text: String, cx: &mut Context<Self>) {
+        if self.content == text {
+            return;
+        }
+        let vh = self.last_bounds.map(|b| f32::from(b.size.height)).unwrap_or(400.);
+        // stick to bottom only if already near it (so scrolling up to read holds)
+        let old_max = (self.line_count() as f32 * LINE_HEIGHT - vh).max(0.0);
+        let stick = f32::from(self.scroll_y) >= old_max - LINE_HEIGHT * 2.0;
+        self.content = text;
+        self.styles = Vec::new();
+        self.selected_range = self.selected_range.start.min(self.content.len())
+            ..self.selected_range.end.min(self.content.len());
+        if stick {
+            let max = (self.line_count() as f32 * LINE_HEIGHT - vh).max(0.0);
+            self.scroll_y = px(max);
+        }
+        cx.notify();
+    }
+
     /// Flash a "read-only" hint at the cursor (when a blocked edit is attempted).
     fn show_ro_hint(&mut self, cx: &mut Context<Self>) {
         self.ro_hint = true;

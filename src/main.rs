@@ -1812,12 +1812,12 @@ struct Storm {
     run_open: bool,
     run_cmd: String,
     run_lines: Vec<String>,
+    run_editor: Entity<Editor>, // read-only view of the log (selectable/copyable)
     run_running: bool,
     run_active: bool, // a command is running or just finished (toast visible)
     run_failed: bool,
     run_spin: usize, // spinner frame
     run_gen: u64,
-    run_scroll: UniformListScrollHandle,
     run_buf: Arc<Mutex<Vec<String>>>, // appended by the reader thread
     run_dirty: Arc<AtomicBool>,
     run_done: Arc<AtomicBool>,
@@ -2083,12 +2083,12 @@ impl Storm {
             run_open: false,
             run_cmd: String::new(),
             run_lines: Vec::new(),
+            run_editor: cx.new(|cx| Editor::new(None, cx)),
             run_running: false,
             run_active: false,
             run_failed: false,
             run_spin: 0,
             run_gen: 0,
-            run_scroll: UniformListScrollHandle::new(),
             run_buf: Arc::new(Mutex::new(Vec::new())),
             run_dirty: Arc::new(AtomicBool::new(false)),
             run_done: Arc::new(AtomicBool::new(true)),
@@ -2769,6 +2769,8 @@ impl Storm {
         self.run_spin = 0;
         self.run_lines.clear();
         self.run_lines.push(format!("$ {}", cmd));
+        let head = self.run_lines.join("\n");
+        self.run_editor.update(cx, |e, cx| e.set_log(head, cx));
 
         // fresh shared state for this run
         let buf = Arc::new(Mutex::new(Vec::new()));
@@ -2837,8 +2839,8 @@ impl Storm {
                         if n > 5000 {
                             this.run_lines.drain(0..n - 5000);
                         }
-                        this.run_scroll
-                            .scroll_to_item(this.run_lines.len().saturating_sub(1), ScrollStrategy::Top);
+                        let text = this.run_lines.join("\n");
+                        this.run_editor.update(cx, |e, cx| e.set_log(text, cx));
                     }
                     if this.run_done.load(Ordering::Relaxed) {
                         this.run_running = false;
@@ -5452,22 +5454,7 @@ impl Storm {
                 cx.notify();
             })));
 
-        let list = uniform_list(
-            "run-log",
-            self.run_lines.len(),
-            cx.processor(|this, range: std::ops::Range<usize>, _w, _cx| {
-                range
-                    .map(|i| div().px_3().child(this.run_lines[i].clone()).into_any_element())
-                    .collect()
-            }),
-        )
-        .track_scroll(&self.run_scroll)
-        .flex_grow(1.0)
-        .font_family("Menlo")
-        .text_size(px(12.))
-        .text_color(rgb(TEXT))
-        .bg(rgb(BG));
-
+        // read-only Editor as the log view → text is selectable + copyable
         div()
             .h(px(260.))
             .flex_shrink_0()
@@ -5477,7 +5464,7 @@ impl Storm {
             .border_t_1()
             .border_color(rgb(if failed { GIT_DELETED } else { BORDER }))
             .child(header)
-            .child(list)
+            .child(div().flex_grow(1.0).min_h(px(0.)).child(self.run_editor.clone()))
     }
 
     fn render_bottom(&self, cx: &mut Context<Self>) -> impl IntoElement {
