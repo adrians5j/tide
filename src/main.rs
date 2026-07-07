@@ -62,7 +62,7 @@ actions!(
         CloseTab, CloseOthers, ToggleTerminal, OpenFinder, GotoLine, NewTerminal, CloseTerminalTab,
         CloseOtherTerminals, GotoCommit, ShowDiff, FindInFiles,
         GitPopup, CommandPalette, CopyReference, OpenOnGithub, NextProject, PrevProject, OpenProject,
-        ShowProjects, PushDialog, RunCommand, NewProject, FetchRemotes, PullRemote, WipPush
+        ShowProjects, PushDialog, RunCommand, NewProject, FetchRemotes, PullRemote, WipPush, RunBuild
     ]
 );
 
@@ -3375,6 +3375,11 @@ impl Storm {
         self.run_command("wipp".into(), cx);
     }
 
+    /// cmd+shift+b: build (`yyb`).
+    fn act_run_build(&mut self, _: &RunBuild, _window: &mut Window, cx: &mut Context<Self>) {
+        self.run_command("yyb".into(), cx);
+    }
+
     /// opt+l: pull the current branch, merging when local+remote have diverged
     /// (--no-rebase) so it never errors asking how to reconcile.
     fn act_pull(&mut self, _: &PullRemote, _window: &mut Window, cx: &mut Context<Self>) {
@@ -4814,6 +4819,7 @@ impl Render for Storm {
             .on_action(cx.listener(Self::act_new_project))
             .on_action(cx.listener(Self::act_fetch))
             .on_action(cx.listener(Self::act_wip_push))
+            .on_action(cx.listener(Self::act_run_build))
             .on_action(cx.listener(Self::act_pull))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -10042,6 +10048,7 @@ fn main() {
             KeyBinding::new("alt-b", GitPopup, None),
             KeyBinding::new("alt-f", FetchRemotes, None),
             KeyBinding::new("cmd-shift-m", WipPush, None),
+            KeyBinding::new("cmd-shift-b", RunBuild, None),
             KeyBinding::new("alt-l", PullRemote, None),
             // command palette (global)
             KeyBinding::new("cmd-shift-p", CommandPalette, None),
