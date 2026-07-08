@@ -1888,6 +1888,11 @@ struct Storm {
     br_open: bool,
     br_focus: FocusHandle,
     br_query: Field,
+    // new-file prompt (from the tree context menu)
+    nf_open: bool,
+    nf_focus: FocusHandle,
+    nf_query: Field,
+    nf_dir: PathBuf, // directory the new file is created in
     br_make_pr: bool, // checkbox: also create a PR after the branch
     // create-PR prompt: optional milestone for `gh pr create`
     prc_open: bool,
@@ -2133,6 +2138,10 @@ impl Storm {
             br_open: false,
             br_focus: cx.focus_handle(),
             br_query: Field::default(),
+            nf_open: false,
+            nf_focus: cx.focus_handle(),
+            nf_query: Field::default(),
+            nf_dir: PathBuf::new(),
             br_make_pr: false,
             prc_open: false,
             prc_focus: cx.focus_handle(),
@@ -2251,6 +2260,7 @@ impl Storm {
         self.finder_open
             || self.goto_open
             || self.br_open
+            || self.nf_open
             || self.prc_open
             || self.runc_open
             || self.newproj_open
@@ -2536,6 +2546,7 @@ impl Storm {
             || self.finder_open
             || self.goto_open
             || self.br_open
+            || self.nf_open
             || self.prc_open
             || self.runc_open
             || self.newproj_open
@@ -2547,6 +2558,7 @@ impl Storm {
             self.finder_open = false;
             self.goto_open = false;
             self.br_open = false;
+            self.nf_open = false;
             self.prc_open = false;
             self.runc_open = false;
             self.newproj_open = false;
@@ -3246,6 +3258,93 @@ impl Storm {
         self.br_make_pr = false;
         window.focus(&self.br_focus, cx);
         cx.notify();
+    }
+
+    /// New-file prompt. Target dir = the right-clicked folder (or the file's
+    /// parent), else the project root.
+    fn open_new_file_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.nf_dir = match self.tree_ctx_path.clone() {
+            Some(p) if p.is_dir() => p,
+            Some(p) => p.parent().map(|d| d.to_path_buf()).unwrap_or_else(|| self.root.clone()),
+            None => self.root.clone(),
+        };
+        self.nf_open = true;
+        self.nf_query.clear();
+        window.focus(&self.nf_focus, cx);
+        cx.notify();
+    }
+
+    fn nf_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        match ks.key.as_str() {
+            "escape" => {
+                self.nf_open = false;
+                self.focus_active(window, cx);
+            }
+            "enter" => {
+                let name = self.nf_query.text.trim().to_string();
+                self.nf_open = false;
+                if name.is_empty() {
+                    return;
+                }
+                // name may include subdirs (e.g. "sub/file.ts") — create parents
+                let path = self.nf_dir.join(&name);
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                if !path.exists() {
+                    let _ = std::fs::write(&path, "");
+                }
+                self.rebuild();
+                self.open_file(path, window, cx);
+            }
+            _ => {
+                Self::field_input(&mut self.nf_query, ks, cx, |_| true);
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_new_file_prompt(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let w = 420.0_f32;
+        let left = ((self.win_width - w) / 2.0).max(0.);
+        let dir = self.rel(&self.nf_dir);
+        let dir = if dir.is_empty() { ".".to_string() } else { dir };
+        div()
+            .absolute()
+            .top(px(120.))
+            .left(px(left))
+            .w(px(w))
+            .bg(rgb(PANEL_BG))
+            .border_1()
+            .border_color(rgb(ACCENT))
+            .rounded_md()
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .track_focus(&self.nf_focus)
+            .on_key_down(cx.listener(Self::nf_key))
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .child(format!("New file in {}", dir)),
+            )
+            .child(
+                div()
+                    .mx_3()
+                    .mb_3()
+                    .px_2()
+                    .py_1()
+                    .bg(rgb(BG))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .rounded_md()
+                    .text_color(rgb(TEXT))
+                    .child(self.nf_query.render(self.caret(), SELECTION)),
+            )
     }
 
     fn br_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -4860,6 +4959,9 @@ impl Render for Storm {
         }
         if self.goto_open {
             root = root.child(self.render_goto(cx));
+        }
+        if self.nf_open {
+            root = root.child(self.render_new_file_prompt(cx));
         }
         if self.br_open {
             root = root.child(self.render_branch_prompt(cx));
@@ -7686,8 +7788,9 @@ impl Storm {
     }
 
     /// Dir-tree right-click actions. Operate on `tree_ctx_path`.
-    fn tree_ctx_actions() -> [(&'static str, fn(&mut Self, &mut Window, &mut Context<Self>)); 2] {
+    fn tree_ctx_actions() -> [(&'static str, fn(&mut Self, &mut Window, &mut Context<Self>)); 3] {
         [
+            ("New File", |this, window, cx| this.open_new_file_prompt(window, cx)),
             ("Refresh", |this, _w, _cx| {
                 // re-read the filesystem so created/deleted files show up; expand
                 // the targeted folder so its current contents are visible
