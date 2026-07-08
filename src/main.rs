@@ -8725,6 +8725,27 @@ impl Storm {
 /// Columns in the project-switcher grid (3x3 for the first 9 projects).
 const SWITCHER_COLS: usize = 3;
 
+/// Drag payload for reordering project cards in the switcher (dragged index).
+struct DraggedProject(usize);
+
+/// Chip rendered under the cursor while dragging a project card.
+struct DragChip {
+    label: String,
+}
+impl Render for DragChip {
+    fn render(&mut self, _w: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(ICON_SELECTED_BG))
+            .text_color(rgb(SEL_TEXT))
+            .text_size(px(12.))
+            .shadow_lg()
+            .child(self.label.clone())
+    }
+}
+
 struct Workspace {
     projects: Vec<Entity<Storm>>,
     active: usize,
@@ -8799,6 +8820,27 @@ impl Workspace {
         }
         self.switcher_sel = self.switcher_sel.min(self.projects.len() - 1);
         self.focus_pending = true;
+        cx.notify();
+    }
+
+    /// Drag-reorder: move project `from` to sit before `to`. Keeps `active`
+    /// pointing at the same project (by identity) and follows the moved card
+    /// with the switcher selection.
+    fn reorder_projects(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        let n = self.projects.len();
+        if from >= n || to >= n || from == to {
+            return;
+        }
+        let active_id = self.projects[self.active].entity_id();
+        let item = self.projects.remove(from);
+        let dst = if from < to { to - 1 } else { to };
+        self.projects.insert(dst, item);
+        self.active = self
+            .projects
+            .iter()
+            .position(|p| p.entity_id() == active_id)
+            .unwrap_or(0);
+        self.switcher_sel = dst;
         cx.notify();
     }
 
@@ -8974,6 +9016,7 @@ impl Render for Workspace {
                 let is_active = i == active;
                 let multi = self.projects.len() > 1;
                 let idx = i;
+                let label_drag = name.clone();
                 grid = grid.child(
                     div()
                         .id(("ws-switch", i))
@@ -8990,6 +9033,14 @@ impl Render for Workspace {
                         .when(sel, |d| d.bg(rgb(SELECTED_BG)))
                         .when(!sel, |d| d.hover(|s| s.bg(rgb(HOVER))))
                         .cursor_pointer()
+                        // drag to reorder: drop onto another card to move before it
+                        .on_drag(DraggedProject(i), move |_, _, _, cx| {
+                            cx.new(|_| DragChip { label: label_drag.clone() })
+                        })
+                        .drag_over::<DraggedProject>(|s, _, _, _| s.border_color(rgb(ACCENT)).bg(rgb(HOVER)))
+                        .on_drop(cx.listener(move |this, d: &DraggedProject, _w, cx| {
+                            this.reorder_projects(d.0, idx, cx);
+                        }))
                         // top row: number badge + folder icon + active dot
                         .child(
                             div()
