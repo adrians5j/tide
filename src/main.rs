@@ -1,6 +1,6 @@
 use gpui::{
     AnyElement, AnyView, AnyWindowHandle, App, Bounds, ClipboardItem, Context, CursorStyle, Div, Entity, EventEmitter,
-    FocusHandle, KeyBinding, WeakEntity,
+    ExternalPaths, FocusHandle, KeyBinding, WeakEntity,
     KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ScrollStrategy, SharedString,
     StyledText, TextRun, Window, WindowBounds, WindowOptions, actions, div, font, prelude::*, px,
@@ -62,7 +62,8 @@ actions!(
         CloseTab, CloseOthers, ToggleTerminal, OpenFinder, GotoLine, NewTerminal, CloseTerminalTab,
         CloseOtherTerminals, GotoCommit, ShowDiff, FindInFiles,
         GitPopup, CommandPalette, CopyReference, OpenOnGithub, NextProject, PrevProject, OpenProject,
-        ShowProjects, PushDialog, RunCommand, NewProject, FetchRemotes, PullRemote, WipPush, RunBuild
+        ShowProjects, PushDialog, RunCommand, NewProject, FetchRemotes, PullRemote, WipPush, RunBuild,
+        NewScratch
     ]
 );
 
@@ -1786,6 +1787,7 @@ fn compute_git(root: &Path) -> HashMap<PathBuf, GitState> {
 struct Tab {
     path: PathBuf,
     editor: Entity<Editor>,
+    scratch: bool, // unsaved in-memory scratch buffer (gone when closed)
 }
 
 struct Storm {
@@ -1870,6 +1872,7 @@ struct Storm {
     // root focus so global shortcuts dispatch even with no file/tab open
     focus: FocusHandle,
     inited: bool,
+    scratch_count: usize, // running number for scratch buffer names
     // chrome
     branch: String,
     branch_parent: Option<String>, // branch this one was created from (reflog, best-effort)
@@ -2118,6 +2121,7 @@ impl Storm {
             goto_query: Field::default(),
             focus: cx.focus_handle(),
             inited: false,
+            scratch_count: 0,
             branch: String::new(),
             branch_parent: None,
             pr_link: None,
@@ -2892,8 +2896,28 @@ impl Storm {
     /// Save the tab at `ix` to disk (no-op if clean).
     fn save_tab(&self, ix: usize, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get(ix) {
+            if tab.scratch {
+                return; // scratch buffers are never written to disk
+            }
             tab.editor.update(cx, |e, cx| e.save(cx));
         }
+    }
+
+    /// cmd+shift+n: open a new empty scratch buffer (editable, not on disk; gone
+    /// when the tab is closed).
+    fn act_new_scratch(&mut self, _: &NewScratch, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_tab(self.active, cx);
+        self.scratch_count += 1;
+        let n = self.scratch_count;
+        let editor = cx.new(|cx| Editor::new(None, cx));
+        editor.update(cx, |e, _| e.set_read_only(false)); // scratch is always editable
+        // synthetic path just for the tab label; the editor itself has no path
+        // (so save() is a no-op — nothing hits disk)
+        let path = PathBuf::from(format!("scratch {n}"));
+        self.tabs.push(Tab { path, editor: editor.clone(), scratch: true });
+        self.active = self.tabs.len() - 1;
+        window.focus(&editor.read(cx).focus_handle.clone(), cx);
+        cx.notify();
     }
 
     fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -2928,7 +2952,7 @@ impl Storm {
                 }
             })
             .detach();
-            self.tabs.push(Tab { path: path.clone(), editor });
+            self.tabs.push(Tab { path: path.clone(), editor, scratch: false });
             self.active = self.tabs.len() - 1;
         }
         self.tree_selected = Some(path.clone());
@@ -4819,6 +4843,7 @@ impl Render for Storm {
             .on_action(cx.listener(Self::act_push_dialog))
             .on_action(cx.listener(Self::act_run_command))
             .on_action(cx.listener(Self::act_new_project))
+            .on_action(cx.listener(Self::act_new_scratch))
             .on_action(cx.listener(Self::act_fetch))
             .on_action(cx.listener(Self::act_wip_push))
             .on_action(cx.listener(Self::act_run_build))
@@ -4913,9 +4938,18 @@ impl Render for Storm {
 impl Storm {
     fn render_editor_wrap(&self, editor: impl IntoElement, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .id("editor-surface")
             .flex_grow(1.0)
             .min_w(px(0.))
             .h_full()
+            // drop OS files (from Finder) here → open them, even outside the project
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                for p in paths.paths() {
+                    if p.is_file() {
+                        this.open_file(p.clone(), window, cx);
+                    }
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, ev: &MouseDownEvent, window, cx| {
@@ -10094,7 +10128,8 @@ fn main() {
             // multi-project workspace (global)
             KeyBinding::new("alt-tab", NextProject, None),
             KeyBinding::new("alt-shift-tab", PrevProject, None),
-            KeyBinding::new("cmd-shift-n", NewProject, None),
+            KeyBinding::new("cmd-o", NewProject, None),
+            KeyBinding::new("cmd-shift-n", NewScratch, None),
             KeyBinding::new("cmd-e", ShowProjects, None),
             // diff (opens in its own window)
             KeyBinding::new("cmd-d", ShowDiff, None),
