@@ -9047,7 +9047,6 @@ impl Render for Workspace {
                     (s.project_name(), s.branch.clone())
                 };
                 let sel = i == self.switcher_sel;
-                let is_active = i == active;
                 let multi = self.projects.len() > 1;
                 let idx = i;
                 let label_drag = name.clone();
@@ -9095,10 +9094,7 @@ impl Render for Workspace {
                                         .text_color(rgb(if sel { SEL_TEXT } else { FOLDER_ICON }))
                                         .child(IC_FOLDER),
                                 )
-                                .child(div().flex_grow(1.0))
-                                .when(is_active, |d| {
-                                    d.child(div().text_size(px(10.)).text_color(rgb(ACCENT)).child("●"))
-                                }),
+                                .child(div().flex_grow(1.0)),
                         )
                         // name + branch
                         .child(
