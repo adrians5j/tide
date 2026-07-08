@@ -3363,8 +3363,12 @@ impl Storm {
                 let make_pr = self.br_make_pr;
                 self.br_open = false;
                 if !name.is_empty() {
-                    // chain the PR after the branch lands so it targets the new branch
-                    let cmd = if make_pr { format!("br {} && pr", name) } else { format!("br {}", name) };
+                    // PR needs the branch pushed first (upstream + a ref to open against)
+                    let cmd = if make_pr {
+                        format!("br {} && git push -u origin HEAD && pr", name)
+                    } else {
+                        format!("br {}", name)
+                    };
                     self.run_command(cmd, cx);
                 }
             }
