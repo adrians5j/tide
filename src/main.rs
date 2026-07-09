@@ -1461,6 +1461,7 @@ enum Cmd {
     CopyRenameSession,
     ProcessManager,
     ToggleReadOnly,
+    ResolveConflicts,
 }
 
 /// (command, label, icon glyph, shortcut hint)
@@ -1488,6 +1489,7 @@ const PALETTE: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::CopyRenameSession, "Copy Claude /rename Command", IC_COPY, ""),
     (Cmd::ProcessManager, "Process Manager", IC_TOOLS, ""),
     (Cmd::ToggleReadOnly, "Toggle Read-Only / Edit Mode", IC_HOME, ""),
+    (Cmd::ResolveConflicts, "Resolve Merge Conflicts", IC_BRANCH, ""),
 ];
 
 /// A running process row for the Process Manager dialog.
@@ -1576,6 +1578,53 @@ fn split_finder_query(q: &str) -> (&str, Option<usize>, Option<usize>) {
 }
 
 /// Current git branch name (empty if not a repo).
+/// Files with unresolved merge conflicts (git status filter U).
+fn conflicted_files(root: &Path) -> Vec<PathBuf> {
+    Command::new("git")
+        .args(["diff", "--name-only", "--diff-filter=U"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| root.join(l.trim()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The branch/ref being merged in, for display. Parses MERGE_MSG's quoted ref
+/// ("Merge remote-tracking branch 'origin/next' …"); falls back to MERGE_HEAD.
+fn merge_source(root: &Path) -> String {
+    let git_dir = Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|d| {
+            let p = PathBuf::from(&d);
+            if p.is_absolute() { p } else { root.join(p) }
+        });
+    if let Some(dir) = git_dir {
+        if let Ok(msg) = std::fs::read_to_string(dir.join("MERGE_MSG")) {
+            if let Some(first) = msg.lines().next() {
+                if let (Some(a), Some(b)) = (first.find('\''), first.rfind('\'')) {
+                    if b > a + 1 {
+                        return first[a + 1..b].to_string();
+                    }
+                }
+            }
+        }
+    }
+    "the other branch".to_string()
+}
+
 fn git_branch(root: &Path) -> String {
     Command::new("git")
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
@@ -1998,6 +2047,12 @@ struct Storm {
     palette_sel: usize,
     palette_results: Vec<(Cmd, &'static str, &'static str, &'static str)>,
     palette_gen: u64,
+    // merge-conflicts dialog
+    mc_open: bool,
+    mc_focus: FocusHandle,
+    mc_files: Vec<PathBuf>,
+    mc_into: String, // current branch (label)
+    mc_from: String, // branch being merged in
     // process manager dialog
     proc_open: bool,
     proc_focus: FocusHandle,
@@ -2219,6 +2274,11 @@ impl Storm {
             palette_sel: 0,
             palette_results: Vec::new(),
             palette_gen: 0,
+            mc_open: false,
+            mc_focus: cx.focus_handle(),
+            mc_files: Vec::new(),
+            mc_into: String::new(),
+            mc_from: String::new(),
             proc_open: false,
             proc_focus: cx.focus_handle(),
             proc_filter: Field::default(),
@@ -2552,6 +2612,7 @@ impl Storm {
             || self.newproj_open
             || self.find_open
             || self.gitp_open
+            || self.mc_open
             || self.ws_open;
         if any_open {
             self.palette_open = false;
@@ -2559,6 +2620,7 @@ impl Storm {
             self.goto_open = false;
             self.br_open = false;
             self.nf_open = false;
+            self.mc_open = false;
             self.prc_open = false;
             self.runc_open = false;
             self.newproj_open = false;
@@ -4402,6 +4464,66 @@ impl Storm {
             }
             Cmd::ProcessManager => self.open_process_manager(window, cx),
             Cmd::ToggleReadOnly => self.toggle_read_only(cx),
+            Cmd::ResolveConflicts => self.open_conflicts(window, cx),
+        }
+    }
+
+    // ── merge conflicts ─────────────────────────────────────────────────────────
+
+    fn open_conflicts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let files = conflicted_files(&self.root);
+        if files.is_empty() {
+            self.show_flash("No merge conflicts", cx);
+            return;
+        }
+        self.mc_files = files;
+        self.mc_into = self.branch_label();
+        self.mc_from = merge_source(&self.root);
+        self.mc_open = true;
+        window.focus(&self.mc_focus, cx);
+        cx.notify();
+    }
+
+    /// Re-scan conflicts; close the dialog once everything is resolved.
+    fn mc_reload(&mut self, cx: &mut Context<Self>) {
+        self.mc_files = conflicted_files(&self.root);
+        if self.mc_files.is_empty() {
+            self.mc_open = false;
+            self.show_flash("All conflicts resolved — commit to finish the merge", cx);
+        }
+        cx.notify();
+    }
+
+    /// Resolve one file by taking our side (`--ours`) or theirs (`--theirs`),
+    /// then stage it, off the main thread; reloads the list when done.
+    fn mc_accept(&mut self, path: PathBuf, theirs: bool, cx: &mut Context<Self>) {
+        let root = self.root.clone();
+        let side = if theirs { "--theirs" } else { "--ours" };
+        let rel = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy().to_string();
+        cx.spawn(async move |this, cx| {
+            let (r1, r2) = (root.clone(), root.clone());
+            let (rel1, rel2) = (rel.clone(), rel.clone());
+            cx.background_executor()
+                .spawn(async move {
+                    let _ = Command::new("git").args(["checkout", side, &rel1]).current_dir(&r1).output();
+                    let _ = Command::new("git").args(["add", "--", &rel2]).current_dir(&r2).output();
+                })
+                .await;
+            this.update(cx, |this, cx| this.mc_reload(cx)).ok();
+        })
+        .detach();
+    }
+
+    fn mc_edit(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.mc_open = false;
+        self.open_file(path, window, cx); // conflict markers visible for manual edit
+    }
+
+    fn mc_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if ev.keystroke.key == "escape" {
+            self.mc_open = false;
+            self.focus_active(window, cx);
+            cx.notify();
         }
     }
 
@@ -4966,6 +5088,9 @@ impl Render for Storm {
         }
         if self.nf_open {
             root = root.child(self.render_new_file_prompt(cx));
+        }
+        if self.mc_open {
+            root = root.child(self.render_conflicts(cx));
         }
         if self.br_open {
             root = root.child(self.render_branch_prompt(cx));
@@ -7295,6 +7420,96 @@ impl Storm {
 
     /// Process Manager dialog: filterable list of running processes with
     /// multi-select (cmd/shift-click) and kill.
+    fn render_conflicts(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let w = 620.0_f32;
+        let left = ((self.win_width - w) / 2.0).max(0.);
+        let mut list = div().flex().flex_col().px_2().pb_2().gap_1();
+        for (i, path) in self.mc_files.clone().into_iter().enumerate() {
+            let rel = self.rel(&path);
+            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| rel.clone());
+            let dir = rel.strip_suffix(&name).unwrap_or("").trim_end_matches('/').to_string();
+            let btn = |id: (&'static str, usize), label: &str, accent: bool| {
+                div()
+                    .id(id)
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_size(px(11.))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(rgb(if accent { ACCENT } else { BORDER }))
+                    .text_color(rgb(if accent { SEL_TEXT } else { TEXT }))
+                    .when(accent, |d| d.bg(rgb(ICON_SELECTED_BG)))
+                    .hover(|s| s.bg(rgb(HOVER)))
+                    .child(label.to_string())
+            };
+            let (po, pt, pe) = (path.clone(), path.clone(), path.clone());
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(BG))
+                    .child(div().font_family(ICON_FONT).text_size(px(12.)).text_color(rgb(GIT_DELETED)).child(IC_BRANCH))
+                    .child(
+                        div()
+                            .flex_grow(1.0)
+                            .flex()
+                            .flex_col()
+                            .child(div().text_size(px(13.)).text_color(rgb(TEXT)).truncate().child(name))
+                            .when(!dir.is_empty(), |d| {
+                                d.child(div().text_size(px(10.)).text_color(rgb(MUTED)).truncate().child(dir))
+                            }),
+                    )
+                    .child(btn(("mc-ours", i), "Accept Yours", false).on_click(
+                        cx.listener(move |this, _e, _w, cx| this.mc_accept(po.clone(), false, cx)),
+                    ))
+                    .child(btn(("mc-theirs", i), "Accept Theirs", false).on_click(
+                        cx.listener(move |this, _e, _w, cx| this.mc_accept(pt.clone(), true, cx)),
+                    ))
+                    .child(btn(("mc-edit", i), "Merge…", true).on_click(
+                        cx.listener(move |this, _e, window, cx| this.mc_edit(pe.clone(), window, cx)),
+                    )),
+            );
+        }
+        div()
+            .absolute()
+            .top(px(100.))
+            .left(px(left))
+            .w(px(w))
+            .bg(rgb(POPUP_BG))
+            .border_1()
+            .border_color(rgb(ACCENT))
+            .rounded_md()
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .py_1()
+            .track_focus(&self.mc_focus)
+            .on_key_down(cx.listener(Self::mc_key))
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(12.))
+                    .text_color(rgb(TEXT))
+                    .child(format!("Conflicts — merging {} into {}", self.mc_from, self.mc_into)),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .pb_1()
+                    .text_size(px(10.))
+                    .text_color(rgb(MUTED))
+                    .child("Accept Yours/Theirs to take one side, or Merge… to edit the file. Esc to close."),
+            )
+            .child(list)
+    }
+
     fn render_process_manager(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let w = 760.0_f32;
         let h = 560.0_f32;
