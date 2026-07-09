@@ -282,6 +282,11 @@ impl Editor {
     /// Replace the buffer with plain log text (no highlight/LSP/undo). Used by
     /// the read-only Run console so its output is selectable/copyable. Tails to
     /// the bottom unless the user scrolled up to read.
+    /// Current buffer text (used by the merge editor to write the result).
+    pub fn text(&self) -> String {
+        self.content.clone()
+    }
+
     pub fn set_log(&mut self, text: String, cx: &mut Context<Self>) {
         if self.content == text {
             return;

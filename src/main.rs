@@ -1596,6 +1596,18 @@ fn conflicted_files(root: &Path) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+/// Contents of a conflicted file's merge stage (1=base, 2=ours, 3=theirs).
+fn git_stage(root: &Path, rel: &str, stage: u8) -> String {
+    Command::new("git")
+        .args(["show", &format!(":{stage}:{rel}")])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default()
+}
+
 /// The branch/ref being merged in, for display. Parses MERGE_MSG's quoted ref
 /// ("Merge remote-tracking branch 'origin/next' …"); falls back to MERGE_HEAD.
 fn merge_source(root: &Path) -> String {
@@ -4514,9 +4526,28 @@ impl Storm {
         .detach();
     }
 
-    fn mc_edit(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    fn mc_edit(&mut self, path: PathBuf, _window: &mut Window, cx: &mut Context<Self>) {
         self.mc_open = false;
-        self.open_file(path, window, cx); // conflict markers visible for manual edit
+        // 3-way merge editor in its own window (Yours | Result | Theirs)
+        let root = self.root.clone();
+        let rel = self.rel(&path);
+        let ours = git_stage(&root, &rel, 2);
+        let theirs = git_stage(&root, &rel, 3);
+        let result = std::fs::read_to_string(&path).unwrap_or_default();
+        let storm = cx.entity().downgrade();
+        let main = cx.active_window();
+        let bounds = Bounds::centered(None, size(px(1660.), px(820.)), cx);
+        let title = format!("Merge — {}", rel);
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(gpui::TitlebarOptions { title: Some(title.into()), ..Default::default() }),
+                focus: true,
+                ..Default::default()
+            },
+            move |_, cx| cx.new(|cx| MergeWindow::new(root, path, ours, theirs, result, storm, main, cx)),
+        )
+        .ok();
     }
 
     fn mc_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -10337,6 +10368,184 @@ impl Render for DiffWindow {
         } else {
             col.child(body)
         }
+    }
+}
+
+/// 3-way merge editor in its own window: Yours | Result (editable) | Theirs.
+struct MergeWindow {
+    root: PathBuf,
+    path: PathBuf,
+    ours: Entity<Editor>,
+    result: Entity<Editor>,
+    theirs: Entity<Editor>,
+    ours_text: String,
+    theirs_text: String,
+    focus: FocusHandle,
+    focused: bool,
+    storm: WeakEntity<Storm>,
+    main_window: Option<AnyWindowHandle>,
+}
+
+impl MergeWindow {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        root: PathBuf,
+        path: PathBuf,
+        ours_text: String,
+        theirs_text: String,
+        result_text: String,
+        storm: WeakEntity<Storm>,
+        main_window: Option<AnyWindowHandle>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let ours = cx.new(|c| Editor::new(None, c));
+        let theirs = cx.new(|c| Editor::new(None, c));
+        let result = cx.new(|c| Editor::new(None, c));
+        ours.update(cx, |e, c| e.set_log(ours_text.clone(), c));
+        theirs.update(cx, |e, c| e.set_log(theirs_text.clone(), c));
+        result.update(cx, |e, c| {
+            e.set_read_only(false); // center pane is hand-editable
+            e.set_log(result_text, c);
+        });
+        Self {
+            root,
+            path,
+            ours,
+            result,
+            theirs,
+            ours_text,
+            theirs_text,
+            focus: cx.focus_handle(),
+            focused: false,
+            storm,
+            main_window,
+        }
+    }
+
+    /// Write the result to disk, stage it, tell the main window to re-scan
+    /// conflicts, and close this window.
+    fn resolve(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.result.read(cx).text();
+        let _ = std::fs::write(&self.path, text);
+        let rel = self.path.strip_prefix(&self.root).unwrap_or(&self.path).to_string_lossy().to_string();
+        let _ = Command::new("git").args(["add", "--", &rel]).current_dir(&self.root).output();
+        if let Some(storm) = self.storm.upgrade() {
+            storm.update(cx, |s, cx| s.mc_reload(cx));
+        }
+        if let Some(main) = self.main_window {
+            let _ = main.update(cx, |_, window, _| window.activate_window());
+        }
+        window.remove_window();
+    }
+}
+
+impl Render for MergeWindow {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.focused {
+            self.focused = true;
+            window.activate_window();
+        }
+        let btn = |id: &'static str, label: &'static str, accent: bool| {
+            div()
+                .id(id)
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .text_size(px(12.))
+                .cursor_pointer()
+                .border_1()
+                .border_color(rgb(if accent { ACCENT } else { BORDER }))
+                .text_color(rgb(if accent { SEL_TEXT } else { TEXT }))
+                .when(accent, |d| d.bg(rgb(ICON_SELECTED_BG)))
+                .hover(|s| s.bg(rgb(HOVER)))
+                .child(label)
+        };
+        let col = |title: &'static str, editor: Entity<Editor>| {
+            div()
+                .flex()
+                .flex_grow(1.0)
+                .min_w(px(0.))
+                .flex_col()
+                .border_r_1()
+                .border_color(rgb(BORDER))
+                .child(
+                    div()
+                        .h(px(24.))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .flex_shrink_0()
+                        .bg(rgb(PANEL_BG))
+                        .border_b_1()
+                        .border_color(rgb(BORDER))
+                        .text_size(px(11.))
+                        .text_color(rgb(MUTED))
+                        .child(title),
+                )
+                .child(div().flex_grow(1.0).min_h(px(0.)).child(editor))
+        };
+
+        let ours_text = self.ours_text.clone();
+        let theirs_text = self.theirs_text.clone();
+        let toolbar = div()
+            .h(px(34.))
+            .flex_shrink_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .bg(rgb(PANEL_BG))
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .child(btn("mw-ours", "◀ Take all Yours", false).on_click(cx.listener(move |this, _e, _w, cx| {
+                let t = ours_text.clone();
+                this.result.update(cx, |e, cx| e.set_log(t, cx));
+            })))
+            .child(btn("mw-theirs", "Take all Theirs ▶", false).on_click(cx.listener(move |this, _e, _w, cx| {
+                let t = theirs_text.clone();
+                this.result.update(cx, |e, cx| e.set_log(t, cx));
+            })))
+            .child(div().flex_grow(1.0))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .child("edit the middle pane freely · <<<< markers mark conflicts"),
+            )
+            .child(btn("mw-resolve", "Resolve", true).on_click(cx.listener(|this, _e, window, cx| {
+                this.resolve(window, cx);
+            })))
+            .child(
+                div()
+                    .id("mw-close")
+                    .px_2()
+                    .cursor_pointer()
+                    .text_color(rgb(MUTED))
+                    .hover(|s| s.text_color(rgb(GIT_DELETED)))
+                    .child("✕")
+                    .on_click(cx.listener(|_this, _e, window, _cx| window.remove_window())),
+            );
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(BG))
+            .font_family("Inter")
+            .text_size(px(13.))
+            .track_focus(&self.focus)
+            .child(toolbar)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_grow(1.0)
+                    .min_h(px(0.))
+                    .child(col("Yours", self.ours.clone()))
+                    .child(col("Result (editable)", self.result.clone()))
+                    .child(col("Theirs", self.theirs.clone())),
+            )
     }
 }
 
