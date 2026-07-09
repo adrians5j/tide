@@ -2949,6 +2949,13 @@ impl Storm {
                                 this.run_active = false;
                             }
                         }
+                        // "Already up to date" → say it in a toast, no console
+                        if success
+                            && this.run_lines.iter().any(|l| l.to_lowercase().contains("already up to date"))
+                        {
+                            this.run_active = false;
+                            this.show_flash("Already up to date", cx);
+                        }
                         if success {
                             // brief success toast, then auto-hide
                             cx.spawn(async move |this, cx| {
