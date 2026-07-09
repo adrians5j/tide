@@ -5764,7 +5764,6 @@ impl Storm {
     }
 
     fn render_bottom(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let path = self.active_path().map(|p| self.rel(p)).unwrap_or_default();
         let ro = self.read_only;
         div()
             .h(px(24.))
@@ -5778,7 +5777,7 @@ impl Storm {
             .border_t_1()
             .border_color(rgb(BORDER))
             .text_size(px(12.))
-            .child(div().text_color(rgb(MUTED)).child(path))
+            .child(div()) // (file path moved to the breadcrumb above the editor)
             .child(
                 div()
                     .flex()
@@ -9016,8 +9015,47 @@ impl Storm {
         col = col.child(self.render_tabs(cx));
 
         if has_tabs {
+            // breadcrumb bar above the file (Zed-style): rel path + copy button
+            let path = self.tabs[self.active].path.clone();
+            let scratch = self.tabs[self.active].scratch;
+            let rel = if scratch {
+                path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+            } else {
+                self.rel(&path)
+            };
+            let crumb = div()
+                .h(px(22.))
+                .flex_shrink_0()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .bg(rgb(BG))
+                .border_b_1()
+                .border_color(rgb(BORDER))
+                .text_size(px(11.))
+                .child(div().flex_grow(1.0).truncate().text_color(rgb(MUTED)).child(rel.clone()))
+                .when(!scratch, |d| {
+                    d.child(
+                        div()
+                            .id("crumb-copy")
+                            .flex_shrink_0()
+                            .font_family(ICON_FONT)
+                            .text_color(rgb(MUTED))
+                            .hover(|s| s.text_color(rgb(TEXT)))
+                            .cursor_pointer()
+                            .child(IC_COPY)
+                            .tooltip(tip("Copy path"))
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(this.rel(&path)));
+                                this.show_flash("Path copied", cx);
+                            })),
+                    )
+                });
+            col = col.child(crumb);
             let editor = self.tabs[self.active].editor.clone();
-            col = col.child(div().flex_grow(1.0).child(editor));
+            col = col.child(div().flex_grow(1.0).min_h(px(0.)).child(editor));
         } else {
             col = col.child(
                 div()
