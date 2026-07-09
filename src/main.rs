@@ -2936,6 +2936,19 @@ impl Storm {
                         this.run_running = false;
                         let success = this.run_ok.load(Ordering::Relaxed);
                         this.run_failed = !success;
+                        // after a merge/pull/rebase, auto-open the conflicts dialog
+                        // if it left unresolved conflicts
+                        let cl = this.run_cmd.to_lowercase();
+                        if cl.contains("merge") || cl.contains("pull") || cl.contains("rebase") || cl.contains("cherry-pick") {
+                            let files = conflicted_files(&this.root);
+                            if !files.is_empty() {
+                                this.mc_files = files;
+                                this.mc_into = this.branch_label();
+                                this.mc_from = merge_source(&this.root);
+                                this.mc_open = true;
+                                this.run_active = false;
+                            }
+                        }
                         if success {
                             // brief success toast, then auto-hide
                             cx.spawn(async move |this, cx| {
