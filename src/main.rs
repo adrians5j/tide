@@ -9023,8 +9023,9 @@ impl Storm {
             } else {
                 self.rel(&path)
             };
+            let path_click = path.clone();
             let crumb = div()
-                .h(px(28.))
+                .h(px(34.))
                 .flex_shrink_0()
                 .flex()
                 .flex_row()
@@ -9034,9 +9035,25 @@ impl Storm {
                 .bg(rgb(BG))
                 .border_b_1()
                 .border_color(rgb(BORDER))
-                .text_size(px(13.))
-                // path sizes to content so the copy button sits right after it
-                .child(div().min_w(px(0.)).truncate().text_color(rgb(MUTED)).child(rel.clone()))
+                .text_size(px(14.))
+                // path sizes to content so the copy button sits right after it;
+                // clicking the path (not just the icon) copies it too
+                .child(
+                    div()
+                        .id("crumb-path")
+                        .min_w(px(0.))
+                        .truncate()
+                        .cursor_pointer()
+                        .text_color(rgb(MUTED))
+                        .hover(|s| s.text_color(rgb(TEXT)))
+                        .child(rel.clone())
+                        .when(!scratch, |d| {
+                            d.on_click(cx.listener(move |this, _e, _w, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(this.rel(&path_click)));
+                                this.show_flash("Path copied", cx);
+                            }))
+                        }),
+                )
                 .when(!scratch, |d| {
                     d.child(
                         div()
