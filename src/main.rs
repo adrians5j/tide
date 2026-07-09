@@ -4218,7 +4218,16 @@ impl Storm {
         self.gitp_open = false;
         let _ = window;
         match action {
-            BranchAction::Checkout => self.run_command(format!("git checkout {}", branch), cx),
+            BranchAction::Checkout => {
+                // if the entry is a remote-tracking ref (origin/x), check out the
+                // local name so git creates/uses a tracking branch instead of
+                // landing in detached HEAD; local branches check out as-is
+                let cmd = format!(
+                    "b='{branch}'; if git show-ref --verify --quiet \"refs/remotes/$b\"; \
+                     then git checkout \"${{b#*/}}\"; else git checkout \"$b\"; fi"
+                );
+                self.run_command(cmd, cx);
+            }
             BranchAction::Merge => self.run_command(format!("git merge {}", branch), cx),
         }
     }
@@ -5175,21 +5184,25 @@ impl Render for Storm {
             root = root.child(
                 div()
                     .absolute()
-                    .bottom(px(34.))
-                    .right(px(16.))
+                    .bottom(px(56.))
+                    .right(px(28.))
+                    .min_w(px(340.))
+                    .max_w(px(560.))
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap_2()
-                    .px_3()
-                    .py_2()
+                    .gap_3()
+                    .pl_3()
+                    .pr_4()
+                    .py_3()
                     .bg(rgb(POPUP_BG))
                     .border_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(rgb(GIT_NEW))
+                    .border_l_4()
                     .rounded_md()
                     .shadow_lg()
-                    .child(div().text_color(rgb(GIT_NEW)).child("✓"))
-                    .child(div().text_size(px(12.)).text_color(rgb(TEXT)).child(msg)),
+                    .child(div().text_size(px(20.)).text_color(rgb(GIT_NEW)).child("✓"))
+                    .child(div().text_size(px(14.)).text_color(rgb(TEXT)).child(msg)),
             );
         }
 
