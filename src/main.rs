@@ -9024,7 +9024,7 @@ impl Storm {
                 self.rel(&path)
             };
             let crumb = div()
-                .h(px(22.))
+                .h(px(28.))
                 .flex_shrink_0()
                 .flex()
                 .flex_row()
@@ -9034,14 +9034,16 @@ impl Storm {
                 .bg(rgb(BG))
                 .border_b_1()
                 .border_color(rgb(BORDER))
-                .text_size(px(11.))
-                .child(div().flex_grow(1.0).truncate().text_color(rgb(MUTED)).child(rel.clone()))
+                .text_size(px(13.))
+                // path sizes to content so the copy button sits right after it
+                .child(div().min_w(px(0.)).truncate().text_color(rgb(MUTED)).child(rel.clone()))
                 .when(!scratch, |d| {
                     d.child(
                         div()
                             .id("crumb-copy")
                             .flex_shrink_0()
                             .font_family(ICON_FONT)
+                            .text_size(px(12.))
                             .text_color(rgb(MUTED))
                             .hover(|s| s.text_color(rgb(TEXT)))
                             .cursor_pointer()
@@ -9052,7 +9054,8 @@ impl Storm {
                                 this.show_flash("Path copied", cx);
                             })),
                     )
-                });
+                })
+                .child(div().flex_grow(1.0)); // spacer keeps path + copy left-aligned
             col = col.child(crumb);
             let editor = self.tabs[self.active].editor.clone();
             col = col.child(div().flex_grow(1.0).min_h(px(0.)).child(editor));
