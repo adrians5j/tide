@@ -5223,8 +5223,9 @@ impl Render for Storm {
                     .border_l_4()
                     .rounded_md()
                     .shadow_lg()
-                    .child(div().text_size(px(20.)).text_color(rgb(GIT_NEW)).child("✓"))
-                    .child(div().text_size(px(14.)).text_color(rgb(TEXT)).child(msg)),
+                    .overflow_hidden()
+                    .child(div().flex_shrink_0().text_size(px(20.)).text_color(rgb(GIT_NEW)).child("✓"))
+                    .child(div().flex_grow(1.0).min_w(px(0.)).text_size(px(14.)).text_color(rgb(TEXT)).truncate().child(msg)),
             );
         }
 
@@ -5711,13 +5712,16 @@ impl Storm {
             .border_l_4()
             .rounded_md()
             .shadow_lg()
+            .overflow_hidden()
             .cursor_pointer()
             // big state glyph
-            .child(div().text_size(px(20.)).text_color(rgb(color)).child(glyph))
+            .child(div().flex_shrink_0().text_size(px(20.)).text_color(rgb(color)).child(glyph))
             .child(
                 div()
                     .flex()
                     .flex_col()
+                    .flex_grow(1.0)
+                    .min_w(px(0.))
                     .gap_1()
                     .child(div().text_size(px(11.)).text_color(rgb(color)).child(label))
                     .child(div().text_size(px(14.)).text_color(rgb(TEXT)).truncate().child(msg)),
@@ -10379,50 +10383,43 @@ impl Render for DiffWindow {
             let viewed_count = self.files.iter().filter(|f| viewed.contains(*f)).count();
             let total = self.files.len();
             let pct = if total == 0 { 0 } else { viewed_count * 100 / total };
-            let mut tree = div()
-                .id("dw-files")
-                .w(px(260.))
+            // fixed filter input (top of the sidebar)
+            let filter_row = div()
+                .id("dw-filter")
+                .h(px(28.))
+                .px_3()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
                 .flex_shrink_0()
-                .h_full()
+                .border_b_1()
+                .border_color(rgb(BORDER))
+                .track_focus(&self.filter_focus)
+                .on_key_down(cx.listener(Self::filter_key))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _e, window, cx| {
+                        window.focus(&this.filter_focus, cx);
+                        cx.notify();
+                    }),
+                )
+                .child(div().font_family(ICON_FONT).text_size(px(12.)).text_color(rgb(MUTED)).child(IC_SEARCH))
+                .child(if self.filter.is_empty() {
+                    div().text_size(px(12.)).text_color(rgb(MUTED)).child("Filter files…")
+                } else {
+                    div().text_size(px(12.)).text_color(rgb(TEXT)).child(self.filter.render("▏", SELECTION))
+                });
+            // the scrolling row list
+            let mut list = div()
+                .id("dw-files")
+                .flex_grow(1.0)
+                .min_h(px(0.))
                 .flex()
                 .flex_col()
-                .overflow_y_scroll()
-                .bg(rgb(PANEL_BG))
-                .border_r_1()
-                .border_color(rgb(BORDER))
-                // don't let clicks in the sidebar start a text selection in the diff
-                .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
-                // filter input (type to narrow the tree by path substring)
-                .child(
-                    div()
-                        .id("dw-filter")
-                        .h(px(28.))
-                        .px_3()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .flex_shrink_0()
-                        .border_b_1()
-                        .border_color(rgb(BORDER))
-                        .track_focus(&self.filter_focus)
-                        .on_key_down(cx.listener(Self::filter_key))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _e, window, cx| {
-                                window.focus(&this.filter_focus, cx);
-                                cx.notify();
-                            }),
-                        )
-                        .child(div().font_family(ICON_FONT).text_size(px(12.)).text_color(rgb(MUTED)).child(IC_SEARCH))
-                        .child(if self.filter.is_empty() {
-                            div().text_size(px(12.)).text_color(rgb(MUTED)).child("Filter files…")
-                        } else {
-                            div().text_size(px(12.)).text_color(rgb(TEXT)).child(self.filter.render("▏", SELECTION))
-                        }),
-                );
-            if self.pr_mode {
-                // All / Unviewed / Viewed segmented control
+                .overflow_y_scroll();
+            // All/Unviewed/Viewed chips (fixed, PR mode)
+            let chips = self.pr_mode.then(|| {
                 let chip = |label: &'static str, f: PrViewFilter| {
                     let on = self.pr_filter == f;
                     div()
@@ -10440,59 +10437,57 @@ impl Render for DiffWindow {
                             cx.notify();
                         }))
                 };
-                tree = tree.child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .px_2()
-                        .py_1()
-                        .flex_shrink_0()
-                        .border_b_1()
-                        .border_color(rgb(BORDER))
-                        .child(chip("All", PrViewFilter::All))
-                        .child(chip("Unviewed", PrViewFilter::Unviewed))
-                        .child(chip("Viewed", PrViewFilter::Viewed)),
-                );
-                // progress bar (viewed / total)
-                tree = tree.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .px_3()
-                        .py_2()
-                        .flex_shrink_0()
-                        .border_b_1()
-                        .border_color(rgb(BORDER))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .justify_between()
-                                .text_size(px(10.))
-                                .text_color(rgb(MUTED))
-                                .child(format!("{viewed_count}/{total} viewed"))
-                                .child(format!("{pct}%")),
-                        )
-                        .child({
-                            let bar_w = 236.0_f32; // ~sidebar width minus padding
-                            div()
-                                .w(px(bar_w))
-                                .h(px(4.))
-                                .rounded_sm()
-                                .bg(rgb(HOVER))
-                                .child(
-                                    div()
-                                        .w(px(bar_w * pct as f32 / 100.0))
-                                        .h_full()
-                                        .rounded_sm()
-                                        .bg(rgb(GIT_NEW)),
-                                )
-                        }),
-                );
-            }
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .flex_shrink_0()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .child(chip("All", PrViewFilter::All))
+                    .child(chip("Unviewed", PrViewFilter::Unviewed))
+                    .child(chip("Viewed", PrViewFilter::Viewed))
+            });
+            // progress bar (viewed / total) — pinned at the bottom (PR mode)
+            let progress = self.pr_mode.then(|| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .px_3()
+                    .py_2()
+                    .flex_shrink_0()
+                    .border_t_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_between()
+                            .text_size(px(10.))
+                            .text_color(rgb(MUTED))
+                            .child(format!("{viewed_count}/{total} viewed"))
+                            .child(format!("{pct}%")),
+                    )
+                    .child({
+                        let bar_w = 236.0_f32; // ~sidebar width minus padding
+                        div()
+                            .w(px(bar_w))
+                            .h(px(4.))
+                            .rounded_sm()
+                            .bg(rgb(HOVER))
+                            .child(
+                                div()
+                                    .w(px(bar_w * pct as f32 / 100.0))
+                                    .h_full()
+                                    .rounded_sm()
+                                    .bg(rgb(GIT_NEW)),
+                            )
+                    })
+            });
             for (ri, row) in self.tree_rows().into_iter().enumerate() {
                 let indent = 8.0 + row.depth as f32 * 14.0;
                 let sel = row.file_idx == Some(self.idx);
@@ -10504,7 +10499,7 @@ impl Render for DiffWindow {
                 let is_viewed = file_path.as_ref().is_some_and(|p| viewed.contains(p));
                 let show_check = self.pr_mode && file_path.is_some();
                 let check_path = file_path.clone();
-                tree = tree.child(
+                list = list.child(
                     div()
                         .id(("dw-row", ri))
                         .flex()
@@ -10594,6 +10589,22 @@ impl Render for DiffWindow {
                         })),
                 );
             }
+            // sidebar: fixed filter + chips on top, scrolling list, progress pinned
+            // at the bottom
+            let sidebar = div()
+                .w(px(260.))
+                .flex_shrink_0()
+                .h_full()
+                .flex()
+                .flex_col()
+                .bg(rgb(PANEL_BG))
+                .border_r_1()
+                .border_color(rgb(BORDER))
+                .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
+                .child(filter_row)
+                .children(chips)
+                .child(list)
+                .children(progress);
             // body added directly as a flex child so it keeps a bounded height
             // (scroll panes need that); a non-flex wrapper here breaks scrolling
             let content = div()
@@ -10601,7 +10612,7 @@ impl Render for DiffWindow {
                 .flex_row()
                 .flex_grow(1.0)
                 .min_h(px(0.))
-                .child(tree)
+                .child(sidebar)
                 .child(body);
             col.child(content)
         } else {
