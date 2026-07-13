@@ -3827,6 +3827,7 @@ impl Storm {
         pr_mode: bool,
         cx: &mut Context<Self>,
     ) {
+        let pr_viewed = if pr_mode { self.pr_viewed.clone() } else { HashSet::new() };
         let root = self.root.clone();
         let storm = cx.entity().downgrade();
         let main = cx.active_window();
@@ -3841,7 +3842,7 @@ impl Storm {
                 focus: true,
                 ..Default::default()
             },
-            move |_, cx| cx.new(|cx| DiffWindow::new(root, files, idx, old, new_rev, pr_mode, storm, main, cx)),
+            move |_, cx| cx.new(|cx| DiffWindow::new(root, files, idx, old, new_rev, pr_mode, pr_viewed, storm, main, cx)),
         )
         .ok();
     }
@@ -9665,6 +9666,7 @@ struct DiffWindow {
     pr_mode: bool,
     pr_filter: PrViewFilter,
     pr_hidden: HashSet<usize>, // file indices filtered out by pr_filter (this render)
+    pr_viewed: HashSet<PathBuf>, // local snapshot (avoids reading Storm mid-update)
 }
 
 /// One visible row in the Diff window's file-tree sidebar.
@@ -9683,6 +9685,7 @@ impl DiffWindow {
         old: Option<String>,
         new_rev: Option<String>,
         pr_mode: bool,
+        pr_viewed: HashSet<PathBuf>,
         storm: WeakEntity<Storm>,
         main_window: Option<AnyWindowHandle>,
         cx: &mut Context<Self>,
@@ -9740,6 +9743,7 @@ impl DiffWindow {
             pr_mode,
             pr_filter: PrViewFilter::All,
             pr_hidden: HashSet::new(),
+            pr_viewed,
         }
     }
 
@@ -10351,13 +10355,9 @@ impl Render for DiffWindow {
         // file-tree sidebar (only for a multi-file diff): collapsible directories,
         // click a file to jump to it, current file highlighted
         if self.files.len() > 1 {
-            // PR mode: pull the viewed set from the main window, compute which
-            // files the viewed-filter hides, and the review progress
-            let viewed: HashSet<PathBuf> = if self.pr_mode {
-                self.storm.upgrade().map(|s| s.read(cx).pr_viewed.clone()).unwrap_or_default()
-            } else {
-                HashSet::new()
-            };
+            // PR mode: use the local viewed snapshot (reading Storm here can
+            // reentrantly panic — cmd+d opens this window mid-Storm-update)
+            let viewed = self.pr_viewed.clone();
             if self.pr_mode {
                 self.pr_hidden = self
                     .files
@@ -10546,8 +10546,14 @@ impl Render for DiffWindow {
                                     .child(if is_viewed { "✓" } else { "" })
                                     .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
                                     .on_click(cx.listener(move |this, _e, _w, cx| {
-                                        if let (Some(p), Some(storm)) = (check_path.clone(), this.storm.upgrade()) {
-                                            storm.update(cx, |s, _| s.toggle_pr_viewed(p));
+                                        if let Some(p) = check_path.clone() {
+                                            // update local snapshot + push to the main window (gh sync)
+                                            if !this.pr_viewed.remove(&p) {
+                                                this.pr_viewed.insert(p.clone());
+                                            }
+                                            if let Some(storm) = this.storm.upgrade() {
+                                                storm.update(cx, |s, _| s.toggle_pr_viewed(p));
+                                            }
                                             cx.notify();
                                         }
                                     })),
