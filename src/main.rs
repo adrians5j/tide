@@ -3813,7 +3813,7 @@ impl Storm {
             return;
         }
         let idx = focus.and_then(|p| files.iter().position(|f| f == &p)).unwrap_or(0);
-        self.open_diff_window(files, idx, None, None, cx);
+        self.open_diff_window(files, idx, None, None, false, cx);
     }
 
     /// Open a diff in its own window. `old` Some → committed diff of `old` vs
@@ -3824,6 +3824,7 @@ impl Storm {
         idx: usize,
         old: Option<String>,
         new_rev: Option<String>,
+        pr_mode: bool,
         cx: &mut Context<Self>,
     ) {
         let root = self.root.clone();
@@ -3840,7 +3841,7 @@ impl Storm {
                 focus: true,
                 ..Default::default()
             },
-            move |_, cx| cx.new(|cx| DiffWindow::new(root, files, idx, old, new_rev, storm, main, cx)),
+            move |_, cx| cx.new(|cx| DiffWindow::new(root, files, idx, old, new_rev, pr_mode, storm, main, cx)),
         )
         .ok();
     }
@@ -3954,7 +3955,7 @@ impl Storm {
         let files: Vec<PathBuf> = self.pr_files.iter().map(|(p, _)| p.clone()).collect();
         let Some(idx) = files.iter().position(|p| p == &path) else { return };
         let old = Some(diff_base_rev(&self.root, &self.pr_base));
-        self.open_diff_window(files, idx, old, None, cx);
+        self.open_diff_window(files, idx, old, None, true, cx);
     }
 
     /// PR pane keys: F4 opens the selected file in a tab, Enter shows its diff,
@@ -4117,7 +4118,7 @@ impl Storm {
             Some(sha) => (Some(format!("{sha}^")), Some(sha.clone())),
             None => (Some(diff_base_rev(&self.root, &self.push_base_ref)), None),
         };
-        self.open_diff_window(files, idx, old, new_rev, cx);
+        self.open_diff_window(files, idx, old, new_rev, false, cx);
     }
 
     fn do_push(&mut self, cx: &mut Context<Self>) {
@@ -9660,6 +9661,10 @@ struct DiffWindow {
     // fraction of the diff area given to the left pane (draggable divider)
     pane_split: f32,
     resizing_pane: bool,
+    // PR-review mode: sidebar gains viewed checkboxes, progress, viewed-filter
+    pr_mode: bool,
+    pr_filter: PrViewFilter,
+    pr_hidden: HashSet<usize>, // file indices filtered out by pr_filter (this render)
 }
 
 /// One visible row in the Diff window's file-tree sidebar.
@@ -9677,6 +9682,7 @@ impl DiffWindow {
         idx: usize,
         old: Option<String>,
         new_rev: Option<String>,
+        pr_mode: bool,
         storm: WeakEntity<Storm>,
         main_window: Option<AnyWindowHandle>,
         cx: &mut Context<Self>,
@@ -9731,6 +9737,9 @@ impl DiffWindow {
             filter_focus: cx.focus_handle(),
             pane_split: 0.5,
             resizing_pane: false,
+            pr_mode,
+            pr_filter: PrViewFilter::All,
+            pr_hidden: HashSet::new(),
         }
     }
 
@@ -9746,6 +9755,9 @@ impl DiffWindow {
         let filtering = !q.is_empty();
         let mut root = Node::default();
         for (i, f) in self.files.iter().enumerate() {
+            if self.pr_hidden.contains(&i) {
+                continue; // filtered out by the viewed-state filter (PR mode)
+            }
             let rel = f.strip_prefix(&self.root).unwrap_or(f);
             // filter on the whole relative path so "core/req" or ".test" both work
             if filtering && !rel.to_string_lossy().to_lowercase().contains(&q) {
@@ -10339,6 +10351,34 @@ impl Render for DiffWindow {
         // file-tree sidebar (only for a multi-file diff): collapsible directories,
         // click a file to jump to it, current file highlighted
         if self.files.len() > 1 {
+            // PR mode: pull the viewed set from the main window, compute which
+            // files the viewed-filter hides, and the review progress
+            let viewed: HashSet<PathBuf> = if self.pr_mode {
+                self.storm.upgrade().map(|s| s.read(cx).pr_viewed.clone()).unwrap_or_default()
+            } else {
+                HashSet::new()
+            };
+            if self.pr_mode {
+                self.pr_hidden = self
+                    .files
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, f)| {
+                        let v = viewed.contains(f);
+                        let hide = match self.pr_filter {
+                            PrViewFilter::All => false,
+                            PrViewFilter::Unviewed => v,
+                            PrViewFilter::Viewed => !v,
+                        };
+                        hide.then_some(i)
+                    })
+                    .collect();
+            } else {
+                self.pr_hidden.clear();
+            }
+            let viewed_count = self.files.iter().filter(|f| viewed.contains(*f)).count();
+            let total = self.files.len();
+            let pct = if total == 0 { 0 } else { viewed_count * 100 / total };
             let mut tree = div()
                 .id("dw-files")
                 .w(px(260.))
@@ -10381,6 +10421,78 @@ impl Render for DiffWindow {
                             div().text_size(px(12.)).text_color(rgb(TEXT)).child(self.filter.render("▏", SELECTION))
                         }),
                 );
+            if self.pr_mode {
+                // All / Unviewed / Viewed segmented control
+                let chip = |label: &'static str, f: PrViewFilter| {
+                    let on = self.pr_filter == f;
+                    div()
+                        .id(label)
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .text_size(px(11.))
+                        .cursor_pointer()
+                        .when(on, |d| d.bg(rgb(ACCENT)).text_color(rgb(SEL_TEXT)))
+                        .when(!on, |d| d.text_color(rgb(MUTED)).hover(|s| s.bg(rgb(HOVER))))
+                        .child(label)
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            this.pr_filter = f;
+                            cx.notify();
+                        }))
+                };
+                tree = tree.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .py_1()
+                        .flex_shrink_0()
+                        .border_b_1()
+                        .border_color(rgb(BORDER))
+                        .child(chip("All", PrViewFilter::All))
+                        .child(chip("Unviewed", PrViewFilter::Unviewed))
+                        .child(chip("Viewed", PrViewFilter::Viewed)),
+                );
+                // progress bar (viewed / total)
+                tree = tree.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .px_3()
+                        .py_2()
+                        .flex_shrink_0()
+                        .border_b_1()
+                        .border_color(rgb(BORDER))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .justify_between()
+                                .text_size(px(10.))
+                                .text_color(rgb(MUTED))
+                                .child(format!("{viewed_count}/{total} viewed"))
+                                .child(format!("{pct}%")),
+                        )
+                        .child({
+                            let bar_w = 236.0_f32; // ~sidebar width minus padding
+                            div()
+                                .w(px(bar_w))
+                                .h(px(4.))
+                                .rounded_sm()
+                                .bg(rgb(HOVER))
+                                .child(
+                                    div()
+                                        .w(px(bar_w * pct as f32 / 100.0))
+                                        .h_full()
+                                        .rounded_sm()
+                                        .bg(rgb(GIT_NEW)),
+                                )
+                        }),
+                );
+            }
             for (ri, row) in self.tree_rows().into_iter().enumerate() {
                 let indent = 8.0 + row.depth as f32 * 14.0;
                 let sel = row.file_idx == Some(self.idx);
@@ -10388,6 +10500,10 @@ impl Render for DiffWindow {
                 let collapsed = row.dir.as_ref().is_some_and(|p| self.tree_collapsed.contains(p));
                 let dir_path = row.dir.clone();
                 let file_idx = row.file_idx;
+                let file_path = file_idx.map(|i| self.files[i].clone());
+                let is_viewed = file_path.as_ref().is_some_and(|p| viewed.contains(p));
+                let show_check = self.pr_mode && file_path.is_some();
+                let check_path = file_path.clone();
                 tree = tree.child(
                     div()
                         .id(("dw-row", ri))
@@ -10411,6 +10527,32 @@ impl Render for DiffWindow {
                                 .text_color(rgb(DIR))
                                 .child(if is_dir { if collapsed { "▸" } else { "▾" } } else { "" }),
                         )
+                        // viewed checkbox (PR mode, file rows) — toggles + syncs to gh
+                        .when(show_check, |d| {
+                            d.child(
+                                div()
+                                    .id(("dw-check", ri))
+                                    .w(px(14.))
+                                    .h(px(14.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_sm()
+                                    .border_1()
+                                    .border_color(rgb(if is_viewed { GIT_NEW } else { MUTED }))
+                                    .when(is_viewed, |d| d.bg(rgb(GIT_NEW)))
+                                    .text_size(px(9.))
+                                    .text_color(rgb(BG))
+                                    .child(if is_viewed { "✓" } else { "" })
+                                    .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
+                                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                                        if let (Some(p), Some(storm)) = (check_path.clone(), this.storm.upgrade()) {
+                                            storm.update(cx, |s, _| s.toggle_pr_viewed(p));
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                        })
                         .when(is_dir, |d| {
                             d.child(
                                 div()
