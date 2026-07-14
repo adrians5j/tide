@@ -10554,6 +10554,14 @@ impl Render for DiffWindow {
                 let is_viewed = file_path.as_ref().is_some_and(|p| viewed.contains(p));
                 let show_check = self.pr_mode && file_path.is_some();
                 let check_path = file_path.clone();
+                // file-type badge (files) / file-count (dirs), like the PR tree
+                let badge = file_path.as_ref().map(|p| ext_badge(p));
+                let dir_count = dir_path.as_ref().map(|dp| {
+                    self.files
+                        .iter()
+                        .filter(|f| f.strip_prefix(&self.root).map(|r| r.starts_with(dp)).unwrap_or(false))
+                        .count()
+                });
                 list = list.child(
                     div()
                         .id(("dw-row", ri))
@@ -10618,6 +10626,18 @@ impl Render for DiffWindow {
                                     .child(IC_FOLDER),
                             )
                         })
+                        // file-type badge (colored, like the PR tree)
+                        .when_some(badge, |d, (b, c)| {
+                            d.child(
+                                div()
+                                    .w(px(16.))
+                                    .flex()
+                                    .justify_center()
+                                    .text_size(px(9.))
+                                    .text_color(rgb(if sel { SEL_TEXT } else { c }))
+                                    .child(b),
+                            )
+                        })
                         .child(
                             div()
                                 .flex_grow(1.0)
@@ -10632,6 +10652,10 @@ impl Render for DiffWindow {
                                 }))
                                 .child(row.label),
                         )
+                        // dir file count on the right
+                        .when_some(dir_count, |d, n| {
+                            d.child(div().text_size(px(10.)).text_color(rgb(MUTED)).child(format!("{n}")))
+                        })
                         .on_click(cx.listener(move |this, _e, _w, cx| {
                             if let Some(p) = &dir_path {
                                 if !this.tree_collapsed.remove(p) {
