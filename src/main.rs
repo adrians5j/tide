@@ -6137,6 +6137,7 @@ impl Storm {
                     .text_size(px(12.))
                     .child(format!("COMMIT  ·  {} changed", count))
                     .child(div().flex_grow(1.0))
+                    .child(self.copy_paths_btn("copy-changed", all_changed.clone(), cx))
                     .child(self.collapse_left_btn(cx)),
             )
             // filter bar
@@ -6633,6 +6634,11 @@ impl Storm {
                         format!("PULL REQUEST  ·  vs {}", self.pr_base)
                     })
                     .child(div().flex_grow(1.0))
+                    .child(self.copy_paths_btn(
+                        "copy-pr",
+                        self.pr_files.iter().map(|(p, _)| p.clone()).collect(),
+                        cx,
+                    ))
                     .child(self.collapse_left_btn(cx)),
             )
             // filter bar
@@ -8898,6 +8904,28 @@ impl Storm {
 
     /// Small "collapse" button for a left-panel header — hides the whole left
     /// sidebar (same as toggling its activity-bar icon off).
+    /// Header button that copies all given file paths (repo-relative, one per
+    /// line) to the clipboard — handy to paste a changed-file list into an LLM.
+    fn copy_paths_btn(&self, id: &'static str, paths: Vec<PathBuf>, cx: &mut Context<Self>) -> impl IntoElement {
+        let n = paths.len();
+        div()
+            .id(id)
+            .px_1()
+            .flex_shrink_0()
+            .font_family(ICON_FONT)
+            .text_size(px(12.))
+            .text_color(rgb(MUTED))
+            .hover(|s| s.text_color(rgb(TEXT)))
+            .cursor_pointer()
+            .child(IC_COPY)
+            .tooltip(tip("Copy all changed paths"))
+            .on_click(cx.listener(move |this, _e, _w, cx| {
+                let list = paths.iter().map(|p| this.rel(p)).collect::<Vec<_>>().join("\n");
+                cx.write_to_clipboard(ClipboardItem::new_string(list));
+                this.show_flash(&format!("Copied {n} paths"), cx);
+            }))
+    }
+
     fn collapse_left_btn(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("panel-collapse")
@@ -9889,6 +9917,46 @@ impl DiffWindow {
         }
     }
 
+    /// File indices currently visible in the sidebar (respecting the viewed
+    /// filter + text filter), in natural order. Drives prev/next so they walk
+    /// the active list only.
+    fn visible_files(&self) -> Vec<usize> {
+        let q = self.filter.text.trim().to_lowercase();
+        (0..self.files.len())
+            .filter(|i| {
+                if self.pr_hidden.contains(i) {
+                    return false;
+                }
+                if !q.is_empty() {
+                    let f = &self.files[*i];
+                    let rel = f.strip_prefix(&self.root).unwrap_or(f).to_string_lossy().to_lowercase();
+                    if !rel.contains(&q) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect()
+    }
+
+    /// Step to the next/previous visible file (skips filtered-out ones).
+    fn goto_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let vis = self.visible_files();
+        if vis.is_empty() {
+            return;
+        }
+        let target = match vis.iter().position(|&i| i == self.idx) {
+            Some(p) if forward => vis.get(p + 1).copied(),
+            Some(p) => p.checked_sub(1).and_then(|q| vis.get(q).copied()),
+            // current file is filtered out → jump to the nearest visible one
+            None if forward => vis.iter().find(|&&i| i > self.idx).copied(),
+            None => vis.iter().rev().find(|&&i| i < self.idx).copied(),
+        };
+        if let Some(t) = target {
+            self.goto(t, cx);
+        }
+    }
+
     /// Row index of the first changed (non-Equal) line, if any.
     fn first_change_row(&self) -> Option<usize> {
         self.rows.iter().position(|r| r.kind != DiffKind::Equal)
@@ -10078,16 +10146,8 @@ impl DiffWindow {
                     window.remove_window();
                 }
             }
-            "down" | "right" => {
-                if self.idx + 1 < self.files.len() {
-                    self.goto(self.idx + 1, cx);
-                }
-            }
-            "up" | "left" => {
-                if self.idx > 0 {
-                    self.goto(self.idx - 1, cx);
-                }
-            }
+            "down" | "right" => self.goto_step(true, cx),
+            "up" | "left" => self.goto_step(false, cx),
             _ => {}
         }
     }
@@ -10181,9 +10241,12 @@ impl Render for DiffWindow {
         self.char_w = f32::from(window.text_system().shape_line("0".into(), px(13.), &[run], None).width);
         let path = &self.files[self.idx];
         let rel = path.strip_prefix(&self.root).unwrap_or(path).to_string_lossy().to_string();
-        let pos = format!("{}/{}", self.idx + 1, self.files.len());
-        let has_prev = self.idx > 0;
-        let has_next = self.idx + 1 < self.files.len();
+        // position within the currently-visible (filtered) list
+        let vis = self.visible_files();
+        let vpos = vis.iter().position(|&i| i == self.idx);
+        let pos = format!("{}/{}", vpos.map(|p| p + 1).unwrap_or(0), vis.len());
+        let has_prev = vpos.map(|p| p > 0).unwrap_or(!vis.is_empty());
+        let has_next = vpos.map(|p| p + 1 < vis.len()).unwrap_or(!vis.is_empty());
         // count changed hunks (contiguous non-Equal runs), shown like WebStorm
         let diffs = {
             let mut n = 0usize;
@@ -10217,11 +10280,7 @@ impl Render for DiffWindow {
                     .text_color(rgb(if has_prev { TEXT } else { MUTED }))
                     .hover(|s| s.text_color(rgb(ACCENT)))
                     .child("‹")
-                    .on_click(cx.listener(|this, _e, _w, cx| {
-                        if this.idx > 0 {
-                            this.goto(this.idx - 1, cx);
-                        }
-                    })),
+                    .on_click(cx.listener(|this, _e, _w, cx| this.goto_step(false, cx))),
             )
             .child(
                 div()
@@ -10231,11 +10290,7 @@ impl Render for DiffWindow {
                     .text_color(rgb(if has_next { TEXT } else { MUTED }))
                     .hover(|s| s.text_color(rgb(ACCENT)))
                     .child("›")
-                    .on_click(cx.listener(|this, _e, _w, cx| {
-                        if this.idx + 1 < this.files.len() {
-                            this.goto(this.idx + 1, cx);
-                        }
-                    })),
+                    .on_click(cx.listener(|this, _e, _w, cx| this.goto_step(true, cx))),
             )
             .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(pos))
             .child(div().flex_grow(1.0).text_color(rgb(TEXT)).text_size(px(12.)).child(rel))
