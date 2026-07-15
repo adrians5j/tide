@@ -61,7 +61,7 @@ actions!(
     [
         CloseTab, CloseOthers, ToggleTerminal, OpenFinder, GotoLine, NewTerminal, CloseTerminalTab,
         CloseOtherTerminals, GotoCommit, ShowDiff, FindInFiles,
-        GitPopup, CommandPalette, CopyReference, OpenOnGithub, NextProject, PrevProject, OpenProject,
+        GitPopup, CommandPalette, CopyReference, CopyReferenceLine, OpenOnGithub, NextProject, PrevProject, OpenProject,
         ShowProjects, PushDialog, RunCommand, NewProject, FetchRemotes, PullRemote, WipPush, RunBuild,
         NewScratch
     ]
@@ -4304,12 +4304,22 @@ impl Storm {
     // ── command palette ───────────────────────────────────────────────────
 
     /// Copy "relative/path.ts:line" of the active file's cursor to the clipboard.
+    /// cmd+shift+c: copy the active file's path (no line number).
     fn act_copy_reference(&mut self, _: &CopyReference, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get(self.active) {
+            let reference = self.rel(&tab.path);
+            cx.write_to_clipboard(ClipboardItem::new_string(reference));
+            self.show_flash("Path copied", cx);
+        }
+    }
+
+    /// cmd+shift+opt+c: copy the active file's path with the cursor line (path:N).
+    fn act_copy_reference_line(&mut self, _: &CopyReferenceLine, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get(self.active) {
             let line = tab.editor.read(cx).cursor_line();
             let reference = format!("{}:{}", self.rel(&tab.path), line);
             cx.write_to_clipboard(ClipboardItem::new_string(reference));
-            self.show_flash("Reference copied", cx);
+            self.show_flash("Path + line copied", cx);
         }
     }
 
@@ -5126,6 +5136,7 @@ impl Render for Storm {
             .on_action(cx.listener(Self::act_git_popup))
             .on_action(cx.listener(Self::act_command_palette))
             .on_action(cx.listener(Self::act_copy_reference))
+            .on_action(cx.listener(Self::act_copy_reference_line))
             .on_action(cx.listener(Self::act_open_on_github))
             .on_action(cx.listener(Self::act_push_dialog))
             .on_action(cx.listener(Self::act_run_command))
@@ -10572,12 +10583,19 @@ impl Render for DiffWindow {
                 let check_path = file_path.clone();
                 // file-type badge (files) / file-count (dirs), like the PR tree
                 let badge = file_path.as_ref().map(|p| ext_badge(p));
-                let dir_count = dir_path.as_ref().map(|dp| {
-                    self.files
-                        .iter()
-                        .filter(|f| f.strip_prefix(&self.root).map(|r| r.starts_with(dp)).unwrap_or(false))
-                        .count()
-                });
+                let dir_files: Vec<PathBuf> = dir_path
+                    .as_ref()
+                    .map(|dp| {
+                        self.files
+                            .iter()
+                            .filter(|f| f.strip_prefix(&self.root).map(|r| r.starts_with(dp)).unwrap_or(false))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let dir_count = dir_path.as_ref().map(|_| dir_files.len());
+                let dir_viewed = !dir_files.is_empty() && dir_files.iter().all(|p| viewed.contains(p));
+                let show_dir_check = self.pr_mode && is_dir;
                 list = list.child(
                     div()
                         .id(("dw-row", ri))
@@ -10601,23 +10619,45 @@ impl Render for DiffWindow {
                                 .text_color(rgb(DIR))
                                 .child(if is_dir { if collapsed { "▸" } else { "▾" } } else { "" }),
                         )
+                        // folder viewed checkbox (PR mode) — marks all files under it
+                        .when(show_dir_check, |d| {
+                            let files = dir_files.clone();
+                            d.child(
+                                div()
+                                    .id(("dw-dcheck", ri))
+                                    .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
+                                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                                        let all = !files.is_empty() && files.iter().all(|p| this.pr_viewed.contains(p));
+                                        for p in &files {
+                                            if all {
+                                                this.pr_viewed.remove(p);
+                                            } else {
+                                                this.pr_viewed.insert(p.clone());
+                                            }
+                                        }
+                                        if let Some(storm) = this.storm.upgrade() {
+                                            let files = files.clone();
+                                            storm.update(cx, |s, _| {
+                                                // Storm::toggle_pr_viewed_all flips based on its own
+                                                // state; set each explicitly to match our target
+                                                for p in &files {
+                                                    let has = s.pr_viewed.contains(p);
+                                                    if all && has || !all && !has {
+                                                        s.toggle_pr_viewed(p.clone());
+                                                    }
+                                                }
+                                            });
+                                        }
+                                        cx.notify();
+                                    }))
+                                    .child(check_box(dir_viewed)),
+                            )
+                        })
                         // viewed checkbox (PR mode, file rows) — toggles + syncs to gh
                         .when(show_check, |d| {
                             d.child(
                                 div()
                                     .id(("dw-check", ri))
-                                    .w(px(14.))
-                                    .h(px(14.))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_sm()
-                                    .border_1()
-                                    .border_color(rgb(if is_viewed { GIT_NEW } else { MUTED }))
-                                    .when(is_viewed, |d| d.bg(rgb(GIT_NEW)))
-                                    .text_size(px(9.))
-                                    .text_color(rgb(BG))
-                                    .child(if is_viewed { "✓" } else { "" })
                                     .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
                                     .on_click(cx.listener(move |this, _e, _w, cx| {
                                         if let Some(p) = check_path.clone() {
@@ -10630,7 +10670,8 @@ impl Render for DiffWindow {
                                             }
                                             cx.notify();
                                         }
-                                    })),
+                                    }))
+                                    .child(check_box(is_viewed)),
                             )
                         })
                         .when(is_dir, |d| {
@@ -10944,6 +10985,7 @@ fn main() {
             KeyBinding::new("cmd-f", SearchOpen, Some("Editor")),
             // copy reference (relpath:line)
             KeyBinding::new("cmd-shift-c", CopyReference, Some("Editor")),
+            KeyBinding::new("cmd-shift-alt-c", CopyReferenceLine, Some("Editor")),
             KeyBinding::new("cmd-w", CloseTab, Some("Editor")),
             KeyBinding::new("cmd-shift-w", CloseOthers, Some("Editor")),
             // selection
