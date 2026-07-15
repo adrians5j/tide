@@ -6449,6 +6449,13 @@ impl Storm {
                     )
                     .child(
                         div()
+                            .font_family(ICON_FONT)
+                            .text_size(px(12.))
+                            .text_color(rgb(FOLDER_ICON))
+                            .child(IC_FOLDER),
+                    )
+                    .child(
+                        div()
                             .id(("pr-dir-label", ix))
                             .flex_grow(1.0)
                             .cursor_pointer()
