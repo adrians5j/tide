@@ -6634,14 +6634,9 @@ impl Storm {
                         format!("PULL REQUEST  ·  vs {}", self.pr_base)
                     })
                     .child(div().flex_grow(1.0))
-                    .child(self.copy_paths_btn(
-                        "copy-pr",
-                        self.pr_files.iter().map(|(p, _)| p.clone()).collect(),
-                        cx,
-                    ))
                     .child(self.collapse_left_btn(cx)),
             )
-            // filter bar
+            // filter bar (copy button here copies the currently-filtered files)
             .child(
                 div()
                     .id("pr-filter")
@@ -6664,10 +6659,11 @@ impl Storm {
                     )
                     .child(div().font_family(ICON_FONT).text_size(px(12.)).text_color(rgb(MUTED)).child(IC_SEARCH))
                     .child(if self.pr_filter.is_empty() {
-                        div().text_size(px(12.)).text_color(rgb(MUTED)).child(format!("Filter files…{}", self.caret_if(filter_focused)))
+                        div().flex_grow(1.0).text_size(px(12.)).text_color(rgb(MUTED)).child(format!("Filter files…{}", self.caret_if(filter_focused)))
                     } else {
-                        div().text_size(px(12.)).text_color(rgb(TEXT)).child(self.pr_filter.render(self.caret_if(filter_focused), SELECTION))
-                    }),
+                        div().flex_grow(1.0).text_size(px(12.)).text_color(rgb(TEXT)).child(self.pr_filter.render(self.caret_if(filter_focused), SELECTION))
+                    })
+                    .child(self.copy_paths_btn("copy-pr", self.pr_shown_files.clone(), cx)),
             )
             // viewed-state segmented control
             .child(
