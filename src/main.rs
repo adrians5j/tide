@@ -10322,15 +10322,23 @@ impl Render for DiffWindow {
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
             .on_scroll_wheel(cx.listener(|_this, _e, _w, cx| cx.notify()))
-            // drag to select text
+            // click to place caret / drag to select; double-click selects a word
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
                     if let Some((side, r, c)) = this.cell_at(ev.position) {
-                        this.sel = Some(DiffSel { side, anchor: (r, c), head: (r, c) });
-                        this.caret = Some((side, r, c));
+                        if ev.click_count >= 2 {
+                            let line = this.rows.get(r).map(|row| diff_side_text(row, side)).unwrap_or_default();
+                            let (s, e) = word_range(&line, c);
+                            this.sel = Some(DiffSel { side, anchor: (r, s), head: (r, e) });
+                            this.caret = Some((side, r, e));
+                            this.dragging = false;
+                        } else {
+                            this.sel = Some(DiffSel { side, anchor: (r, c), head: (r, c) });
+                            this.caret = Some((side, r, c));
+                            this.dragging = true;
+                        }
                         this.caret_on = true;
-                        this.dragging = true;
                         cx.notify();
                     }
                 }),
