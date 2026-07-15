@@ -8082,9 +8082,14 @@ impl Storm {
     }
 
     /// Dir-tree right-click actions. Operate on `tree_ctx_path`.
-    fn tree_ctx_actions() -> [(&'static str, fn(&mut Self, &mut Window, &mut Context<Self>)); 3] {
+    fn tree_ctx_actions() -> [(&'static str, fn(&mut Self, &mut Window, &mut Context<Self>)); 4] {
         [
             ("New File", |this, window, cx| this.open_new_file_prompt(window, cx)),
+            ("Reveal in Finder", |this, _w, _cx| {
+                if let Some(p) = this.tree_ctx_path.clone() {
+                    let _ = Command::new("open").arg("-R").arg(&p).spawn();
+                }
+            }),
             ("Refresh", |this, _w, _cx| {
                 // re-read the filesystem so created/deleted files show up; expand
                 // the targeted folder so its current contents are visible
