@@ -7980,15 +7980,15 @@ impl Storm {
     fn editor_ctx_actions() -> [(&'static str, fn(&mut Self, &mut Window, &mut Context<Self>)); 4] {
         [
             ("Reveal in Dir Tree", |this, window, cx| this.reveal_active_in_tree(window, cx)),
-            ("Copy Path", |this, _w, cx| {
+            ("Copy Full Path", |this, _w, cx| {
                 if let Some(p) = this.active_path().cloned() {
                     cx.write_to_clipboard(ClipboardItem::new_string(p.to_string_lossy().to_string()));
-                    this.show_flash("Path copied", cx);
+                    this.show_flash("Full path copied", cx);
                 }
             }),
-            ("Copy Reference", |this, _w, cx| {
+            ("Copy Path", |this, _w, cx| {
                 if let Some(p) = this.active_path().cloned() {
-                    this.copy_reference(&p, cx);
+                    this.copy_reference(&p, cx); // repo-relative path
                 }
             }),
             ("Close Tab", |this, window, cx| this.close_tab(this.active, window, cx)),
