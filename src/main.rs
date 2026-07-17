@@ -8168,12 +8168,23 @@ impl Storm {
     }
 
     /// Dir-tree right-click actions. Operate on `tree_ctx_path`.
-    fn tree_ctx_actions() -> [(&'static str, fn(&mut Self, &mut Window, &mut Context<Self>)); 4] {
+    fn tree_ctx_actions() -> [(&'static str, fn(&mut Self, &mut Window, &mut Context<Self>)); 6] {
         [
             ("New File", |this, window, cx| this.open_new_file_prompt(window, cx)),
             ("Reveal in Finder", |this, _w, _cx| {
                 if let Some(p) = this.tree_ctx_path.clone() {
                     let _ = Command::new("open").arg("-R").arg(&p).spawn();
+                }
+            }),
+            ("Copy Full Path", |this, _w, cx| {
+                if let Some(p) = this.tree_ctx_path.clone() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(p.to_string_lossy().to_string()));
+                    this.show_flash("Full path copied", cx);
+                }
+            }),
+            ("Copy Path", |this, _w, cx| {
+                if let Some(p) = this.tree_ctx_path.clone() {
+                    this.copy_reference(&p, cx); // repo-relative path
                 }
             }),
             ("Refresh", |this, _w, _cx| {
