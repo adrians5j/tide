@@ -20,6 +20,7 @@ use field::{Edit, Field};
 mod syntax;
 mod editor;
 mod term;
+mod acp;
 mod diff;
 mod lsp;
 use diff::{DiffKind, DiffRow};
@@ -63,9 +64,21 @@ actions!(
         CloseOtherTerminals, GotoCommit, ShowDiff, FindInFiles,
         GitPopup, CommandPalette, CopyReference, CopyReferenceLine, OpenOnGithub, NextProject, PrevProject, OpenProject,
         ShowProjects, PushDialog, RunCommand, NewProject, FetchRemotes, PullRemote, WipPush, RunBuild,
-        NewScratch
+        NewScratch, ToggleAgent
     ]
 );
+
+/// One entry in the agent conversation transcript.
+enum AgentMsg {
+    /// Something the user typed.
+    User(String),
+    /// Streamed assistant text (mutated in place as chunks arrive).
+    Agent(String),
+    /// Streamed assistant reasoning ("thinking"), shown dimmed.
+    Thought(String),
+    /// A tool call the agent ran: title + latest status.
+    Tool { id: String, title: String, status: String },
+}
 
 #[derive(Clone)]
 struct FindResult {
@@ -2080,6 +2093,19 @@ struct Storm {
     ws_branches: Vec<String>,
     ws_active: usize,
     ws_open: bool, // project-switcher dropdown expanded
+    // ── native agent panel (ACP) ───────────────────────────────────────────
+    agent_open: bool,                // right-side dock visible
+    agent_width: f32,                // dock width
+    resizing_agent: bool,            // dragging the dock divider
+    acp: Option<Arc<acp::Acp>>,      // lazily spawned on first open
+    acp_polling: bool,               // the drain poll loop is running
+    agent_msgs: Vec<AgentMsg>,       // conversation transcript
+    agent_cur: Option<usize>,        // index of the assistant text bubble being streamed
+    agent_cur_thought: Option<usize>, // index of the reasoning bubble being streamed
+    agent_busy: bool,                // a turn is in flight
+    agent_input: Field,              // prompt input box
+    agent_focus: FocusHandle,        // focus for the dock (routes typing)
+    agent_scroll: ScrollHandle,      // transcript scroll
 }
 
 /// Navigation requests a project view sends up to the workspace.
@@ -2304,6 +2330,18 @@ impl Storm {
             ws_branches: Vec::new(),
             ws_active: 0,
             ws_open: false,
+            agent_open: false,
+            agent_width: 380.,
+            resizing_agent: false,
+            acp: None,
+            acp_polling: false,
+            agent_msgs: Vec::new(),
+            agent_cur: None,
+            agent_cur_thought: None,
+            agent_busy: false,
+            agent_input: Field::default(),
+            agent_focus: cx.focus_handle(),
+            agent_scroll: ScrollHandle::new(),
         };
         s.ignored = git_ignored_paths(&s.root); // hide git-ignored paths from the tree
         s.expanded.insert(s.root.clone()); // the root node starts expanded
@@ -4944,6 +4982,10 @@ impl Storm {
         } else if self.resizing_term {
             self.term_width = (self.win_width - f32::from(ev.position.x)).clamp(200., 1125.);
             cx.notify();
+        } else if self.resizing_agent {
+            // dock sits left of the 44px right activity bar; divider is on its left edge
+            self.agent_width = (self.win_width - 44. - f32::from(ev.position.x)).clamp(280., 900.);
+            cx.notify();
         } else if let Some(e) = self.find_resize {
             // window-style resize: drag any edge/corner; the opposite edge stays
             let (mx, my) = (f32::from(ev.position.x), f32::from(ev.position.y));
@@ -4989,12 +5031,14 @@ impl Storm {
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if self.resizing
             || self.resizing_term
+            || self.resizing_agent
             || self.find_resize.is_some()
             || self.find_moving
             || self.find_split_dragging
         {
             self.resizing = false;
             self.resizing_term = false;
+            self.resizing_agent = false;
             self.find_resize = None;
             self.find_moving = false;
             self.find_split_dragging = false;
@@ -5110,6 +5154,26 @@ impl Render for Storm {
                         .child(div().flex_grow(1.0).child(term)),
                 );
         }
+        if self.agent_open {
+            let agent = self.render_agent(window, cx);
+            middle = middle
+                .child(
+                    div()
+                        .w(px(4.))
+                        .h_full()
+                        .flex_shrink_0()
+                        .bg(rgb(if self.resizing_agent { ACCENT } else { BORDER }))
+                        .cursor(CursorStyle::ResizeLeftRight)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev, _window, cx| {
+                                this.resizing_agent = true;
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .child(agent);
+        }
         middle = middle.child(act_right);
 
         let mut root = div()
@@ -5146,6 +5210,7 @@ impl Render for Storm {
             .on_action(cx.listener(Self::act_wip_push))
             .on_action(cx.listener(Self::act_run_build))
             .on_action(cx.listener(Self::act_pull))
+            .on_action(cx.listener(Self::act_toggle_agent))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .child(topbar)
@@ -5617,6 +5682,9 @@ impl Storm {
             .child(activity_icon("act-run", IC_RUN, "Run console", self.run_open, 0, cx.listener(|this, _ev, _w, cx| {
                 this.run_open = !this.run_open;
                 cx.notify();
+            })))
+            .child(activity_icon("act-agent", IC_TOOLS, "Agent  (⌘⇧A)", self.agent_open, 0, cx.listener(|this, _ev, window, cx| {
+                this.toggle_agent(window, cx);
             })))
     }
 
@@ -8703,6 +8771,305 @@ fn tip(text: &'static str) -> impl Fn(&mut Window, &mut App) -> AnyView + 'stati
     move |_w, cx| cx.new(|_| TooltipView { text: text.into() }).into()
 }
 
+// ── native agent panel (ACP) ────────────────────────────────────────────────
+impl Storm {
+    fn act_toggle_agent(&mut self, _: &ToggleAgent, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_agent(window, cx);
+    }
+
+    fn toggle_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.agent_open = !self.agent_open;
+        if self.agent_open {
+            self.ensure_acp(cx);
+            window.focus(&self.agent_focus, cx);
+        } else {
+            self.focus_active(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Spawn the ACP adapter on first use and start the event drain poll.
+    fn ensure_acp(&mut self, cx: &mut Context<Self>) {
+        if self.acp.is_none() {
+            self.acp = acp::Acp::new(&self.root);
+            if self.acp.is_none() {
+                self.agent_msgs.push(AgentMsg::Tool {
+                    id: String::new(),
+                    title: "could not start agent — is `npx` (Node 22+) on PATH?".into(),
+                    status: "failed".into(),
+                });
+            }
+        }
+        if self.acp.is_some() && !self.acp_polling {
+            self.acp_polling = true;
+            self.start_acp_poll(cx);
+        }
+    }
+
+    /// Drain agent events ~12x/s and fold them into the transcript.
+    fn start_acp_poll(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_millis(80)).await;
+            let alive = this.update(cx, |this, cx| {
+                let Some(acp) = this.acp.clone() else { return false };
+                if acp.dirty() {
+                    for ev in acp.drain() {
+                        this.apply_acp_event(ev);
+                    }
+                    cx.notify();
+                }
+                true
+            });
+            if !matches!(alive, Ok(true)) {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    fn apply_acp_event(&mut self, ev: acp::AcpEvent) {
+        use acp::AcpEvent::*;
+        match ev {
+            Ready => {} // session ready; input was already accepting text
+            Text(t) => {
+                self.agent_cur_thought = None; // real answer began → close the reasoning bubble
+                match self.agent_cur {
+                    Some(i) => {
+                        if let Some(AgentMsg::Agent(s)) = self.agent_msgs.get_mut(i) {
+                            s.push_str(&t);
+                        }
+                    }
+                    None => {
+                        self.agent_msgs.push(AgentMsg::Agent(t));
+                        self.agent_cur = Some(self.agent_msgs.len() - 1);
+                    }
+                }
+            }
+            Thought(t) => match self.agent_cur_thought {
+                Some(i) => {
+                    if let Some(AgentMsg::Thought(s)) = self.agent_msgs.get_mut(i) {
+                        s.push_str(&t);
+                    }
+                }
+                None => {
+                    self.agent_msgs.push(AgentMsg::Thought(t));
+                    self.agent_cur_thought = Some(self.agent_msgs.len() - 1);
+                }
+            },
+            Tool { id, title, status } => {
+                self.agent_cur = None; // text after a tool call starts a fresh bubble
+                self.agent_cur_thought = None;
+                self.agent_msgs.push(AgentMsg::Tool { id, title, status });
+            }
+            ToolStatus { id, status } => {
+                for m in self.agent_msgs.iter_mut() {
+                    if let AgentMsg::Tool { id: mid, status: st, .. } = m {
+                        if *mid == id {
+                            *st = status.clone();
+                        }
+                    }
+                }
+            }
+            TurnEnd => {
+                self.agent_busy = false;
+                self.agent_cur = None;
+                self.agent_cur_thought = None;
+            }
+            Error(e) => {
+                self.agent_busy = false;
+                self.agent_cur = None;
+                self.agent_cur_thought = None;
+                self.agent_msgs.push(AgentMsg::Tool { id: String::new(), title: e, status: "failed".into() });
+            }
+        }
+    }
+
+    fn agent_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        match ks.key.as_str() {
+            "escape" => {
+                self.agent_open = false;
+                self.focus_active(window, cx);
+            }
+            "enter" => {
+                let text = self.agent_input.text.trim().to_string();
+                if text.is_empty() {
+                    return;
+                }
+                self.agent_input.clear();
+                self.send_agent_prompt(text, cx);
+            }
+            _ => {
+                Self::field_input(&mut self.agent_input, ks, cx, |_| true);
+            }
+        }
+        cx.notify();
+    }
+
+    fn send_agent_prompt(&mut self, text: String, cx: &mut Context<Self>) {
+        self.ensure_acp(cx);
+        let Some(acp) = self.acp.clone() else { return };
+        acp.prompt(&text);
+        self.agent_msgs.push(AgentMsg::User(text));
+        self.agent_cur = None;
+        self.agent_cur_thought = None;
+        self.agent_busy = true;
+        cx.notify();
+    }
+
+    fn render_agent(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // header
+        let header = div()
+            .h(px(34.))
+            .flex_shrink_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .px_3()
+            .bg(rgb(PANEL_BG))
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(div().font_family(ICON_FONT).text_size(px(14.)).text_color(rgb(ICON)).child(IC_TOOLS))
+                    .child(div().text_size(px(12.)).text_color(rgb(TEXT)).child("Agent")),
+            )
+            .child(
+                div()
+                    .id("agent-close")
+                    .px_1()
+                    .cursor_pointer()
+                    .text_size(px(13.))
+                    .text_color(rgb(MUTED))
+                    .hover(|s| s.text_color(rgb(TEXT)))
+                    .child("✕")
+                    .on_click(cx.listener(|this, _e, window, cx| this.toggle_agent(window, cx))),
+            );
+
+        // transcript
+        let mut list = div()
+            .id("agent-transcript")
+            .flex_grow(1.0)
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .track_scroll(&self.agent_scroll)
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3();
+
+        if self.agent_msgs.is_empty() {
+            let starting = self.acp.as_ref().map(|a| !a.is_ready()).unwrap_or(false);
+            let hint = if starting {
+                "Starting agent…"
+            } else {
+                "Ask Claude about this project. It can read and edit files in the working tree."
+            };
+            list = list.child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(hint));
+        }
+        for m in &self.agent_msgs {
+            list = list.child(render_agent_msg(m));
+        }
+        if self.agent_busy {
+            list = list.child(
+                div().text_size(px(12.)).text_color(rgb(MUTED)).child("● thinking…"),
+            );
+        }
+
+        // input box
+        let input = div()
+            .flex_shrink_0()
+            .m_2()
+            .px_2()
+            .py_1()
+            .bg(rgb(BG))
+            .border_1()
+            .border_color(rgb(if self.agent_focus.is_focused(window) { ACCENT } else { BORDER }))
+            .rounded_md()
+            .text_size(px(13.))
+            .text_color(rgb(TEXT))
+            .child(if self.agent_input.text.is_empty() {
+                div().text_color(rgb(MUTED)).child("Message the agent…  (Enter to send)")
+            } else {
+                self.agent_input.render(self.caret(), SELECTION)
+            });
+
+        div()
+            .w(px(self.agent_width))
+            .h_full()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .bg(rgb(PANEL_BG))
+            .track_focus(&self.agent_focus)
+            .on_key_down(cx.listener(Self::agent_key))
+            .child(header)
+            .child(list)
+            .child(input)
+    }
+}
+
+/// Render one transcript entry (user bubble, assistant text, or a tool card).
+fn render_agent_msg(m: &AgentMsg) -> impl IntoElement {
+    match m {
+        AgentMsg::User(t) => div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(div().text_size(px(10.)).text_color(rgb(MUTED)).child("You"))
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(SELECTED_BG))
+                    .text_size(px(13.))
+                    .text_color(rgb(SEL_TEXT))
+                    .child(t.clone()),
+            )
+            .into_any_element(),
+        AgentMsg::Agent(t) => div()
+            .text_size(px(13.))
+            .text_color(rgb(TEXT))
+            .child(t.clone())
+            .into_any_element(),
+        AgentMsg::Thought(t) => div()
+            .pl_2()
+            .border_l_2()
+            .border_color(rgb(BORDER))
+            .text_size(px(12.))
+            .text_color(rgb(MUTED))
+            .child(t.clone())
+            .into_any_element(),
+        AgentMsg::Tool { title, status, .. } => {
+            let (glyph, color) = match status.as_str() {
+                "completed" => (IC_CHECK, GIT_NEW),
+                "failed" | "cancelled" => ("✕", GIT_DELETED),
+                _ => ("●", MUTED),
+            };
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(rgb(BG))
+                .border_1()
+                .border_color(rgb(BORDER))
+                .child(div().font_family(ICON_FONT).text_size(px(11.)).text_color(rgb(color)).child(glyph))
+                .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(title.clone()))
+                .into_any_element()
+        }
+    }
+}
+
 /// A vertical-activity-bar icon button.
 fn activity_icon(
     id: &'static str,
@@ -11035,6 +11402,7 @@ fn main() {
             KeyBinding::new("alt-f", FetchRemotes, None),
             KeyBinding::new("cmd-shift-m", WipPush, None),
             KeyBinding::new("cmd-shift-b", RunBuild, None),
+            KeyBinding::new("cmd-shift-a", ToggleAgent, None),
             KeyBinding::new("alt-l", PullRemote, None),
             // command palette (global)
             KeyBinding::new("cmd-shift-p", CommandPalette, None),
