@@ -57,6 +57,10 @@ const IC_CHECK: &str = "\u{eab2}";
 // load any font lacking an 'm' glyph — except that one specially-cased name.
 const ICON_FONT: &str = "Segoe Fluent Icons";
 
+// Native ACP agent panel — built but parked. Flip to `true` (and it reappears
+// as the right-side dock + ⌘⇧A) to continue the work; see src/acp.rs.
+const AGENT_PANEL: bool = false;
+
 actions!(
     workspace,
     [
@@ -5683,9 +5687,9 @@ impl Storm {
                 this.run_open = !this.run_open;
                 cx.notify();
             })))
-            .child(activity_icon("act-agent", IC_TOOLS, "Agent  (⌘⇧A)", self.agent_open, 0, cx.listener(|this, _ev, window, cx| {
+            .when(AGENT_PANEL, |d| d.child(activity_icon("act-agent", IC_TOOLS, "Agent  (⌘⇧A)", self.agent_open, 0, cx.listener(|this, _ev, window, cx| {
                 this.toggle_agent(window, cx);
-            })))
+            }))))
     }
 
     fn render_term_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -8778,6 +8782,9 @@ impl Storm {
     }
 
     fn toggle_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !AGENT_PANEL {
+            return; // feature parked; flip AGENT_PANEL to re-enable
+        }
         self.agent_open = !self.agent_open;
         if self.agent_open {
             self.ensure_acp(cx);
