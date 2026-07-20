@@ -28,7 +28,7 @@ actions!(
         SelectLeft, SelectRight, SelectUp, SelectDown, SelectHome, SelectEnd, SelectAll, Copy,
         Paste, Cut, WordLeft, WordRight, SelectWordLeft, SelectWordRight, Undo, Redo, DeleteLine,
         MoveLineUp, MoveLineDown, CompTrigger, CompDismiss, GotoDef, SearchOpen,
-        DeleteWordLeft, DeleteWordRight
+        DeleteWordLeft, DeleteWordRight, EnableEdit
     ]
 );
 
@@ -545,6 +545,10 @@ impl Editor {
     fn act_home(&mut self, _: &Home, w: &mut Window, cx: &mut Context<Self>) { self.on_key("home", w, cx); }
     fn act_end(&mut self, _: &End, w: &mut Window, cx: &mut Context<Self>) { self.on_key("end", w, cx); }
     fn act_newline(&mut self, _: &Newline, w: &mut Window, cx: &mut Context<Self>) { self.on_key("enter", w, cx); }
+    /// ⌘⏎ from a read-only editor asks the workspace to switch to edit mode
+    /// (same effect as clicking the "enable EDIT" hint). A no-op when already
+    /// editable, since the workspace only flips when currently read-only.
+    fn act_enable_edit(&mut self, _: &EnableEdit, _w: &mut Window, cx: &mut Context<Self>) { cx.emit(ToggleReadOnly); }
     fn act_indent(&mut self, _: &Indent, w: &mut Window, cx: &mut Context<Self>) { self.on_key("tab", w, cx); }
     fn act_save(&mut self, _: &Save, _w: &mut Window, cx: &mut Context<Self>) { self.save(cx); }
     fn act_sel_left(&mut self, _: &SelectLeft, w: &mut Window, cx: &mut Context<Self>) { self.on_key("select-left", w, cx); }
@@ -2012,6 +2016,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::act_comp_trigger))
             .on_action(cx.listener(Self::act_comp_dismiss))
             .on_action(cx.listener(Self::act_goto_def))
+            .on_action(cx.listener(Self::act_enable_edit))
             .on_action(cx.listener(Self::act_search))
             .on_action(cx.listener(Self::act_undo))
             .on_action(cx.listener(Self::act_redo))
@@ -2191,7 +2196,7 @@ impl Editor {
             // capture the click so the editor underneath doesn't move the cursor
             // (which was re-anchoring the hint and eating the link click)
             .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
-            .child("🔒 Read-only —")
+            .child("🔒 Read-only — press ⌘⏎ or")
             // clickable link → workspace flips to edit mode
             .child(
                 div()

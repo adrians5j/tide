@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 use term::Terminal;
 use editor::{
     Backspace, CompDismiss, CompTrigger, Copy, Cut, Delete, DeleteLine, DeleteWordLeft,
-    DeleteWordRight, Editor, End, GotoDef, Home, Indent, MoveDown, MoveLeft, MoveLineDown,
+    DeleteWordRight, Editor, EnableEdit, End, GotoDef, Home, Indent, MoveDown, MoveLeft, MoveLineDown,
     MoveLineUp, MoveRight, MoveUp, Newline, OpenLocation, Paste, Redo, Save, SearchOpen, SelectAll,
     SelectDown, SelectEnd, SelectHome, SelectLeft, SelectRight, SelectUp, SelectWordLeft,
     SelectWordRight, ToggleReadOnly, Undo, WordLeft, WordRight,
@@ -11366,6 +11366,7 @@ fn main() {
             // go to definition
             KeyBinding::new("cmd-down", GotoDef, Some("Editor")),
             KeyBinding::new("cmd-b", GotoDef, Some("Editor")),
+            KeyBinding::new("cmd-enter", EnableEdit, Some("Editor")),
             // in-file search
             KeyBinding::new("cmd-f", SearchOpen, Some("Editor")),
             // copy reference (relpath:line)
