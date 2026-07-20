@@ -3855,7 +3855,13 @@ impl Storm {
             return;
         }
         let idx = focus.and_then(|p| files.iter().position(|f| f == &p)).unwrap_or(0);
-        self.open_diff_window(files, idx, None, None, false, cx);
+        // carry the Changes-pane filter text when that's the pane in use
+        let filter_text = if self.left_view == LeftView::Changes {
+            self.commit_filter.text.clone()
+        } else {
+            String::new()
+        };
+        self.open_diff_window(files, idx, None, None, false, filter_text, PrViewFilter::All, cx);
     }
 
     /// Open a diff in its own window. `old` Some → committed diff of `old` vs
@@ -3867,6 +3873,10 @@ impl Storm {
         old: Option<String>,
         new_rev: Option<String>,
         pr_mode: bool,
+        // carried over from the source pane so the diff opens already filtered:
+        // `filter_text` seeds the sidebar path filter, `pr_view` the viewed chips
+        filter_text: String,
+        pr_view: PrViewFilter,
         cx: &mut Context<Self>,
     ) {
         let pr_viewed = if pr_mode { self.pr_viewed.clone() } else { HashSet::new() };
@@ -3884,7 +3894,14 @@ impl Storm {
                 focus: true,
                 ..Default::default()
             },
-            move |_, cx| cx.new(|cx| DiffWindow::new(root, files, idx, old, new_rev, pr_mode, pr_viewed, storm, main, cx)),
+            move |_, cx| {
+                cx.new(|cx| {
+                    DiffWindow::new(
+                        root, files, idx, old, new_rev, pr_mode, pr_viewed, filter_text, pr_view,
+                        storm, main, cx,
+                    )
+                })
+            },
         )
         .ok();
     }
@@ -3998,7 +4015,8 @@ impl Storm {
         let files: Vec<PathBuf> = self.pr_files.iter().map(|(p, _)| p.clone()).collect();
         let Some(idx) = files.iter().position(|p| p == &path) else { return };
         let old = Some(diff_base_rev(&self.root, &self.pr_base));
-        self.open_diff_window(files, idx, old, None, true, cx);
+        // carry the PR pane's path filter + viewed-state chip into the diff window
+        self.open_diff_window(files, idx, old, None, true, self.pr_filter.text.clone(), self.pr_view_filter, cx);
     }
 
     /// PR pane keys: F4 opens the selected file in a tab, Enter shows its diff,
@@ -4161,7 +4179,7 @@ impl Storm {
             Some(sha) => (Some(format!("{sha}^")), Some(sha.clone())),
             None => (Some(diff_base_rev(&self.root, &self.push_base_ref)), None),
         };
-        self.open_diff_window(files, idx, old, new_rev, false, cx);
+        self.open_diff_window(files, idx, old, new_rev, false, String::new(), PrViewFilter::All, cx);
     }
 
     fn do_push(&mut self, cx: &mut Context<Self>) {
@@ -10122,11 +10140,18 @@ impl DiffWindow {
         new_rev: Option<String>,
         pr_mode: bool,
         pr_viewed: HashSet<PathBuf>,
+        filter_text: String,
+        pr_view: PrViewFilter,
         storm: WeakEntity<Storm>,
         main_window: Option<AnyWindowHandle>,
         cx: &mut Context<Self>,
     ) -> Self {
         let hl = Highlighter::new();
+        // seed the sidebar filter from the source pane so cmd+d keeps the view
+        let mut filter = Field::default();
+        if !filter_text.trim().is_empty() {
+            filter.set(filter_text);
+        }
         let (rows, left_styles, right_styles) = compute_diff(&root, &files[idx], &old, &new_rev, &hl);
         // blink the text caret
         cx.spawn(async move |this, cx| loop {
@@ -10172,12 +10197,12 @@ impl DiffWindow {
             storm,
             main_window,
             tree_collapsed: HashSet::new(),
-            filter: Field::default(),
+            filter,
             filter_focus: cx.focus_handle(),
             pane_split: 0.5,
             resizing_pane: false,
             pr_mode,
-            pr_filter: PrViewFilter::All,
+            pr_filter: pr_view,
             pr_hidden: HashSet::new(),
             pr_viewed,
         }
