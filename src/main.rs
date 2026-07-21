@@ -5257,7 +5257,6 @@ impl Render for Storm {
         } else {
             None
         };
-        let bottom = self.render_bottom(cx);
         let left_panel = if self.show_left {
             Some(match self.left_view {
                 LeftView::Files => self.render_tree(window, cx).into_any_element(),
@@ -5380,8 +5379,7 @@ impl Render for Storm {
             .child(topbar)
             .child(middle)
             .when_some(run_dock, |d, dock| d.child(dock))
-            .when_some(git_dock, |d, dock| d.child(dock))
-            .child(bottom);
+            .when_some(git_dock, |d, dock| d.child(dock));
 
         if self.finder_open {
             root = root.child(self.render_finder(cx));
@@ -5673,9 +5671,33 @@ impl Storm {
                         )
                     }),
             );
-        // (workspace quick-switch chips removed — switch projects via cmd+e or the
-        // project-name dropdown; the spacer keeps the left group left-aligned)
-        bar = bar.child(div().flex_1());
+        // right: read-only toggle + memory (moved here from the old bottom bar).
+        // The flex_1 spacer keeps the left group left-aligned and pushes these right.
+        let ro = self.read_only;
+        bar = bar.child(div().flex_1()).child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .child(
+                    div()
+                        .id("ro-toggle")
+                        .px_1p5()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_size(px(11.))
+                        // blue pill when read-only (locked), amber when editing
+                        .bg(rgb(if ro { ACCENT } else { GIT_MODIFIED }))
+                        .text_color(rgb(if ro { SEL_TEXT } else { BG }))
+                        .child(if ro { "🔒 READ-ONLY" } else { "✎ EDIT" })
+                        .tooltip(|_w, cx| {
+                            cx.new(|_| TooltipView { text: "Toggle read-only / edit mode".into() }).into()
+                        })
+                        .on_click(cx.listener(|this, _e, _w, cx| this.toggle_read_only(cx))),
+                )
+                .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(format!("{} MB", self.mem_mb))),
+        );
         bar
     }
 
@@ -6049,48 +6071,6 @@ impl Storm {
             .border_color(rgb(if failed { GIT_DELETED } else { BORDER }))
             .child(header)
             .child(div().flex_grow(1.0).min_h(px(0.)).child(self.run_editor.clone()))
-    }
-
-    fn render_bottom(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let ro = self.read_only;
-        div()
-            .h(px(24.))
-            .w_full()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .px_3()
-            .bg(rgb(PANEL_BG))
-            .border_t_1()
-            .border_color(rgb(BORDER))
-            .text_size(px(12.))
-            .child(div()) // (file path moved to the breadcrumb above the editor)
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_3()
-                    // read-only / edit toggle: click to switch
-                    .child(
-                        div()
-                            .id("ro-toggle")
-                            .px_1p5()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .text_size(px(11.))
-                            // colored pill: blue when read-only (locked), amber when editing
-                            .bg(rgb(if ro { ACCENT } else { GIT_MODIFIED }))
-                            .text_color(rgb(if ro { SEL_TEXT } else { BG }))
-                            .child(if ro { "🔒 READ-ONLY" } else { "✎ EDIT" })
-                            .tooltip(|_w, cx| {
-                                cx.new(|_| TooltipView { text: "Toggle read-only / edit mode".into() }).into()
-                            })
-                            .on_click(cx.listener(|this, _e, _w, cx| this.toggle_read_only(cx))),
-                    )
-                    .child(div().text_color(rgb(MUTED)).child(format!("{} MB", self.mem_mb))),
-            )
     }
 
     fn render_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
