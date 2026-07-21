@@ -22,6 +22,10 @@ two-face      = "0.4"
 # embedded WebView for the in-pane browser (WKWebView on macOS); positioned as
 # a child view over the pane using gpui's raw-window-handle impl
 wry = "0.52"
+# set the WebKit inspector to open detached (own window) instead of docking
+# into — and resizing — our shared app window
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", features = ["NSUserDefaults", "NSString"] }
 
 # Optimize dependencies even in dev builds. Font shaping (gpui), the VT parser
 # (alacritty_terminal), and syntect are the hot paths; at opt-level 0 they make

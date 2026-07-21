@@ -19,6 +19,7 @@ impl Browser {
     /// Create the WebView as a child of `window`, showing `url`, positioned at
     /// the given logical rect (top-left origin, y down — matching gpui coords).
     pub fn new(window: &Window, url: &str, x: f32, y: f32, w: f32, h: f32) -> Option<Browser> {
+        inspector_detached_default();
         let webview = WebViewBuilder::new()
             .with_url(url)
             .with_devtools(true) // enable Web Inspector (⌥⌘I / right-click → Inspect)
@@ -52,6 +53,20 @@ impl Browser {
     pub fn reload(&self) {
         let _ = self.webview.evaluate_script("location.reload()");
     }
+}
+
+/// Tell WebKit to open the Web Inspector in its own window rather than docking
+/// it into (and resizing) our shared app window. Runs once.
+fn inspector_detached_default() {
+    use std::sync::OnceLock;
+    static DONE: OnceLock<()> = OnceLock::new();
+    DONE.get_or_init(|| {
+        use objc2_foundation::{NSString, NSUserDefaults};
+        unsafe {
+            let defaults = NSUserDefaults::standardUserDefaults();
+            defaults.setBool_forKey(false, &NSString::from_str("WebKit2InspectorStartsAttached"));
+        }
+    });
 }
 
 fn rect(x: f32, y: f32, w: f32, h: f32) -> Rect {
