@@ -21,6 +21,7 @@ mod syntax;
 mod editor;
 mod term;
 mod acp;
+mod browser;
 mod diff;
 mod lsp;
 use diff::{DiffKind, DiffRow};
@@ -2194,6 +2195,11 @@ struct Storm {
     git_details_msg: String,                 // full message of the selected commit
     git_details_files: Vec<(PathBuf, GitState)>, // its changed files
     git_scroll: ScrollHandle,                // commit list scroll
+    // ── in-pane browser (shares the right dock with the terminal) ──────────
+    browser_open: bool,
+    browser: Option<browser::Browser>, // embedded WebView, created on first open
+    browser_url: Field,                // address bar
+    browser_focus: FocusHandle,
 }
 
 /// Navigation requests a project view sends up to the workspace.
@@ -2446,6 +2452,14 @@ impl Storm {
             git_details_msg: String::new(),
             git_details_files: Vec::new(),
             git_scroll: ScrollHandle::new(),
+            browser_open: false,
+            browser: None,
+            browser_url: {
+                let mut f = Field::default();
+                f.set("http://localhost:3000".into());
+                f
+            },
+            browser_focus: cx.focus_handle(),
         };
         s.ignored = git_ignored_paths(&s.root); // hide git-ignored paths from the tree
         s.expanded.insert(s.root.clone()); // the root node starts expanded
@@ -3317,6 +3331,7 @@ impl Storm {
         self.save_tab(self.active, cx); // leaving the editor → auto-save
         self.show_terminal = !self.show_terminal;
         if self.show_terminal {
+            self.hide_browser(); // terminal + browser share the right dock
             self.ensure_terminal(cx);
             if let Some(t) = self.active_terminal() {
                 let fh = t.read(cx).focus_handle.clone();
@@ -3326,6 +3341,46 @@ impl Storm {
             self.focus_active(window, cx);
         }
         cx.notify();
+    }
+
+    /// Close the browser dock and hide the WebView (terminal ↔ browser swap).
+    fn hide_browser(&mut self) {
+        self.browser_open = false;
+        if let Some(b) = &self.browser {
+            b.set_visible(false);
+        }
+    }
+
+    fn toggle_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.browser_open = !self.browser_open;
+        if self.browser_open {
+            self.show_terminal = false; // shares the right dock with the terminal
+            window.focus(&self.browser_focus, cx);
+            // the WebView is created + shown on the next render (needs &Window)
+        } else if let Some(b) = &self.browser {
+            b.set_visible(false);
+        }
+        cx.notify();
+    }
+
+    /// Navigate the browser to the address-bar text (adds a scheme if missing).
+    fn browser_navigate(&mut self, cx: &mut Context<Self>) {
+        let url = normalize_url(self.browser_url.text.trim());
+        self.browser_url.set(url.clone());
+        if let Some(b) = &self.browser {
+            b.navigate(&url);
+        }
+        cx.notify();
+    }
+
+    fn browser_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        match ev.keystroke.key.as_str() {
+            "enter" => self.browser_navigate(cx),
+            _ => {
+                Self::field_input(&mut self.browser_url, &ev.keystroke, cx, |_| true);
+                cx.notify();
+            }
+        }
     }
 
     fn act_open_finder(&mut self, _: &OpenFinder, window: &mut Window, cx: &mut Context<Self>) {
@@ -5317,6 +5372,30 @@ impl Render for Storm {
                         .child(div().flex_grow(1.0).child(term)),
                 );
         }
+        // browser shares the right dock with the terminal (never both — the
+        // toggles are mutually exclusive); its WebView floats over the dock
+        if self.browser_open {
+            let dock = self.render_browser_dock(window, cx);
+            middle = middle
+                .child(
+                    div()
+                        .w(px(4.))
+                        .h_full()
+                        .flex_shrink_0()
+                        .bg(rgb(if self.resizing_term { ACCENT } else { BORDER }))
+                        .cursor(CursorStyle::ResizeLeftRight)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev, _window, cx| {
+                                this.resizing_term = true;
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .child(dock);
+        } else if let Some(b) = &self.browser {
+            b.set_visible(false); // dock closed → hide the floating WebView
+        }
         if self.agent_open {
             let agent = self.render_agent(window, cx);
             middle = middle
@@ -5875,9 +5954,9 @@ impl Storm {
             .child(activity_icon("act-term", IC_TERMINAL, "Terminal  (⌥F12)", self.show_terminal, 0, cx.listener(|this, _ev, window, cx| {
                 this.toggle_terminal(window, cx);
             })))
-            .child(activity_icon("act-browser", IC_BROWSER, "Browser", false, 0, |_ev, _w, _cx| {
-                open_browser("http://localhost:3000");
-            }))
+            .child(activity_icon("act-browser", IC_BROWSER, "Browser", self.browser_open, 0, cx.listener(|this, _ev, window, cx| {
+                this.toggle_browser(window, cx);
+            })))
             .when(AGENT_PANEL, |d| d.child(activity_icon("act-agent", IC_TOOLS, "Agent  (⌘⇧A)", self.agent_open, 0, cx.listener(|this, _ev, window, cx| {
                 this.toggle_agent(window, cx);
             }))))
@@ -9724,6 +9803,120 @@ impl Storm {
             );
         }
         panel
+    }
+}
+
+// ── in-pane browser dock ─────────────────────────────────────────────────────
+impl Storm {
+    /// The right-dock browser: an address bar + nav controls (gpui), with the
+    /// embedded WebView floating over the region below the bar. Computes that
+    /// region's rect from the current layout and (re)positions the WebView.
+    fn render_browser_dock(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let addr_h = 36.0_f32;
+        let dock_w = self.term_width;
+        // column sits just left of the 44px right activity bar
+        let region_x = self.win_width - 44.0 - dock_w;
+        let region_y = 44.0 + addr_h; // below topbar + address bar
+        let bottom = (if self.run_open { 260.0 } else { 0.0 })
+            + (if self.git_open { self.git_height + 4.0 } else { 0.0 });
+        let region_h = (self.win_height - region_y - bottom).max(0.0);
+        let region_w = dock_w;
+
+        // create the WebView on first open; afterwards just reposition + show it
+        if self.browser.is_none() {
+            let url = normalize_url(self.browser_url.text.trim());
+            self.browser = browser::Browser::new(window, &url, region_x, region_y, region_w, region_h);
+        } else if let Some(b) = &self.browser {
+            b.set_bounds(region_x, region_y, region_w, region_h);
+            b.set_visible(true);
+        }
+
+        let nav = |id: &'static str, glyph: &'static str, enabled: bool| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(22.))
+                .rounded_md()
+                .text_size(px(13.))
+                .text_color(rgb(if enabled { MUTED } else { LINE_NUMBER }))
+                .when(enabled, |d| d.cursor_pointer().hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT))))
+                .child(glyph)
+        };
+
+        let focused = self.browser_focus.is_focused(window);
+        let bar = div()
+            .h(px(addr_h))
+            .flex_shrink_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .bg(rgb(PANEL_BG))
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .child(nav("br-back", "‹", true).on_click(cx.listener(|this, _e, _w, _cx| {
+                if let Some(b) = &this.browser { b.back(); }
+            })))
+            .child(nav("br-fwd", "›", true).on_click(cx.listener(|this, _e, _w, _cx| {
+                if let Some(b) = &this.browser { b.forward(); }
+            })))
+            .child(nav("br-reload", "↻", true).on_click(cx.listener(|this, _e, _w, _cx| {
+                if let Some(b) = &this.browser { b.reload(); }
+            })))
+            .child(
+                div()
+                    .flex_grow(1.0)
+                    .min_w(px(0.))
+                    .px_2()
+                    .py(px(3.))
+                    .bg(rgb(BG))
+                    .border_1()
+                    .border_color(rgb(if focused { ACCENT } else { BORDER }))
+                    .rounded_md()
+                    .text_size(px(12.))
+                    .text_color(rgb(TEXT))
+                    .track_focus(&self.browser_focus)
+                    .on_key_down(cx.listener(Self::browser_key))
+                    .child(self.browser_url.render(self.caret(), SELECTION)),
+            )
+            .child(nav("br-ext", "⧉", true).tooltip(tip("Open in system browser")).on_click(cx.listener(|this, _e, _w, _cx| {
+                open_browser(&normalize_url(this.browser_url.text.trim()));
+            })))
+            .child(nav("br-close", "✕", true).tooltip(tip("Close browser")).on_click(cx.listener(|this, _e, window, cx| {
+                this.toggle_browser(window, cx);
+            })));
+
+        // the region below the bar is left empty — the native WebView floats over it
+        div()
+            .w(px(dock_w))
+            .h_full()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .bg(rgb(BG))
+            .child(bar)
+            .child(div().flex_grow(1.0).min_h(px(0.)))
+    }
+}
+
+/// Add a scheme to a bare address-bar entry. Loopback/port-only hosts default
+/// to http; everything else to https.
+fn normalize_url(s: &str) -> String {
+    let s = s.trim();
+    if s.is_empty() {
+        return "about:blank".into();
+    }
+    if s.contains("://") {
+        return s.to_string();
+    }
+    let host = s.split(['/', ':']).next().unwrap_or(s);
+    if host == "localhost" || host == "127.0.0.1" || host.parse::<std::net::Ipv4Addr>().is_ok() {
+        format!("http://{s}")
+    } else {
+        format!("https://{s}")
     }
 }
 
