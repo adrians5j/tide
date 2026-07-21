@@ -68,7 +68,7 @@ actions!(
         CloseOtherTerminals, GotoCommit, ShowDiff, FindInFiles,
         GitPopup, CommandPalette, CopyReference, CopyReferenceLine, OpenOnGithub, NextProject, PrevProject, OpenProject,
         ShowProjects, PushDialog, RunCommand, NewProject, FetchRemotes, PullRemote, WipPush, RunBuild,
-        NewScratch, ToggleAgent
+        NewScratch, ToggleAgent, GitLog
     ]
 );
 
@@ -1350,6 +1350,62 @@ fn git_log_range(root: &Path, range: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// One commit row in the Git log panel.
+#[derive(Clone)]
+struct LogCommit {
+    hash: String,   // full sha
+    short: String,  // abbreviated sha
+    author: String, // author name
+    date: String,   // formatted date/time
+    subject: String,
+}
+
+/// Recent commits reachable from `rev` (a branch name, "HEAD", or "--all"),
+/// newest first, capped at `limit`. Fields are unit-separated (\x1f) so the
+/// subject can safely contain any character.
+fn git_log_commits(root: &Path, rev: &str, limit: usize) -> Vec<LogCommit> {
+    let out = Command::new("git")
+        .args([
+            "log",
+            &format!("-n{}", limit),
+            "--date=format:%Y-%m-%d %H:%M",
+            "--pretty=format:%H\x1f%h\x1f%an\x1f%ad\x1f%s",
+            rev,
+        ])
+        .current_dir(root)
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.splitn(5, '\x1f');
+            Some(LogCommit {
+                hash: f.next()?.to_string(),
+                short: f.next()?.to_string(),
+                author: f.next()?.to_string(),
+                date: f.next()?.to_string(),
+                subject: f.next().unwrap_or("").to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Full commit message body for `hash` (`git show -s --format=%B`).
+fn git_commit_message(root: &Path, hash: &str) -> String {
+    Command::new("git")
+        .args(["show", "-s", "--format=%B", hash])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim_end().to_string())
+        .unwrap_or_default()
+}
+
 /// Files changed in `range` (two-dot, e.g. `origin/feat..HEAD`), as
 /// (absolute path, status).
 fn git_range_files(root: &Path, range: &str) -> Vec<(PathBuf, GitState)> {
@@ -2110,6 +2166,22 @@ struct Storm {
     agent_input: Field,              // prompt input box
     agent_focus: FocusHandle,        // focus for the dock (routes typing)
     agent_scroll: ScrollHandle,      // transcript scroll
+    // ── Git log panel (bottom dock) ────────────────────────────────────────
+    git_open: bool,                          // dock visible
+    git_height: f32,                         // dock height
+    resizing_git: bool,                      // dragging the top divider
+    git_focus: FocusHandle,                  // commit-list nav focus
+    git_filter_focus: FocusHandle,           // filter input focus
+    git_query: Field,                        // text/hash/author filter
+    git_rev: String,                         // branch/rev the log is showing ("HEAD" default)
+    git_commits: Vec<LogCommit>,             // loaded log (newest first)
+    git_sel: Option<usize>,                  // selected commit (index into git_commits)
+    git_gen: u64,                            // async-load generation guard
+    git_branches_list: Vec<String>,          // branches for the left tree
+    git_collapsed: HashSet<String>,          // collapsed branch-tree folders
+    git_details_msg: String,                 // full message of the selected commit
+    git_details_files: Vec<(PathBuf, GitState)>, // its changed files
+    git_scroll: ScrollHandle,                // commit list scroll
 }
 
 /// Navigation requests a project view sends up to the workspace.
@@ -2346,6 +2418,21 @@ impl Storm {
             agent_input: Field::default(),
             agent_focus: cx.focus_handle(),
             agent_scroll: ScrollHandle::new(),
+            git_open: false,
+            git_height: 320.,
+            resizing_git: false,
+            git_focus: cx.focus_handle(),
+            git_filter_focus: cx.focus_handle(),
+            git_query: Field::default(),
+            git_rev: "HEAD".into(),
+            git_commits: Vec::new(),
+            git_sel: None,
+            git_gen: 0,
+            git_branches_list: Vec::new(),
+            git_collapsed: HashSet::new(),
+            git_details_msg: String::new(),
+            git_details_files: Vec::new(),
+            git_scroll: ScrollHandle::new(),
         };
         s.ignored = git_ignored_paths(&s.root); // hide git-ignored paths from the tree
         s.expanded.insert(s.root.clone()); // the root node starts expanded
@@ -5008,6 +5095,10 @@ impl Storm {
             // dock sits left of the 44px right activity bar; divider is on its left edge
             self.agent_width = (self.win_width - 44. - f32::from(ev.position.x)).clamp(280., 900.);
             cx.notify();
+        } else if self.resizing_git {
+            // bottom dock: divider on its top edge; drag up grows it
+            self.git_height = (self.win_height - f32::from(ev.position.y)).clamp(160., self.win_height - 120.);
+            cx.notify();
         } else if let Some(e) = self.find_resize {
             // window-style resize: drag any edge/corner; the opposite edge stays
             let (mx, my) = (f32::from(ev.position.x), f32::from(ev.position.y));
@@ -5054,6 +5145,7 @@ impl Storm {
         if self.resizing
             || self.resizing_term
             || self.resizing_agent
+            || self.resizing_git
             || self.find_resize.is_some()
             || self.find_moving
             || self.find_split_dragging
@@ -5061,6 +5153,7 @@ impl Storm {
             self.resizing = false;
             self.resizing_term = false;
             self.resizing_agent = false;
+            self.resizing_git = false;
             self.find_resize = None;
             self.find_moving = false;
             self.find_split_dragging = false;
@@ -5116,6 +5209,25 @@ impl Render for Storm {
         let act_left = self.render_activity_left(cx);
         let act_right = self.render_activity_right(cx);
         let run_dock = if self.run_open { Some(self.render_run(cx).into_any_element()) } else { None };
+        let git_dock = if self.git_open {
+            let panel = self.render_git_log(window, cx);
+            let divider = div()
+                .h(px(4.))
+                .w_full()
+                .flex_shrink_0()
+                .bg(rgb(if self.resizing_git { ACCENT } else { BORDER }))
+                .cursor(CursorStyle::ResizeUpDown)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _ev, _window, cx| {
+                        this.resizing_git = true;
+                        cx.notify();
+                    }),
+                );
+            Some(div().flex().flex_col().flex_shrink_0().child(divider).child(panel).into_any_element())
+        } else {
+            None
+        };
         let bottom = self.render_bottom(cx);
         let left_panel = if self.show_left {
             Some(match self.left_view {
@@ -5233,11 +5345,13 @@ impl Render for Storm {
             .on_action(cx.listener(Self::act_run_build))
             .on_action(cx.listener(Self::act_pull))
             .on_action(cx.listener(Self::act_toggle_agent))
+            .on_action(cx.listener(Self::act_git_log))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .child(topbar)
             .child(middle)
             .when_some(run_dock, |d, dock| d.child(dock))
+            .when_some(git_dock, |d, dock| d.child(dock))
             .child(bottom);
 
         if self.finder_open {
@@ -5682,6 +5796,11 @@ impl Storm {
                     this.load_pr(cx);
                 }
                 cx.notify();
+            })))
+            // push the Git log button to the bottom-left corner
+            .child(div().flex_grow(1.0))
+            .child(activity_icon("act-git", IC_BRANCH, "Git  (⌘9)", self.git_open, 0, cx.listener(|this, _ev, window, cx| {
+                this.toggle_git_log(window, cx);
             })))
     }
 
@@ -9106,6 +9225,484 @@ fn render_agent_msg(m: &AgentMsg) -> impl IntoElement {
     }
 }
 
+/// One visible row in the Git panel's branch tree.
+struct GitBranchRow {
+    depth: usize,
+    label: String,
+    branch: Option<String>, // Some → a leaf branch (its full name, e.g. "adrian/foo")
+    folder: Option<String>, // Some → a folder row (its path key), toggles collapse
+}
+
+// ── Git log panel ────────────────────────────────────────────────────────────
+impl Storm {
+    fn act_git_log(&mut self, _: &GitLog, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_git_log(window, cx);
+    }
+
+    fn toggle_git_log(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.git_open = !self.git_open;
+        if self.git_open {
+            self.load_git_log(cx);
+            window.focus(&self.git_focus, cx);
+        } else {
+            self.focus_active(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// (Re)load the branch list + commit log for the current rev, off-thread.
+    fn load_git_log(&mut self, cx: &mut Context<Self>) {
+        self.git_gen += 1;
+        let gen = self.git_gen;
+        let root = self.root.clone();
+        let rev = self.git_rev.clone();
+        cx.spawn(async move |this, cx| {
+            let (branches, commits) = cx
+                .background_executor()
+                .spawn(async move { (git_branches(&root), git_log_commits(&root, &rev, 500)) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.git_gen != gen {
+                    return;
+                }
+                this.git_branches_list = branches;
+                this.git_commits = commits;
+                this.git_sel = None;
+                this.git_details_msg.clear();
+                this.git_details_files.clear();
+                if !this.git_commits.is_empty() {
+                    this.select_commit(0, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Show a different branch/rev in the log (branch-tree click).
+    fn git_show_rev(&mut self, rev: String, cx: &mut Context<Self>) {
+        self.git_rev = rev;
+        self.load_git_log(cx);
+    }
+
+    /// Select commit `idx` and load its message + changed files off-thread.
+    fn select_commit(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let Some(c) = self.git_commits.get(idx) else { return };
+        self.git_sel = Some(idx);
+        let hash = c.hash.clone();
+        let root = self.root.clone();
+        let gen = self.git_gen;
+        cx.spawn(async move |this, cx| {
+            let (msg, files) = cx
+                .background_executor()
+                .spawn(async move { (git_commit_message(&root, &hash), git_commit_files(&root, &hash)) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.git_gen == gen {
+                    this.git_details_msg = msg;
+                    this.git_details_files = files;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Indices into `git_commits` matching the filter (subject/hash/author).
+    fn git_visible(&self) -> Vec<usize> {
+        let q = self.git_query.text.trim().to_lowercase();
+        (0..self.git_commits.len())
+            .filter(|&i| {
+                if q.is_empty() {
+                    return true;
+                }
+                let c = &self.git_commits[i];
+                c.subject.to_lowercase().contains(&q)
+                    || c.short.to_lowercase().contains(&q)
+                    || c.hash.to_lowercase().contains(&q)
+                    || c.author.to_lowercase().contains(&q)
+            })
+            .collect()
+    }
+
+    /// Flatten branch names into a collapsible tree (split on '/').
+    fn git_branch_rows(&self) -> Vec<GitBranchRow> {
+        #[derive(Default)]
+        struct Node {
+            dirs: std::collections::BTreeMap<String, Node>,
+            leaves: std::collections::BTreeMap<String, String>, // label → full branch name
+        }
+        let mut root = Node::default();
+        for name in &self.git_branches_list {
+            let comps: Vec<&str> = name.split('/').collect();
+            let mut node = &mut root;
+            for c in &comps[..comps.len().saturating_sub(1)] {
+                node = node.dirs.entry(c.to_string()).or_default();
+            }
+            if let Some(leaf) = comps.last() {
+                node.leaves.insert(leaf.to_string(), name.clone());
+            }
+        }
+        let mut out = Vec::new();
+        fn walk(node: &Node, depth: usize, prefix: &str, collapsed: &HashSet<String>, out: &mut Vec<GitBranchRow>) {
+            for (name, child) in &node.dirs {
+                let key = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+                out.push(GitBranchRow { depth, label: name.clone(), branch: None, folder: Some(key.clone()) });
+                if !collapsed.contains(&key) {
+                    walk(child, depth + 1, &key, collapsed, out);
+                }
+            }
+            for (label, full) in &node.leaves {
+                out.push(GitBranchRow { depth, label: label.clone(), branch: Some(full.clone()), folder: None });
+            }
+        }
+        walk(&root, 1, "", &self.git_collapsed, &mut out);
+        out
+    }
+
+    /// Open the diff of `path` at the selected commit (commit^ vs commit).
+    fn open_commit_diff(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(sel) = self.git_sel else { return };
+        let Some(c) = self.git_commits.get(sel) else { return };
+        let files: Vec<PathBuf> = self.git_details_files.iter().map(|(p, _)| p.clone()).collect();
+        let Some(idx) = files.iter().position(|p| p == &path) else { return };
+        let old = Some(format!("{}^", c.hash));
+        let new_rev = Some(c.hash.clone());
+        self.open_diff_window(files, idx, old, new_rev, false, String::new(), PrViewFilter::All, cx);
+    }
+
+    fn git_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // the filter input is nested in the same focus scope; ignore its keys here
+        if self.git_filter_focus.is_focused(window) {
+            return;
+        }
+        let key = ev.keystroke.key.as_str();
+        let vis = self.git_visible();
+        let cur = self.git_sel.and_then(|s| vis.iter().position(|&i| i == s)).unwrap_or(0);
+        match key {
+            "escape" => {
+                self.git_open = false;
+                self.focus_active(window, cx);
+                cx.notify();
+            }
+            "down" => {
+                if let Some(&i) = vis.get((cur + 1).min(vis.len().saturating_sub(1))) {
+                    self.select_commit(i, cx);
+                    cx.notify();
+                }
+            }
+            "up" => {
+                if let Some(&i) = vis.get(cur.saturating_sub(1)) {
+                    self.select_commit(i, cx);
+                    cx.notify();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn git_filter_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if ev.keystroke.key == "escape" {
+            self.git_query.clear();
+        } else {
+            Self::field_input(&mut self.git_query, &ev.keystroke, cx, |_| true);
+        }
+        cx.notify();
+    }
+
+    fn render_git_log(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let header = div()
+            .h(px(28.))
+            .flex_shrink_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .bg(rgb(PANEL_BG))
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .child(div().font_family(ICON_FONT).text_size(px(12.)).text_color(rgb(ICON)).child(IC_BRANCH))
+            .child(div().text_size(px(12.)).text_color(rgb(TEXT)).child("Git"))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("git-close")
+                    .px_1()
+                    .cursor_pointer()
+                    .text_size(px(13.))
+                    .text_color(rgb(MUTED))
+                    .hover(|s| s.text_color(rgb(TEXT)))
+                    .child("✕")
+                    .on_click(cx.listener(|this, _e, window, cx| this.toggle_git_log(window, cx))),
+            );
+
+        // left: branch tree
+        let cur_branch = self.branch.clone();
+        let mut branches = div()
+            .id("git-branches")
+            .w(px(240.))
+            .flex_shrink_0()
+            .h_full()
+            .overflow_y_scroll()
+            .border_r_1()
+            .border_color(rgb(BORDER))
+            .flex()
+            .flex_col()
+            .py_1()
+            .child(
+                // HEAD (current branch) — clicking shows HEAD
+                div()
+                    .id("git-head")
+                    .px_2()
+                    .py_1()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .when(self.git_rev == "HEAD", |d| d.bg(rgb(SELECTED_BG)))
+                    .hover(|s| s.bg(rgb(HOVER)))
+                    .child(div().font_family(ICON_FONT).text_size(px(11.)).text_color(rgb(ACCENT)).child(IC_HOME))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(TEXT))
+                            .child(format!("HEAD  ·  {}", if cur_branch.is_empty() { "detached".into() } else { cur_branch.clone() })),
+                    )
+                    .on_click(cx.listener(|this, _e, _w, cx| this.git_show_rev("HEAD".into(), cx))),
+            );
+        for row in self.git_branch_rows() {
+            let indent = 8.0 + row.depth as f32 * 12.0;
+            if let Some(folder) = row.folder.clone() {
+                let collapsed = self.git_collapsed.contains(&folder);
+                branches = branches.child(
+                    div()
+                        .id(SharedString::from(format!("git-fold-{folder}")))
+                        .pl(px(indent))
+                        .pr_2()
+                        .py(px(2.))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(HOVER)))
+                        .child(div().text_size(px(10.)).text_color(rgb(MUTED)).child(if collapsed { "▸" } else { "▾" }))
+                        .child(div().font_family(ICON_FONT).text_size(px(11.)).text_color(rgb(FOLDER_ICON)).child(IC_FOLDER))
+                        .child(div().text_size(px(12.)).text_color(rgb(DIR)).child(row.label.clone()))
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            if !this.git_collapsed.remove(&folder) {
+                                this.git_collapsed.insert(folder.clone());
+                            }
+                            cx.notify();
+                        })),
+                );
+            } else if let Some(branch) = row.branch.clone() {
+                let sel = self.git_rev == branch;
+                let is_cur = branch == cur_branch;
+                branches = branches.child(
+                    div()
+                        .id(SharedString::from(format!("git-br-{branch}")))
+                        .pl(px(indent + 12.0))
+                        .pr_2()
+                        .py(px(2.))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .cursor_pointer()
+                        .when(sel, |d| d.bg(rgb(SELECTED_BG)))
+                        .hover(|s| s.bg(rgb(HOVER)))
+                        .child(div().font_family(ICON_FONT).text_size(px(10.)).text_color(rgb(if is_cur { ACCENT } else { MUTED })).child(IC_BRANCH))
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .truncate()
+                                .text_color(rgb(if is_cur { ACCENT } else { TEXT }))
+                                .child(row.label.clone()),
+                        )
+                        .on_click(cx.listener(move |this, _e, _w, cx| this.git_show_rev(branch.clone(), cx))),
+                );
+            }
+        }
+
+        // center: filter bar + commit list
+        let vis = self.git_visible();
+        let filter_bar = div()
+            .h(px(34.))
+            .flex_shrink_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .child(
+                div()
+                    .flex_grow(1.0)
+                    .min_w(px(0.))
+                    .px_2()
+                    .py_1()
+                    .bg(rgb(BG))
+                    .border_1()
+                    .border_color(rgb(if self.git_filter_focus.is_focused(window) { ACCENT } else { BORDER }))
+                    .rounded_md()
+                    .text_size(px(12.))
+                    .text_color(rgb(TEXT))
+                    .track_focus(&self.git_filter_focus)
+                    .on_key_down(cx.listener(Self::git_filter_key))
+                    .child(if self.git_query.text.is_empty() {
+                        div().text_color(rgb(MUTED)).child("Text or hash")
+                    } else {
+                        self.git_query.render(self.caret(), SELECTION)
+                    }),
+            )
+            .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(format!("⎇ {}", self.git_rev)))
+            .child(
+                div()
+                    .id("git-reload")
+                    .px_2()
+                    .cursor_pointer()
+                    .text_size(px(13.))
+                    .text_color(rgb(MUTED))
+                    .hover(|s| s.text_color(rgb(TEXT)))
+                    .child("↻")
+                    .tooltip(tip("Reload"))
+                    .on_click(cx.listener(|this, _e, _w, cx| this.load_git_log(cx))),
+            );
+
+        let mut list = div()
+            .id("git-commits")
+            .flex_grow(1.0)
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .track_scroll(&self.git_scroll)
+            .flex()
+            .flex_col();
+        if self.git_commits.is_empty() {
+            list = list.child(div().px_3().py_2().text_size(px(12.)).text_color(rgb(MUTED)).child("No commits"));
+        }
+        for &i in &vis {
+            let c = &self.git_commits[i];
+            let sel = self.git_sel == Some(i);
+            list = list.child(
+                div()
+                    .id(("git-c", i))
+                    .h(px(24.))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .cursor_pointer()
+                    .when(sel, |d| d.bg(rgb(SELECTED_BG)))
+                    .when(!sel, |d| d.hover(|s| s.bg(rgb(HOVER))))
+                    .child(div().flex_shrink_0().text_size(px(9.)).text_color(rgb(ACCENT)).child("●"))
+                    .child(
+                        div()
+                            .flex_grow(1.0)
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(12.))
+                            .text_color(rgb(if sel { SEL_TEXT } else { TEXT }))
+                            .child(c.subject.clone()),
+                    )
+                    .child(div().flex_shrink_0().w(px(120.)).truncate().text_size(px(11.)).text_color(rgb(MUTED)).child(c.author.clone()))
+                    .child(div().flex_shrink_0().text_size(px(11.)).text_color(rgb(MUTED)).child(c.date.clone()))
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                        this.select_commit(i, cx);
+                        cx.notify();
+                    })),
+            );
+        }
+        let center = div().flex_grow(1.0).min_w(px(0.)).h_full().flex().flex_col().child(filter_bar).child(list);
+
+        // right: commit details
+        let details = self.render_git_details(cx);
+
+        div()
+            .w_full()
+            .h(px(self.git_height))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .bg(rgb(BG))
+            .border_t_1()
+            .border_color(rgb(BORDER))
+            .track_focus(&self.git_focus)
+            .on_key_down(cx.listener(Self::git_key))
+            .child(header)
+            .child(div().flex_grow(1.0).min_h(px(0.)).flex().flex_row().child(branches).child(center).child(details))
+    }
+
+    fn render_git_details(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut panel = div()
+            .id("git-details")
+            .w(px(360.))
+            .flex_shrink_0()
+            .h_full()
+            .overflow_y_scroll()
+            .border_l_1()
+            .border_color(rgb(BORDER))
+            .flex()
+            .flex_col()
+            .p_3()
+            .gap_2();
+        let Some(sel) = self.git_sel else {
+            return panel.child(div().text_size(px(12.)).text_color(rgb(MUTED)).child("Select commit to view changes"));
+        };
+        let Some(c) = self.git_commits.get(sel) else {
+            return panel.child(div());
+        };
+        panel = panel
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(div().text_size(px(11.)).text_color(rgb(ACCENT)).child(c.short.clone()))
+                    .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(format!("{}  ·  {}", c.author, c.date))),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(TEXT))
+                    .child(if self.git_details_msg.is_empty() { c.subject.clone() } else { self.git_details_msg.clone() }),
+            )
+            .child(div().h(px(1.)).bg(rgb(BORDER)))
+            .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(format!("{} file(s) changed", self.git_details_files.len())));
+        for (path, state) in &self.git_details_files {
+            let rel = self.rel(path);
+            let color = match state {
+                GitState::New => GIT_NEW,
+                GitState::Deleted => GIT_DELETED,
+                _ => GIT_MODIFIED,
+            };
+            let p = path.clone();
+            panel = panel.child(
+                div()
+                    .id(SharedString::from(format!("git-df-{}", rel)))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .py(px(1.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(HOVER)))
+                    .child(div().w(px(6.)).flex_shrink_0().text_size(px(11.)).text_color(rgb(color)).child("●"))
+                    .child(div().min_w(px(0.)).truncate().text_size(px(12.)).text_color(rgb(TEXT)).child(rel))
+                    .on_click(cx.listener(move |this, _e, _w, cx| this.open_commit_diff(p.clone(), cx))),
+            );
+        }
+        panel
+    }
+}
+
 /// A vertical-activity-bar icon button.
 fn activity_icon(
     id: &'static str,
@@ -11441,6 +12038,7 @@ fn main() {
             KeyBinding::new("cmd-shift-m", WipPush, None),
             KeyBinding::new("cmd-shift-b", RunBuild, None),
             KeyBinding::new("cmd-shift-a", ToggleAgent, None),
+            KeyBinding::new("cmd-9", GitLog, None),
             KeyBinding::new("alt-l", PullRemote, None),
             // command palette (global)
             KeyBinding::new("cmd-shift-p", CommandPalette, None),
