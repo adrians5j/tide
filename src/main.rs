@@ -54,6 +54,7 @@ const IC_FOLDER: &str = "\u{ea83}";
 const IC_COPY: &str = "\u{ebcc}";
 const IC_CHECK: &str = "\u{eab2}";
 const IC_TRASH: &str = "\u{ea81}";
+const IC_BROWSER: &str = "\u{eb48}"; // codicon "globe"
 // The codicon font is renamed to "Segoe Fluent Icons" because GPUI refuses to
 // load any font lacking an 'm' glyph — except that one specially-cased name.
 const ICON_FONT: &str = "Segoe Fluent Icons";
@@ -5848,8 +5849,11 @@ impl Storm {
                 }
                 cx.notify();
             })))
-            // push the Git log button to the bottom-left corner
+            // push Run + Git to the bottom-left corner
             .child(div().flex_grow(1.0))
+            .child(activity_icon("act-run", IC_RUN, "Run console", self.run_open, 0, cx.listener(|this, _ev, _w, cx| {
+                this.toggle_run(cx);
+            })))
             .child(activity_icon("act-git", IC_BRANCH, "Git  (⌘9)", self.git_open, 0, cx.listener(|this, _ev, window, cx| {
                 this.toggle_git_log(window, cx);
             })))
@@ -5871,10 +5875,9 @@ impl Storm {
             .child(activity_icon("act-term", IC_TERMINAL, "Terminal  (⌥F12)", self.show_terminal, 0, cx.listener(|this, _ev, window, cx| {
                 this.toggle_terminal(window, cx);
             })))
-            .child(activity_icon("act-run", IC_RUN, "Run console", self.run_open, 0, cx.listener(|this, _ev, _w, cx| {
-                this.run_open = !this.run_open;
-                cx.notify();
-            })))
+            .child(activity_icon("act-browser", IC_BROWSER, "Browser", false, 0, |_ev, _w, _cx| {
+                open_browser("http://localhost:3000");
+            }))
             .when(AGENT_PANEL, |d| d.child(activity_icon("act-agent", IC_TOOLS, "Agent  (⌘⇧A)", self.agent_open, 0, cx.listener(|this, _ev, window, cx| {
                 this.toggle_agent(window, cx);
             }))))
@@ -9252,10 +9255,21 @@ impl Storm {
     fn toggle_git_log(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.git_open = !self.git_open;
         if self.git_open {
+            self.run_open = false; // Git + Run console share the bottom; only one at a time
             self.load_git_log(cx);
             window.focus(&self.git_focus, cx);
         } else {
             self.focus_active(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Toggle the Run console; it and the Git panel are mutually exclusive
+    /// (both are bottom docks).
+    fn toggle_run(&mut self, cx: &mut Context<Self>) {
+        self.run_open = !self.run_open;
+        if self.run_open {
+            self.git_open = false;
         }
         cx.notify();
     }
@@ -9711,6 +9725,25 @@ impl Storm {
         }
         panel
     }
+}
+
+/// Open `url` in a chromeless app-mode Chromium window (a "simple browser"):
+/// tries Chrome/Chromium/Edge/Brave with `--app=`, falling back to the system
+/// default browser via `open`.
+fn open_browser(url: &str) {
+    const BROWSERS: &[&str] = &[
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+    ];
+    for bin in BROWSERS {
+        if Path::new(bin).exists() {
+            let _ = Command::new(bin).arg(format!("--app={url}")).arg("--new-window").spawn();
+            return;
+        }
+    }
+    let _ = Command::new("open").arg(url).spawn(); // default browser
 }
 
 /// A vertical-activity-bar icon button.
