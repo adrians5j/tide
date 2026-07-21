@@ -9656,10 +9656,7 @@ impl Storm {
 
 /// Holds every open project as a live `Storm` view and renders the active one.
 /// Background projects keep their editors and running terminals alive.
-/// Columns in the project-switcher grid (3x3 for the first 9 projects).
-const SWITCHER_COLS: usize = 3;
-
-/// Drag payload for reordering project cards in the switcher (dragged index).
+/// Drag payload for reordering project rows in the switcher (dragged index).
 struct DraggedProject(usize);
 
 /// Chip rendered under the cursor while dragging a project card.
@@ -9845,23 +9842,13 @@ impl Workspace {
                 self.focus_pending = true;
                 cx.notify();
             }
-            // grid navigation: left/right step by one, up/down by a row
-            "right" => {
+            // list navigation: up/down (and left/right) step by one
+            "down" | "right" => {
                 self.switcher_sel = (self.switcher_sel + 1).min(n.saturating_sub(1));
                 cx.notify();
             }
-            "left" => {
+            "up" | "left" => {
                 self.switcher_sel = self.switcher_sel.saturating_sub(1);
-                cx.notify();
-            }
-            "down" => {
-                self.switcher_sel = (self.switcher_sel + SWITCHER_COLS).min(n.saturating_sub(1));
-                cx.notify();
-            }
-            "up" => {
-                if self.switcher_sel >= SWITCHER_COLS {
-                    self.switcher_sel -= SWITCHER_COLS;
-                }
                 cx.notify();
             }
             "enter" => {
@@ -9936,11 +9923,10 @@ impl Render for Workspace {
 
         if self.switcher_open {
             let win = window.viewport_size();
-            // width holds SWITCHER_COLS cards (168px) + gaps + padding
-            const CARD_W: f32 = 168.0;
-            let w = SWITCHER_COLS as f32 * CARD_W + (SWITCHER_COLS as f32 + 1.0) * 8.0 + 8.0;
+            let w = 380.0_f32;
             let left = ((f32::from(win.width) - w) / 2.0).max(0.);
-            let mut grid = div().flex().flex_row().flex_wrap().gap_2().px_2().pb_2();
+            // vertical list, one full-width row per project
+            let mut grid = div().flex().flex_col().gap_1().px_2().pb_2();
             for i in 0..self.projects.len() {
                 let (name, branch) = {
                     let s = self.projects[i].read(cx);
@@ -9954,19 +9940,20 @@ impl Render for Workspace {
                     div()
                         .id(("ws-switch", i))
                         .relative()
-                        .w(px(CARD_W))
-                        .h(px(76.))
-                        .p_2()
+                        .w_full()
+                        .h(px(40.))
+                        .px_2()
                         .flex()
-                        .flex_col()
-                        .justify_between()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
                         .rounded_md()
                         .border_1()
                         .border_color(rgb(if sel { ACCENT } else { BORDER }))
                         .when(sel, |d| d.bg(rgb(SELECTED_BG)))
                         .when(!sel, |d| d.hover(|s| s.bg(rgb(HOVER))))
                         .cursor_pointer()
-                        // drag to reorder: drop onto another card to move before it
+                        // drag to reorder: drop onto another row to move before it
                         .on_drag(DraggedProject(i), move |_, _, _, cx| {
                             cx.new(|_| DragChip { label: label_drag.clone() })
                         })
@@ -9974,31 +9961,29 @@ impl Render for Workspace {
                         .on_drop(cx.listener(move |this, d: &DraggedProject, _w, cx| {
                             this.reorder_projects(d.0, idx, cx);
                         }))
-                        // top row: number badge + folder icon + active dot
+                        // number badge
                         .child(
                             div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .text_size(px(11.))
-                                        .text_color(rgb(if sel { SEL_TEXT } else { MUTED }))
-                                        .child(format!("{}", i + 1)),
-                                )
-                                .child(
-                                    div()
-                                        .font_family(ICON_FONT)
-                                        .text_size(px(12.))
-                                        .text_color(rgb(if sel { SEL_TEXT } else { FOLDER_ICON }))
-                                        .child(IC_FOLDER),
-                                )
-                                .child(div().flex_grow(1.0)),
+                                .w(px(14.))
+                                .flex_shrink_0()
+                                .text_size(px(11.))
+                                .text_color(rgb(if sel { SEL_TEXT } else { MUTED }))
+                                .child(format!("{}", i + 1)),
                         )
-                        // name + branch
+                        // folder icon
                         .child(
                             div()
+                                .flex_shrink_0()
+                                .font_family(ICON_FONT)
+                                .text_size(px(13.))
+                                .text_color(rgb(if sel { SEL_TEXT } else { FOLDER_ICON }))
+                                .child(IC_FOLDER),
+                        )
+                        // name + branch, taking the remaining width
+                        .child(
+                            div()
+                                .flex_grow(1.0)
+                                .min_w(px(0.))
                                 .flex()
                                 .flex_col()
                                 .child(
@@ -10018,14 +10003,12 @@ impl Render for Workspace {
                                     )
                                 }),
                         )
-                        // close button, top-right corner (hidden with one project left)
+                        // close button (hidden with one project left)
                         .when(multi, |d| {
                             d.child(
                                 div()
                                     .id(("ws-close", i))
-                                    .absolute()
-                                    .top(px(2.))
-                                    .right(px(4.))
+                                    .flex_shrink_0()
                                     .px_1()
                                     .text_size(px(12.))
                                     .text_color(rgb(MUTED))
@@ -10033,8 +10016,19 @@ impl Render for Workspace {
                                     .cursor_pointer()
                                     .child("✕")
                                     .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
-                                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                                    .on_click(cx.listener(move |this, _e, window, cx| {
                                         this.remove_project(idx, cx);
+                                        // keep the switcher focused so Esc still closes it
+                                        // (remove_project set focus_pending, which would
+                                        // otherwise hand focus to a project view)
+                                        if this.projects.len() <= 1 {
+                                            this.switcher_open = false;
+                                            this.focus_pending = true;
+                                        } else {
+                                            this.focus_pending = false;
+                                            window.focus(&this.switcher_focus, cx);
+                                        }
+                                        cx.notify();
                                     })),
                             )
                         })
