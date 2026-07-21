@@ -10163,18 +10163,136 @@ impl Storm {
             let editor = self.tabs[self.active].editor.clone();
             col = col.child(div().flex_grow(1.0).min_h(px(0.)).child(editor));
         } else {
-            col = col.child(
-                div()
-                    .flex_grow(1.0)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_color(rgb(MUTED))
-                    .child("Select a file"),
-            );
+            col = col.child(self.render_status(cx));
         }
 
         col
+    }
+
+    /// Empty-pane dashboard: a snapshot of the current work — branch, PR (with
+    /// target + status, click to open), uncommitted count, and a refresh button.
+    fn render_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let project = self.project_name();
+        let branch = self.branch_label();
+        let changed = self.git_status.len();
+
+        // a labeled row: leading icon glyph + content
+        let row = |icon: &'static str, icon_color: u32| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(div().w(px(16.)).flex_shrink_0().font_family(ICON_FONT).text_size(px(13.)).text_color(rgb(icon_color)).child(icon))
+        };
+
+        let mut card = div()
+            .w(px(460.))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_size(px(18.)).text_color(rgb(TEXT)).child(project))
+                    .child(
+                        div()
+                            .id("status-refresh")
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_size(px(13.))
+                            .text_color(rgb(MUTED))
+                            .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                            .child("↻ Refresh")
+                            .tooltip(tip("Refresh branch + PR status"))
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                this.refresh_pr_link(cx);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(div().h(px(1.)).bg(rgb(BORDER)))
+            // current branch
+            .child(
+                row(IC_BRANCH, ACCENT)
+                    .child(div().text_size(px(13.)).text_color(rgb(MUTED)).child("On branch"))
+                    .child(div().text_size(px(13.)).text_color(rgb(TEXT)).child(branch)),
+            );
+
+        // pull request
+        if let Some((num, url, status, base, _head)) = self.pr_link.clone() {
+            let (status_text, status_color) = match status {
+                PrStatus::Passing => ("checks passing", status.color()),
+                PrStatus::Pending => ("checks running", status.color()),
+                PrStatus::Failing => ("checks failing", status.color()),
+                PrStatus::None => ("no checks", MUTED),
+            };
+            let open_url = url.clone();
+            card = card.child(
+                row(IC_PR, GIT_NEW)
+                    .child(
+                        div()
+                            .id("status-pr")
+                            .cursor_pointer()
+                            .text_size(px(13.))
+                            .text_color(rgb(ACCENT))
+                            .hover(|s| s.underline())
+                            .child(format!("PR #{num}"))
+                            .tooltip(tip("Open on GitHub"))
+                            .on_click(cx.listener(move |_t, _e, _w, _cx| {
+                                let _ = Command::new("open").arg(&open_url).spawn();
+                            })),
+                    )
+                    .child(div().text_size(px(13.)).text_color(rgb(MUTED)).child("→"))
+                    .child(div().text_size(px(13.)).text_color(rgb(TEXT)).child(base))
+                    .child(div().w(px(6.)).flex_shrink_0().text_size(px(12.)).text_color(rgb(status_color)).child("●"))
+                    .child(div().text_size(px(12.)).text_color(rgb(status_color)).child(status_text)),
+            );
+        } else {
+            let mut r = row(IC_PR, MUTED)
+                .child(div().text_size(px(13.)).text_color(rgb(MUTED)).child("No open PR for this branch"));
+            if let Some(parent) = self.branch_parent.clone() {
+                r = r
+                    .child(div().text_size(px(13.)).text_color(rgb(MUTED)).child("·  from"))
+                    .child(div().text_size(px(13.)).text_color(rgb(TEXT)).child(parent));
+            }
+            card = card.child(r);
+        }
+
+        // uncommitted changes — click to open the Changes pane
+        card = card.child(
+            row(IC_SCM, if changed > 0 { GIT_MODIFIED } else { MUTED })
+                .child(
+                    div()
+                        .id("status-changes")
+                        .cursor_pointer()
+                        .text_size(px(13.))
+                        .text_color(rgb(if changed > 0 { TEXT } else { MUTED }))
+                        .hover(|s| s.text_color(rgb(ACCENT)))
+                        .child(if changed == 0 {
+                            "Working tree clean".to_string()
+                        } else {
+                            format!("{changed} uncommitted file{}", if changed == 1 { "" } else { "s" })
+                        })
+                        .on_click(cx.listener(|this, _e, _w, cx| {
+                            this.left_view = LeftView::Changes;
+                            this.show_left = true;
+                            cx.notify();
+                        })),
+                ),
+        );
+
+        div()
+            .flex_grow(1.0)
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(card)
     }
 
     fn render_tabs(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
