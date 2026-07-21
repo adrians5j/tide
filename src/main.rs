@@ -10289,7 +10289,11 @@ impl Storm {
 
         div()
             .flex_grow(1.0)
+            .w_full()
+            .h_full()
+            .min_h(px(0.))
             .flex()
+            .flex_row()
             .items_center()
             .justify_center()
             .child(card)
