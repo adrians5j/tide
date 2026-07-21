@@ -21,6 +21,7 @@ impl Browser {
     pub fn new(window: &Window, url: &str, x: f32, y: f32, w: f32, h: f32) -> Option<Browser> {
         let webview = WebViewBuilder::new()
             .with_url(url)
+            .with_devtools(true) // enable Web Inspector (⌥⌘I / right-click → Inspect)
             .with_bounds(rect(x, y, w, h))
             .build_as_child(window)
             .ok()?;
