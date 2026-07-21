@@ -53,6 +53,7 @@ const IC_RUN: &str = "\u{eb2c}"; // play
 const IC_FOLDER: &str = "\u{ea83}";
 const IC_COPY: &str = "\u{ebcc}";
 const IC_CHECK: &str = "\u{eab2}";
+const IC_TRASH: &str = "\u{ea81}";
 // The codicon font is renamed to "Segoe Fluent Icons" because GPUI refuses to
 // load any font lacking an 'm' glyph — except that one specially-cased name.
 const ICON_FONT: &str = "Segoe Fluent Icons";
@@ -1477,6 +1478,20 @@ fn git_branches(root: &Path) -> Vec<String> {
     out
 }
 
+/// Names of local branches only (refs/heads), for distinguishing local vs
+/// remote-tracking entries in the branch popup.
+fn git_local_branches(root: &Path) -> HashSet<String> {
+    Command::new("git")
+        .args(["for-each-ref", "--format=%(refname:short)", "refs/heads"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default()
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum GitAction {
     Update,
@@ -1499,14 +1514,9 @@ enum GitItem {
 enum BranchAction {
     Checkout,
     Merge,
+    Delete,
 }
 
-/// (action, label, icon) — the submenu entries, in display order. The label is
-/// a fallback; render builds a dynamic one (e.g. "Merge 'x' into 'y'").
-const BRANCH_ACTIONS: &[(BranchAction, &'static str, &'static str)] = &[
-    (BranchAction::Checkout, "Checkout", IC_HOME),
-    (BranchAction::Merge, "Merge", IC_BRANCH),
-];
 
 /// Commands available in the command palette (cmd+shift+p).
 #[derive(Clone, Copy, PartialEq)]
@@ -2124,6 +2134,7 @@ struct Storm {
     gitp_sel: usize,
     // when Some, the per-branch action submenu is open for this branch
     gitp_action_branch: Option<String>,
+    gitp_local: HashSet<String>, // local branch names (refs/heads), for gating Delete
     gitp_action_sel: usize,
     // command palette
     palette_open: bool,
@@ -2381,6 +2392,7 @@ impl Storm {
             gitp_branches: Vec::new(),
             gitp_sel: 0,
             gitp_action_branch: None,
+            gitp_local: HashSet::new(),
             gitp_action_sel: 0,
             palette_open: false,
             palette_focus: cx.focus_handle(),
@@ -4305,6 +4317,7 @@ impl Storm {
 
     fn act_git_popup(&mut self, _: &GitPopup, window: &mut Window, cx: &mut Context<Self>) {
         self.gitp_branches = git_branches(&self.root);
+        self.gitp_local = git_local_branches(&self.root);
         self.gitp_open = true;
         self.gitp_query.clear();
         self.gitp_sel = 0;
@@ -4376,6 +4389,20 @@ impl Storm {
         }
     }
 
+    /// Submenu entries for the branch the popup is acting on (display order).
+    /// Delete is offered only for a local branch that isn't the current one.
+    fn gitp_branch_actions(&self) -> Vec<(BranchAction, &'static str, &'static str)> {
+        let mut v = vec![
+            (BranchAction::Checkout, "Checkout", IC_HOME),
+            (BranchAction::Merge, "Merge", IC_BRANCH),
+        ];
+        let b = self.gitp_action_branch.as_deref().unwrap_or("");
+        if self.gitp_local.contains(b) && b != self.branch {
+            v.push((BranchAction::Delete, "Delete", IC_TRASH));
+        }
+        v
+    }
+
     /// Run a submenu action against the branch the submenu was opened for.
     fn gitp_run_branch_action(
         &mut self,
@@ -4398,6 +4425,8 @@ impl Storm {
                 self.run_command(cmd, cx);
             }
             BranchAction::Merge => self.run_command(format!("git merge {}", branch), cx),
+            // safe delete (-d refuses unmerged branches; git prints why in the console)
+            BranchAction::Delete => self.run_command(format!("git branch -d {}", branch), cx),
         }
     }
 
@@ -4409,13 +4438,13 @@ impl Storm {
         if self.gitp_action_branch.is_some() {
             match ks.key.as_str() {
                 "enter" => {
-                    if let Some(&(action, ..)) = BRANCH_ACTIONS.get(self.gitp_action_sel) {
+                    if let Some(&(action, ..)) = self.gitp_branch_actions().get(self.gitp_action_sel) {
                         self.gitp_run_branch_action(action, window, cx);
                     }
                 }
                 "down" => {
                     self.gitp_action_sel =
-                        (self.gitp_action_sel + 1).min(BRANCH_ACTIONS.len().saturating_sub(1));
+                        (self.gitp_action_sel + 1).min(self.gitp_branch_actions().len().saturating_sub(1));
                 }
                 "up" => self.gitp_action_sel = self.gitp_action_sel.saturating_sub(1),
                 _ => {}
@@ -7588,11 +7617,12 @@ impl Storm {
                     .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(branch.clone())),
             );
 
-        for (i, &(action, label, icon)) in BRANCH_ACTIONS.iter().enumerate() {
+        for (i, (action, label, icon)) in self.gitp_branch_actions().into_iter().enumerate() {
             let sel = i == self.gitp_action_sel;
             // dynamic, WebStorm-style label (e.g. "Merge 'next' into 'mine'")
             let display = match action {
                 BranchAction::Merge => format!("Merge '{}' into '{}'", branch, self.branch),
+                BranchAction::Delete => format!("Delete '{}'", branch),
                 _ => label.to_string(),
             };
             panel = panel.child(
