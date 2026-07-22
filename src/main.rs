@@ -12530,6 +12530,7 @@ fn main() {
             KeyBinding::new("cmd-shift-b", RunBuild, None),
             KeyBinding::new("cmd-shift-a", ToggleAgent, None),
             KeyBinding::new("cmd-9", GitLog, None),
+            KeyBinding::new("alt-h", GitLog, None),
             KeyBinding::new("alt-l", PullRemote, None),
             // command palette (global)
             KeyBinding::new("cmd-shift-p", CommandPalette, None),
