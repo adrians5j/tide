@@ -416,6 +416,15 @@ fn push_recent_project(root: &Path) {
 /// directories (.git, .webiny, node_modules, target, …). Caps total count so a
 /// pathological tree can't hang the finder.
 /// Recursively copy `src` to `dst` (a file or a whole directory tree).
+/// Process-global tree clipboard shared across all workspaces (each project is
+/// a separate `Storm`, so a per-view clipboard can't paste across windows/tabs).
+/// Holds `(source path, is_cut)`.
+fn tree_clip() -> &'static Mutex<Option<(PathBuf, bool)>> {
+    use std::sync::OnceLock;
+    static C: OnceLock<Mutex<Option<(PathBuf, bool)>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(None))
+}
+
 fn copy_path(src: &Path, dst: &Path) -> std::io::Result<()> {
     if src.is_dir() {
         fs::create_dir_all(dst)?;
@@ -1950,8 +1959,6 @@ struct Storm {
     resizing: bool,
     tree_scroll: UniformListScrollHandle,
     tree_focus: FocusHandle,
-    // path copied with cmd+c in the tree, to be pasted with cmd+v
-    tree_clipboard: Option<PathBuf>,
     // pending delete confirmation: the tree path awaiting yes/no
     confirm_delete: Option<PathBuf>,
     confirm_focus: FocusHandle,
@@ -2259,7 +2266,6 @@ impl Storm {
             resizing: false,
             tree_scroll: UniformListScrollHandle::new(),
             tree_focus: cx.focus_handle(),
-            tree_clipboard: None,
             confirm_delete: None,
             confirm_focus: cx.focus_handle(),
             confirm_revert: None,
@@ -2886,8 +2892,14 @@ impl Storm {
             match ks.key.as_str() {
                 "c" => {
                     if let Some(p) = self.tree_selected.clone() {
-                        self.tree_clipboard = Some(p);
-                        cx.notify();
+                        *tree_clip().lock().unwrap() = Some((p, false));
+                        self.show_flash("Copied", cx);
+                    }
+                }
+                "x" => {
+                    if let Some(p) = self.tree_selected.clone() {
+                        *tree_clip().lock().unwrap() = Some((p, true));
+                        self.show_flash("Cut", cx);
                     }
                 }
                 "v" => self.paste_into_selected(cx),
@@ -2925,7 +2937,7 @@ impl Storm {
     /// Paste the copied file/folder into the selected folder (recursively for
     /// directories), avoiding clobbering by adding a " copy" suffix on collision.
     fn paste_into_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(src) = self.tree_clipboard.clone() else { return };
+        let Some((src, is_cut)) = tree_clip().lock().unwrap().clone() else { return };
         if !src.exists() {
             return;
         }
@@ -2937,13 +2949,19 @@ impl Storm {
         };
         let Some(name) = src.file_name() else { return };
         let dest = unique_dest(target_dir.join(name));
-        if copy_path(&src, &dest).is_err() {
+        if src == dest || copy_path(&src, &dest).is_err() {
             return;
+        }
+        // a cut moves: remove the source after a successful copy, clear the clipboard
+        if is_cut {
+            let _ = if src.is_dir() { std::fs::remove_dir_all(&src) } else { std::fs::remove_file(&src) };
+            *tree_clip().lock().unwrap() = None;
         }
         self.expanded.insert(target_dir);
         self.rebuild();
         self.tree_selected = Some(dest.clone());
         self.reveal_in_tree(&dest);
+        self.show_flash(if is_cut { "Moved" } else { "Pasted" }, cx);
         cx.notify();
     }
 
@@ -2983,8 +3001,8 @@ impl Storm {
             if self.commit_selected.as_ref() == Some(&path) {
                 self.commit_selected = None;
             }
-            if self.tree_clipboard.as_ref() == Some(&path) {
-                self.tree_clipboard = None;
+            if tree_clip().lock().unwrap().as_ref().map(|(p, _)| p) == Some(&path) {
+                *tree_clip().lock().unwrap() = None;
             }
             self.rebuild();
         }
