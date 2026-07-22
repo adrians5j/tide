@@ -1955,6 +1955,8 @@ struct Storm {
     // pending delete confirmation: the tree path awaiting yes/no
     confirm_delete: Option<PathBuf>,
     confirm_focus: FocusHandle,
+    // pending revert confirmation: the path awaiting yes/no (git checkout HEAD)
+    confirm_revert: Option<PathBuf>,
     terminals: Vec<Entity<Terminal>>,
     active_term: usize,
     show_terminal: bool,
@@ -2260,6 +2262,7 @@ impl Storm {
             tree_clipboard: None,
             confirm_delete: None,
             confirm_focus: cx.focus_handle(),
+            confirm_revert: None,
             pr_files: Vec::new(),
             pr_viewed: HashSet::new(),
             pr_collapsed: HashSet::new(),
@@ -2984,6 +2987,45 @@ impl Storm {
                 self.tree_clipboard = None;
             }
             self.rebuild();
+        }
+        window.focus(&self.tree_focus, cx);
+        cx.notify();
+    }
+
+    fn revert_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match ev.keystroke.key.as_str() {
+            "enter" | "y" => self.do_revert(window, cx),
+            "escape" | "n" => {
+                self.confirm_revert = None;
+                window.focus(&self.tree_focus, cx);
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    /// Revert the confirmed file to its HEAD version (`git checkout HEAD -- path`),
+    /// discarding staged + unstaged changes, then reload any open tab for it.
+    fn do_revert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.confirm_revert.take() else { return };
+        let rel = self.rel(&path);
+        let ok = Command::new("git")
+            .args(["checkout", "HEAD", "--", &rel])
+            .current_dir(&self.root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            // reload the on-disk (now reverted) content into any open tab
+            for t in &self.tabs {
+                if t.path == path {
+                    t.editor.update(cx, |e, cx| e.force_reload(cx));
+                }
+            }
+            self.rebuild();
+            self.show_flash("Reverted to HEAD", cx);
+        } else {
+            self.show_flash("Nothing to revert", cx);
         }
         window.focus(&self.tree_focus, cx);
         cx.notify();
@@ -5503,6 +5545,9 @@ impl Render for Storm {
         }
         if self.confirm_delete.is_some() {
             root = root.child(self.render_confirm_delete(cx));
+        }
+        if self.confirm_revert.is_some() {
+            root = root.child(self.render_confirm_revert(cx));
         }
         if let Some(pos) = self.editor_ctx {
             root = root.child(self.render_editor_ctx_menu(pos, cx));
@@ -8285,7 +8330,7 @@ impl Storm {
     /// full-window transparent backdrop dismisses it on any outside click.
     /// The editor context-menu actions, in display order. Shared by the menu
     /// renderer and the keyboard handler so the numbers always line up.
-    fn editor_ctx_actions() -> [(&'static str, fn(&mut Self, &mut Window, &mut Context<Self>)); 4] {
+    fn editor_ctx_actions() -> [(&'static str, fn(&mut Self, &mut Window, &mut Context<Self>)); 5] {
         [
             ("Reveal in Dir Tree", |this, window, cx| this.reveal_active_in_tree(window, cx)),
             ("Copy Full Path", |this, _w, cx| {
@@ -8297,6 +8342,12 @@ impl Storm {
             ("Copy Path", |this, _w, cx| {
                 if let Some(p) = this.active_path().cloned() {
                     this.copy_reference(&p, cx); // repo-relative path
+                }
+            }),
+            ("Revert File", |this, window, cx| {
+                if let Some(p) = this.active_path().cloned().filter(|p| p.is_file()) {
+                    this.confirm_revert = Some(p);
+                    window.focus(&this.confirm_focus, cx);
                 }
             }),
             ("Close Tab", |this, window, cx| this.close_tab(this.active, window, cx)),
@@ -8404,7 +8455,7 @@ impl Storm {
     }
 
     /// Dir-tree right-click actions. Operate on `tree_ctx_path`.
-    fn tree_ctx_actions() -> [(&'static str, fn(&mut Self, &mut Window, &mut Context<Self>)); 6] {
+    fn tree_ctx_actions() -> [(&'static str, fn(&mut Self, &mut Window, &mut Context<Self>)); 7] {
         [
             ("New File", |this, window, cx| this.open_new_file_prompt(window, cx)),
             ("Reveal in Finder", |this, _w, _cx| {
@@ -8432,6 +8483,12 @@ impl Storm {
                     }
                 }
                 this.rebuild();
+            }),
+            ("Revert", |this, window, cx| {
+                if let Some(p) = this.tree_ctx_path.clone().filter(|p| p.is_file()) {
+                    this.confirm_revert = Some(p);
+                    window.focus(&this.confirm_focus, cx);
+                }
             }),
             ("Delete", |this, window, cx| {
                 if let Some(p) = this.tree_ctx_path.clone() {
@@ -8622,6 +8679,75 @@ impl Storm {
                             .on_click(cx.listener(|this, _ev, window, cx| {
                                 this.do_delete(window, cx);
                             })),
+                    ),
+            )
+    }
+
+    fn render_confirm_revert(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let path = self.confirm_revert.clone().unwrap_or_default();
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let w = 400.0_f32;
+        let left = ((self.win_width - w) / 2.0).max(0.);
+        div()
+            .absolute()
+            .top(px(160.))
+            .left(px(left))
+            .w(px(w))
+            .bg(rgb(PANEL_BG))
+            .border_1()
+            .border_color(rgb(ACCENT))
+            .rounded_md()
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .track_focus(&self.confirm_focus)
+            .on_key_down(cx.listener(Self::revert_key))
+            .child(div().px_4().pt_3().pb_1().text_size(px(13.)).text_color(rgb(TEXT)).child("Revert file?"))
+            .child(
+                div()
+                    .px_4()
+                    .pb_3()
+                    .text_size(px(12.))
+                    .text_color(rgb(MUTED))
+                    .child(format!("“{}” will be restored to HEAD. Uncommitted changes will be lost.", name)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap_2()
+                    .px_4()
+                    .pb_3()
+                    .child(
+                        div()
+                            .id("revert-cancel")
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .text_color(rgb(TEXT))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(HOVER)))
+                            .child("Cancel")
+                            .on_click(cx.listener(|this, _ev, window, cx| {
+                                this.confirm_revert = None;
+                                window.focus(&this.tree_focus, cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("revert-go")
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .bg(rgb(GIT_DELETED))
+                            .text_color(rgb(SEL_TEXT))
+                            .cursor_pointer()
+                            .child("Revert")
+                            .on_click(cx.listener(|this, _ev, window, cx| this.do_revert(window, cx))),
                     ),
             )
     }
