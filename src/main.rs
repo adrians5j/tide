@@ -64,6 +64,10 @@ const ICON_FONT: &str = "Segoe Fluent Icons";
 // as the right-side dock + ⌘⇧A) to continue the work; see src/acp.rs.
 const AGENT_PANEL: bool = false;
 
+// In-pane browser (embedded WKWebView) — built but parked. Flip to `true` to
+// bring back the Browser icon + right-dock. See src/browser.rs.
+const BROWSER_PANEL: bool = false;
+
 actions!(
     workspace,
     [
@@ -3352,6 +3356,9 @@ impl Storm {
     }
 
     fn toggle_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !BROWSER_PANEL {
+            return; // feature parked; flip BROWSER_PANEL to re-enable
+        }
         self.browser_open = !self.browser_open;
         if self.browser_open {
             self.show_terminal = false; // shares the right dock with the terminal
@@ -5954,9 +5961,9 @@ impl Storm {
             .child(activity_icon("act-term", IC_TERMINAL, "Terminal  (⌥F12)", self.show_terminal, 0, cx.listener(|this, _ev, window, cx| {
                 this.toggle_terminal(window, cx);
             })))
-            .child(activity_icon("act-browser", IC_BROWSER, "Browser", self.browser_open, 0, cx.listener(|this, _ev, window, cx| {
+            .when(BROWSER_PANEL, |d| d.child(activity_icon("act-browser", IC_BROWSER, "Browser", self.browser_open, 0, cx.listener(|this, _ev, window, cx| {
                 this.toggle_browser(window, cx);
-            })))
+            }))))
             .when(AGENT_PANEL, |d| d.child(activity_icon("act-agent", IC_TOOLS, "Agent  (⌘⇧A)", self.agent_open, 0, cx.listener(|this, _ev, window, cx| {
                 this.toggle_agent(window, cx);
             }))))
