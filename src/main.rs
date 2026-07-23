@@ -2213,10 +2213,6 @@ struct Storm {
     browser: Option<browser::Browser>, // embedded WebView, created on first open
     browser_url: Field,                // address bar
     browser_focus: FocusHandle,
-    // diff shown as a main-area tab (embedded DiffWindow), navigated via the
-    // PR / commit pane rather than its own sidebar
-    diff_view: Option<Entity<DiffWindow>>,
-    diff_active: bool,
 }
 
 /// Navigation requests a project view sends up to the workspace.
@@ -2477,8 +2473,6 @@ impl Storm {
                 f
             },
             browser_focus: cx.focus_handle(),
-            diff_view: None,
-            diff_active: false,
         };
         s.ignored = git_ignored_paths(&s.root); // hide git-ignored paths from the tree
         s.expanded.insert(s.root.clone()); // the root node starts expanded
@@ -3255,7 +3249,6 @@ impl Storm {
     fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         // leaving the current tab → auto-save it
         self.save_tab(self.active, cx);
-        self.diff_active = false; // opening a file leaves the diff tab
         // already open? just switch (and pick up any external edits)
         if let Some(i) = self.tabs.iter().position(|t| t.path == path) {
             self.active = i;
@@ -3344,7 +3337,6 @@ impl Storm {
             if ix != self.active {
                 self.save_tab(self.active, cx); // auto-save the tab we leave
             }
-            self.diff_active = false; // leaving the diff tab for a file tab
             self.active = ix;
             // show any external edits made while this tab was in the background
             let ed = self.tabs[ix].editor.clone();
@@ -4096,9 +4088,6 @@ impl Storm {
 
     /// Open a diff in its own window. `old` Some → committed diff of `old` vs
     /// `new_rev` (default HEAD); `old` None → working-tree diff (HEAD vs disk).
-    /// Open (or re-point) the diff as an embedded main-area tab. Only the single
-    /// focused file is shown — navigation is via the PR / commit pane. `_filter`
-    /// and `_pr_view` are no longer used (the embedded diff has no sidebar).
     fn open_diff_window(
         &mut self,
         files: Vec<PathBuf>,
@@ -4106,38 +4095,37 @@ impl Storm {
         old: Option<String>,
         new_rev: Option<String>,
         pr_mode: bool,
-        _filter: String,
-        _pr_view: PrViewFilter,
+        // carried over from the source pane so the diff opens already filtered:
+        // `filter_text` seeds the sidebar path filter, `pr_view` the viewed chips
+        filter_text: String,
+        pr_view: PrViewFilter,
         cx: &mut Context<Self>,
     ) {
-        let Some(path) = files.get(idx).cloned() else { return };
-        if let Some(dv) = self.diff_view.clone() {
-            dv.update(cx, |d, cx| {
-                d.pr_mode = pr_mode;
-                d.set_file(path, old, new_rev, cx);
-            });
-        } else {
-            let pr_viewed = if pr_mode { self.pr_viewed.clone() } else { HashSet::new() };
-            let root = self.root.clone();
-            let storm = cx.entity().downgrade();
-            let main = cx.active_window();
-            let dv = cx.new(|cx| {
-                DiffWindow::new(
-                    root, vec![path], 0, old, new_rev, pr_mode, pr_viewed, String::new(),
-                    PrViewFilter::All, true, storm, main, cx,
-                )
-            });
-            cx.subscribe(&dv, |this, _dv, _ev: &CloseDiff, cx| this.close_diff(cx)).detach();
-            self.diff_view = Some(dv);
-        }
-        self.diff_active = true;
-        cx.notify();
-    }
-
-    fn close_diff(&mut self, cx: &mut Context<Self>) {
-        self.diff_view = None;
-        self.diff_active = false;
-        cx.notify();
+        let pr_viewed = if pr_mode { self.pr_viewed.clone() } else { HashSet::new() };
+        let root = self.root.clone();
+        let storm = cx.entity().downgrade();
+        let main = cx.active_window();
+        let bounds = Bounds::centered(None, size(px(1660.), px(820.)), cx);
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(gpui::TitlebarOptions {
+                    title: Some("Diff".into()),
+                    ..Default::default()
+                }),
+                focus: true,
+                ..Default::default()
+            },
+            move |_, cx| {
+                cx.new(|cx| {
+                    DiffWindow::new(
+                        root, files, idx, old, new_rev, pr_mode, pr_viewed, filter_text, pr_view,
+                        storm, main, cx,
+                    )
+                })
+            },
+        )
+        .ok();
     }
 
     // ── pull-request review ──────────────────────────────────────────────────
@@ -10499,13 +10487,6 @@ impl Storm {
         // tab bar
         col = col.child(self.render_tabs(cx));
 
-        // the embedded diff tab takes over the content area when active
-        if self.diff_active {
-            if let Some(dv) = self.diff_view.clone() {
-                return col.child(div().flex_grow(1.0).min_h(px(0.)).child(dv));
-            }
-        }
-
         if has_tabs {
             // breadcrumb bar above the file (Zed-style): rel path + copy button
             let path = self.tabs[self.active].path.clone();
@@ -10717,7 +10698,7 @@ impl Storm {
             .overflow_hidden();
 
         for (ix, tab) in self.tabs.iter().enumerate() {
-            let active = ix == self.active && !self.diff_active;
+            let active = ix == self.active;
             let dirty = tab.editor.read(cx).is_dirty();
             let name = tab
                 .path
@@ -10773,54 +10754,6 @@ impl Storm {
                 );
 
             bar = bar.child(chip);
-        }
-
-        // the embedded diff tab (its label = the file being diffed), if open
-        if let Some(dv) = &self.diff_view {
-            let active = self.diff_active;
-            let name = dv
-                .read(cx)
-                .files
-                .first()
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "Diff".into());
-            bar = bar.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .h_full()
-                    .px_3()
-                    .gap_2()
-                    .border_r_1()
-                    .border_color(rgb(BORDER))
-                    .when(active, |d| d.bg(rgb(BG)))
-                    .when(!active, |d| d.hover(|s| s.bg(rgb(HOVER))))
-                    .child(
-                        div()
-                            .id("difftab")
-                            .cursor_pointer()
-                            .text_size(px(12.))
-                            .text_color(rgb(if active { TEXT } else { MUTED }))
-                            .child(format!("⇄ {}", name))
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.diff_active = true;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        div()
-                            .id("difftab-close")
-                            .px_1()
-                            .cursor_pointer()
-                            .text_size(px(12.))
-                            .text_color(rgb(MUTED))
-                            .hover(|s| s.text_color(rgb(0xf7768e)))
-                            .child("✕")
-                            .on_click(cx.listener(|this, _e, _w, cx| this.close_diff(cx))),
-                    ),
-            );
         }
 
         bar
@@ -11288,14 +11221,7 @@ struct DiffWindow {
     pr_filter: PrViewFilter,
     pr_hidden: HashSet<usize>, // file indices filtered out by pr_filter (this render)
     pr_viewed: HashSet<PathBuf>, // local snapshot (avoids reading Storm mid-update)
-    // when true this diff renders inside a main-area tab (not its own window):
-    // no sidebar, container-relative pane widths, close emits CloseDiff
-    embedded: bool,
 }
-
-/// Emitted by an embedded diff tab when its close button is clicked.
-struct CloseDiff;
-impl EventEmitter<CloseDiff> for DiffWindow {}
 
 /// One visible row in the Diff window's file-tree sidebar.
 struct DiffTreeRow {
@@ -11316,7 +11242,6 @@ impl DiffWindow {
         pr_viewed: HashSet<PathBuf>,
         filter_text: String,
         pr_view: PrViewFilter,
-        embedded: bool,
         storm: WeakEntity<Storm>,
         main_window: Option<AnyWindowHandle>,
         cx: &mut Context<Self>,
@@ -11380,25 +11305,7 @@ impl DiffWindow {
             pr_filter: pr_view,
             pr_hidden: HashSet::new(),
             pr_viewed,
-            embedded,
         }
-    }
-
-    /// Re-point an embedded diff tab at a different file (recompute + reset view).
-    fn set_file(&mut self, path: PathBuf, old: Option<String>, new_rev: Option<String>, cx: &mut Context<Self>) {
-        self.files = vec![path.clone()];
-        self.idx = 0;
-        self.old = old;
-        self.new_rev = new_rev;
-        let (rows, ls, rs) = compute_diff(&self.root, &path, &self.old, &self.new_rev, &self.hl);
-        self.rows = rows;
-        self.left_styles = ls;
-        self.right_styles = rs;
-        self.sel = None;
-        self.caret = None;
-        self.matches.clear();
-        self.pending_scroll = true;
-        cx.notify();
     }
 
     /// Flatten `files` into a directory tree (respecting collapsed dirs) for the
@@ -11849,9 +11756,7 @@ impl Render for DiffWindow {
         if !self.focused {
             self.focused = true;
             window.focus(&self.focus, cx);
-            if !self.embedded {
-                window.activate_window(); // become the key window so scroll works without a click
-            }
+            window.activate_window(); // become the key window so scroll works without a click
         }
         // measure the real monospace advance so columns + selection are precise
         let run = TextRun {
@@ -11932,13 +11837,7 @@ impl Render for DiffWindow {
                     .text_color(rgb(MUTED))
                     .hover(|s| s.text_color(rgb(GIT_DELETED)))
                     .child("✕")
-                    .on_click(cx.listener(|this, _e, window, cx| {
-                        if this.embedded {
-                            cx.emit(CloseDiff); // Storm closes the diff tab
-                        } else {
-                            window.remove_window();
-                        }
-                    })),
+                    .on_click(cx.listener(|_this, _e, window, _cx| window.remove_window())),
             );
 
         let col = div()
@@ -12028,41 +11927,26 @@ impl Render for DiffWindow {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _e: &MouseDownEvent, _w, cx| {
-                    if !this.embedded {
-                        this.resizing_pane = true; // embedded drag math is viewport-relative; skip
-                    }
+                    this.resizing_pane = true;
                     cx.stop_propagation(); // don't also start a text selection
                     cx.notify();
                 }),
             );
         // explicit pixel widths (flex_grow split was unreliable — a pane's content
         // min-width leaked through and skewed the ratio). Compute from the window:
-        let body = if self.embedded {
-            // embedded in a tab (narrower than the window): size panes to the
-            // container via flex ratios, not absolute viewport pixels
-            div()
-                .flex()
-                .flex_row()
-                .flex_grow(1.0)
-                .min_h(px(0.))
-                .child(div().flex_grow(split).min_w(px(0.)).h_full().overflow_hidden().child(left_pane))
-                .child(divider)
-                .child(div().flex_grow(1.0 - split).min_w(px(0.)).h_full().overflow_hidden().child(right_pane))
-        } else {
-            let win_w = f32::from(window.viewport_size().width);
-            let sidebar_w = if self.files.len() > 1 { 260.0 } else { 0.0 };
-            let avail = (win_w - sidebar_w - 4.0).max(2.0); // minus the 4px divider
-            let lw = (avail * split).max(1.0);
-            let rw = (avail - lw).max(1.0);
-            div()
-                .flex()
-                .flex_row()
-                .flex_grow(1.0)
-                .min_h(px(0.))
-                .child(div().w(px(lw)).h_full().flex_shrink_0().overflow_hidden().child(left_pane))
-                .child(divider)
-                .child(div().w(px(rw)).h_full().flex_shrink_0().overflow_hidden().child(right_pane))
-        };
+        let win_w = f32::from(window.viewport_size().width);
+        let sidebar_w = if self.files.len() > 1 { 260.0 } else { 0.0 };
+        let avail = (win_w - sidebar_w - 4.0).max(2.0); // minus the 4px divider
+        let lw = (avail * split).max(1.0);
+        let rw = (avail - lw).max(1.0);
+        let body = div()
+            .flex()
+            .flex_row()
+            .flex_grow(1.0)
+            .min_h(px(0.))
+            .child(div().w(px(lw)).h_full().flex_shrink_0().overflow_hidden().child(left_pane))
+            .child(divider)
+            .child(div().w(px(rw)).h_full().flex_shrink_0().overflow_hidden().child(right_pane));
 
         // file-tree sidebar (only for a multi-file diff): collapsible directories,
         // click a file to jump to it, current file highlighted
