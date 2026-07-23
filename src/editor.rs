@@ -140,6 +140,7 @@ pub struct Editor {
     // soft-wrap visual layout, rebuilt each prepaint; drives scroll bounds,
     // cursor/click mapping, and vertical movement
     vlines: Vec<VLine>,
+    wrap_cols: usize, // columns the last layout wrapped at (for off-render reflow)
     hl: Highlighter,
     dirty: bool,
     read_only: bool, // when true, all edits are blocked (nav/select/copy still work)
@@ -217,6 +218,7 @@ impl Editor {
             scroll_y: px(0.),
             scroll_x: px(0.),
             vlines: Vec::new(),
+            wrap_cols: 80,
             hl: Highlighter::new(),
             dirty: false,
             read_only: true, // read-only by default; the workspace sets it per editor
@@ -374,6 +376,7 @@ impl Editor {
         let old_max = (self.line_count() as f32 * LINE_HEIGHT - vh).max(0.0);
         let stick = f32::from(self.scroll_y) >= old_max - LINE_HEIGHT * 2.0;
         self.content = text;
+        self.reflow();
         self.styles = Vec::new();
         self.selected_range = self.selected_range.start.min(self.content.len())
             ..self.selected_range.end.min(self.content.len());
@@ -474,6 +477,12 @@ impl Editor {
         self.vlines.len().max(1)
     }
 
+    /// Rebuild the wrap cache from the current content (call after any edit so
+    /// off-render offset/click/movement mapping never indexes stale ranges).
+    fn reflow(&mut self) {
+        self.vlines = wrap_lines(&self.content, &self.line_starts(), self.wrap_cols.max(1));
+    }
+
     /// Index of the visual row containing byte offset `off`.
     fn voffset(&self, off: usize) -> usize {
         let off = off.min(self.content.len());
@@ -572,11 +581,17 @@ impl Editor {
             return None;
         }
         let t = &self.vlines[ti as usize];
-        let seg_len = t.end - t.start;
+        // clamp: the cache can lag a content shrink by a frame
+        let clen = self.content.len();
+        let (start, end) = (t.start.min(clen), t.end.min(clen));
+        if start >= end {
+            return Some(start);
+        }
+        let seg_len = end - start;
         // land on a char boundary within the target row
-        let seg = &self.content[t.start..t.end];
+        let seg = &self.content[start..end];
         let byte = seg.char_indices().map(|(b, _)| b).chain(std::iter::once(seg_len)).find(|&b| b >= col.min(seg_len)).unwrap_or(seg_len);
-        Some(t.start + byte)
+        Some(start + byte)
     }
 
     fn prev_boundary(&self, offset: usize) -> usize {
@@ -692,6 +707,7 @@ impl Editor {
         self.redo_stack.clear();
         self.typing_run = false;
         self.content = new_content;
+        self.reflow();
         let c = cursor.min(self.content.len());
         self.selected_range = c..c;
         self.selection_reversed = false;
@@ -977,6 +993,7 @@ impl Editor {
             &self.content[range.end..]
         );
         self.content = new_content;
+        self.reflow();
         let new_cursor = range.start + text.len();
         self.selected_range = new_cursor..new_cursor;
         self.selection_reversed = false;
@@ -1241,6 +1258,7 @@ impl Editor {
                 cursor: self.cursor_offset(),
             });
             self.content = snap.content;
+            self.reflow();
             self.selected_range = snap.cursor..snap.cursor;
             self.selection_reversed = false;
             self.dirty = true;
@@ -1260,6 +1278,7 @@ impl Editor {
                 cursor: self.cursor_offset(),
             });
             self.content = snap.content;
+            self.reflow();
             self.selected_range = snap.cursor..snap.cursor;
             self.selection_reversed = false;
             self.dirty = true;
@@ -1587,6 +1606,7 @@ impl Element for EditorElement {
             e.last_char_width = char_width;
             e.last_gutter_width = gutter_width;
             e.vlines = vlines;
+            e.wrap_cols = cols;
         });
 
         EditorPrepaint {
@@ -1930,12 +1950,18 @@ impl Editor {
         let rel_y = f32::from(pos.y - bounds.top()) + f32::from(self.scroll_y);
         let vi = ((rel_y / LINE_HEIGHT).floor().max(0.) as usize).min(self.vlines.len() - 1);
         let v = &self.vlines[vi];
+        // the cache can lag a content shrink (undo) by a frame — clamp to be safe
+        let clen = self.content.len();
+        let (start, end) = (v.start.min(clen), v.end.min(clen));
+        if start >= end {
+            return Some(start);
+        }
         let rel_x = f32::from(pos.x - bounds.left() - self.last_gutter_width);
         let col = (rel_x / f32::from(self.last_char_width)).round().max(0.) as usize;
         // char column → byte offset within the visual row's slice
-        let seg = &self.content[v.start..v.end];
-        let byte = seg.char_indices().nth(col).map(|(b, _)| b).unwrap_or(v.end - v.start);
-        Some(v.start + byte)
+        let seg = &self.content[start..end];
+        let byte = seg.char_indices().nth(col).map(|(b, _)| b).unwrap_or(end - start);
+        Some(start + byte)
     }
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
