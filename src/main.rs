@@ -4101,6 +4101,15 @@ impl Storm {
         pr_view: PrViewFilter,
         cx: &mut Context<Self>,
     ) {
+        // guard: diffing a huge file (e.g. a JSON db export) synchronously
+        // computes + syntax-highlights the whole thing and freezes the UI
+        const MAX_DIFF_BYTES: u64 = 2_000_000;
+        if let Some(p) = files.get(idx) {
+            if std::fs::metadata(p).map(|m| m.len() > MAX_DIFF_BYTES).unwrap_or(false) {
+                self.show_flash("File too large to diff (>2 MB)", cx);
+                return;
+            }
+        }
         let pr_viewed = if pr_mode { self.pr_viewed.clone() } else { HashSet::new() };
         let root = self.root.clone();
         let storm = cx.entity().downgrade();
@@ -10790,8 +10799,9 @@ struct Workspace {
     focus: FocusHandle,
     // project-switcher dialog
     switcher_open: bool,
-    switcher_sel: usize,
+    switcher_sel: usize, // index into the *filtered* list
     switcher_focus: FocusHandle,
+    switcher_query: String, // type-to-filter text
 }
 
 impl Workspace {
@@ -10804,6 +10814,7 @@ impl Workspace {
             switcher_open: false,
             switcher_sel: 0,
             switcher_focus: cx.focus_handle(),
+            switcher_query: String::new(),
         };
         // open every passed root as its own workspace; first one is active
         for root in roots {
@@ -10914,54 +10925,78 @@ impl Workspace {
     /// cmd+shift+e: open the project switcher dialog.
     fn show_projects(&mut self, _: &ShowProjects, window: &mut Window, cx: &mut Context<Self>) {
         self.switcher_open = true;
+        self.switcher_query.clear();
         self.switcher_sel = self.active;
         window.focus(&self.switcher_focus, cx);
         cx.notify();
     }
 
+    /// Project indices matching the type-to-filter query (name or branch).
+    fn switcher_matches(&self, cx: &App) -> Vec<usize> {
+        let q = self.switcher_query.to_lowercase();
+        (0..self.projects.len())
+            .filter(|&i| {
+                if q.is_empty() {
+                    return true;
+                }
+                let s = self.projects[i].read(cx);
+                s.project_name().to_lowercase().contains(&q) || s.branch.to_lowercase().contains(&q)
+            })
+            .collect()
+    }
+
     fn switcher_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let n = self.projects.len();
         let key = ev.keystroke.key.as_str();
-        // press a digit to jump straight to that workspace
-        if let Some(d) = key.parse::<usize>().ok().filter(|d| *d >= 1 && *d <= n) {
-            self.switcher_open = false;
-            self.switch_to(d - 1, cx);
-            return;
-        }
+        let filtered = self.switcher_matches(cx);
         match key {
-            // x / delete / backspace closes the highlighted workspace (stays open
-            // so you can close several); closing the last one is a no-op
-            "x" | "delete" | "backspace" => {
-                self.remove_project(self.switcher_sel, cx);
-                if self.projects.len() <= 1 {
+            "escape" => {
+                if self.switcher_query.is_empty() {
                     self.switcher_open = false;
                     self.focus_pending = true;
                 } else {
-                    // stay in the switcher; keep focus here (remove_project set
-                    // focus_pending, which would otherwise jump to a project)
-                    self.focus_pending = false;
+                    self.switcher_query.clear();
+                    self.switcher_sel = 0;
                 }
                 cx.notify();
             }
-            "escape" => {
-                self.switcher_open = false;
-                self.focus_pending = true;
-                cx.notify();
+            "enter" => {
+                if let Some(&pi) = filtered.get(self.switcher_sel) {
+                    self.switcher_open = false;
+                    self.switch_to(pi, cx);
+                }
             }
-            // list navigation: up/down (and left/right) step by one
             "down" | "right" => {
-                self.switcher_sel = (self.switcher_sel + 1).min(n.saturating_sub(1));
+                self.switcher_sel = (self.switcher_sel + 1).min(filtered.len().saturating_sub(1));
                 cx.notify();
             }
             "up" | "left" => {
                 self.switcher_sel = self.switcher_sel.saturating_sub(1);
                 cx.notify();
             }
-            "enter" => {
-                self.switcher_open = false;
-                self.switch_to(self.switcher_sel, cx); // focus_pending re-focuses the project
+            "backspace" => {
+                self.switcher_query.pop();
+                self.switcher_sel = 0;
+                cx.notify();
             }
-            _ => {}
+            _ => {
+                // digit with an empty query → quick-jump to that workspace
+                if self.switcher_query.is_empty() {
+                    if let Some(d) = key.parse::<usize>().ok().filter(|d| *d >= 1 && *d <= self.projects.len()) {
+                        self.switcher_open = false;
+                        self.switch_to(d - 1, cx);
+                        return;
+                    }
+                }
+                // otherwise type-to-filter: append a single printable char
+                let mut chars = key.chars();
+                if let (Some(c), None) = (chars.next(), chars.next()) {
+                    if !c.is_control() {
+                        self.switcher_query.push(c);
+                        self.switcher_sel = 0;
+                        cx.notify();
+                    }
+                }
+            }
         }
     }
 
@@ -11029,18 +11064,23 @@ impl Render for Workspace {
 
         if self.switcher_open {
             let win = window.viewport_size();
-            let w = 380.0_f32;
+            let w = 520.0_f32;
+            let filtered = self.switcher_matches(cx);
+            // center the dialog on screen (estimated height from the row count)
+            let est_h = 46.0 + filtered.len() as f32 * 44.0 + 12.0;
             let left = ((f32::from(win.width) - w) / 2.0).max(0.);
-            // vertical list, one full-width row per project
+            let top = (((f32::from(win.height) - est_h) / 2.0).max(40.)).min(f32::from(win.height) - 80.);
+            // vertical list, one full-width row per matching project
             let mut grid = div().flex().flex_col().gap_1().px_2().pb_2();
-            for i in 0..self.projects.len() {
+            for (pos, &i) in filtered.iter().enumerate() {
                 let (name, branch) = {
                     let s = self.projects[i].read(cx);
                     (s.project_name(), s.branch.clone())
                 };
-                let sel = i == self.switcher_sel;
+                let sel = pos == self.switcher_sel;
                 let multi = self.projects.len() > 1;
                 let idx = i;
+                let num = pos + 1;
                 let label_drag = name.clone();
                 grid = grid.child(
                     div()
@@ -11067,14 +11107,14 @@ impl Render for Workspace {
                         .on_drop(cx.listener(move |this, d: &DraggedProject, _w, cx| {
                             this.reorder_projects(d.0, idx, cx);
                         }))
-                        // number badge
+                        // number badge (sequential over the filtered list)
                         .child(
                             div()
                                 .w(px(14.))
                                 .flex_shrink_0()
                                 .text_size(px(11.))
                                 .text_color(rgb(if sel { SEL_TEXT } else { MUTED }))
-                                .child(format!("{}", i + 1)),
+                                .child(format!("{}", num)),
                         )
                         // folder icon
                         .child(
@@ -11144,9 +11184,27 @@ impl Render for Workspace {
                         })),
                 );
             }
+            let header = if self.switcher_query.is_empty() {
+                div()
+                    .px_3()
+                    .py_1()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .child("Switch Project  ·  type to filter  ·  ↑↓ move  ·  enter to open")
+            } else {
+                div()
+                    .px_3()
+                    .py_1()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .text_size(px(12.))
+                    .child(div().text_color(rgb(MUTED)).child("Filter:"))
+                    .child(div().text_color(rgb(TEXT)).child(format!("{}▏", self.switcher_query)))
+            };
             let panel = div()
                 .absolute()
-                .top(px(120.))
+                .top(px(top))
                 .left(px(left))
                 .w(px(w))
                 .bg(rgb(POPUP_BG))
@@ -11159,14 +11217,7 @@ impl Render for Workspace {
                 .py_1()
                 .track_focus(&self.switcher_focus)
                 .on_key_down(cx.listener(Self::switcher_key))
-                .child(
-                    div()
-                        .px_3()
-                        .py_1()
-                        .text_size(px(11.))
-                        .text_color(rgb(MUTED))
-                        .child("Switch Project  ·  arrows to move  ·  enter to open  ·  number to jump  ·  x to close"),
-                )
+                .child(header)
                 .child(grid);
             root = root.child(panel);
         }
