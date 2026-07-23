@@ -50,6 +50,80 @@ impl gpui::EventEmitter<ToggleReadOnly> for Editor {}
 const FONT: &str = "Menlo";
 const FONT_SIZE: f32 = 13.0;
 const LINE_HEIGHT: f32 = 20.0;
+
+/// One visual (on-screen) row after soft-wrap. `start`/`end` are absolute byte
+/// offsets into `content` (end exclusive, never past the logical line's newline);
+/// `row` is the logical line it belongs to; `first` marks a logical line's first
+/// visual row (the only one that shows a gutter number).
+#[derive(Clone)]
+struct VLine {
+    start: usize,
+    end: usize,
+    row: usize,
+    first: bool,
+}
+
+/// Break every logical line of `content` into visual rows of at most `cols`
+/// columns, preferring to break after a space (soft word-wrap). Monospace, so a
+/// column is one char. `starts` are the logical line start offsets.
+fn wrap_lines(content: &str, starts: &[usize], cols: usize) -> Vec<VLine> {
+    let cols = cols.max(1);
+    let mut out = Vec::new();
+    for (row, &ls) in starts.iter().enumerate() {
+        let le = if row + 1 < starts.len() { starts[row + 1] - 1 } else { content.len() };
+        let line = &content[ls..le];
+        if line.is_empty() {
+            out.push(VLine { start: ls, end: ls, row, first: true });
+            continue;
+        }
+        // (absolute byte offset, is-breakable-space) for each char
+        let chars: Vec<(usize, bool)> =
+            line.char_indices().map(|(b, c)| (ls + b, c == ' ' || c == '\t')).collect();
+        let n = chars.len();
+        let mut i = 0; // char index into this line
+        let mut first = true;
+        let mut segs = 0usize;
+        while i < n {
+            let seg_start = chars[i].0;
+            if n - i <= cols {
+                out.push(VLine { start: seg_start, end: le, row, first });
+                break;
+            }
+            if segs >= 4000 {
+                // pathological (minified) line: stop wrapping after one more capped
+                // row so we never shape a giant segment; the rest stays hidden
+                let cut = (i + cols).min(n);
+                let end_abs = if cut < n { chars[cut].0 } else { le };
+                out.push(VLine { start: seg_start, end: end_abs, row, first });
+                break;
+            }
+            let hard = (i + cols).min(n);
+            // last space in (i, hard) → break after it; else hard-break
+            let mut brk = None;
+            let mut j = hard - 1;
+            while j > i {
+                if chars[j].1 {
+                    brk = Some(j);
+                    break;
+                }
+                j -= 1;
+            }
+            let next = match brk {
+                Some(s) => s + 1, // keep the space on this row, start next after it
+                None => hard,
+            };
+            let end_abs = if next < n { chars[next].0 } else { le };
+            out.push(VLine { start: seg_start, end: end_abs, row, first });
+            i = next;
+            first = false;
+            segs += 1;
+        }
+    }
+    if out.is_empty() {
+        out.push(VLine { start: 0, end: 0, row: 0, first: true });
+    }
+    out
+}
 const GUTTER_PAD: f32 = 16.0; // px between gutter numbers and code
 
 pub struct Editor {
@@ -63,6 +137,9 @@ pub struct Editor {
     styles: Vec<Vec<(usize, u32)>>,
     scroll_y: Pixels,
     scroll_x: Pixels,
+    // soft-wrap visual layout, rebuilt each prepaint; drives scroll bounds,
+    // cursor/click mapping, and vertical movement
+    vlines: Vec<VLine>,
     hl: Highlighter,
     dirty: bool,
     read_only: bool, // when true, all edits are blocked (nav/select/copy still work)
@@ -139,6 +216,7 @@ impl Editor {
             styles: Vec::new(),
             scroll_y: px(0.),
             scroll_x: px(0.),
+            vlines: Vec::new(),
             hl: Highlighter::new(),
             dirty: false,
             read_only: true, // read-only by default; the workspace sets it per editor
@@ -392,6 +470,21 @@ impl Editor {
         }
     }
 
+    fn visual_count(&self) -> usize {
+        self.vlines.len().max(1)
+    }
+
+    /// Index of the visual row containing byte offset `off`.
+    fn voffset(&self, off: usize) -> usize {
+        let off = off.min(self.content.len());
+        for (vi, v) in self.vlines.iter().enumerate() {
+            if off <= v.end {
+                return vi;
+            }
+        }
+        self.vlines.len().saturating_sub(1)
+    }
+
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         let o = offset.min(self.content.len());
         self.selected_range = o..o;
@@ -417,10 +510,12 @@ impl Editor {
         let off = (line_start + col1.saturating_sub(1)).min(line_end);
         self.move_to(off, cx);
 
-        // center the target row in the viewport
+        // center the target visual row in the viewport
         let vh = self.last_bounds.map(|b| f32::from(b.size.height)).unwrap_or(600.);
-        let target = (row as f32 * LINE_HEIGHT) - vh / 2.0;
+        let vi = self.voffset(off);
+        let target = (vi as f32 * LINE_HEIGHT) - vh / 2.0;
         self.scroll_y = px(target.max(0.));
+        let _ = row;
         cx.notify();
     }
 
@@ -464,22 +559,24 @@ impl Editor {
         cx.notify();
     }
 
-    /// Byte offset one line up/down from the cursor, keeping the column.
+    /// Byte offset one *visual* row up/down from the cursor, keeping the column.
     fn vertical_target(&self, dir: i32) -> Option<usize> {
-        let (row, col) = self.offset_to_pos(self.cursor_offset());
-        let starts = self.line_starts();
-        let target = row as i32 + dir;
-        if target < 0 || target as usize >= starts.len() {
+        if self.vlines.is_empty() {
             return None;
         }
-        let target = target as usize;
-        let line_start = starts[target];
-        let line_end = if target + 1 < starts.len() {
-            starts[target + 1] - 1
-        } else {
-            self.content.len()
-        };
-        Some(line_start + col.min(line_end - line_start))
+        let off = self.cursor_offset();
+        let vi = self.voffset(off);
+        let col = off.saturating_sub(self.vlines[vi].start); // byte column in this visual row
+        let ti = vi as i32 + dir;
+        if ti < 0 || ti as usize >= self.vlines.len() {
+            return None;
+        }
+        let t = &self.vlines[ti as usize];
+        let seg_len = t.end - t.start;
+        // land on a char boundary within the target row
+        let seg = &self.content[t.start..t.end];
+        let byte = seg.char_indices().map(|(b, _)| b).chain(std::iter::once(seg_len)).find(|&b| b >= col.min(seg_len)).unwrap_or(seg_len);
+        Some(t.start + byte)
     }
 
     fn prev_boundary(&self, offset: usize) -> usize {
@@ -1077,9 +1174,9 @@ impl Editor {
         let m = self.search_matches[self.search_idx].clone();
         self.selected_range = m.clone();
         self.selection_reversed = false;
-        let (row, _) = self.offset_to_pos(m.start);
+        let vi = self.voffset(m.start);
         let vh = self.last_bounds.map(|b| f32::from(b.size.height)).unwrap_or(600.);
-        self.scroll_y = px(((row as f32) * LINE_HEIGHT - vh / 2.0).max(0.));
+        self.scroll_y = px(((vi as f32) * LINE_HEIGHT - vh / 2.0).max(0.));
         cx.notify();
     }
 
@@ -1176,9 +1273,8 @@ impl Editor {
     }
 
     fn scroll_cursor_into_view(&mut self, _window: &mut Window) {
-        let (row, _) = self.offset_to_pos(self.cursor_offset());
-        let line_h = px(LINE_HEIGHT);
-        let cursor_top = line_h * (row as f32);
+        let vi = self.voffset(self.cursor_offset());
+        let cursor_top = px(LINE_HEIGHT * vi as f32);
         if cursor_top < self.scroll_y {
             self.scroll_y = cursor_top;
         }
@@ -1363,16 +1459,11 @@ impl Element for EditorElement {
         );
         let char_width = probe.width;
 
-        let lines: Vec<&str> = content.split('\n').collect();
-        let total = lines.len();
+        let _ = scroll_x; // soft-wrap → no horizontal scroll
+        let total = content.split('\n').count();
         let digits = total.to_string().len().max(2);
         let gutter_width = char_width * (digits as f32) + px(GUTTER_PAD);
         let code_x = bounds.left() + gutter_width;
-
-        // visible line range
-        let first = (f32::from(scroll_y) / LINE_HEIGHT).floor().max(0.) as usize;
-        let visible = (f32::from(bounds.size.height) / LINE_HEIGHT).ceil() as usize + 2;
-        let last = (first + visible).min(total);
 
         let mut line_starts = vec![0usize];
         for (i, b) in content.bytes().enumerate() {
@@ -1381,19 +1472,21 @@ impl Element for EditorElement {
             }
         }
 
-        // current-line highlight (full width, behind everything)
-        let cursor_row = {
-            let mut r = 0;
-            for (i, &s) in line_starts.iter().enumerate() {
-                if s > cursor_offset {
-                    break;
-                }
-                r = i;
-            }
-            r
-        };
-        let current_line = if cursor_row >= first && cursor_row < last {
-            let y = bounds.top() + line_height * (cursor_row as f32) - scroll_y;
+        // soft-wrap layout: how many monospace columns fit in the code area
+        let code_w = f32::from(bounds.size.width) - f32::from(gutter_width) - 6.0;
+        let cols = (code_w / f32::from(char_width)).floor().max(1.0) as usize;
+        let vlines = wrap_lines(&content, &line_starts, cols);
+        let vtotal = vlines.len();
+
+        // visible visual-row range
+        let first = (f32::from(scroll_y) / LINE_HEIGHT).floor().max(0.) as usize;
+        let visible = (f32::from(bounds.size.height) / LINE_HEIGHT).ceil() as usize + 2;
+        let last = (first + visible).min(vtotal);
+
+        // the visual row holding the cursor (for the current-line highlight + caret)
+        let cursor_vi = vlines.iter().position(|v| cursor_offset <= v.end).unwrap_or(vtotal.saturating_sub(1));
+        let current_line = if cursor_vi >= first && cursor_vi < last {
+            let y = bounds.top() + line_height * (cursor_vi as f32) - scroll_y;
             Some(fill(
                 Bounds::new(point(bounds.left(), y), size(bounds.size.width, line_height)),
                 rgb(CURRENT_LINE),
@@ -1401,19 +1494,6 @@ impl Element for EditorElement {
         } else {
             None
         };
-
-        // resolve the link token to (row, start_col, end_col) on its line
-        let link_pos = link_range.as_ref().map(|r| {
-            let mut row = 0;
-            for (i, &s) in line_starts.iter().enumerate() {
-                if s > r.start {
-                    break;
-                }
-                row = i;
-            }
-            let rs = line_starts[row];
-            (row, r.start - rs, r.end - rs)
-        });
 
         let mut gutter = Vec::new();
         let mut code = Vec::new();
@@ -1423,113 +1503,90 @@ impl Element for EditorElement {
         let mut search = Vec::new();
         let mut word = Vec::new();
 
-        for row in first..last {
-            let y = bounds.top() + line_height * (row as f32) - scroll_y;
-            let line = lines[row];
+        // x within a shaped visual-row slice for an absolute offset (clamped)
+        let seg_x = |shaped: &ShapedLine, seg_start: usize, seg_end: usize, off: usize| -> Pixels {
+            let i = off.clamp(seg_start, seg_end) - seg_start;
+            code_x + shaped.x_for_index(i)
+        };
 
-            // gutter number (right-aligned)
-            let num = format!("{}", row + 1);
-            let num_run = TextRun {
-                len: num.len(),
-                font: font(FONT),
-                color: rgb(LINE_NUMBER).into(),
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            };
-            let num_line = text_sys.shape_line(num.into(), font_size, &[num_run], None);
-            gutter.push((y, num_line));
+        for vi in first..last {
+            let v = &vlines[vi];
+            let y = bounds.top() + line_height * (vi as f32) - scroll_y;
 
-            // code line with syntect runs. Cap the shaped length so a single
-            // absurdly long line (minified bundle) can't freeze layout — normal
-            // source lines are far under this, so this only bites huge files.
-            const MAX_SHAPE: usize = 4000;
-            let disp: String = if line.len() > MAX_SHAPE {
-                let mut s: String = line.chars().take(MAX_SHAPE).collect();
-                s.push('…');
-                s
-            } else {
-                line.to_string()
-            };
-            let runs = build_runs(&disp, styles.get(row));
-            let shaped = text_sys.shape_line(SharedString::from(disp), font_size, &runs, None);
-
-            // selection highlight on this row
-            let row_start = line_starts[row];
-            let row_end = row_start + line.len();
-            if !selected.is_empty() && selected.start < row_end + 1 && selected.end > row_start {
-                let sel_start = selected.start.saturating_sub(row_start).min(line.len());
-                let sel_end = selected.end.saturating_sub(row_start).min(line.len());
-                let x0 = code_x + shaped.x_for_index(sel_start) - scroll_x;
-                let x1 = code_x + shaped.x_for_index(sel_end) - scroll_x;
-                // extend full line when selection spans the newline
-                let x1 = if selected.end > row_end { x1 + char_width } else { x1 };
-                selections.push(fill(
-                    Bounds::from_corners(point(x0, y), point(x1, y + line_height)),
-                    rgb(SELECTION),
-                ));
+            // gutter number only on a logical line's first visual row
+            if v.first {
+                let num = format!("{}", v.row + 1);
+                let num_run = TextRun {
+                    len: num.len(),
+                    font: font(FONT),
+                    color: rgb(LINE_NUMBER).into(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                gutter.push((y, text_sys.shape_line(num.into(), font_size, &[num_run], None)));
             }
 
-            // cursor on this row (only when in the "on" phase of the blink)
-            if blink_on && cursor_offset >= row_start && cursor_offset <= row_end {
-                let col = cursor_offset - row_start;
-                let cx_pos = code_x + shaped.x_for_index(col) - scroll_x;
-                cursor = Some(fill(
-                    Bounds::new(point(cx_pos, y), size(px(2.), line_height)),
-                    rgb(CURSOR),
-                ));
+            // shape this visual row's slice; syntect runs are sliced to it
+            let seg = &content[v.start..v.end];
+            let line_col_start = v.start - line_starts[v.row]; // byte col within the logical line
+            let runs = build_runs_slice(seg, styles.get(v.row), line_col_start);
+            let shaped = text_sys.shape_line(SharedString::from(seg.to_string()), font_size, &runs, None);
+            let seg_w = shaped.width;
+
+            // selection overlaps this visual row
+            if !selected.is_empty() && selected.start <= v.end && selected.end > v.start {
+                let x0 = seg_x(&shaped, v.start, v.end, selected.start);
+                let x1 = seg_x(&shaped, v.start, v.end, selected.end);
+                // continues onto the next visual row → extend to the right edge
+                let x1 = if selected.end > v.end { code_x + seg_w + char_width } else { x1 };
+                selections.push(fill(Bounds::from_corners(point(x0, y), point(x1, y + line_height)), rgb(SELECTION)));
             }
 
-            // search match highlights on this row
+            // caret (only on its visual row, in the "on" blink phase)
+            if blink_on && vi == cursor_vi {
+                let cx_pos = seg_x(&shaped, v.start, v.end, cursor_offset);
+                cursor = Some(fill(Bounds::new(point(cx_pos, y), size(px(2.), line_height)), rgb(CURSOR)));
+            }
+
+            // search matches
             for (mi, m) in search_matches.iter().enumerate() {
-                if m.start < row_end + 1 && m.end > row_start {
-                    let s0 = m.start.saturating_sub(row_start).min(line.len());
-                    let s1 = m.end.saturating_sub(row_start).min(line.len());
-                    let x0 = code_x + shaped.x_for_index(s0) - scroll_x;
-                    let x1 = code_x + shaped.x_for_index(s1) - scroll_x;
+                if m.start < v.end && m.end > v.start {
+                    let x0 = seg_x(&shaped, v.start, v.end, m.start);
+                    let x1 = seg_x(&shaped, v.start, v.end, m.end);
                     let bg = if mi == search_idx { SEARCH_CURRENT_BG } else { SEARCH_MATCH_BG };
-                    search.push(fill(
-                        Bounds::from_corners(point(x0, y), point(x1, y + line_height)),
-                        rgb(bg),
-                    ));
+                    search.push(fill(Bounds::from_corners(point(x0, y), point(x1, y + line_height)), rgb(bg)));
                 }
             }
 
-            // same-word occurrence highlights (skip the active selection itself)
+            // same-word occurrence highlights (skip the active selection)
             for m in &word_hi {
-                if *m != selected && m.start >= row_start && m.end <= row_end {
-                    let s0 = m.start - row_start;
-                    let s1 = m.end - row_start;
-                    let x0 = code_x + shaped.x_for_index(s0) - scroll_x;
-                    let x1 = code_x + shaped.x_for_index(s1) - scroll_x;
-                    word.push(fill(
-                        Bounds::from_corners(point(x0, y), point(x1, y + line_height)),
-                        rgb(WORD_MATCH_BG),
-                    ));
+                if *m != selected && m.start < v.end && m.end > v.start {
+                    let x0 = seg_x(&shaped, v.start, v.end, m.start);
+                    let x1 = seg_x(&shaped, v.start, v.end, m.end);
+                    word.push(fill(Bounds::from_corners(point(x0, y), point(x1, y + line_height)), rgb(WORD_MATCH_BG)));
                 }
             }
 
-            // cmd-hover link underline on this row
-            if let Some((lrow, c0, c1)) = link_pos {
-                if row == lrow && c1 <= line.len() {
-                    let x0 = code_x + shaped.x_for_index(c0) - scroll_x;
-                    let x1 = code_x + shaped.x_for_index(c1) - scroll_x;
+            // cmd-hover link underline
+            if let Some(r) = &link_range {
+                if r.start < v.end && r.end > v.start {
+                    let x0 = seg_x(&shaped, v.start, v.end, r.start);
+                    let x1 = seg_x(&shaped, v.start, v.end, r.end);
                     let uy = y + line_height - px(2.);
-                    link = Some(fill(
-                        Bounds::from_corners(point(x0, uy), point(x1, uy + px(1.5))),
-                        rgb(ACCENT),
-                    ));
+                    link = Some(fill(Bounds::from_corners(point(x0, uy), point(x1, uy + px(1.5))), rgb(ACCENT)));
                 }
             }
 
             code.push((y, shaped));
         }
 
-        // stash layout info for mouse mapping
+        // stash layout info for mouse mapping + scroll bounds
         self.editor.update(cx, |e, _| {
             e.last_bounds = Some(bounds);
             e.last_char_width = char_width;
             e.last_gutter_width = gutter_width;
+            e.vlines = vlines;
         });
 
         EditorPrepaint {
@@ -1750,26 +1807,43 @@ fn word_occurrences(content: &str, word: &str) -> Vec<Range<usize>> {
     out
 }
 
-fn build_runs(line: &str, styles: Option<&Vec<(usize, u32)>>) -> Vec<TextRun> {
-    let total: usize = styles.map(|s| s.iter().map(|(l, _)| *l).sum()).unwrap_or(0);
+
+/// Like `build_runs`, but for a wrapped slice `seg` starting `start` bytes into
+/// its logical line — clips the line's syntect runs to `[start, start+seg.len())`.
+fn build_runs_slice(seg: &str, styles: Option<&Vec<(usize, u32)>>, start: usize) -> Vec<TextRun> {
+    let end = start + seg.len();
     if let Some(styles) = styles {
-        if total == line.len() && !styles.is_empty() {
-            return styles
-                .iter()
-                .map(|(len, color)| TextRun {
-                    len: *len,
-                    font: font(FONT),
-                    color: rgb(*color).into(),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                })
-                .collect();
+        let total: usize = styles.iter().map(|(l, _)| *l).sum();
+        if !styles.is_empty() && total >= end {
+            let mut out = Vec::new();
+            let mut pos = 0usize;
+            for (len, color) in styles {
+                let (rs, re) = (pos, pos + len);
+                pos = re;
+                let a = rs.max(start);
+                let b = re.min(end);
+                if b > a {
+                    out.push(TextRun {
+                        len: b - a,
+                        font: font(FONT),
+                        color: rgb(*color).into(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    });
+                }
+                if pos >= end {
+                    break;
+                }
+            }
+            let covered: usize = out.iter().map(|r| r.len).sum();
+            if covered == seg.len() && !out.is_empty() {
+                return out;
+            }
         }
     }
-    // fallback: single plain run
     vec![TextRun {
-        len: line.len(),
+        len: seg.len(),
         font: font(FONT),
         color: rgb(TEXT).into(),
         background_color: None,
@@ -1794,24 +1868,18 @@ impl Editor {
             return;
         }
         let pos = ev.position;
-        let cw = f32::from(self.last_char_width);
         let gw = f32::from(self.last_gutter_width);
         let relx = f32::from(pos.x - b.left()) - gw;
         if relx < 0.0 {
             return; // over the gutter
         }
-        let row = ((f32::from(pos.y - b.top()) + f32::from(self.scroll_y)) / LINE_HEIGHT)
-            .floor()
-            .max(0.) as usize;
-        let col = ((relx + f32::from(self.scroll_x)) / cw).floor().max(0.) as usize;
+        // wrap-aware: map the pointer to a byte offset, then to a logical (row,col)
+        let Some(offset) = self.offset_at(pos) else { return };
+        let (row, col) = self.offset_to_pos(offset);
 
         // cmd held → show the hovered identifier as a clickable link
         {
-            let starts = self.line_starts();
-            let new_link = if ev.modifiers.platform && row < starts.len() {
-                let line_start = starts[row];
-                let line_end = if row + 1 < starts.len() { starts[row + 1] - 1 } else { self.content.len() };
-                let offset = (line_start + col).min(line_end);
+            let new_link = if ev.modifiers.platform {
                 let r = self.word_at(offset);
                 if r.is_empty() { None } else { Some(r) }
             } else {
@@ -1823,9 +1891,10 @@ impl Editor {
             }
         }
 
-        // popup coords are relative to the editor div (not the window)
-        let px_x = gw + (col as f32) * cw - f32::from(self.scroll_x);
-        let px_y = ((row + 1) as f32) * LINE_HEIGHT - f32::from(self.scroll_y);
+        // popup coords are relative to the editor div (anchored at the pointer's row)
+        let vi = self.voffset(offset);
+        let px_x = relx;
+        let px_y = ((vi + 1) as f32) * LINE_HEIGHT - f32::from(self.scroll_y);
 
         self.hover_gen += 1;
         let gen = self.hover_gen;
@@ -1852,28 +1921,21 @@ impl Editor {
     }
 
     /// Map a window-space position to a byte offset into `content`, clamped to
-    /// the clicked line. Used by click placement and drag-selection.
+    /// the clicked *visual* row. Used by click placement and drag-selection.
     fn offset_at(&self, pos: Point<Pixels>) -> Option<usize> {
         let bounds = self.last_bounds?;
-        let rel_y = f32::from(pos.y - bounds.top()) + f32::from(self.scroll_y);
-        let row = (rel_y / LINE_HEIGHT).floor().max(0.) as usize;
-        let starts = self.line_starts();
-        if row >= starts.len() {
+        if self.vlines.is_empty() {
             return Some(self.content.len());
         }
-        let line_start = starts[row];
-        let line_end = if row + 1 < starts.len() {
-            starts[row + 1] - 1
-        } else {
-            self.content.len()
-        };
-        let rel_x = f32::from(pos.x - bounds.left() - self.last_gutter_width) + f32::from(self.scroll_x);
+        let rel_y = f32::from(pos.y - bounds.top()) + f32::from(self.scroll_y);
+        let vi = ((rel_y / LINE_HEIGHT).floor().max(0.) as usize).min(self.vlines.len() - 1);
+        let v = &self.vlines[vi];
+        let rel_x = f32::from(pos.x - bounds.left() - self.last_gutter_width);
         let col = (rel_x / f32::from(self.last_char_width)).round().max(0.) as usize;
-        // `col` is a char column; map it to a real byte offset (multi-byte chars
-        // like '─' mean byte != column), landing on a char boundary
-        let line = &self.content[line_start..line_end];
-        let byte_in_line = line.char_indices().nth(col).map(|(b, _)| b).unwrap_or(line.len());
-        Some(line_start + byte_in_line)
+        // char column → byte offset within the visual row's slice
+        let seg = &self.content[v.start..v.end];
+        let byte = seg.char_indices().nth(col).map(|(b, _)| b).unwrap_or(v.end - v.start);
+        Some(v.start + byte)
     }
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1957,21 +2019,11 @@ impl Editor {
         self.link = None;
         let delta = event.delta.pixel_delta(px(LINE_HEIGHT));
 
-        // vertical
+        // vertical (visual rows — soft-wrap means no horizontal scroll)
         let new_y = f32::from(self.scroll_y) - f32::from(delta.y);
-        let max_y = (self.line_count() as f32 * LINE_HEIGHT - 100.).max(0.);
+        let max_y = (self.visual_count() as f32 * LINE_HEIGHT - 100.).max(0.);
         self.scroll_y = px(new_y.clamp(0., max_y));
-
-        // horizontal
-        let longest = self.content.split('\n').map(|l| l.chars().count()).max().unwrap_or(0);
-        let viewport_w = self
-            .last_bounds
-            .map(|b| f32::from(b.size.width) - f32::from(self.last_gutter_width))
-            .unwrap_or(0.);
-        let content_w = longest as f32 * f32::from(self.last_char_width);
-        let max_x = (content_w - viewport_w + f32::from(self.last_char_width) * 2.).max(0.);
-        let new_x = f32::from(self.scroll_x) - f32::from(delta.x);
-        self.scroll_x = px(new_x.clamp(0., max_x));
+        self.scroll_x = px(0.);
 
         cx.notify();
     }
