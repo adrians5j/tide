@@ -390,11 +390,19 @@ fn last_session_label(root: &Path) -> Option<String> {
         }
     }
     let (_, file) = newest?;
-    // read a bounded prefix (lines can be large); find the first meaningful prompt
-    use std::io::Read;
-    let mut buf = vec![0u8; 256 * 1024];
-    let n = std::fs::File::open(&file).ok()?.read(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf[..n]);
+    // the last prompt is at the END of the file → read a bounded tail (a partial
+    // first line is fine, we skip unparseable lines) and keep the last real prompt
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(&file).ok()?;
+    let len = f.metadata().ok()?.len();
+    const TAIL: u64 = 512 * 1024;
+    if len > TAIL {
+        f.seek(SeekFrom::Start(len - TAIL)).ok()?;
+    }
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    let mut last: Option<String> = None;
     for line in text.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
         if v.get("type").and_then(|t| t.as_str()) != Some("user") {
@@ -411,20 +419,19 @@ fn last_session_label(root: &Path) -> Option<String> {
             _ => continue,
         };
         let s = s.trim();
-        // skip command/caveat/meta noise, keep the first real ask
+        // skip command/caveat/tool-result/meta noise
         let skip = s.is_empty()
             || s.starts_with('<')
             || s.starts_with("Caveat:")
             || s.starts_with('[')
             || s.starts_with("This session is being continued");
-        if skip {
-            continue;
+        if !skip {
+            last = Some(s.split_whitespace().collect::<Vec<_>>().join(" "));
         }
-        let one_line: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
-        let label: String = one_line.chars().take(52).collect();
-        return Some(if one_line.chars().count() > 52 { format!("{label}…") } else { label });
     }
-    None
+    let one_line = last?;
+    let label: String = one_line.chars().take(52).collect();
+    Some(if one_line.chars().count() > 52 { format!("{label}…") } else { label })
 }
 
 fn load_recent_projects() -> Vec<PathBuf> {
