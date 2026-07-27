@@ -366,6 +366,67 @@ fn recents_path() -> Option<PathBuf> {
 }
 
 /// Recently-opened project paths, most recent first; only existing dirs.
+/// Claude Code's per-project session dir name: the cwd with every non-alphanumeric
+/// char replaced by '-' (e.g. /Users/adrian/dev/tide → -Users-adrian-dev-tide).
+fn claude_project_slug(root: &Path) -> String {
+    root.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
+}
+
+/// A short label for the most recent Claude Code session in `root`: the newest
+/// session's first real user prompt, truncated. None if there's no session.
+fn last_session_label(root: &Path) -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let dir = PathBuf::from(home).join(".claude/projects").join(claude_project_slug(root));
+    // newest .jsonl by mtime
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for e in std::fs::read_dir(&dir).ok()?.flatten() {
+        let p = e.path();
+        if p.extension().map(|x| x == "jsonl").unwrap_or(false) {
+            if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
+                if newest.as_ref().map(|(t, _)| m > *t).unwrap_or(true) {
+                    newest = Some((m, p));
+                }
+            }
+        }
+    }
+    let (_, file) = newest?;
+    // read a bounded prefix (lines can be large); find the first meaningful prompt
+    use std::io::Read;
+    let mut buf = vec![0u8; 256 * 1024];
+    let n = std::fs::File::open(&file).ok()?.read(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf[..n]);
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if v.get("type").and_then(|t| t.as_str()) != Some("user") {
+            continue;
+        }
+        let content = v.get("message").and_then(|m| m.get("content")).or_else(|| v.get("content"));
+        let s = match content {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Array(a)) => a
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join(" "),
+            _ => continue,
+        };
+        let s = s.trim();
+        // skip command/caveat/meta noise, keep the first real ask
+        let skip = s.is_empty()
+            || s.starts_with('<')
+            || s.starts_with("Caveat:")
+            || s.starts_with('[')
+            || s.starts_with("This session is being continued");
+        if skip {
+            continue;
+        }
+        let one_line: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let label: String = one_line.chars().take(52).collect();
+        return Some(if one_line.chars().count() > 52 { format!("{label}…") } else { label });
+    }
+    None
+}
+
 fn load_recent_projects() -> Vec<PathBuf> {
     let Some(file) = recents_path() else { return Vec::new() };
     let Ok(text) = std::fs::read_to_string(&file) else { return Vec::new() };
@@ -10905,6 +10966,8 @@ struct Workspace {
     switcher_query: String, // type-to-filter text
     // opened via alt-tab (cmd+tab style): keep advancing on tab; commit on opt release
     switcher_quick: bool,
+    // last Claude Code session label per project root (loaded async on open)
+    session_labels: HashMap<PathBuf, String>,
 }
 
 impl Workspace {
@@ -10919,6 +10982,7 @@ impl Workspace {
             switcher_focus: cx.focus_handle(),
             switcher_query: String::new(),
             switcher_quick: false,
+            session_labels: HashMap::new(),
         };
         // open every passed root as its own workspace; first one is active
         for root in roots {
@@ -11027,6 +11091,7 @@ impl Workspace {
             self.switcher_quick = true;
             // start from the project after (or before) the active one
             self.switcher_sel = ((self.active as i32 + dir).rem_euclid(n as i32)) as usize;
+            self.load_session_labels(cx);
             window.focus(&self.switcher_focus, cx);
         } else {
             let len = self.switcher_matches(cx).len().max(1);
@@ -11067,8 +11132,32 @@ impl Workspace {
         self.switcher_quick = false;
         self.switcher_query.clear();
         self.switcher_sel = self.active;
+        self.load_session_labels(cx);
         window.focus(&self.switcher_focus, cx);
         cx.notify();
+    }
+
+    /// Read each project's most recent Claude Code session label off-thread and
+    /// cache it (shown under the project in the switcher).
+    fn load_session_labels(&mut self, cx: &mut Context<Self>) {
+        let roots: Vec<PathBuf> = self.projects.iter().map(|p| p.read(cx).root.clone()).collect();
+        cx.spawn(async move |this, cx| {
+            let labels = cx
+                .background_executor()
+                .spawn(async move {
+                    roots
+                        .into_iter()
+                        .filter_map(|r| last_session_label(&r).map(|l| (r, l)))
+                        .collect::<HashMap<PathBuf, String>>()
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.session_labels = labels;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Project indices matching the type-to-filter query (name or branch).
@@ -11231,16 +11320,17 @@ impl Render for Workspace {
             let w = 520.0_f32;
             let filtered = self.switcher_matches(cx);
             // center the dialog on screen (estimated height from the row count)
-            let est_h = 46.0 + filtered.len() as f32 * 44.0 + 12.0;
+            let est_h = 46.0 + filtered.len() as f32 * 56.0 + 12.0;
             let left = ((f32::from(win.width) - w) / 2.0).max(0.);
             let top = (((f32::from(win.height) - est_h) / 2.0).max(40.)).min(f32::from(win.height) - 80.);
             // vertical list, one full-width row per matching project
             let mut grid = div().flex().flex_col().gap_1().px_2().pb_2();
             for (pos, &i) in filtered.iter().enumerate() {
-                let (name, branch) = {
+                let (name, branch, root) = {
                     let s = self.projects[i].read(cx);
-                    (s.project_name(), s.branch.clone())
+                    (s.project_name(), s.branch.clone(), s.root.clone())
                 };
+                let session = self.session_labels.get(&root).cloned();
                 let sel = pos == self.switcher_sel;
                 let multi = self.projects.len() > 1;
                 let idx = i;
@@ -11258,7 +11348,7 @@ impl Render for Workspace {
                         .id(("ws-switch", i))
                         .relative()
                         .w_full()
-                        .h(px(40.))
+                        .h(px(52.))
                         .px_2()
                         .flex()
                         .flex_row()
@@ -11319,6 +11409,16 @@ impl Render for Workspace {
                                             .truncate()
                                             .text_color(rgb(if sel { SEL_TEXT } else { MUTED }))
                                             .child(format!("⎇ {}", branch)),
+                                    )
+                                })
+                                // last Claude Code session (if any)
+                                .when_some(session, |d, s| {
+                                    d.child(
+                                        div()
+                                            .text_size(px(10.))
+                                            .truncate()
+                                            .text_color(rgb(if sel { SEL_TEXT } else { LINE_NUMBER }))
+                                            .child(format!("✳ {}", s)),
                                     )
                                 }),
                         )
