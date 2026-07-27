@@ -10127,10 +10127,10 @@ impl Storm {
                     .on_key_down(cx.listener(Self::browser_key))
                     .child(self.browser_url.render(self.caret(), SELECTION)),
             )
-            .child(nav("br-ext", "⧉", true).tooltip(tip("Open in system browser")).on_click(cx.listener(|this, _e, _w, _cx| {
+            .child(nav("br-ext", "⧉", true).on_click(cx.listener(|this, _e, _w, _cx| {
                 open_browser(&normalize_url(this.browser_url.text.trim()));
             })))
-            .child(nav("br-close", "✕", true).tooltip(tip("Close browser")).on_click(cx.listener(|this, _e, window, cx| {
+            .child(nav("br-close", "✕", true).on_click(cx.listener(|this, _e, window, cx| {
                 this.toggle_browser(window, cx);
             })));
 
