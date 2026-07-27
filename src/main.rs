@@ -3442,6 +3442,15 @@ impl Storm {
         }
     }
 
+    /// Hide this project's native WebView without changing `browser_open`, so a
+    /// background project's browser doesn't float over the active one. It
+    /// re-shows when this project becomes active again (render_browser_dock).
+    fn park_browser(&self) {
+        if let Some(b) = &self.browser {
+            b.set_visible(false);
+        }
+    }
+
     fn toggle_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !BROWSER_PANEL {
             return; // feature parked; flip BROWSER_PANEL to re-enable
@@ -11158,6 +11167,13 @@ impl Render for Workspace {
             s.ws_branches = branches;
             s.ws_active = active;
         });
+        // hide every background project's native WebView so it doesn't float
+        // over the active workspace (the active one re-shows its own on render)
+        for (i, p) in self.projects.iter().enumerate() {
+            if i != active {
+                p.update(cx, |s, _| s.park_browser());
+            }
+        }
         // focus the active project after a switch (render has the Window)
         if self.focus_pending {
             self.focus_pending = false;
