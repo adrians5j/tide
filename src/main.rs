@@ -2094,6 +2094,7 @@ struct Storm {
     newproj_focus: FocusHandle,
     newproj_path: Field,
     newproj_recents: Vec<PathBuf>, // recent projects, loaded when the dialog opens
+    newproj_sel: usize,            // highlighted row in the filtered recents list
     // commit message
     commit_msg: Field,
     commit_focus: FocusHandle,
@@ -2381,6 +2382,7 @@ impl Storm {
             newproj_focus: cx.focus_handle(),
             newproj_path: Field::default(),
             newproj_recents: Vec::new(),
+            newproj_sel: 0,
             commit_msg: Field::default(),
             commit_focus: cx.focus_handle(),
             wip_id: random_id(),
@@ -3916,8 +3918,21 @@ impl Storm {
         self.newproj_open = true;
         self.newproj_path.clear();
         self.newproj_recents = load_recent_projects();
+        self.newproj_sel = 0;
         window.focus(&self.newproj_focus, cx);
         cx.notify();
+    }
+
+    /// Recent projects filtered by the typed text (matches name or full path),
+    /// most-recent first, capped at 20.
+    fn newproj_filtered(&self) -> Vec<PathBuf> {
+        let q = self.newproj_path.text.trim().to_lowercase();
+        self.newproj_recents
+            .iter()
+            .filter(|p| q.is_empty() || p.to_string_lossy().to_lowercase().contains(&q))
+            .take(20)
+            .cloned()
+            .collect()
     }
 
     fn newproj_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -3927,9 +3942,24 @@ impl Storm {
                 self.newproj_open = false;
                 self.focus_active(window, cx);
             }
-            "enter" => self.newproj_submit(cx),
+            "down" => {
+                let n = self.newproj_filtered().len();
+                self.newproj_sel = (self.newproj_sel + 1).min(n.saturating_sub(1));
+            }
+            "up" => self.newproj_sel = self.newproj_sel.saturating_sub(1),
+            "enter" => {
+                // open the highlighted recent, or fall back to the typed path
+                let filtered = self.newproj_filtered();
+                if let Some(p) = filtered.get(self.newproj_sel).cloned() {
+                    self.newproj_open = false;
+                    cx.emit(ProjectNav::OpenPath(p));
+                } else {
+                    self.newproj_submit(cx);
+                }
+            }
             _ => {
                 Self::field_input(&mut self.newproj_path, ks, cx, |_| true);
+                self.newproj_sel = 0; // filter changed → reset highlight to the top
             }
         }
         cx.notify();
@@ -9112,8 +9142,10 @@ impl Storm {
             })
             .child("Open");
 
-        // recent projects (most recent first) — click to open
-        let mut recents = div().id("newproj-recents").flex().flex_col().max_h(px(280.)).overflow_y_scroll().pb_2();
+        // recent projects (most recent first, filtered by the typed text) — click
+        // or arrow+enter to open; capped at 20
+        let filtered = self.newproj_filtered();
+        let mut recents = div().id("newproj-recents").flex().flex_col().max_h(px(480.)).overflow_y_scroll().pb_2();
         if !self.newproj_recents.is_empty() {
             recents = recents.child(
                 div()
@@ -9123,12 +9155,17 @@ impl Storm {
                     .text_color(rgb(MUTED))
                     .border_t_1()
                     .border_color(rgb(BORDER))
-                    .child("Recent"),
+                    .child(if self.newproj_path.text.trim().is_empty() {
+                        "Recent".to_string()
+                    } else {
+                        format!("Recent · {} match(es)", filtered.len())
+                    }),
             );
-            for (i, p) in self.newproj_recents.iter().take(10).enumerate() {
+            for (i, p) in filtered.iter().enumerate() {
                 let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                 let dir = p.parent().map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
                 let path = p.clone();
+                let sel = i == self.newproj_sel;
                 recents = recents.child(
                     div()
                         .id(("newproj-recent", i))
@@ -9139,9 +9176,10 @@ impl Storm {
                         .h(px(26.))
                         .px_3()
                         .cursor_pointer()
-                        .hover(|s| s.bg(rgb(HOVER)))
+                        .when(sel, |d| d.bg(rgb(SELECTED_BG)))
+                        .when(!sel, |d| d.hover(|s| s.bg(rgb(HOVER))))
                         .child(div().font_family(ICON_FONT).text_size(px(12.)).text_color(rgb(FOLDER_ICON)).child(IC_FOLDER))
-                        .child(div().flex_shrink_0().text_size(px(12.)).text_color(rgb(TEXT)).child(name))
+                        .child(div().flex_shrink_0().text_size(px(12.)).text_color(rgb(if sel { SEL_TEXT } else { TEXT })).child(name))
                         .child(div().flex_grow(1.0).text_size(px(11.)).text_color(rgb(MUTED)).truncate().child(dir))
                         .on_click(cx.listener(move |this, _e, _w, cx| {
                             this.newproj_open = false;

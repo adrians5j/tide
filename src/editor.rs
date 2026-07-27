@@ -2249,11 +2249,14 @@ impl Editor {
     /// Small "read-only" badge floated just below the cursor (mirrors the
     /// completion-popup placement) when a hand edit is attempted while locked.
     fn render_ro_hint(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (row, col) = self.offset_to_pos(self.cursor_offset());
+        // anchor at the cursor's *visual* row/col (soft-wrap aware)
+        let off = self.cursor_offset();
+        let vi = self.voffset(off);
+        let col = self.vlines.get(vi).map(|v| off.saturating_sub(v.start)).unwrap_or(0);
         let cw = f32::from(self.last_char_width);
         let gw = f32::from(self.last_gutter_width);
-        let x = gw + (col as f32) * cw - f32::from(self.scroll_x);
-        let y = ((row + 1) as f32) * LINE_HEIGHT - f32::from(self.scroll_y);
+        let x = gw + (col as f32) * cw;
+        let y = ((vi + 1) as f32) * LINE_HEIGHT - f32::from(self.scroll_y);
         div()
             .id("ro-hint")
             .absolute()
