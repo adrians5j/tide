@@ -11061,11 +11061,19 @@ impl Workspace {
                 cx.notify();
             }
             _ => {
-                // digit with an empty query → quick-jump to that workspace
+                // quick-jump when the filter is empty: 1-9, then 0, -, = (10, 11, 12)
                 if self.switcher_query.is_empty() {
-                    if let Some(d) = key.parse::<usize>().ok().filter(|d| *d >= 1 && *d <= self.projects.len()) {
-                        self.switcher_open = false;
-                        self.switch_to(d - 1, cx);
+                    let target = match key {
+                        "0" => Some(9),
+                        "-" => Some(10),
+                        "=" => Some(11),
+                        _ => key.parse::<usize>().ok().filter(|d| (1..=9).contains(d)).map(|d| d - 1),
+                    };
+                    if let Some(t) = target {
+                        if t < self.projects.len() {
+                            self.switcher_open = false;
+                            self.switch_to(t, cx);
+                        }
                         return;
                     }
                 }
@@ -11162,7 +11170,14 @@ impl Render for Workspace {
                 let sel = pos == self.switcher_sel;
                 let multi = self.projects.len() > 1;
                 let idx = i;
-                let num = pos + 1;
+                // quick-jump key label: 1-9, then 0, -, = for rows 10-12
+                let num = match pos {
+                    0..=8 => (pos + 1).to_string(),
+                    9 => "0".to_string(),
+                    10 => "-".to_string(),
+                    11 => "=".to_string(),
+                    _ => String::new(),
+                };
                 let label_drag = name.clone();
                 grid = grid.child(
                     div()
