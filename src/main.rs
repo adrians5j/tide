@@ -64,8 +64,9 @@ const ICON_FONT: &str = "Segoe Fluent Icons";
 // as the right-side dock + ⌘⇧A) to continue the work; see src/acp.rs.
 const AGENT_PANEL: bool = false;
 
-// In-pane browser (embedded WKWebView) — Browser icon + right-dock.
-const BROWSER_PANEL: bool = true;
+// In-pane browser (embedded WKWebView) — parked (too hiccuppy). Flip to `true`
+// to bring back the Browser icon + right-dock. See src/browser.rs.
+const BROWSER_PANEL: bool = false;
 
 actions!(
     workspace,
