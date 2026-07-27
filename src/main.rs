@@ -2282,6 +2282,7 @@ impl Storm {
     fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
         let mut expanded = HashSet::new();
         expanded.insert(root.clone());
+        let browser_default = default_browser_url(&root);
         let mut s = Self {
             root,
             expanded,
@@ -2496,7 +2497,7 @@ impl Storm {
             browser: None,
             browser_url: {
                 let mut f = Field::default();
-                f.set("http://localhost:3000".into());
+                f.set(browser_default);
                 f
             },
             browser_focus: cx.focus_handle(),
@@ -10144,6 +10145,18 @@ impl Storm {
             .child(bar)
             .child(div().flex_grow(1.0).min_h(px(0.)))
     }
+}
+
+/// Default browser URL for a project. `wby-next{N}` → `https://admin{N}.localhost`
+/// (Webiny multi-workspace convention); everything else → localhost:3000.
+fn default_browser_url(root: &Path) -> String {
+    let name = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    if let Some(n) = name.strip_prefix("wby-next") {
+        if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
+            return format!("https://admin{n}.localhost");
+        }
+    }
+    "http://localhost:3000".into()
 }
 
 /// Add a scheme to a bare address-bar entry. Loopback/port-only hosts default
