@@ -10655,7 +10655,7 @@ impl Storm {
             .child(
                 row(IC_BRANCH, ACCENT)
                     .child(div().text_size(px(13.)).text_color(rgb(MUTED)).child("On branch"))
-                    .child(div().text_size(px(13.)).text_color(rgb(TEXT)).child(branch)),
+                    .child(branch_name_el(&branch, TEXT).text_size(px(13.))),
             );
 
         // pull request
@@ -10683,7 +10683,7 @@ impl Storm {
                             })),
                     )
                     .child(div().text_size(px(13.)).text_color(rgb(MUTED)).child("→"))
-                    .child(div().text_size(px(13.)).text_color(rgb(TEXT)).child(base))
+                    .child(branch_name_el(&base, TEXT).text_size(px(13.)))
                     .child(div().w(px(6.)).flex_shrink_0().text_size(px(12.)).text_color(rgb(status_color)).child("●"))
                     .child(div().text_size(px(12.)).text_color(rgb(status_color)).child(status_text)),
             );
