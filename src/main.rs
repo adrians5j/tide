@@ -10921,6 +10921,15 @@ impl Workspace {
     }
 
     fn add_project(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        // already open? focus the existing project instead of opening a duplicate
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let target = canon(&root);
+        if let Some(i) = self.projects.iter().position(|p| canon(&p.read(cx).root) == target) {
+            self.active = i;
+            self.focus_pending = true;
+            cx.notify();
+            return;
+        }
         push_recent_project(&root); // remember it for the New Project dialog
         let storm = cx.new(|cx| Storm::new(root, cx));
         cx.subscribe(&storm, |this, _s, ev: &ProjectNav, cx| match ev {
