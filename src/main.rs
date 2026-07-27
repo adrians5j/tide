@@ -11042,11 +11042,17 @@ impl Workspace {
                 }
             }
             "down" | "right" => {
-                self.switcher_sel = (self.switcher_sel + 1).min(filtered.len().saturating_sub(1));
+                let n = filtered.len();
+                if n > 0 {
+                    self.switcher_sel = (self.switcher_sel + 1) % n; // wrap to first
+                }
                 cx.notify();
             }
             "up" | "left" => {
-                self.switcher_sel = self.switcher_sel.saturating_sub(1);
+                let n = filtered.len();
+                if n > 0 {
+                    self.switcher_sel = (self.switcher_sel + n - 1) % n; // wrap to last
+                }
                 cx.notify();
             }
             "backspace" => {
@@ -11173,7 +11179,9 @@ impl Render for Workspace {
                         .border_1()
                         .border_color(rgb(if sel { ACCENT } else { BORDER }))
                         .when(sel, |d| d.bg(rgb(SELECTED_BG)))
-                        .when(!sel, |d| d.hover(|s| s.bg(rgb(HOVER))))
+                        // HOVER is nearly identical to POPUP_BG here → use a clearly
+                        // lighter tint + accent border so hover is actually visible
+                        .when(!sel, |d| d.hover(|s| s.bg(rgb(0x34373c)).border_color(rgb(ACCENT))))
                         .cursor_pointer()
                         // drag to reorder: drop onto another row to move before it
                         .on_drag(DraggedProject(i), move |_, _, _, cx| {
