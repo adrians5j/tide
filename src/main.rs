@@ -5315,7 +5315,10 @@ impl Storm {
             self.tree_width = f32::from(ev.position.x).clamp(150., 750.);
             cx.notify();
         } else if self.resizing_term {
-            self.term_width = (self.win_width - f32::from(ev.position.x)).clamp(200., 1125.);
+            // allow the terminal/browser dock to grow up to ~90% of the window
+            // (so the browser can go nearly full-screen)
+            let max_w = (self.win_width * 0.92).max(200.);
+            self.term_width = (self.win_width - f32::from(ev.position.x)).clamp(200., max_w);
             cx.notify();
         } else if self.resizing_agent {
             // dock sits left of the 44px right activity bar; divider is on its left edge
