@@ -1,7 +1,7 @@
 use gpui::{
     AnyElement, AnyView, AnyWindowHandle, App, Bounds, ClipboardItem, Context, CursorStyle, Div, Entity, EventEmitter,
     ExternalPaths, FocusHandle, KeyBinding, WeakEntity,
-    KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    KeyDownEvent, Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ScrollStrategy, SharedString,
     StyledText, TextRun, Window, WindowBounds, WindowOptions, actions, div, font, prelude::*, px,
     rgb, rgba, size, uniform_list, ScrollHandle, UniformListScrollHandle,
@@ -10878,6 +10878,8 @@ struct Workspace {
     switcher_sel: usize, // index into the *filtered* list
     switcher_focus: FocusHandle,
     switcher_query: String, // type-to-filter text
+    // opened via alt-tab (cmd+tab style): keep advancing on tab; commit on opt release
+    switcher_quick: bool,
 }
 
 impl Workspace {
@@ -10891,6 +10893,7 @@ impl Workspace {
             switcher_sel: 0,
             switcher_focus: cx.focus_handle(),
             switcher_query: String::new(),
+            switcher_quick: false,
         };
         // open every passed root as its own workspace; first one is active
         for root in roots {
@@ -10968,20 +10971,46 @@ impl Workspace {
         cx.notify();
     }
 
-    fn next_project(&mut self, _: &NextProject, _w: &mut Window, cx: &mut Context<Self>) {
-        let n = self.projects.len();
-        if n > 1 {
-            self.active = (self.active + 1) % n;
-            self.focus_pending = true;
-            cx.notify();
-        }
+    fn next_project(&mut self, _: &NextProject, window: &mut Window, cx: &mut Context<Self>) {
+        self.switcher_step(1, window, cx);
     }
 
-    fn prev_project(&mut self, _: &PrevProject, _w: &mut Window, cx: &mut Context<Self>) {
+    fn prev_project(&mut self, _: &PrevProject, window: &mut Window, cx: &mut Context<Self>) {
+        self.switcher_step(-1, window, cx);
+    }
+
+    /// alt-tab (cmd+tab style): open the switcher in "quick" mode and advance the
+    /// highlight by `dir`; each further alt-tab advances again. Releasing opt
+    /// commits the highlighted project (see `switcher_modifiers`).
+    fn switcher_step(&mut self, dir: i32, window: &mut Window, cx: &mut Context<Self>) {
         let n = self.projects.len();
-        if n > 1 {
-            self.active = (self.active + n - 1) % n;
-            self.focus_pending = true;
+        if n <= 1 {
+            return;
+        }
+        if !self.switcher_open {
+            self.switcher_open = true;
+            self.switcher_query.clear();
+            self.switcher_quick = true;
+            // start from the project after (or before) the active one
+            self.switcher_sel = ((self.active as i32 + dir).rem_euclid(n as i32)) as usize;
+            window.focus(&self.switcher_focus, cx);
+        } else {
+            let len = self.switcher_matches(cx).len().max(1);
+            self.switcher_sel = ((self.switcher_sel as i32 + dir).rem_euclid(len as i32)) as usize;
+        }
+        cx.notify();
+    }
+
+    /// Commit the quick-switcher pick when the opt/alt modifier is released.
+    fn switcher_modifiers(&mut self, ev: &ModifiersChangedEvent, _w: &mut Window, cx: &mut Context<Self>) {
+        if self.switcher_open && self.switcher_quick && !ev.modifiers.alt {
+            let filtered = self.switcher_matches(cx);
+            let target = filtered.get(self.switcher_sel).copied();
+            self.switcher_open = false;
+            self.switcher_quick = false;
+            if let Some(pi) = target {
+                self.switch_to(pi, cx);
+            }
             cx.notify();
         }
     }
@@ -11001,6 +11030,7 @@ impl Workspace {
     /// cmd+shift+e: open the project switcher dialog.
     fn show_projects(&mut self, _: &ShowProjects, window: &mut Window, cx: &mut Context<Self>) {
         self.switcher_open = true;
+        self.switcher_quick = false;
         self.switcher_query.clear();
         self.switcher_sel = self.active;
         window.focus(&self.switcher_focus, cx);
@@ -11028,6 +11058,7 @@ impl Workspace {
             "escape" => {
                 if self.switcher_query.is_empty() {
                     self.switcher_open = false;
+                    self.switcher_quick = false;
                     self.focus_pending = true;
                 } else {
                     self.switcher_query.clear();
@@ -11038,6 +11069,7 @@ impl Workspace {
             "enter" => {
                 if let Some(&pi) = filtered.get(self.switcher_sel) {
                     self.switcher_open = false;
+                    self.switcher_quick = false;
                     self.switch_to(pi, cx);
                 }
             }
@@ -11146,6 +11178,7 @@ impl Render for Workspace {
             .size_full()
             .relative()
             .track_focus(&self.focus)
+            .on_modifiers_changed(cx.listener(Self::switcher_modifiers))
             .on_action(cx.listener(Self::next_project))
             .on_action(cx.listener(Self::prev_project))
             .on_action(cx.listener(Self::open_project_action))
@@ -11279,6 +11312,7 @@ impl Render for Workspace {
                         })
                         .on_click(cx.listener(move |this, _e, _w, cx| {
                             this.switcher_open = false;
+                            this.switcher_quick = false;
                             this.switch_to(idx, cx);
                         })),
                 );
