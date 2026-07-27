@@ -11320,7 +11320,7 @@ impl Render for Workspace {
             let w = 520.0_f32;
             let filtered = self.switcher_matches(cx);
             // center the dialog on screen (estimated height from the row count)
-            let est_h = 46.0 + filtered.len() as f32 * 56.0 + 12.0;
+            let est_h = 46.0 + filtered.len() as f32 * 68.0 + 12.0;
             let left = ((f32::from(win.width) - w) / 2.0).max(0.);
             let top = (((f32::from(win.height) - est_h) / 2.0).max(40.)).min(f32::from(win.height) - 80.);
             // vertical list, one full-width row per matching project
@@ -11348,8 +11348,8 @@ impl Render for Workspace {
                         .id(("ws-switch", i))
                         .relative()
                         .w_full()
-                        .h(px(52.))
-                        .px_2()
+                        .h(px(64.))
+                        .px_3()
                         .flex()
                         .flex_row()
                         .items_center()
@@ -11395,6 +11395,7 @@ impl Render for Workspace {
                                 .min_w(px(0.))
                                 .flex()
                                 .flex_col()
+                                .gap(px(2.))
                                 .child(
                                     div()
                                         .text_size(px(13.))
