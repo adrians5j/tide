@@ -5723,9 +5723,8 @@ impl Storm {
                                 .gap_1()
                                 .text_color(rgb(MUTED))
                                 .text_size(px(12.))
-                                .child(format!("⎇ {}", self.branch_label()))
-                                // target/parent: the PR's base branch if there's a PR
-                                // (authoritative), else the reflog "created from" guess
+                                // target/base first (GitHub order: base ← head): the
+                                // PR's base branch if there's a PR, else the reflog guess
                                 .when_some(
                                     self.pr_link
                                         .as_ref()
@@ -5737,10 +5736,11 @@ impl Storm {
                                             div()
                                                 .text_size(px(11.))
                                                 .text_color(rgb(LINE_NUMBER))
-                                                .child(format!("→ {}", target)),
+                                                .child(format!("{} ←", target)),
                                         )
                                     },
                                 )
+                                .child(format!("⎇ {}", self.branch_label()))
                                 // copy-to-clipboard button for the branch name
                                 .child(
                                     div()
