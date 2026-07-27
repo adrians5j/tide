@@ -425,6 +425,32 @@ fn tree_clip() -> &'static Mutex<Option<(PathBuf, bool)>> {
     C.get_or_init(|| Mutex::new(None))
 }
 
+/// Special branches get a tag pill instead of plain text: `next` → green,
+/// `release/*` → orange. Returns the accent rgb, or None for ordinary branches.
+fn branch_style(name: &str) -> Option<u32> {
+    if name == "next" {
+        Some(GIT_NEW) // green
+    } else if name.starts_with("release/") {
+        Some(0xd9a23b) // orange
+    } else {
+        None
+    }
+}
+
+/// Render a branch name: a colored tag pill for special branches (next,
+/// release/*), otherwise plain text in `plain` color.
+fn branch_name_el(name: &str, plain: u32) -> gpui::Div {
+    match branch_style(name) {
+        Some(fg) => div()
+            .px_1()
+            .rounded_md()
+            .bg(rgba((fg << 8) | 0x33)) // ~20% tint of the accent
+            .text_color(rgb(fg))
+            .child(name.to_string()),
+        None => div().text_color(rgb(plain)).child(name.to_string()),
+    }
+}
+
 fn copy_path(src: &Path, dst: &Path) -> std::io::Result<()> {
     if src.is_dir() {
         fs::create_dir_all(dst)?;
@@ -5734,13 +5760,25 @@ impl Storm {
                                     |d, target| {
                                         d.child(
                                             div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_1()
                                                 .text_size(px(11.))
-                                                .text_color(rgb(LINE_NUMBER))
-                                                .child(format!("{} ←", target)),
+                                                .child(branch_name_el(&target, LINE_NUMBER))
+                                                .child(div().text_color(rgb(LINE_NUMBER)).child("←")),
                                         )
                                     },
                                 )
-                                .child(format!("⎇ {}", self.branch_label()))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(div().text_color(rgb(MUTED)).child("⎇"))
+                                        .child(branch_name_el(&self.branch_label(), MUTED)),
+                                )
                                 // copy-to-clipboard button for the branch name
                                 .child(
                                     div()
