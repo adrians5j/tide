@@ -2253,7 +2253,7 @@ struct Storm {
     palette_focus: FocusHandle,
     palette_query: Field,
     palette_sel: usize,
-    palette_results: Vec<(Cmd, &'static str, &'static str, &'static str)>,
+    palette_results: Vec<(Cmd, String, &'static str, &'static str)>,
     palette_gen: u64,
     // merge-conflicts dialog
     mc_open: bool,
@@ -4907,15 +4907,23 @@ impl Storm {
     }
 
     /// Fuzzy-filtered, ranked command list.
-    fn palette_items(&self) -> Vec<(Cmd, &'static str, &'static str, &'static str)> {
-        let has_admin = admin_url(&self.root).is_some();
-        let mut scored: Vec<(i32, (Cmd, &str, &str, &str))> = PALETTE
-            .iter()
-            .filter(|&&(c, ..)| c != Cmd::OpenAdmin || has_admin) // Open Admin: wby-next* only
-            .filter_map(|&(c, label, icon, hint)| {
-                fuzzy_score(&self.palette_query.text, label).map(|s| (s, (c, label, icon, hint)))
-            })
-            .collect();
+    fn palette_items(&self) -> Vec<(Cmd, String, &'static str, &'static str)> {
+        let admin = admin_url(&self.root);
+        let mut scored: Vec<(i32, (Cmd, String, &'static str, &'static str))> = Vec::new();
+        for &(c, label, icon, hint) in PALETTE {
+            // Open Admin: wby-next* only, and show the target URL in the label
+            let label = if c == Cmd::OpenAdmin {
+                match &admin {
+                    Some(u) => format!("Open Admin ({u})"),
+                    None => continue,
+                }
+            } else {
+                label.to_string()
+            };
+            if let Some(s) = fuzzy_score(&self.palette_query.text, &label) {
+                scored.push((s, (c, label, icon, hint)));
+            }
+        }
         scored.sort_by(|a, b| b.0.cmp(&a.0));
         scored.into_iter().map(|(_, it)| it).collect()
     }
@@ -7776,7 +7784,7 @@ impl Storm {
                         div()
                             .flex_grow(1.0)
                             .text_color(rgb(if sel { SEL_TEXT } else { TEXT }))
-                            .child(*label),
+                            .child(label.clone()),
                     )
                     .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(*hint))
                     .on_click(cx.listener(move |this, _ev, window, cx| {
@@ -10291,23 +10299,10 @@ fn normalize_url(s: &str) -> String {
     }
 }
 
-/// Open `url` in a chromeless app-mode Chromium window (a "simple browser"):
-/// tries Chrome/Chromium/Edge/Brave with `--app=`, falling back to the system
-/// default browser via `open`.
+/// Open `url` in the user's default browser.
 fn open_browser(url: &str) {
-    const BROWSERS: &[&str] = &[
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "/Applications/Chromium.app/Contents/MacOS/Chromium",
-        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-    ];
-    for bin in BROWSERS {
-        if Path::new(bin).exists() {
-            let _ = Command::new(bin).arg(format!("--app={url}")).arg("--new-window").spawn();
-            return;
-        }
-    }
-    let _ = Command::new("open").arg(url).spawn(); // default browser
+    // open in the user's default browser (respects Brave/Chrome/etc. preference)
+    let _ = Command::new("open").arg(url).spawn();
 }
 
 /// A vertical-activity-bar icon button.
