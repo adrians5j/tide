@@ -2310,6 +2310,8 @@ struct Storm {
     browser: Option<browser::Browser>, // embedded WebView, created on first open
     browser_url: Field,                // address bar
     browser_focus: FocusHandle,
+    // wby-next admin health: None = unknown, Some(true/false) = up/down
+    admin_up: Option<bool>,
 }
 
 /// Navigation requests a project view sends up to the workspace.
@@ -2572,12 +2574,14 @@ impl Storm {
                 f
             },
             browser_focus: cx.focus_handle(),
+            admin_up: None,
         };
         s.ignored = git_ignored_paths(&s.root); // hide git-ignored paths from the tree
         s.expanded.insert(s.root.clone()); // the root node starts expanded
         s.rebuild();
         s.start_git_poll(cx);
         s.start_caret_blink(cx);
+        s.start_admin_health(cx);
         s.lsp = Lsp::new(&s.root);
         let root = s.root.clone();
         let term = cx.new(|cx| Terminal::new(root, cx));
@@ -2623,6 +2627,30 @@ impl Storm {
         } else {
             ""
         }
+    }
+
+    /// Poll the wby-next admin URL periodically (every ~15s) and cache up/down.
+    fn start_admin_health(&self, cx: &mut Context<Self>) {
+        let Some(url) = admin_url(&self.root) else { return };
+        cx.spawn(async move |this, cx| loop {
+            let u = url.clone();
+            let up = cx.background_executor().spawn(async move { admin_reachable(&u) }).await;
+            if this.update(cx, |this, cx| { this.admin_up = Some(up); cx.notify(); }).is_err() {
+                break;
+            }
+            cx.background_executor().timer(Duration::from_secs(15)).await;
+        })
+        .detach();
+    }
+
+    /// Re-check admin health now (used by the summary Refresh button).
+    fn check_admin_now(&self, cx: &mut Context<Self>) {
+        let Some(url) = admin_url(&self.root) else { return };
+        cx.spawn(async move |this, cx| {
+            let up = cx.background_executor().spawn(async move { admin_reachable(&url) }).await;
+            this.update(cx, |this, cx| { this.admin_up = Some(up); cx.notify(); }).ok();
+        })
+        .detach();
     }
 
     fn start_caret_blink(&self, cx: &mut Context<Self>) {
@@ -10269,6 +10297,16 @@ fn admin_url(root: &Path) -> Option<String> {
     (!n.is_empty() && n.chars().all(|c| c.is_ascii_digit())).then(|| format!("https://admin{n}.localhost"))
 }
 
+/// Is the admin URL reachable? Any HTTP response (even 4xx/5xx) counts as up;
+/// a connection failure ("000") is down. `-k` since local certs are self-signed.
+fn admin_reachable(url: &str) -> bool {
+    Command::new("curl")
+        .args(["-sk", "--max-time", "3", "-o", "/dev/null", "-w", "%{http_code}", url])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().unwrap_or(0) > 0)
+        .unwrap_or(false)
+}
+
 /// Default browser URL for a project. `wby-next{N}` → `https://admin{N}.localhost`
 /// (Webiny multi-workspace convention); everything else → localhost:3000.
 fn default_browser_url(root: &Path) -> String {
@@ -10815,6 +10853,7 @@ impl Storm {
                             .tooltip(tip("Refresh branch + PR status"))
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 this.refresh_pr_link(cx);
+                                this.check_admin_now(cx);
                                 cx.notify();
                             })),
                     ),
@@ -10889,6 +10928,32 @@ impl Storm {
                         })),
                 ),
         );
+
+        // admin (wby-next* only): health dot + clickable host → opens the browser
+        if let Some(url) = admin_url(&self.root) {
+            let host = url.trim_start_matches("https://").trim_start_matches("http://").to_string();
+            let (dot, up_txt) = match self.admin_up {
+                Some(true) => (GIT_NEW, "up"),
+                Some(false) => (GIT_DELETED, "down"),
+                None => (MUTED, "checking…"),
+            };
+            let open = url.clone();
+            card = card.child(
+                row(IC_BROWSER, ACCENT)
+                    .child(
+                        div()
+                            .id("status-admin")
+                            .cursor_pointer()
+                            .text_size(px(13.))
+                            .text_color(rgb(ACCENT))
+                            .hover(|s| s.underline())
+                            .child(host)
+                            .on_click(move |_e, _w, _cx| open_browser(&open)),
+                    )
+                    .child(div().w(px(6.)).flex_shrink_0().text_size(px(12.)).text_color(rgb(dot)).child("●"))
+                    .child(div().text_size(px(12.)).text_color(rgb(dot)).child(up_txt)),
+            );
+        }
 
         div()
             .flex_grow(1.0)
