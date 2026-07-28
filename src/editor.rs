@@ -657,9 +657,14 @@ impl Editor {
     fn act_home(&mut self, _: &Home, w: &mut Window, cx: &mut Context<Self>) { self.on_key("home", w, cx); }
     fn act_end(&mut self, _: &End, w: &mut Window, cx: &mut Context<Self>) { self.on_key("end", w, cx); }
     fn act_newline(&mut self, _: &Newline, w: &mut Window, cx: &mut Context<Self>) {
-        // in read-only, Enter enables edit mode (no need for cmd+Enter)
+        // in read-only: first Enter shows the hint; a second Enter (while the hint
+        // is still visible) enables edit mode — so you don't flip in by accident
         if self.read_only {
-            cx.emit(ToggleReadOnly);
+            if self.ro_hint {
+                cx.emit(ToggleReadOnly);
+            } else {
+                self.show_ro_hint(cx);
+            }
             return;
         }
         self.on_key("enter", w, cx);

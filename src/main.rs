@@ -6012,7 +6012,7 @@ impl Storm {
                                 .text_color(rgb(MUTED))
                                 .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
                                 .child(div().font_family(ICON_FONT).text_size(px(12.)).child(IC_BROWSER))
-                                .child("Admin")
+                                .child(url.trim_start_matches("https://").trim_start_matches("http://").to_string())
                                 .tooltip(|_w, cx| cx.new(|_| TooltipView { text: "Open Admin".into() }).into())
                                 .on_click(move |_e, _w, _cx| open_browser(&url)),
                         )
