@@ -1654,6 +1654,7 @@ enum Cmd {
     ProcessManager,
     ToggleReadOnly,
     ResolveConflicts,
+    OpenAdmin,
 }
 
 /// (command, label, icon glyph, shortcut hint)
@@ -1682,6 +1683,7 @@ const PALETTE: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::ProcessManager, "Process Manager", IC_TOOLS, ""),
     (Cmd::ToggleReadOnly, "Toggle Read-Only / Edit Mode", IC_HOME, ""),
     (Cmd::ResolveConflicts, "Resolve Merge Conflicts", IC_BRANCH, ""),
+    (Cmd::OpenAdmin, "Open Admin", IC_BROWSER, ""),
 ];
 
 /// A running process row for the Process Manager dialog.
@@ -4906,8 +4908,10 @@ impl Storm {
 
     /// Fuzzy-filtered, ranked command list.
     fn palette_items(&self) -> Vec<(Cmd, &'static str, &'static str, &'static str)> {
+        let has_admin = admin_url(&self.root).is_some();
         let mut scored: Vec<(i32, (Cmd, &str, &str, &str))> = PALETTE
             .iter()
+            .filter(|&&(c, ..)| c != Cmd::OpenAdmin || has_admin) // Open Admin: wby-next* only
             .filter_map(|&(c, label, icon, hint)| {
                 fuzzy_score(&self.palette_query.text, label).map(|s| (s, (c, label, icon, hint)))
             })
@@ -4960,6 +4964,11 @@ impl Storm {
             Cmd::ProcessManager => self.open_process_manager(window, cx),
             Cmd::ToggleReadOnly => self.toggle_read_only(cx),
             Cmd::ResolveConflicts => self.open_conflicts(window, cx),
+            Cmd::OpenAdmin => {
+                if let Some(u) = admin_url(&self.root) {
+                    open_browser(&u);
+                }
+            }
         }
     }
 
@@ -5976,6 +5985,28 @@ impl Storm {
                                     cx.new(|_| TooltipView { text: tip.into() }).into()
                                 })
                                 .on_click(cx.listener(|this, _e, _w, cx| this.refresh_pr_link(cx))),
+                        )
+                    })
+                    // Open Admin (wby-next* only): opens admin{N}.localhost
+                    .when_some(admin_url(&self.root), |d, url| {
+                        d.child(
+                            div()
+                                .id("open-admin")
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .h(px(18.))
+                                .px_1()
+                                .gap_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .text_size(px(11.))
+                                .text_color(rgb(MUTED))
+                                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                .child(div().font_family(ICON_FONT).text_size(px(12.)).child(IC_BROWSER))
+                                .child("Admin")
+                                .tooltip(|_w, cx| cx.new(|_| TooltipView { text: "Open Admin".into() }).into())
+                                .on_click(move |_e, _w, _cx| open_browser(&url)),
                         )
                     }),
             );
@@ -10220,6 +10251,14 @@ impl Storm {
             .child(bar)
             .child(div().flex_grow(1.0).min_h(px(0.)))
     }
+}
+
+/// The Webiny admin URL for a `wby-next{N}` project (`https://admin{N}.localhost`),
+/// or None for any other project.
+fn admin_url(root: &Path) -> Option<String> {
+    let name = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let n = name.strip_prefix("wby-next")?;
+    (!n.is_empty() && n.chars().all(|c| c.is_ascii_digit())).then(|| format!("https://admin{n}.localhost"))
 }
 
 /// Default browser URL for a project. `wby-next{N}` → `https://admin{N}.localhost`
