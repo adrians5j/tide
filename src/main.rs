@@ -2638,7 +2638,7 @@ impl Storm {
             if this.update(cx, |this, cx| { this.admin_up = Some(up); cx.notify(); }).is_err() {
                 break;
             }
-            cx.background_executor().timer(Duration::from_secs(15)).await;
+            cx.background_executor().timer(Duration::from_secs(7)).await;
         })
         .detach();
     }
@@ -6025,7 +6025,8 @@ impl Storm {
                     })
                     // Open Admin (wby-next* only): opens admin{N}.localhost
                     .when_some(admin_url(&self.root), |d, url| {
-                        d.child(
+                        d.child(div().w(px(1.)).h(px(16.)).mx_1().bg(rgb(BORDER))) // separator
+                            .child(
                             div()
                                 .id("open-admin")
                                 .flex()
