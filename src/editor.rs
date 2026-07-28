@@ -656,7 +656,14 @@ impl Editor {
     fn act_down(&mut self, _: &MoveDown, w: &mut Window, cx: &mut Context<Self>) { self.on_key("down", w, cx); }
     fn act_home(&mut self, _: &Home, w: &mut Window, cx: &mut Context<Self>) { self.on_key("home", w, cx); }
     fn act_end(&mut self, _: &End, w: &mut Window, cx: &mut Context<Self>) { self.on_key("end", w, cx); }
-    fn act_newline(&mut self, _: &Newline, w: &mut Window, cx: &mut Context<Self>) { self.on_key("enter", w, cx); }
+    fn act_newline(&mut self, _: &Newline, w: &mut Window, cx: &mut Context<Self>) {
+        // in read-only, Enter enables edit mode (no need for cmd+Enter)
+        if self.read_only {
+            cx.emit(ToggleReadOnly);
+            return;
+        }
+        self.on_key("enter", w, cx);
+    }
     /// ⌘⏎ from a read-only editor asks the workspace to switch to edit mode
     /// (same effect as clicking the "enable EDIT" hint). A no-op when already
     /// editable, since the workspace only flips when currently read-only.
@@ -2277,7 +2284,7 @@ impl Editor {
             // capture the click so the editor underneath doesn't move the cursor
             // (which was re-anchoring the hint and eating the link click)
             .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
-            .child("🔒 Read-only — press ⌘⏎ or")
+            .child("🔒 Read-only — press ⏎ or")
             // clickable link → workspace flips to edit mode
             .child(
                 div()
