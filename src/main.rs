@@ -365,6 +365,41 @@ fn recents_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".config/tide/recent-projects.txt"))
 }
 
+/// Persistent custom workspace titles, keyed by absolute project path.
+fn ws_titles_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".config/tide/workspace-titles.json"))
+}
+fn load_ws_titles() -> HashMap<String, String> {
+    ws_titles_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+fn load_ws_title(root: &Path) -> Option<String> {
+    load_ws_titles().remove(&root.to_string_lossy().to_string())
+}
+/// Set (or clear, if empty) the custom title for `root` and persist.
+fn save_ws_title(root: &Path, title: Option<&str>) {
+    let Some(path) = ws_titles_path() else { return };
+    let mut m = load_ws_titles();
+    let key = root.to_string_lossy().to_string();
+    match title.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => {
+            m.insert(key, t.to_string());
+        }
+        None => {
+            m.remove(&key);
+        }
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(s) = serde_json::to_string_pretty(&m) {
+        let _ = std::fs::write(path, s);
+    }
+}
+
 /// Recently-opened project paths, most recent first; only existing dirs.
 /// Claude Code's per-project session dir name: the cwd with every non-alphanumeric
 /// char replaced by '-' (e.g. /Users/adrian/dev/tide → -Users-adrian-dev-tide).
@@ -1655,6 +1690,7 @@ enum Cmd {
     ToggleReadOnly,
     ResolveConflicts,
     OpenAdmin,
+    SetWorkspaceTitle,
 }
 
 /// (command, label, icon glyph, shortcut hint)
@@ -1684,6 +1720,7 @@ const PALETTE: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::ToggleReadOnly, "Toggle Read-Only / Edit Mode", IC_HOME, ""),
     (Cmd::ResolveConflicts, "Resolve Merge Conflicts", IC_BRANCH, ""),
     (Cmd::OpenAdmin, "Open Admin", IC_BROWSER, ""),
+    (Cmd::SetWorkspaceTitle, "Set Workspace Title…", IC_HOME, ""),
 ];
 
 /// A running process row for the Process Manager dialog.
@@ -2312,6 +2349,11 @@ struct Storm {
     browser_focus: FocusHandle,
     // wby-next admin health: None = unknown, Some(true/false) = up/down
     admin_up: Option<bool>,
+    // custom workspace title (persisted); overrides the folder name in the UI
+    ws_title: Option<String>,
+    title_open: bool,
+    title_focus: FocusHandle,
+    title_query: Field,
 }
 
 /// Navigation requests a project view sends up to the workspace.
@@ -2356,6 +2398,7 @@ impl Storm {
         let mut expanded = HashSet::new();
         expanded.insert(root.clone());
         let browser_default = default_browser_url(&root);
+        let ws_title = load_ws_title(&root);
         let mut s = Self {
             root,
             expanded,
@@ -2575,6 +2618,10 @@ impl Storm {
             },
             browser_focus: cx.focus_handle(),
             admin_up: None,
+            ws_title,
+            title_open: false,
+            title_focus: cx.focus_handle(),
+            title_query: Field::default(),
         };
         s.ignored = git_ignored_paths(&s.root); // hide git-ignored paths from the tree
         s.expanded.insert(s.root.clone()); // the root node starts expanded
@@ -2864,6 +2911,9 @@ impl Storm {
     }
 
     fn project_name(&self) -> String {
+        if let Some(t) = self.ws_title.as_ref().filter(|t| !t.trim().is_empty()) {
+            return t.clone();
+        }
         self.root
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -3742,6 +3792,73 @@ impl Storm {
             }
         }
         cx.notify();
+    }
+
+    fn open_title_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.title_open = true;
+        self.title_query.set(self.ws_title.clone().unwrap_or_default());
+        window.focus(&self.title_focus, cx);
+        cx.notify();
+    }
+
+    fn title_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match ev.keystroke.key.as_str() {
+            "escape" => {
+                self.title_open = false;
+                self.focus_active(window, cx);
+            }
+            "enter" => {
+                let t = self.title_query.text.trim().to_string();
+                self.ws_title = (!t.is_empty()).then(|| t.clone());
+                save_ws_title(&self.root, if t.is_empty() { None } else { Some(&t) });
+                self.title_open = false;
+                self.focus_active(window, cx);
+            }
+            _ => {
+                Self::field_input(&mut self.title_query, &ev.keystroke, cx, |_| true);
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_title_prompt(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let w = 360.0_f32;
+        let left = ((self.win_width - w) / 2.0).max(0.);
+        div()
+            .absolute()
+            .top(px(120.))
+            .left(px(left))
+            .w(px(w))
+            .bg(rgb(PANEL_BG))
+            .border_1()
+            .border_color(rgb(ACCENT))
+            .rounded_md()
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .track_focus(&self.title_focus)
+            .on_key_down(cx.listener(Self::title_key))
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .child("Workspace title  (empty = folder name)"),
+            )
+            .child(
+                div()
+                    .mx_3()
+                    .mb_3()
+                    .px_2()
+                    .py_1()
+                    .bg(rgb(BG))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .rounded_md()
+                    .text_color(rgb(TEXT))
+                    .child(self.title_query.render(self.caret(), SELECTION)),
+            )
     }
 
     // ── toolbar alias actions (run zsh aliases in the terminal) ─────────────
@@ -5005,6 +5122,7 @@ impl Storm {
                     open_browser(&u);
                 }
             }
+            Cmd::SetWorkspaceTitle => self.open_title_prompt(window, cx),
         }
     }
 
@@ -5532,11 +5650,7 @@ impl Render for Storm {
         }
 
         // WebStorm-style title: "<project> - <open file>"
-        let project = self
-            .root
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "tide".into());
+        let project = self.project_name();
         let title = match self.active_path() {
             Some(p) => format!(
                 "{} - {}",
@@ -5734,6 +5848,9 @@ impl Render for Storm {
         if self.br_open {
             root = root.child(self.render_branch_prompt(cx));
         }
+        if self.title_open {
+            root = root.child(self.render_title_prompt(cx));
+        }
         if self.prc_open {
             root = root.child(self.render_pr_create_prompt(cx));
         }
@@ -5895,6 +6012,24 @@ impl Storm {
                                 this.ws_open = !this.ws_open;
                                 cx.notify();
                             })),
+                    )
+                    // edit workspace title
+                    .child(
+                        div()
+                            .id("edit-ws-title")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h(px(18.))
+                            .px_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_size(px(11.))
+                            .text_color(rgb(MUTED))
+                            .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                            .child("✎")
+                            .tooltip(|_w, cx| cx.new(|_| TooltipView { text: "Set workspace title".into() }).into())
+                            .on_click(cx.listener(|this, _e, window, cx| this.open_title_prompt(window, cx))),
                     )
                     .when(!self.branch.is_empty(), |d| {
                         d.child(
