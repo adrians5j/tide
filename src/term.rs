@@ -4,9 +4,10 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color as VteColor, NamedColor, Processor, StdSyncHandler};
 use gpui::{
-    App, Bounds, ClipboardItem, Context, DispatchPhase, Element, ElementId, Entity, FocusHandle, Focusable,
+    App, Bounds, ClipboardItem, Context, DispatchPhase, Element, ElementId, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, Focusable,
     GlobalElementId, InspectorElementId, KeyDownEvent, Keystroke, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollWheelEvent, ShapedLine, Style,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollDelta, ScrollWheelEvent, ShapedLine, Style,
     TextRun, Window, div, fill, font, point, prelude::*, px, relative, rgb, size,
 };
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -135,7 +136,14 @@ pub struct Terminal {
 }
 
 impl Terminal {
-    pub fn new(working_dir: std::path::PathBuf, cx: &mut Context<Self>) -> Self {
+    /// `rpc` is `(url, token)` for TIDE's loopback control channel; it lands in
+    /// the shell's environment together with this pane's id, so an agent running
+    /// here can report its state back and be attributed to this exact pane.
+    pub fn new(
+        working_dir: std::path::PathBuf,
+        rpc: Option<(String, String)>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let cols = 80usize;
         let rows = 24usize;
 
@@ -151,8 +159,14 @@ impl Terminal {
 
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
         let mut cmd = CommandBuilder::new(shell);
-        cmd.cwd(working_dir);
+        cmd.cwd(&working_dir);
         cmd.env("TERM", "xterm-256color");
+        if let Some((url, token)) = rpc {
+            cmd.env("TIDE_RPC", url);
+            cmd.env("TIDE_TOKEN", token);
+            cmd.env("TIDE_PANE", cx.entity_id().as_u64().to_string());
+            cmd.env("TIDE_ROOT", working_dir.to_string_lossy().to_string());
+        }
         let child = pair.slave.spawn_command(cmd).expect("spawn shell");
         drop(pair.slave);
 
@@ -228,6 +242,12 @@ impl Terminal {
             sel_text: None,
             _child: child,
         }
+    }
+
+    /// Window-space rect this terminal painted into last frame (None before the
+    /// first paint). Used by the pane splitter to size a drag.
+    pub fn bounds(&self) -> Option<Bounds<Pixels>> {
+        self.last_bounds
     }
 
     /// Map a window-space position to a 0-based (col, row) display cell.
@@ -400,6 +420,27 @@ impl Terminal {
         self.write(s.as_bytes());
     }
 
+    /// Paste multi-line text as ONE paste. A TUI prompt (Claude Code, an editor)
+    /// treats a bare newline as "submit", so sending several lines raw would fire
+    /// the prompt on the first one; bracketed paste markers keep them together.
+    /// Caller sends the newline separately when it wants the prompt submitted.
+    pub fn send_paste(&self, text: &str) {
+        let bracketed = self
+            .term
+            .lock()
+            .map(|g| g.mode().contains(TermMode::BRACKETED_PASTE))
+            .unwrap_or(false);
+        let mut buf = Vec::with_capacity(text.len() + 12);
+        if bracketed {
+            buf.extend_from_slice(b"\x1b[200~");
+            buf.extend_from_slice(text.as_bytes());
+            buf.extend_from_slice(b"\x1b[201~");
+        } else {
+            buf.extend_from_slice(text.as_bytes());
+        }
+        self.write(&buf);
+    }
+
     /// Kill the child shell (when closing a terminal tab).
     pub fn kill(&mut self) {
         let _ = self._child.kill();
@@ -436,6 +477,18 @@ impl Terminal {
         let ks = &ev.keystroke;
         // keep the cursor solid while actively typing
         self.cursor_on = true;
+        // shift+PageUp/PageDown page through the scrollback — a keyboard way out
+        // when the wheel is awkward. Unshifted PageUp/Down still goes to the app.
+        if ks.modifiers.shift && matches!(ks.key.as_str(), "pageup" | "pagedown") {
+            let half = (self.rows.max(2) / 2) as i32;
+            let lines = if ks.key == "pageup" { half } else { -half };
+            if let Ok(mut g) = self.term.lock() {
+                g.scroll_display(Scroll::Delta(lines));
+            }
+            self.dirty.store(true, Ordering::Relaxed);
+            cx.notify();
+            return;
+        }
         // cmd+c copies the current selection (don't forward it to the shell).
         // Compute from the live selection so it works for drag, double-click and
         // select-all alike — not just whatever last set `sel_text`.
@@ -542,11 +595,14 @@ impl Terminal {
 
     fn on_scroll(&mut self, ev: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let report = self.term.lock().map(|g| g.mode().intersects(TermMode::MOUSE_MODE)).unwrap_or(false);
-        let dy = f32::from(ev.delta.pixel_delta(px(LINE_HEIGHT)).y);
-        // Bank fractional lines and apply a speed factor so a macOS trackpad's
-        // large, momentum-driven pixel deltas don't overscroll. TIDE_SCROLL_SPEED
-        // tunes it (1.0 = one line per line-height of travel; lower = calmer).
-        self.scroll_accum += (dy / LINE_HEIGHT) * scroll_speed();
+        // A mouse wheel sends discrete line deltas — one notch has to move one
+        // line, so dampening must not apply (it made a wheel need 3 notches per
+        // line). Only a trackpad's momentum-driven pixel deltas get the speed
+        // factor, which TIDE_SCROLL_SPEED tunes. Fractions bank across events.
+        self.scroll_accum += match ev.delta {
+            ScrollDelta::Lines(d) => d.y,
+            ScrollDelta::Pixels(d) => (f32::from(d.y) / LINE_HEIGHT) * scroll_speed(),
+        };
         let lines = self.scroll_accum.trunc() as i32;
         if lines == 0 {
             return; // keep banking until a whole line accrues
@@ -598,6 +654,98 @@ impl Render for Terminal {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .child(TerminalElement { term: cx.entity() })
+    }
+}
+
+// ── EntityInputHandler: where typed text actually comes from ───────────────
+//
+// macOS delivers text through NSTextInputClient rather than as raw keystrokes:
+// ordinary typing, dictation, IME composition and the emoji picker all arrive
+// via `insertText:`. `keystroke_to_bytes` therefore handles only control keys —
+// if both paths inserted, every character would be written twice.
+
+impl EntityInputHandler for Terminal {
+    fn text_for_range(
+        &mut self,
+        _range: std::ops::Range<usize>,
+        _actual: &mut Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        None // the grid isn't an editable buffer; nothing to read back
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::UTF16Selection> {
+        // an empty selection at the origin: enough for the input system to
+        // consider this a live text destination
+        Some(gpui::UTF16Selection { range: 0..0, reversed: false })
+    }
+
+    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<std::ops::Range<usize>> {
+        None
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {}
+
+    fn replace_text_in_range(
+        &mut self,
+        _range: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        if new_text.is_empty() {
+            return;
+        }
+        self.scroll_to_bottom();
+        // multi-line text (a dictated sentence, a paste) goes as one bracketed
+        // paste so a TUI prompt doesn't submit it line by line
+        if new_text.contains('\n') {
+            self.send_paste(new_text);
+        } else {
+            self.write(new_text.as_bytes());
+        }
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        _new_selected: Option<std::ops::Range<usize>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // in-progress IME composition: send it through; the app echoes it back
+        self.replace_text_in_range(range, new_text, window, cx);
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range: std::ops::Range<usize>,
+        _bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        // where an IME candidate window should sit: at the cursor
+        let b = self.last_bounds?;
+        Some(Bounds::new(
+            gpui::point(b.left(), b.top() + px(LINE_HEIGHT)),
+            gpui::size(px(1.), px(LINE_HEIGHT)),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
     }
 }
 
@@ -670,15 +818,16 @@ fn keystroke_to_bytes(ks: &Keystroke) -> Option<Vec<u8>> {
         "tab" => b"\t",
         "escape" => b"\x1b",
         _ => {
-            if let Some(kc) = &ks.key_char {
-                // Alt prefixes with ESC (meta)
-                if m.alt {
-                    let mut v = vec![0x1b];
-                    v.extend_from_slice(kc.as_bytes());
-                    return Some(v);
-                }
-                return Some(kc.as_bytes().to_vec());
+            // Alt prefixes with ESC (meta) — macOS won't deliver ⌥x as text
+            if let (Some(kc), true) = (&ks.key_char, m.alt) {
+                let mut v = vec![0x1b];
+                v.extend_from_slice(kc.as_bytes());
+                return Some(v);
             }
+            // Plain printable characters arrive through EntityInputHandler
+            // (`insertText:`), which is also how dictation, IME composition and
+            // the emoji picker deliver text. Writing them here as well would
+            // double every keystroke.
             return None;
         }
     };
@@ -1035,6 +1184,14 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        // typed text (and dictation / IME) is routed here, not through key events
+        let focus_handle = self.term.read(cx).focus_handle.clone();
+        window.handle_input(
+            &focus_handle,
+            ElementInputHandler::new(_bounds, self.term.clone()),
+            cx,
+        );
+
         for bg in prepaint.bgs.drain(..) {
             window.paint_quad(bg);
         }

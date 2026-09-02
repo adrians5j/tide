@@ -21,6 +21,31 @@ impl Highlighter {
         Self { syntaxes, theme }
     }
 
+    /// Highlight a snippet by language tag — a markdown fence's `ts`, `rust`,
+    /// `sh`, … Falls back to plain text when the tag is missing or unknown, which
+    /// renders as one uncolored run per line.
+    pub fn highlight_lang(&self, text: &str, lang: &str) -> Vec<Vec<Run>> {
+        let syntax = self
+            .syntaxes
+            .find_syntax_by_token(lang)
+            .or_else(|| self.syntaxes.find_syntax_by_extension(lang))
+            .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text());
+        let mut hl = HighlightLines::new(syntax, &self.theme);
+        text.split('\n')
+            .map(|line| match hl.highlight_line(line, &self.syntaxes) {
+                Ok(ranges) => ranges
+                    .iter()
+                    .map(|(style, piece)| {
+                        let c = style.foreground;
+                        let rgb = ((c.r as u32) << 16) | ((c.g as u32) << 8) | (c.b as u32);
+                        (piece.len(), rgb)
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            })
+            .collect()
+    }
+
     /// Highlight a whole file. Returns one Vec<Run> per line, parallel to the
     /// file's lines. Run byte-lengths sum to each line's byte length.
     pub fn highlight(&self, text: &str, path: &Path) -> Vec<Vec<Run>> {

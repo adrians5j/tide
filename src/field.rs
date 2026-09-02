@@ -53,6 +53,10 @@ pub enum Edit {
 /// cmd+c/x/v clipboard, cmd+z/cmd+shift+z undo/redo, and word/line deletes.
 #[derive(Default)]
 pub struct Field {
+    /// When set, Enter inserts a newline and pasted newlines survive — for a
+    /// comment body rather than a one-line filter. The submit key is the
+    /// caller's business (⌘↩ where this is used).
+    pub multiline: bool,
     pub text: String,
     pub caret: usize,
     anchor: Option<usize>,        // selection anchor; selection spans anchor..caret
@@ -63,6 +67,11 @@ pub struct Field {
 }
 
 impl Field {
+    /// A field whose ⇧↩/⌘↩ insert line breaks and whose pastes keep newlines.
+    pub fn multiline() -> Self {
+        Self { multiline: true, ..Self::default() }
+    }
+
     pub fn clear(&mut self) {
         self.text.clear();
         self.caret = 0;
@@ -83,6 +92,29 @@ impl Field {
         self.anchor = None;
     }
 
+    /// Insert text at the caret, replacing any selection. This is the path
+    /// dictation and IME take: macOS delivers those through `insertText:`, not as
+    /// key events, so they never reach `key`.
+    pub fn insert_text(&mut self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        let s = if self.multiline { s.replace('\r', "\n") } else { s.replace(['\n', '\r'], " ") };
+        self.push_undo();
+        self.delete_selection();
+        self.insert(&s);
+        self.typing = false;
+    }
+
+    /// Insert a line break at the caret (a host binds its own key to this —
+    /// the agent box uses ctrl+j, since ↩ sends).
+    pub fn newline(&mut self) {
+        self.push_undo();
+        self.delete_selection();
+        self.insert("\n");
+        self.typing = false;
+    }
+
     fn insert(&mut self, s: &str) {
         self.text.insert_str(self.caret, s);
         self.caret += s.len();
@@ -94,7 +126,12 @@ impl Field {
         if a == self.caret {
             None
         } else {
-            Some((a.min(self.caret), a.max(self.caret)))
+            let c = self.caret_safe();
+            let mut a = a.min(self.text.len());
+            while a > 0 && !self.text.is_char_boundary(a) {
+                a -= 1;
+            }
+            (a != c).then(|| (a.min(c), a.max(c)))
         }
     }
 
@@ -153,15 +190,65 @@ impl Field {
         self.typing = false;
     }
 
+    /// Caret snapped into the text and onto a char boundary. Every index that
+    /// reaches a slice goes through here: a stray mid-character caret (an IME
+    /// commit, a host that hands us byte offsets) must degrade, never panic.
+    fn caret_safe(&self) -> usize {
+        let mut i = self.caret.min(self.text.len());
+        while i > 0 && !self.text.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    }
+
     /// The text with `glyph` inserted at the caret (caret-only rendering).
     pub fn display(&self, glyph: &str) -> String {
-        let (a, b) = self.text.split_at(self.caret);
+        let (a, b) = self.text.split_at(self.caret_safe());
         format!("{a}{glyph}{b}")
     }
 
     /// Render the text with the selection highlighted (and caret when there's
     /// no selection). `glyph` is the blinking caret string.
     pub fn render(&self, glyph: &str, sel_bg: u32) -> Div {
+        if self.multiline {
+            let Some((s, e)) = self.selection() else {
+                // stack the lines; the caret glyph is already inside `display`
+                let shown = self.display(glyph);
+                let mut col = div().flex().flex_col();
+                for line in shown.split('\n') {
+                    col = col.child(div().child(line.to_string()));
+                }
+                return col;
+            };
+            // a selection spans lines: highlight each line's slice of it, and
+            // mark a swallowed newline with a highlighted trailing space so
+            // whole-line and empty-line selections are still visible
+            let mut col = div().flex().flex_col();
+            let mut off = 0usize;
+            for line in self.text.split('\n') {
+                let (ls, le) = (off, off + line.len());
+                off = le + 1; // past the '\n'
+                let (a, b) = (s.clamp(ls, le), e.clamp(ls, le));
+                let mut row = div().flex().flex_row();
+                // `get` rather than slicing: an index inside a multi-byte char
+                // yields None and the line renders unhighlighted instead of
+                // taking the process down
+                match (line.get(..a - ls), line.get(a - ls..b - ls), line.get(b - ls..)) {
+                    (Some(pre), Some(sel), Some(post)) if a != b => {
+                        row = row
+                            .child(div().child(pre.to_string()))
+                            .child(div().bg(rgb(sel_bg)).child(sel.to_string()))
+                            .child(div().child(post.to_string()));
+                    }
+                    _ => row = row.child(div().child(line.to_string())),
+                }
+                if s <= le && e > le {
+                    row = row.child(div().bg(rgb(sel_bg)).child(" "));
+                }
+                col = col.child(row);
+            }
+            return col;
+        }
         if let Some((s, e)) = self.selection() {
             div()
                 .flex()
@@ -219,8 +306,20 @@ impl Field {
         let moved = match key {
             "left" if m.alt => Some(word_left(&self.text, self.caret)),
             "right" if m.alt => Some(word_right(&self.text, self.caret)),
-            "left" if m.platform => Some(0),
-            "right" if m.platform => Some(self.text.len()),
+            // ⌘←/⌘→: line start/end in a text area, buffer start/end in a
+            // one-line field (where they're the same thing). ⇧ extends, since
+            // every motion here runs through `move_caret`.
+            "left" if m.platform => Some(if self.multiline {
+                self.text[..self.caret_safe()].rfind('\n').map(|i| i + 1).unwrap_or(0)
+            } else {
+                0
+            }),
+            "right" if m.platform => Some(if self.multiline {
+                let at = self.caret_safe();
+                self.text[at..].find('\n').map(|i| at + i).unwrap_or_else(|| self.text.len())
+            } else {
+                self.text.len()
+            }),
             "left" => {
                 if !shift {
                     if let Some((s, _)) = self.selection() {
@@ -270,6 +369,14 @@ impl Field {
                 }
                 Edit::Changed
             }
+            // ↩ belongs to the form (it submits); ⇧↩ / ⌘↩ add the line break
+            "enter" if self.multiline && (m.shift || m.platform) && !m.control => {
+                self.push_undo();
+                self.delete_selection();
+                self.insert("\n");
+                self.typing = false;
+                Edit::Changed
+            }
             "delete" => {
                 self.push_undo();
                 self.typing = false;
@@ -284,7 +391,8 @@ impl Field {
             }
             "v" if m.platform => {
                 if let Some(t) = clip {
-                    let pasted = t.replace(['\n', '\r'], " ");
+                    let pasted =
+                        if self.multiline { t.replace('\r', "\n") } else { t.replace(['\n', '\r'], " ") };
                     let pasted = pasted.trim();
                     if !pasted.is_empty() && accept(pasted) {
                         self.push_undo();
@@ -312,5 +420,60 @@ impl Field {
                 Edit::None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn field(text: &str, caret: usize) -> Field {
+        let mut f = Field::multiline();
+        f.set(text.to_string());
+        f.caret = caret;
+        f
+    }
+
+    fn press(f: &mut Field, key: &str, platform: bool, shift: bool) {
+        let ks = Keystroke {
+            modifiers: gpui::Modifiers { platform, shift, ..Default::default() },
+            key: key.into(),
+            key_char: None,
+        };
+        f.key(&ks, None, |_| true);
+    }
+
+    /// ⌘←/⌘→ work on the caret's own line, not the whole buffer — a text area
+    /// with three paragraphs would otherwise jump to the very top or bottom.
+    #[test]
+    fn cmd_arrows_go_to_the_line_edges() {
+        let mut f = field("one\ntwo\nthree", 5); // inside "two"
+        press(&mut f, "left", true, false);
+        assert_eq!(f.caret, 4, "start of the middle line");
+        press(&mut f, "right", true, false);
+        assert_eq!(f.caret, 7, "end of the middle line");
+    }
+
+    /// ⇧ turns the same motions into a selection.
+    #[test]
+    fn shift_cmd_arrows_select_to_the_line_edge() {
+        let mut f = field("one\ntwo\nthree", 5);
+        press(&mut f, "right", true, true);
+        assert_eq!(f.selection(), Some((5, 7)));
+        let mut f = field("one\ntwo\nthree", 5);
+        press(&mut f, "left", true, true);
+        assert_eq!(f.selection(), Some((4, 5)));
+    }
+
+    /// A one-line field keeps buffer start/end.
+    #[test]
+    fn a_single_line_field_still_jumps_to_the_ends() {
+        let mut f = Field::default();
+        f.set("hello".into());
+        f.caret = 2;
+        press(&mut f, "right", true, false);
+        assert_eq!(f.caret, 5);
+        press(&mut f, "left", true, false);
+        assert_eq!(f.caret, 0);
     }
 }

@@ -14,6 +14,7 @@ use crate::field::{Edit, Field};
 use crate::lsp::{parse_completions, CompItem, Lsp};
 use crate::syntax::Highlighter;
 use crate::theme::*;
+use crate::{IC_COMMENT, ICON_FONT};
 
 #[derive(Clone)]
 struct Snapshot {
@@ -28,9 +29,16 @@ actions!(
         SelectLeft, SelectRight, SelectUp, SelectDown, SelectHome, SelectEnd, SelectAll, Copy,
         Paste, Cut, WordLeft, WordRight, SelectWordLeft, SelectWordRight, Undo, Redo, DeleteLine,
         MoveLineUp, MoveLineDown, CompTrigger, CompDismiss, GotoDef, SearchOpen,
-        DeleteWordLeft, DeleteWordRight, EnableEdit
+        DeleteWordLeft, DeleteWordRight, EnableEdit, DupLine, ToggleComment
     ]
 );
+
+/// Emitted when the gutter's "+" is used: comment on lines `line..=end`
+/// (1-based, inclusive).
+pub struct CommentRequest {
+    pub line: usize,
+    pub end: usize,
+}
 
 /// Emitted when the editor wants the workspace to open a file at a position
 /// (e.g. go-to-definition). The workspace handles opening + cursor placement.
@@ -41,6 +49,7 @@ pub struct OpenLocation {
 }
 
 impl gpui::EventEmitter<OpenLocation> for Editor {}
+impl gpui::EventEmitter<CommentRequest> for Editor {}
 
 /// Emitted when the user clicks the read-only hint to switch to edit mode.
 /// The workspace flips read-only for all editors (same as the bottom-bar pill).
@@ -66,6 +75,21 @@ struct VLine {
 /// Break every logical line of `content` into visual rows of at most `cols`
 /// columns, preferring to break after a space (soft word-wrap). Monospace, so a
 /// column is one char. `starts` are the logical line start offsets.
+/// Clamp a cached byte span to the current content *and* to char boundaries.
+/// The vline cache can lag an edit by a frame, so its offsets may land mid-char
+/// (any multi-byte char — an em dash, an emoji) and slicing there panics.
+fn clamp_span(content: &str, a: usize, b: usize) -> (usize, usize) {
+    let floor = |mut i: usize| {
+        i = i.min(content.len());
+        while i > 0 && !content.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    };
+    let (a, b) = (floor(a), floor(b));
+    (a, b.max(a))
+}
+
 fn wrap_lines(content: &str, starts: &[usize], cols: usize) -> Vec<VLine> {
     let cols = cols.max(1);
     let mut out = Vec::new();
@@ -164,6 +188,20 @@ pub struct Editor {
     last_bounds: Option<Bounds<Pixels>>,
     last_char_width: Pixels,
     last_gutter_width: Pixels,
+    /// 1-based inclusive line spans carrying a review comment. A span gets one
+    /// icon and a bar down its side, rather than an icon per line.
+    pub comment_spans: Vec<(usize, usize)>,
+    /// Gutter row the pointer is over (drives the "+" affordance).
+    pub gutter_hover: Option<usize>,
+    /// In-flight drag from the "+": `(anchor line, current line)`, 1-based.
+    pub gutter_drag: Option<(usize, usize)>,
+    /// Span whose comment box is open but not yet saved — drawn like a real span
+    /// so the bar doesn't vanish the moment the mouse is released.
+    pub pending_span: Option<(usize, usize)>,
+    /// Blocks of empty space inserted *after* a logical line: `(line, height)`.
+    /// The workspace parks review-comment UI in them, and the text below moves
+    /// down instead of being covered (GitHub-style inline forms).
+    pub inline_gaps: Vec<(usize, f32)>,
 
     // LSP
     lsp: Option<Arc<Lsp>>,
@@ -235,6 +273,11 @@ impl Editor {
             last_bounds: None,
             last_char_width: px(8.),
             last_gutter_width: px(56.),
+            comment_spans: Vec::new(),
+            gutter_hover: None,
+            gutter_drag: None,
+            pending_span: None,
+            inline_gaps: Vec::new(),
         }
     }
 
@@ -407,6 +450,86 @@ impl Editor {
     }
 
     /// 1-based line of the cursor (for "copy reference").
+    /// Visual row a logical line starts on.
+    fn line_vi(&self, line1: usize) -> usize {
+        let starts = self.line_starts();
+        let off = starts.get(line1.saturating_sub(1)).copied().unwrap_or(0);
+        self.voffset(off)
+    }
+
+    /// Pixels of inserted gap sitting above visual row `vi`.
+    fn gap_above(&self, vi: usize) -> f32 {
+        self.inline_gaps
+            .iter()
+            .filter(|(line, _)| self.line_vi(*line) < vi)
+            .map(|(_, h)| *h)
+            .sum()
+    }
+
+    fn gap_total(&self) -> f32 {
+        self.inline_gaps.iter().map(|(_, h)| *h).sum()
+    }
+
+    /// Window-space rect of a logical line's first visual row: `(x, y, w, h)`,
+    /// with `x` past the gutter. `None` when the line is scrolled out of view or
+    /// the editor hasn't painted yet — callers then fall back to a centred UI.
+    /// Lets the workspace park an inline widget (a review-comment box, a note)
+    /// against a line even though the editor paints its own text.
+    pub fn line_screen_rect(&self, line1: usize) -> Option<(f32, f32, f32, f32)> {
+        let bounds = self.last_bounds?;
+        let starts = self.line_starts();
+        let off = *starts.get(line1.saturating_sub(1))?;
+        let vi = self.voffset(off);
+        let y = f32::from(bounds.top()) + (vi as f32) * LINE_HEIGHT + self.gap_above(vi)
+            - f32::from(self.scroll_y);
+        let (top, bottom) = (f32::from(bounds.top()), f32::from(bounds.bottom()));
+        if y < top - LINE_HEIGHT || y > bottom - LINE_HEIGHT {
+            return None; // off-screen (or so close to the edge there's no room)
+        }
+        let x = f32::from(bounds.left()) + f32::from(self.last_gutter_width);
+        let w = (f32::from(bounds.size.width) - f32::from(self.last_gutter_width) - 8.0).max(120.0);
+        Some((x, y, w, LINE_HEIGHT))
+    }
+
+    /// Where inline notes should start: just past the longest line currently on
+    /// screen, so they sit next to the code instead of hugging the window edge.
+    /// `None` before the first paint.
+    pub fn notes_anchor_x(&self) -> Option<f32> {
+        let b = self.last_bounds?;
+        let cw = f32::from(self.last_char_width).max(1.0);
+        let first = (f32::from(self.scroll_y) / LINE_HEIGHT).floor().max(0.) as usize;
+        let visible = (f32::from(b.size.height) / LINE_HEIGHT).ceil() as usize + 2;
+        let last = (first + visible).min(self.vlines.len());
+        let longest = self.vlines[first.min(self.vlines.len())..last]
+            .iter()
+            .map(|v| {
+                let (a, b) = clamp_span(&self.content, v.start, v.end);
+                self.content[a..b].chars().count()
+            })
+            .max()
+            .unwrap_or(0);
+        let x = f32::from(b.left()) + f32::from(self.last_gutter_width) + longest as f32 * cw + 16.0;
+        // keep room for a readable chip even when a line runs long
+        Some(x.min(f32::from(b.right()) - 180.0).max(f32::from(b.left()) + f32::from(self.last_gutter_width)))
+    }
+
+    /// 1-based inclusive line span the caret or selection covers — what a review
+    /// comment attaches to.
+    pub fn selected_lines(&self) -> (usize, usize) {
+        let rows = self.selected_rows();
+        (rows.start + 1, rows.end)
+    }
+
+    /// The text of lines `a..=b` (1-based), for a comment's quoted snippet.
+    pub fn lines_text(&self, a: usize, b: usize) -> String {
+        self.content
+            .split('\n')
+            .skip(a.saturating_sub(1))
+            .take(b.saturating_sub(a) + 1)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     pub fn cursor_line(&self) -> usize {
         self.offset_to_pos(self.cursor_offset()).0 + 1
     }
@@ -582,8 +705,7 @@ impl Editor {
         }
         let t = &self.vlines[ti as usize];
         // clamp: the cache can lag a content shrink by a frame
-        let clen = self.content.len();
-        let (start, end) = (t.start.min(clen), t.end.min(clen));
+        let (start, end) = clamp_span(&self.content, t.start, t.end);
         if start >= end {
             return Some(start);
         }
@@ -694,6 +816,8 @@ impl Editor {
     fn act_undo(&mut self, _: &Undo, _w: &mut Window, cx: &mut Context<Self>) { self.undo(cx); }
     fn act_redo(&mut self, _: &Redo, _w: &mut Window, cx: &mut Context<Self>) { self.redo(cx); }
     fn act_delete_line(&mut self, _: &DeleteLine, _w: &mut Window, cx: &mut Context<Self>) { self.delete_line(cx); }
+    fn act_dup_line(&mut self, _: &DupLine, _w: &mut Window, cx: &mut Context<Self>) { self.duplicate_lines(cx); }
+    fn act_toggle_comment(&mut self, _: &ToggleComment, _w: &mut Window, cx: &mut Context<Self>) { self.toggle_comment(cx); }
     fn act_move_line_up(&mut self, _: &MoveLineUp, _w: &mut Window, cx: &mut Context<Self>) { self.move_line(-1, cx); }
     fn act_move_line_down(&mut self, _: &MoveLineDown, _w: &mut Window, cx: &mut Context<Self>) { self.move_line(1, cx); }
     fn act_comp_trigger(&mut self, _: &CompTrigger, _w: &mut Window, cx: &mut Context<Self>) { self.request_completion(cx); }
@@ -741,6 +865,101 @@ impl Editor {
         let nr = row.min(v.len() - 1);
         let cur: usize = v[..nr].iter().map(|s| s.len() + 1).sum();
         self.set_content(new_content, cur, cx);
+    }
+
+    /// Rows the caret or selection touches (a selection ending exactly at a line
+    /// start doesn't drag the next line in — that's the row you'd expect from a
+    /// shift+down selection).
+    fn selected_rows(&self) -> Range<usize> {
+        let (first, _) = self.offset_to_pos(self.selected_range.start);
+        if self.selected_range.is_empty() {
+            return first..first + 1;
+        }
+        let (mut last, last_col) = self.offset_to_pos(self.selected_range.end);
+        if last_col == 0 && last > first {
+            last -= 1;
+        }
+        first..last + 1
+    }
+
+    /// ⌘D: copy the caret's line (or every line the selection touches) below it.
+    fn duplicate_lines(&mut self, cx: &mut Context<Self>) {
+        let mut v: Vec<String> = self.content.split('\n').map(|s| s.to_string()).collect();
+        let rows = self.selected_rows();
+        let block: Vec<String> = v[rows.clone()].to_vec();
+        let n = block.len();
+        for (i, line) in block.into_iter().enumerate() {
+            v.insert(rows.end + i, line);
+        }
+        let new_content = v.join("\n");
+        // keep the caret's column, moved onto the copy, so ⌘D twice stacks copies
+        let (row, col) = self.offset_to_pos(self.cursor_offset());
+        let target = row + n;
+        let line_start: usize = v[..target].iter().map(|s| s.len() + 1).sum();
+        let cur = line_start + col.min(v[target].len());
+        self.set_content(new_content, cur, cx);
+    }
+
+    /// ⌘/: comment or uncomment the caret's line / the selected lines. Every
+    /// affected line already commented → uncomment; otherwise comment them all,
+    /// with the marker at the block's shallowest indent so it stays aligned.
+    fn toggle_comment(&mut self, cx: &mut Context<Self>) {
+        let token = comment_token(self.path.as_deref());
+        let mut v: Vec<String> = self.content.split('\n').map(|s| s.to_string()).collect();
+        let rows = self.selected_rows();
+        let nonblank: Vec<usize> = rows.clone().filter(|&r| !v[r].trim().is_empty()).collect();
+        if nonblank.is_empty() {
+            return;
+        }
+        let all_commented = nonblank.iter().all(|&r| v[r].trim_start().starts_with(token));
+        let (start_off, end_off) = (self.selected_range.start, self.selected_range.end);
+        let mut shift_start: i64 = 0;
+        let mut shift_end: i64 = 0;
+        if all_commented {
+            for &r in &nonblank {
+                let indent = v[r].len() - v[r].trim_start().len();
+                let rest = v[r][indent + token.len()..].to_string();
+                // drop the single space we add when commenting, if it's there
+                let rest = rest.strip_prefix(' ').map(|s| s.to_string()).unwrap_or(rest);
+                let removed = (v[r].len() - (indent + rest.len())) as i64;
+                v[r] = format!("{}{}", &" ".repeat(indent), rest);
+                let line_start: usize = self.line_starts()[r];
+                if line_start < start_off {
+                    shift_start -= removed;
+                }
+                if line_start < end_off {
+                    shift_end -= removed;
+                }
+            }
+        } else {
+            let indent = nonblank
+                .iter()
+                .map(|&r| v[r].len() - v[r].trim_start().len())
+                .min()
+                .unwrap_or(0);
+            let added = token.len() as i64 + 1;
+            for &r in &nonblank {
+                let (head, tail) = v[r].split_at(indent.min(v[r].len()));
+                v[r] = format!("{head}{token} {tail}");
+                let line_start: usize = self.line_starts()[r];
+                if line_start < start_off {
+                    shift_start += added;
+                }
+                if line_start < end_off {
+                    shift_end += added;
+                }
+            }
+        }
+        let new_content = v.join("\n");
+        // keep the selection over the same lines so ⌘/ ⌘/ is a no-op
+        let cursor = ((end_off as i64 + shift_end).max(0) as usize).min(new_content.len());
+        self.set_content(new_content, cursor, cx);
+        if start_off != end_off {
+            let s = (start_off as i64 + shift_start).max(0) as usize;
+            self.selected_range = s.min(self.content.len())..cursor.min(self.content.len());
+            self.selection_reversed = false;
+            cx.notify();
+        }
     }
 
     fn move_line(&mut self, dir: i32, cx: &mut Context<Self>) {
@@ -1401,7 +1620,12 @@ pub struct EditorElement {
 
 pub struct EditorPrepaint {
     current_line: Option<PaintQuad>,
-    gutter: Vec<(Pixels, ShapedLine)>,
+    /// `(x offset from the gutter's left edge, y, shaped line)` — the marker and
+    /// the number are separate entries so the digits keep one column across
+    /// rows, commented or not.
+    gutter: Vec<(Pixels, Pixels, ShapedLine)>,
+    /// vertical bars marking commented spans in the gutter
+    gutter_bars: Vec<gpui::PaintQuad>,
     code: Vec<(Pixels, ShapedLine)>,
     cursor: Option<PaintQuad>,
     selections: Vec<PaintQuad>,
@@ -1493,7 +1717,12 @@ impl Element for EditorElement {
         let _ = scroll_x; // soft-wrap → no horizontal scroll
         let total = content.split('\n').count();
         let digits = total.to_string().len().max(2);
-        let gutter_width = char_width * (digits as f32) + px(GUTTER_PAD);
+        // one extra column when any line carries a comment, so the ✎ marker has
+        // room and neither the numbers nor the code shift around
+        // the marker column is always reserved: it holds the "+" on hover too, so
+        // rows mustn't shift when the pointer moves
+        let marker_col = 2.2;
+        let gutter_width = char_width * (digits as f32 + marker_col) + px(GUTTER_PAD);
         let code_x = bounds.left() + gutter_width;
 
         let mut line_starts = vec![0usize];
@@ -1509,6 +1738,20 @@ impl Element for EditorElement {
         let vlines = wrap_lines(&content, &line_starts, cols);
         let vtotal = vlines.len();
 
+        // inserted gaps (review-comment UI), as (visual row it follows, height):
+        // every row below one is pushed down by its height
+        let mut gaps: Vec<(usize, f32)> = editor
+            .inline_gaps
+            .iter()
+            .map(|(line, h)| {
+                let off = line_starts.get(line.saturating_sub(1)).copied().unwrap_or(0);
+                let vi = vlines.iter().position(|v| off <= v.end).unwrap_or(0);
+                (vi, *h)
+            })
+            .collect();
+        gaps.sort_by_key(|(vi, _)| *vi);
+        let gap_above = |vi: usize| -> f32 { gaps.iter().filter(|(g, _)| *g < vi).map(|(_, h)| *h).sum() };
+
         // visible visual-row range
         let first = (f32::from(scroll_y) / LINE_HEIGHT).floor().max(0.) as usize;
         let visible = (f32::from(bounds.size.height) / LINE_HEIGHT).ceil() as usize + 2;
@@ -1517,7 +1760,7 @@ impl Element for EditorElement {
         // the visual row holding the cursor (for the current-line highlight + caret)
         let cursor_vi = vlines.iter().position(|v| cursor_offset <= v.end).unwrap_or(vtotal.saturating_sub(1));
         let current_line = if cursor_vi >= first && cursor_vi < last {
-            let y = bounds.top() + line_height * (cursor_vi as f32) - scroll_y;
+            let y = bounds.top() + line_height * (cursor_vi as f32) + px(gap_above(cursor_vi)) - scroll_y;
             Some(fill(
                 Bounds::new(point(bounds.left(), y), size(bounds.size.width, line_height)),
                 rgb(CURRENT_LINE),
@@ -1527,6 +1770,7 @@ impl Element for EditorElement {
         };
 
         let mut gutter = Vec::new();
+        let mut gutter_bars = Vec::new();
         let mut code = Vec::new();
         let mut selections = Vec::new();
         let mut cursor = None;
@@ -1542,20 +1786,73 @@ impl Element for EditorElement {
 
         for vi in first..last {
             let v = &vlines[vi];
-            let y = bounds.top() + line_height * (vi as f32) - scroll_y;
+            let y = bounds.top() + line_height * (vi as f32) + px(gap_above(vi)) - scroll_y;
 
             // gutter number only on a logical line's first visual row
             if v.first {
-                let num = format!("{}", v.row + 1);
+                let line1 = v.row + 1;
+                // the icon marks a span's first line only
+                let commented = editor.comment_spans.iter().any(|(a, _)| *a == line1);
+                let in_span = editor
+                    .comment_spans
+                    .iter()
+                    .chain(editor.pending_span.iter())
+                    .any(|(a, b)| line1 >= *a && line1 <= *b);
+                let digits = format!("{}", line1);
+                let color = if in_span { rgb(COMMENT_MARK) } else { rgb(LINE_NUMBER) };
+                // the number always starts past the marker column, so a commented
+                // line's digits stay aligned with every other row's
                 let num_run = TextRun {
-                    len: num.len(),
+                    len: digits.len(),
                     font: font(FONT),
-                    color: rgb(LINE_NUMBER).into(),
+                    color: color.into(),
                     background_color: None,
                     underline: None,
                     strikethrough: None,
                 };
-                gutter.push((y, text_sys.shape_line(num.into(), font_size, &[num_run], None)));
+                gutter.push((
+                    px(marker_col * f32::from(char_width)),
+                    y,
+                    text_sys.shape_line(digits.clone().into(), font_size, &[num_run], None),
+                ));
+                let drag_range = editor.gutter_drag.map(|(a, b)| (a.min(b), a.max(b)));
+                let dragging_here = drag_range.is_some_and(|(a, b)| line1 >= a && line1 <= b);
+                let glyph = if commented {
+                    Some((IC_COMMENT.to_string(), color))
+                } else if editor.gutter_drag.is_none()
+                    && editor.gutter_hover == Some(line1)
+                    && !in_span
+                {
+                    // click it to comment on this line; drag it to cover a range.
+                    // Lines already inside a span don't get one — clicking those
+                    // opens the note that's there instead of stacking another.
+                    Some(("+".to_string(), rgb(COMMENT_MARK)))
+                } else {
+                    None
+                };
+                if let Some((text, c)) = glyph {
+                    let is_icon = text != "+";
+                    let run = TextRun {
+                        len: text.len(),
+                        font: if is_icon { font(ICON_FONT) } else { font(FONT) },
+                        color: c.into(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    gutter.push((px(0.), y, text_sys.shape_line(text.into(), font_size, &[run], None)));
+                }
+                // a bar down the side of every commented span (and of the range
+                // being dragged), instead of an icon repeated on each line
+                if in_span || dragging_here {
+                    // hard against the editor's left edge, clear of the icon
+                    // column — drawn over the icon it looked like a clipped glyph
+                    let x = bounds.left() + px(2.);
+                    gutter_bars.push(fill(
+                        Bounds::new(point(x, y), size(px(2.), line_height)),
+                        rgb(COMMENT_MARK),
+                    ));
+                }
             }
 
             // shape this visual row's slice; syntect runs are sliced to it
@@ -1624,6 +1921,7 @@ impl Element for EditorElement {
         EditorPrepaint {
             current_line,
             gutter,
+            gutter_bars,
             code,
             cursor,
             selections,
@@ -1656,6 +1954,8 @@ impl Element for EditorElement {
         }
 
         let editor = self.editor.read(cx);
+        // a comment bar sits at the very edge, so shift the gutter text a touch
+        let has_comment_bar = !editor.comment_spans.is_empty() || editor.pending_span.is_some();
         let gutter_width = editor.last_gutter_width;
         let scroll_x = editor.scroll_x;
         let code_x = bounds.left() + gutter_width;
@@ -1694,7 +1994,7 @@ impl Element for EditorElement {
 
         // gutter numbers (fixed column, clipped to the editor's own bounds so a
         // partially-scrolled top line can't bleed up over the tab bar)
-        let gutter_left = bounds.left() + px(8.);
+        let gutter_left = bounds.left() + px(if has_comment_bar { 10. } else { 8. });
         let gutter_mask = gpui::ContentMask {
             bounds: Bounds::from_corners(
                 point(bounds.left(), bounds.top()),
@@ -1702,8 +2002,12 @@ impl Element for EditorElement {
             ),
         };
         window.with_content_mask(Some(gutter_mask), |window| {
-            for (y, line) in prepaint.gutter.drain(..) {
-                line.paint(point(gutter_left, y), px(LINE_HEIGHT), gpui::TextAlign::Left, None, window, cx).ok();
+            for bar in prepaint.gutter_bars.drain(..) {
+                window.paint_quad(bar);
+            }
+            for (dx, y, line) in prepaint.gutter.drain(..) {
+                line.paint(point(gutter_left + dx, y), px(LINE_HEIGHT), gpui::TextAlign::Left, None, window, cx)
+                    .ok();
             }
         });
 
@@ -1717,6 +2021,22 @@ impl Element for EditorElement {
                 return;
             }
             let changed = ed.update(cx, |e, cx| {
+                // dragging the gutter grows the line range the comment will cover
+                if e.gutter_drag.is_some() && ev.pressed_button == Some(MouseButton::Left) {
+                    if let Some(line) = e
+                        .gutter_line_at(ev.position)
+                        .or_else(|| e.offset_at(ev.position).map(|o| e.offset_to_pos(o).0 + 1))
+                    {
+                        if let Some((_, cur)) = &mut e.gutter_drag {
+                            if *cur != line {
+                                *cur = line;
+                                cx.notify();
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                }
                 if !e.selecting || ev.pressed_button != Some(MouseButton::Left) {
                     return false;
                 }
@@ -1738,7 +2058,25 @@ impl Element for EditorElement {
             if phase != DispatchPhase::Bubble || ev.button != MouseButton::Left {
                 return;
             }
-            ed_up.update(cx, |e, _cx| e.selecting = false);
+            ed_up.update(cx, |e, cx| {
+                e.selecting = false;
+                // releasing in the gutter asks the workspace for a comment form
+                if let Some((a, b)) = e.gutter_drag.take() {
+                    let (lo, hi) = (a.min(b), a.max(b));
+                    // overlapping an existing note would leave two comments on the
+                    // same lines; edit the one that's there instead
+                    let overlap = e
+                        .comment_spans
+                        .iter()
+                        .copied()
+                        .find(|(s, t)| lo <= *t && hi >= *s);
+                    match overlap {
+                        Some((s0, t0)) => cx.emit(CommentRequest { line: s0, end: t0 }),
+                        None => cx.emit(CommentRequest { line: lo, end: hi }),
+                    }
+                    cx.notify();
+                }
+            });
         });
     }
 }
@@ -1888,10 +2226,34 @@ fn build_runs_slice(seg: &str, styles: Option<&Vec<(usize, u32)>>, start: usize)
 
 impl Editor {
     /// Hover: after the pointer rests ~350ms, ask the server for hover info.
+    /// The comment span covering `line1`, if there is one.
+    fn span_at(&self, line1: usize) -> Option<(usize, usize)> {
+        self.comment_spans.iter().copied().find(|(a, b)| line1 >= *a && line1 <= *b)
+    }
+
+    /// 1-based logical line under `pos`, if the pointer is over the gutter.
+    fn gutter_line_at(&self, pos: Point<Pixels>) -> Option<usize> {
+        let b = self.last_bounds?;
+        if pos.x < b.left() || pos.x > b.left() + self.last_gutter_width {
+            return None;
+        }
+        if pos.y < b.top() || pos.y > b.bottom() {
+            return None;
+        }
+        let off = self.offset_at(pos)?;
+        Some(self.offset_to_pos(off).0 + 1)
+    }
+
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
         // moving hides any shown hover
         if self.hover.is_some() {
             self.hover = None;
+            cx.notify();
+        }
+        // the gutter's "+" follows the pointer (and clears when it leaves)
+        let over = if self.gutter_drag.is_some() { self.gutter_hover } else { self.gutter_line_at(ev.position) };
+        if over != self.gutter_hover {
+            self.gutter_hover = over;
             cx.notify();
         }
         let Some(b) = self.last_bounds else { return };
@@ -1959,12 +2321,24 @@ impl Editor {
         if self.vlines.is_empty() {
             return Some(self.content.len());
         }
-        let rel_y = f32::from(pos.y - bounds.top()) + f32::from(self.scroll_y);
+        let mut rel_y = f32::from(pos.y - bounds.top()) + f32::from(self.scroll_y);
+        // walk the gaps above this point and take their height back out, so a
+        // click below an inline form still lands on the line it looks like
+        let mut gaps: Vec<(usize, f32)> =
+            self.inline_gaps.iter().map(|(l, h)| (self.line_vi(*l), *h)).collect();
+        gaps.sort_by_key(|(vi, _)| *vi);
+        for (gvi, h) in gaps {
+            let gap_top = (gvi + 1) as f32 * LINE_HEIGHT;
+            if rel_y >= gap_top + h {
+                rel_y -= h; // fully below this gap
+            } else if rel_y >= gap_top {
+                rel_y = gap_top - 1.0; // inside the gap → the line it belongs to
+            }
+        }
         let vi = ((rel_y / LINE_HEIGHT).floor().max(0.) as usize).min(self.vlines.len() - 1);
         let v = &self.vlines[vi];
         // the cache can lag a content shrink (undo) by a frame — clamp to be safe
-        let clen = self.content.len();
-        let (start, end) = (v.start.min(clen), v.end.min(clen));
+        let (start, end) = clamp_span(&self.content, v.start, v.end);
         if start >= end {
             return Some(start);
         }
@@ -1978,6 +2352,19 @@ impl Editor {
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.hover = None;
+        // the gutter belongs to review comments: press starts a line-range drag,
+        // release (below, in the window handler) opens the form
+        if !event.modifiers.platform && event.click_count < 2 {
+            if let Some(line) = self.gutter_line_at(event.position) {
+                match self.span_at(line) {
+                    // already commented: open that one rather than adding another
+                    Some((a, b)) => cx.emit(CommentRequest { line: a, end: b }),
+                    None => self.gutter_drag = Some((line, line)),
+                }
+                cx.notify();
+                return;
+            }
+        }
         let Some(offset) = self.offset_at(event.position) else { return };
 
         // cmd+click → follow an import path, else go to definition at the symbol
@@ -2059,7 +2446,7 @@ impl Editor {
 
         // vertical (visual rows — soft-wrap means no horizontal scroll)
         let new_y = f32::from(self.scroll_y) - f32::from(delta.y);
-        let max_y = (self.visual_count() as f32 * LINE_HEIGHT - 100.).max(0.);
+        let max_y = (self.visual_count() as f32 * LINE_HEIGHT + self.gap_total() - 100.).max(0.);
         self.scroll_y = px(new_y.clamp(0., max_y));
         self.scroll_x = px(0.);
 
@@ -2111,6 +2498,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::act_undo))
             .on_action(cx.listener(Self::act_redo))
             .on_action(cx.listener(Self::act_delete_line))
+            .on_action(cx.listener(Self::act_dup_line))
+            .on_action(cx.listener(Self::act_toggle_comment))
             .on_action(cx.listener(Self::act_move_line_up))
             .on_action(cx.listener(Self::act_move_line_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
@@ -2388,6 +2777,36 @@ impl Editor {
 }
 
 /// LSP languageId for a path.
+/// Line-comment marker for a file, by extension (then by file name for the
+/// dotfiles that have no extension, like `.env` / `Makefile`). Defaults to `#`,
+/// which is what most config formats use.
+fn comment_token(path: Option<&Path>) -> &'static str {
+    let Some(path) = path else { return "//" };
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    match ext {
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "rs" | "go" | "java" | "kt" | "swift"
+        | "c" | "h" | "cpp" | "hpp" | "cc" | "cs" | "scss" | "less" | "php" | "dart" | "zig"
+        | "proto" | "graphql" | "gql" | "json5" | "jsonc" => "//",
+        "sql" | "lua" | "hs" | "elm" => "--",
+        "vim" => "\"",
+        "lisp" | "clj" | "el" => ";",
+        "sh" | "bash" | "zsh" | "fish" | "py" | "rb" | "pl" | "yml" | "yaml" | "toml" | "ini"
+        | "cfg" | "conf" | "env" | "gitignore" | "dockerignore" | "tf" | "tfvars" | "r"
+        | "just" | "mk" | "properties" => "#",
+        _ => {
+            // no (or unknown) extension: fall back to the file name
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with(".env") || matches!(name, "Makefile" | "Dockerfile" | "Justfile" | ".gitignore" | ".dockerignore") {
+                "#"
+            } else if name.ends_with(".ts") || name.ends_with(".js") {
+                "//"
+            } else {
+                "#"
+            }
+        }
+    }
+}
+
 fn lang_id(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
         "ts" => "typescript",
@@ -2412,5 +2831,31 @@ fn kind_icon(kind: u8) -> &'static str {
         14 => "K",          // keyword
         21 => "k",          // constant
         _ => "·",
+    }
+}
+
+#[cfg(test)]
+mod comment_token_tests {
+    use super::*;
+
+    #[test]
+    fn env_and_config_files_use_hash() {
+        for name in [".env", ".env.local", "docker-compose.yml", "Cargo.toml", "Makefile", "deploy.sh"] {
+            assert_eq!(comment_token(Some(Path::new(name))), "#", "{name}");
+        }
+    }
+
+    #[test]
+    fn code_files_use_slashes() {
+        for name in ["main.rs", "index.ts", "app.tsx", "util.js", "Feature.java"] {
+            assert_eq!(comment_token(Some(Path::new(name))), "//", "{name}");
+        }
+    }
+
+    #[test]
+    fn a_few_odd_ones_and_the_no_path_default() {
+        assert_eq!(comment_token(Some(Path::new("q.sql"))), "--");
+        assert_eq!(comment_token(Some(Path::new("init.lua"))), "--");
+        assert_eq!(comment_token(None), "//"); // scratch buffer: assume code
     }
 }

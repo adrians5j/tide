@@ -1,6 +1,6 @@
 use gpui::{
-    AnyElement, AnyView, AnyWindowHandle, App, Bounds, ClipboardItem, Context, CursorStyle, Div, Entity, EventEmitter,
-    ExternalPaths, FocusHandle, KeyBinding, WeakEntity,
+    AnyElement, AnyView, AnyWindowHandle, App, Bounds, ClipboardItem, Context, CursorStyle, Div, Entity, EntityId,
+    ElementInputHandler, EntityInputHandler, EventEmitter, ExternalPaths, FocusHandle, KeyBinding, WeakEntity, relative,
     KeyDownEvent, Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ScrollStrategy, SharedString,
     StyledText, TextRun, Window, WindowBounds, WindowOptions, actions, div, font, prelude::*, px,
@@ -24,6 +24,10 @@ mod acp;
 mod browser;
 mod diff;
 mod lsp;
+mod md;
+mod rpc;
+mod usage;
+use rpc::AgentState;
 use diff::{DiffKind, DiffRow};
 use syntax::{Highlighter, Run};
 use lsp::Lsp;
@@ -32,11 +36,12 @@ use std::sync::{Arc, Mutex};
 use term::Terminal;
 use editor::{
     Backspace, CompDismiss, CompTrigger, Copy, Cut, Delete, DeleteLine, DeleteWordLeft,
-    DeleteWordRight, Editor, EnableEdit, End, GotoDef, Home, Indent, MoveDown, MoveLeft, MoveLineDown,
+    DeleteWordRight, DupLine, Editor, EnableEdit, End, GotoDef, Home, Indent, MoveDown, MoveLeft, MoveLineDown,
     MoveLineUp, MoveRight, MoveUp, Newline, OpenLocation, Paste, Redo, Save, SearchOpen, SelectAll,
     SelectDown, SelectEnd, SelectHome, SelectLeft, SelectRight, SelectUp, SelectWordLeft,
-    SelectWordRight, ToggleReadOnly, Undo, WordLeft, WordRight,
+    SelectWordRight, ToggleComment, ToggleReadOnly, Undo, WordLeft, WordRight,
 };
+use editor::CommentRequest;
 
 // Codicon (VS Code icon font) glyphs — rendered with font_family("codicon").
 const IC_COMMIT: &str = "\u{eafc}";
@@ -56,13 +61,15 @@ const IC_COPY: &str = "\u{ebcc}";
 const IC_CHECK: &str = "\u{eab2}";
 const IC_TRASH: &str = "\u{ea81}";
 const IC_BROWSER: &str = "\u{eb48}"; // codicon "globe"
+const IC_COMMENT: &str = "\u{ea6b}"; // codicon "comment"
+const IC_GRAPH: &str = "\u{ebe2}"; // codicon "graph-line" — plan usage
 // The codicon font is renamed to "Segoe Fluent Icons" because GPUI refuses to
 // load any font lacking an 'm' glyph — except that one specially-cased name.
 const ICON_FONT: &str = "Segoe Fluent Icons";
 
-// Native ACP agent panel — built but parked. Flip to `true` (and it reappears
-// as the right-side dock + ⌘⇧A) to continue the work; see src/acp.rs.
-const AGENT_PANEL: bool = false;
+// Native ACP agent panel: the right-side dock + ⌘⇧A. Talks to
+// @agentclientprotocol/claude-agent-acp over stdio; see src/acp.rs.
+const AGENT_PANEL: bool = true;
 
 // In-pane browser (embedded WKWebView) — parked (too hiccuppy). Flip to `true`
 // to bring back the Browser icon + right-dock. See src/browser.rs.
@@ -72,10 +79,12 @@ actions!(
     workspace,
     [
         CloseTab, CloseOthers, ToggleTerminal, OpenFinder, GotoLine, NewTerminal, CloseTerminalTab,
-        CloseOtherTerminals, GotoCommit, ShowDiff, FindInFiles,
+        CloseOtherTerminals, SplitTermRight, SplitTermDown, ToggleTermZoom, FocusPaneLeft, FocusPaneRight,
+        FocusPaneUp, FocusPaneDown, GotoCommit, ShowDiff, FindInFiles,
         GitPopup, CommandPalette, CopyReference, CopyReferenceLine, OpenOnGithub, NextProject, PrevProject, OpenProject,
         ShowProjects, PushDialog, RunCommand, NewProject, FetchRemotes, PullRemote, WipPush, RunBuild,
-        NewScratch, ToggleAgent, GitLog
+        NewScratch, ToggleAgent, GitLog, SetWsTitle, RefreshPr, AddComment, ShowComments, SendComments,
+        QuitApp, ToggleMdPreview, QuoteAgentSel
     ]
 );
 
@@ -135,16 +144,34 @@ struct ResizeEdges {
 /// rather than search text; `-*.ts` negates a glob, `-foo` excludes a substring.
 fn parse_search_query(q: &str) -> SearchQuery {
     let is_glob = |s: &str| s.contains('*') || s.contains('?');
+    // A bare directory name (`__tests__`, `dist`) only excludes anything if it
+    // covers the whole subtree, so grow it into `**/name/**` — typing the full
+    // form by hand is the difference between "no matches removed" and working.
+    let as_path_glob = |s: &str| {
+        if s.contains('/') || s.contains('.') {
+            s.to_string()
+        } else {
+            format!("**/{s}/**")
+        }
+    };
     let mut include = Vec::new();
     let mut excludes = Vec::new();
     let mut globs = Vec::new();
     for tok in q.split_whitespace() {
-        if tok.len() > 1 && tok.starts_with('-') {
+        // `-x` and `!x` both mean "exclude x" — `!` is what most search UIs use
+        if tok.len() > 1 && (tok.starts_with('-') || tok.starts_with('!')) {
             let inner = &tok[1..];
             if is_glob(inner) {
                 globs.push(format!("!{inner}"));
-            } else {
+            } else if inner.contains('/') || inner.contains('.') {
+                // looks like text or an explicit path (`-context.container`):
+                // drop matching *lines*, and the path glob if it happens to hit
+                globs.push(format!("!{inner}"));
                 excludes.push(inner.to_string());
+            } else {
+                // a bare word is a directory name (`!__tests__`, `!dist`): skip
+                // that subtree, but keep lines elsewhere that merely mention it
+                globs.push(format!("!{}", as_path_glob(inner)));
             }
         } else if is_glob(tok) {
             globs.push(tok.to_string());
@@ -153,6 +180,103 @@ fn parse_search_query(q: &str) -> SearchQuery {
         }
     }
     SearchQuery { include: include.join(" "), excludes, globs }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn numbers_sort_numerically_not_lexically() {
+        let mut v: Vec<PathBuf> = ["wby-next10", "wby-next2", "wby-next1", "wby-next9"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        v.sort_by_key(|p| natural_key(p));
+        let names: Vec<String> = v.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        assert_eq!(names, ["wby-next1", "wby-next2", "wby-next9", "wby-next10"]);
+    }
+
+    #[test]
+    fn a_glob_arg_expands_to_matching_dirs_in_natural_order() {
+        let tmp = std::env::temp_dir().join(format!("tide-cli-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        for n in [1, 2, 10] {
+            std::fs::create_dir_all(tmp.join(format!("wby-next{n}"))).unwrap();
+        }
+        std::fs::create_dir_all(tmp.join("other")).unwrap();
+        std::fs::write(tmp.join("wby-next-file"), b"x").unwrap(); // a file must not match
+
+        let hits = resolve_arg(&format!("{}/wby-next*", tmp.to_string_lossy()));
+        let names: Vec<String> = hits
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, ["wby-next1", "wby-next2", "wby-next10"]);
+
+        // a plain path still resolves to itself, and a non-directory is dropped
+        assert_eq!(resolve_arg(&tmp.join("other").to_string_lossy()).len(), 1);
+        assert!(resolve_arg(&tmp.join("wby-next-file").to_string_lossy()).is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod search_query_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn bare_exclusions_grow_into_subtree_globs() {
+        for q in ["RequestInitializer *.ts !__tests__", "RequestInitializer *.ts -__tests__"] {
+            let p = parse_search_query(q);
+            assert_eq!(p.include, "RequestInitializer");
+            assert!(p.globs.contains(&"*.ts".to_string()), "{q}: {:?}", p.globs);
+            assert!(p.globs.contains(&"!**/__tests__/**".to_string()), "{q}: {:?}", p.globs);
+        }
+    }
+
+    #[test]
+    fn a_test_dir_file_is_excluded_but_a_source_file_is_not() {
+        let globs = parse_search_query("RequestInitializer *.ts !__tests__").globs;
+        let in_tests = PathBuf::from("packages/event-handler-aws/__tests__/requestInitializer.test.ts");
+        let in_src = PathBuf::from("packages/event-handler-core/src/features/events/createHandler.ts");
+        assert!(!file_matches_globs(&in_tests, &globs));
+        assert!(file_matches_globs(&in_src, &globs));
+    }
+
+    /// Exclusions stack, and a hyphenated package name is still one bare token
+    /// (the leading `-`/`!` is the only thing treated as a sign).
+    #[test]
+    fn several_bare_exclusions_stack() {
+        let globs = parse_search_query("RequestInitializer *.ts !__tests__ !api-event-handler-core").globs;
+        assert!(globs.contains(&"!**/__tests__/**".to_string()), "{globs:?}");
+        assert!(globs.contains(&"!**/api-event-handler-core/**".to_string()), "{globs:?}");
+        let excluded = PathBuf::from("packages/api-event-handler-core/src/features/events/createHandler.ts");
+        let kept = PathBuf::from("packages/api-file-manager-s3/src/FileManagerS3Feature.ts");
+        assert!(!file_matches_globs(&excluded, &globs));
+        assert!(file_matches_globs(&kept, &globs));
+    }
+
+    /// A bare `!folder` prunes that subtree only. A line elsewhere that happens
+    /// to mention the folder name is still a legitimate match — excluding it
+    /// silently dropped results that looked like they should be there.
+    #[test]
+    fn a_bare_folder_exclusion_does_not_filter_line_text() {
+        let p = parse_search_query("RequestInitializer !event-handler-core");
+        assert!(p.globs.contains(&"!**/event-handler-core/**".to_string()), "{:?}", p.globs);
+        assert!(p.excludes.is_empty(), "{:?}", p.excludes);
+        // a dotted token is text, not a directory: that one still filters lines
+        let q = parse_search_query("context. -context.container");
+        assert_eq!(q.excludes, vec!["context.container".to_string()]);
+    }
+
+    #[test]
+    fn explicit_path_globs_are_left_alone() {
+        let p = parse_search_query("foo -**/dist/** -*.test.ts");
+        assert!(p.globs.contains(&"!**/dist/**".to_string()), "{:?}", p.globs);
+        assert!(p.globs.contains(&"!*.test.ts".to_string()), "{:?}", p.globs);
+    }
 }
 
 /// Parsed pieces of the find-in-files query box.
@@ -359,10 +483,49 @@ fn file_matches_globs(path: &Path, globs: &[String]) -> bool {
     !positives || matched_positive
 }
 
+/// The set of workspaces that were open last time, in order — so plain `tide`
+/// picks up where you left off instead of opening whatever directory you happen
+/// to be standing in. Written whenever the list changes.
+fn session_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".config/tide/session.txt"))
+}
+fn load_session() -> Vec<PathBuf> {
+    session_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| {
+            s.lines()
+                .map(|l| PathBuf::from(l.trim()))
+                .filter(|p| p.is_dir())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+fn save_session(roots: &[PathBuf]) {
+    let Some(path) = session_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let body: String = roots.iter().map(|p| format!("{}\n", p.to_string_lossy())).collect();
+    let _ = std::fs::write(path, body);
+}
+
 /// File holding the recent-projects list (most-recent first, one path per line).
 fn recents_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     Some(PathBuf::from(home).join(".config/tide/recent-projects.txt"))
+}
+
+/// `/Users/me/dev/x` → `~/dev/x`; other paths are left as-is. Used to show the
+/// real project folder next to a (possibly custom) workspace title.
+fn tilde_path(p: &Path) -> String {
+    let s = p.to_string_lossy().to_string();
+    if let Ok(home) = std::env::var("HOME") {
+        if let Some(rest) = s.strip_prefix(&home) {
+            return format!("~{rest}");
+        }
+    }
+    s
 }
 
 /// Persistent custom workspace titles, keyed by absolute project path.
@@ -400,75 +563,113 @@ fn save_ws_title(root: &Path, title: Option<&str>) {
     }
 }
 
-/// Recently-opened project paths, most recent first; only existing dirs.
-/// Claude Code's per-project session dir name: the cwd with every non-alphanumeric
-/// char replaced by '-' (e.g. /Users/adrian/dev/tide → -Users-adrian-dev-tide).
-fn claude_project_slug(root: &Path) -> String {
-    root.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
-}
-
-/// A short label for the most recent Claude Code session in `root`: the newest
-/// session's first real user prompt, truncated. None if there's no session.
-fn last_session_label(root: &Path) -> Option<String> {
+/// Idle is a property of the *workspace*, not of a running pane: "nobody is on
+/// this one". So unlike working/blocked/done it is persisted, and every TIDE
+/// instance that has the project open sees it.
+fn ws_idle_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
-    let dir = PathBuf::from(home).join(".claude/projects").join(claude_project_slug(root));
-    // newest .jsonl by mtime
-    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
-    for e in std::fs::read_dir(&dir).ok()?.flatten() {
-        let p = e.path();
-        if p.extension().map(|x| x == "jsonl").unwrap_or(false) {
-            if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
-                if newest.as_ref().map(|(t, _)| m > *t).unwrap_or(true) {
-                    newest = Some((m, p));
-                }
-            }
-        }
+    Some(PathBuf::from(home).join(".config/tide/workspace-idle.json"))
+}
+fn load_ws_idle_set() -> HashSet<String> {
+    ws_idle_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .map(|v| v.into_iter().collect())
+        .unwrap_or_default()
+}
+fn load_ws_idle(root: &Path) -> bool {
+    load_ws_idle_set().contains(&root.to_string_lossy().to_string())
+}
+fn save_ws_idle(root: &Path, idle: bool) {
+    let Some(path) = ws_idle_path() else { return };
+    let mut set = load_ws_idle_set();
+    let key = root.to_string_lossy().to_string();
+    if idle {
+        set.insert(key);
+    } else {
+        set.remove(&key);
     }
-    let (_, file) = newest?;
-    // the last prompt is at the END of the file → read a bounded tail (a partial
-    // first line is fine, we skip unparseable lines) and keep the last real prompt
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(&file).ok()?;
-    let len = f.metadata().ok()?.len();
-    const TAIL: u64 = 512 * 1024;
-    if len > TAIL {
-        f.seek(SeekFrom::Start(len - TAIL)).ok()?;
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
     }
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf);
-    let mut last: Option<String> = None;
-    for line in text.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        if v.get("type").and_then(|t| t.as_str()) != Some("user") {
-            continue;
-        }
-        let content = v.get("message").and_then(|m| m.get("content")).or_else(|| v.get("content"));
-        let s = match content {
-            Some(serde_json::Value::String(s)) => s.clone(),
-            Some(serde_json::Value::Array(a)) => a
-                .iter()
-                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join(" "),
-            _ => continue,
-        };
-        let s = s.trim();
-        // skip command/caveat/tool-result/meta noise
-        let skip = s.is_empty()
-            || s.starts_with('<')
-            || s.starts_with("Caveat:")
-            || s.starts_with('[')
-            || s.starts_with("This session is being continued");
-        if !skip {
-            last = Some(s.split_whitespace().collect::<Vec<_>>().join(" "));
-        }
+    let mut list: Vec<String> = set.into_iter().collect();
+    list.sort();
+    if let Ok(s) = serde_json::to_string_pretty(&list) {
+        let _ = std::fs::write(path, s);
     }
-    let one_line = last?;
-    let label: String = one_line.chars().take(52).collect();
-    Some(if one_line.chars().count() > 52 { format!("{label}…") } else { label })
 }
 
+/// Client a workspace's work belongs to, keyed by project path. Shown next to
+/// the title so client work is identifiable at a glance.
+fn ws_clients_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".config/tide/workspace-clients.json"))
+}
+fn load_ws_clients() -> HashMap<String, String> {
+    ws_clients_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+fn load_ws_client(root: &Path) -> Option<String> {
+    load_ws_clients().remove(&root.to_string_lossy().to_string())
+}
+fn save_ws_client(root: &Path, client: Option<&str>) {
+    let Some(path) = ws_clients_path() else { return };
+    let mut m = load_ws_clients();
+    let key = root.to_string_lossy().to_string();
+    match client.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(c) => {
+            m.insert(key, c.to_string());
+        }
+        None => {
+            m.remove(&key);
+        }
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(s) = serde_json::to_string_pretty(&m) {
+        let _ = std::fs::write(path, s);
+    }
+}
+
+/// Paused workspaces: ⌥Tab skips them, so parked work stays out of the rotation
+/// until you pick it up again. Persisted per project path, like the idle marker.
+fn ws_paused_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".config/tide/workspace-paused.json"))
+}
+fn load_ws_paused_set() -> HashSet<String> {
+    ws_paused_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .map(|v| v.into_iter().collect())
+        .unwrap_or_default()
+}
+fn load_ws_paused(root: &Path) -> bool {
+    load_ws_paused_set().contains(&root.to_string_lossy().to_string())
+}
+fn save_ws_paused(root: &Path, paused: bool) {
+    let Some(path) = ws_paused_path() else { return };
+    let mut set = load_ws_paused_set();
+    let key = root.to_string_lossy().to_string();
+    if paused {
+        set.insert(key);
+    } else {
+        set.remove(&key);
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut list: Vec<String> = set.into_iter().collect();
+    list.sort();
+    if let Ok(s) = serde_json::to_string_pretty(&list) {
+        let _ = std::fs::write(path, s);
+    }
+}
+
+/// Recently-opened project paths, most recent first; only existing dirs.
 fn load_recent_projects() -> Vec<PathBuf> {
     let Some(file) = recents_path() else { return Vec::new() };
     let Ok(text) = std::fs::read_to_string(&file) else { return Vec::new() };
@@ -528,30 +729,27 @@ fn tree_clip() -> &'static Mutex<Option<(PathBuf, bool)>> {
     C.get_or_init(|| Mutex::new(None))
 }
 
-/// Special branches get a tag pill instead of plain text: `next` → green,
-/// `release/*` → orange. Returns the accent rgb, or None for ordinary branches.
-fn branch_style(name: &str) -> Option<u32> {
+/// Accent color for a branch tag pill: `next` → green, `release/*` → orange,
+/// everything else → dull gray.
+fn branch_style(name: &str) -> u32 {
     if name == "next" {
-        Some(GIT_NEW) // green
+        GIT_NEW // green
     } else if name.starts_with("release/") {
-        Some(0xd9a23b) // orange
+        0xd9a23b // orange
     } else {
-        None
+        MUTED // dull gray
     }
 }
 
-/// Render a branch name: a colored tag pill for special branches (next,
-/// release/*), otherwise plain text in `plain` color.
-fn branch_name_el(name: &str, plain: u32) -> gpui::Div {
-    match branch_style(name) {
-        Some(fg) => div()
-            .px_1()
-            .rounded_md()
-            .bg(rgba((fg << 8) | 0x33)) // ~20% tint of the accent
-            .text_color(rgb(fg))
-            .child(name.to_string()),
-        None => div().text_color(rgb(plain)).child(name.to_string()),
-    }
+/// Render a branch name as a colored tag pill (see `branch_style`).
+fn branch_name_el(name: &str) -> gpui::Div {
+    let fg = branch_style(name);
+    div()
+        .px_1()
+        .rounded_md()
+        .bg(rgba((fg << 8) | 0x33)) // ~20% tint of the accent
+        .text_color(rgb(fg))
+        .child(name.to_string())
 }
 
 fn copy_path(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -959,6 +1157,14 @@ fn diff_pane(
     cur_match: usize,
     caret: Option<(DiffSide, usize, usize)>,
     caret_on: bool,
+    // review comments on this file, as (file line, note) — drawn as a row under
+    // the line they belong to, on the right side only (that's the new code)
+    comments: &[(usize, String)],
+    // the row currently being commented on, plus its rendered input
+    mut editing: Option<(usize, f32, gpui::AnyElement)>,
+    // visible width of this pane — comment widgets use it so they don't run off
+    // into the horizontally-scrollable area
+    vis_w: f32,
 ) -> impl IntoElement {
     let side_w = diff_side_w(rows, char_w, side);
     let id = match side {
@@ -1021,6 +1227,8 @@ fn diff_pane(
                 }
             }
         }
+        // a commented line gets the same ✎ marker as the editor's gutter
+        let has_note = row.right_no.is_some_and(|n| comments.iter().any(|(l, _)| *l == n));
         area = area.child(
             line.child(
                 div()
@@ -1028,11 +1236,57 @@ fn diff_pane(
                     .pr_2()
                     .flex()
                     .justify_end()
-                    .text_color(rgb(LINE_NUMBER))
+                    .gap(px(2.))
+                    .text_color(rgb(if has_note { COMMENT_MARK } else { LINE_NUMBER }))
+                    .when(has_note, |d| {
+                        d.child(div().font_family(ICON_FONT).text_size(px(9.)).child(IC_COMMENT))
+                    })
                     .child(no.map(|n| n.to_string()).unwrap_or_default()),
             )
             .child(div().flex_grow(1.0).px_2().child(StyledText::new(text).with_runs(runs))),
         );
+        // Notes and the comment input are extra rows. Both panes scroll
+        // independently, so each extra row needs a matching spacer on the other
+        // side or the two files stop lining up. Heights are fixed for that reason.
+        const NOTE_H: f32 = RC_NOTE_H;
+        if let Some(n) = row.right_no {
+            for (_, note) in comments.iter().filter(|(l, _)| *l == n) {
+                area = area.child(if side == DiffSide::Right {
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .h(px(NOTE_H))
+                        .w(px(vis_w))
+                        .flex_shrink_0()
+                        .px_2()
+                        .bg(rgba(COMMENT_TINT))
+                        .text_size(px(11.))
+                        .text_color(rgb(COMMENT_MARK))
+                        .child(
+                            div()
+                                .w(px(44.))
+                                .flex_shrink_0()
+                                .font_family(ICON_FONT)
+                                .text_size(px(10.))
+                                .child(IC_COMMENT),
+                        )
+                        .child(div().flex_grow(1.0).truncate().child(note.clone()))
+                } else {
+                    div().h(px(NOTE_H)).w(px(vis_w)).flex_shrink_0() // alignment spacer
+                });
+            }
+        }
+        if let Some((erow, box_h)) = editing.as_ref().map(|(r, h, _)| (*r, *h)) {
+            if erow == i {
+                area = area.child(if side == DiffSide::Right {
+                    let el = editing.take().map(|(_, _, el)| el);
+                    div().h(px(box_h)).w(px(vis_w)).flex_shrink_0().children(el)
+                } else {
+                    div().h(px(box_h)).w(px(vis_w)).flex_shrink_0()
+                });
+            }
+        }
     }
     // fill the (already split-sized) wrapper — the 50/50 vs custom split is set
     // by the flex_grow on the wrappers in DiffWindow::render, not here
@@ -1151,11 +1405,23 @@ fn flatten_changes(
     }
 }
 
+/// Which right-click menu is open.
+#[derive(Clone, Copy, PartialEq)]
+enum CtxKind {
+    Tree,
+    /// A file row in Changes / PR Review — file-level actions only.
+    ReviewFile,
+    /// Selected text in the agent transcript.
+    AgentSel,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum LeftView {
     Files,
     Changes,
     PullRequest,
+    /// Pending review comments, with a button that sends them to the agent.
+    Review,
 }
 
 /// PR review file filter by viewed-state.
@@ -1172,6 +1438,418 @@ enum CommitFilter {
     All,
     Unchecked,
     Checked,
+}
+
+/// Render an agent reply as light markdown: inline `code` chips, **bold**,
+/// *italic*, bullets, and fenced blocks. Words are separate children with
+/// `flex_wrap`, which is what lets a formatted line still wrap inside the box.
+fn md_text(text: &str, size: f32, color: u32) -> Div {
+    let rows = md_prepare(text);
+    let mut col = div().flex().flex_col().min_w(px(0.)).text_color(rgb(color));
+    for row in rows.iter() {
+        col = col.child(div().text_size(px(size)).child(md_row_el(row, false)));
+    }
+    col
+}
+
+/// A markdown line ready to draw: the flattened text plus the styling runs over
+/// it. One `StyledText` per line instead of one div per word — a long agent
+/// transcript was building tens of thousands of elements every frame.
+#[derive(Clone)]
+struct MdRow {
+    text: SharedString,
+    highlights: Vec<(std::ops::Range<usize>, gpui::HighlightStyle)>,
+    /// Ranges that render monospaced (inline `code`, whole code blocks).
+    mono: Vec<std::ops::Range<usize>>,
+    size: f32,
+    heading: bool,
+    /// A fenced code block: drawn in its own bordered, scrollable slab.
+    fence: bool,
+    indent: f32,
+    /// A table's cells (each already flattened the same way).
+    cells: Option<Vec<MdRow>>,
+    table_header: bool,
+    /// A blank line — pure paragraph spacing.
+    gap: bool,
+    /// Position among this document's rows, so a fence's scroll id is unique
+    /// even when two blocks happen to be the same length.
+    ix: usize,
+}
+
+fn md_row_blank() -> MdRow {
+    MdRow {
+        text: SharedString::default(),
+        highlights: Vec::new(),
+        mono: Vec::new(),
+        size: 0.0,
+        heading: false,
+        fence: false,
+        indent: 0.0,
+        cells: None,
+        table_header: false,
+        gap: true,
+        ix: 0,
+    }
+}
+
+/// Flatten spans into one string plus its styling runs.
+fn md_flatten(spans: &[md::Span], size: f32, prefix: &str) -> MdRow {
+    let mut text = String::from(prefix);
+    let mut highlights = Vec::new();
+    let mut mono = Vec::new();
+    for span in spans {
+        let start = text.len();
+        match span {
+            md::Span::Text(t) => text.push_str(t),
+            md::Span::Code(c) => {
+                text.push_str(c);
+                highlights.push((
+                    start..text.len(),
+                    gpui::HighlightStyle {
+                        background_color: Some(rgb(CURRENT_LINE).into()),
+                        ..Default::default()
+                    },
+                ));
+                mono.push(start..text.len());
+            }
+            md::Span::Bold(t) => {
+                text.push_str(t);
+                highlights.push((
+                    start..text.len(),
+                    gpui::HighlightStyle {
+                        color: Some(rgb(SEL_TEXT).into()),
+                        font_weight: Some(gpui::FontWeight::BOLD),
+                        ..Default::default()
+                    },
+                ));
+            }
+            md::Span::Italic(t) => {
+                text.push_str(t);
+                highlights.push((
+                    start..text.len(),
+                    gpui::HighlightStyle {
+                        font_style: Some(gpui::FontStyle::Italic),
+                        ..Default::default()
+                    },
+                ));
+            }
+        }
+    }
+    MdRow {
+        text: text.into(),
+        highlights,
+        mono,
+        size,
+        heading: false,
+        fence: false,
+        indent: 0.0,
+        cells: None,
+        table_header: false,
+        gap: false,
+        ix: 0,
+    }
+}
+
+/// Parse + highlight a markdown document into drawable rows. Cached by content,
+/// so re-rendering a long transcript costs no parsing and no syntax work.
+fn md_prepare(text: &str) -> Arc<Vec<MdRow>> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<(u64, usize), Arc<Vec<MdRow>>>>> =
+        std::sync::OnceLock::new();
+    let mut h = DefaultHasher::new();
+    text.hash(&mut h);
+    let key = (h.finish(), text.len());
+    if let Some(hit) = CACHE.get_or_init(Default::default).lock().ok().and_then(|c| c.get(&key).cloned()) {
+        return hit;
+    }
+
+    let mut rows: Vec<MdRow> = Vec::new();
+    let mut fence: Vec<String> = Vec::new();
+    let mut fence_lang = String::new();
+    let mut table: Vec<MdRow> = Vec::new();
+
+    // a fenced block becomes one row: the whole body, highlighted by syntect
+    let flush_fence = |fence: &mut Vec<String>, lang: &str, rows: &mut Vec<MdRow>| {
+        if fence.is_empty() {
+            return;
+        }
+        let body = std::mem::take(fence).join("\n");
+        let runs = highlighter().highlight_lang(&body, lang);
+        let mut highlights = Vec::new();
+        let mut at = 0usize;
+        for (li, line) in body.split('\n').enumerate() {
+            let mut col = at;
+            for (len, color) in runs.get(li).into_iter().flatten() {
+                let end = (col + len).min(at + line.len());
+                if col < end && body.is_char_boundary(col) && body.is_char_boundary(end) {
+                    highlights.push((
+                        col..end,
+                        gpui::HighlightStyle { color: Some(rgb(*color).into()), ..Default::default() },
+                    ));
+                }
+                col = end;
+            }
+            at += line.len() + 1; // past the newline
+        }
+        let len = body.len();
+        rows.push(MdRow {
+            text: body.into(),
+            highlights,
+            mono: vec![0..len],
+            size: 13.0,
+            heading: false,
+            fence: true,
+            indent: 0.0,
+            cells: None,
+            table_header: false,
+            gap: false,
+            ix: rows.len(),
+        });
+    };
+
+    for line in md::parse(text) {
+        if let Some(cells) = line.cells {
+            let mut row = md_flatten(&[], 13.5, "");
+            row.cells = Some(cells.iter().map(|c| md_flatten(c, 13.5, "")).collect());
+            row.table_header = line.header;
+            table.push(row);
+            continue;
+        }
+        if !table.is_empty() {
+            rows.append(&mut table);
+        }
+        if line.code {
+            if !line.lang.is_empty() {
+                fence_lang = line.lang.clone();
+            }
+            fence.push(match line.spans.first() {
+                Some(md::Span::Text(t)) => t.clone(),
+                _ => String::new(),
+            });
+            continue;
+        }
+        flush_fence(&mut fence, &fence_lang, &mut rows);
+        let size = match line.heading {
+            1 => 23.0,
+            2 => 19.0,
+            3 => 16.5,
+            4..=6 => 15.0,
+            _ => 14.5,
+        };
+        if line.spans.is_empty() && line.bullet.is_none() {
+            rows.push(md_row_blank());
+            continue;
+        }
+        let prefix = line.bullet.map(|b| format!("{b}  ")).unwrap_or_default();
+        let mut row = md_flatten(&line.spans, size, &prefix);
+        row.heading = line.heading > 0;
+        row.indent = line.indent as f32 * 16.0;
+        rows.push(row);
+    }
+    if !table.is_empty() {
+        rows.append(&mut table);
+    }
+    flush_fence(&mut fence, &fence_lang, &mut rows);
+
+    let mut rows = rows;
+    for (i, r) in rows.iter_mut().enumerate() {
+        r.ix = i;
+    }
+    let out = Arc::new(rows);
+    if let Ok(mut c) = CACHE.get_or_init(Default::default).lock() {
+        // bounded: a long session would otherwise keep every version of every
+        // streaming message alive
+        if c.len() > 512 {
+            c.clear();
+        }
+        c.insert(key, out.clone());
+    }
+    out
+}
+
+/// Draw one prepared row.
+fn md_row_el(row: &MdRow, selected: bool) -> AnyElement {
+    if row.gap {
+        return div().h(px(8.)).into_any_element();
+    }
+    if let Some(cells) = &row.cells {
+        let n = cells.len().max(1);
+        let mut el = div()
+            .flex()
+            .flex_row()
+            .items_start()
+            .when(row.table_header, |d| d.bg(rgb(CURRENT_LINE)))
+            .border_b_1()
+            .border_color(rgb(BORDER));
+        for (i, cell) in cells.iter().enumerate() {
+            el = el.child(
+                div()
+                    .flex_basis(relative(1.0 / n as f32))
+                    .min_w(px(0.))
+                    .px_2()
+                    .py_1()
+                    .when(i + 1 < n, |d| d.border_r_1().border_color(rgb(BORDER)))
+                    .child(md_styled_sel(cell, row.table_header, selected)),
+            );
+        }
+        return el.into_any_element();
+    }
+    if row.fence {
+        return div()
+            .id(SharedString::from(format!("md-fence-{}-{}", row.ix, row.text.len())))
+            .my_1()
+            .px_2()
+            .py_1()
+            .bg(rgb(CURRENT_LINE))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .rounded_md()
+            .overflow_x_scroll()
+            .child(div().whitespace_nowrap().child(md_styled_sel(row, false, selected)))
+            .into_any_element();
+    }
+    div()
+        .when(row.indent > 0.0, |d| d.pl(px(row.indent)))
+        .when(row.heading, |d| d.mt_2())
+        .child(md_styled_sel(row, row.heading, selected))
+        .into_any_element()
+}
+
+/// One row's text as a single styled element: `mono` ranges get Menlo, the
+/// highlight runs carry colour, weight, italics and code backgrounds.
+/// `selected` drops the inline-code chip backgrounds: they're opaque and would
+/// paint over the row's selection highlight, leaving `code` words looking
+/// unselected inside a selected line.
+fn md_styled_sel(row: &MdRow, bold: bool, selected: bool) -> gpui::StyledText {
+    let mut hl: Vec<(std::ops::Range<usize>, gpui::HighlightStyle)> = row
+        .highlights
+        .iter()
+        .cloned()
+        .map(|(r, mut style)| {
+            if selected {
+                style.background_color = None;
+            }
+            (r, style)
+        })
+        .collect();
+    if bold {
+        hl.push((
+            0..row.text.len(),
+            gpui::HighlightStyle {
+                color: Some(rgb(SEL_TEXT).into()),
+                font_weight: Some(gpui::FontWeight::BOLD),
+                ..Default::default()
+            },
+        ));
+    }
+    let mono: Vec<(std::ops::Range<usize>, SharedString)> =
+        row.mono.iter().cloned().map(|r| (r, SharedString::from("Menlo"))).collect();
+    gpui::StyledText::new(row.text.clone())
+        .with_highlights(hl)
+        .with_font_family_overrides(mono)
+}
+
+/// Clamp a byte span into `text`, snapping both ends down to char boundaries.
+fn clamp_span_str(text: &str, a: usize, b: usize) -> (usize, usize) {
+    let floor = |mut i: usize| {
+        i = i.min(text.len());
+        while i > 0 && !text.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    };
+    let (a, b) = (floor(a), floor(b));
+    (a.min(b), b.max(a))
+}
+
+/// A whole markdown file, rendered at document scale: sized headings, bullets,
+/// fenced blocks as one monospaced slab, and blank lines kept as spacing. Shares
+/// the parser with `md_text`; only the sizing differs.
+fn md_doc(text: &str) -> Div {
+    // the caller decides the padding: a file preview wants a margin, an agent
+    // bubble sits flush in the transcript
+    let rows = md_prepare(text);
+    let mut col = div().flex().flex_col().gap(px(4.)).text_color(rgb(TEXT));
+    // consecutive table rows share one bordered grid
+    let mut i = 0;
+    while i < rows.len() {
+        if rows[i].cells.is_some() {
+            let mut grid = div()
+                .my_1()
+                .flex()
+                .flex_col()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .rounded_md()
+                .overflow_hidden();
+            while i < rows.len() && rows[i].cells.is_some() {
+                grid = grid.child(md_row_el(&rows[i], false));
+                i += 1;
+            }
+            col = col.child(grid);
+            continue;
+        }
+        let row = &rows[i];
+        col = col.child(div().text_size(px(row.size.max(1.0))).child(md_row_el(row, false)));
+        i += 1;
+    }
+    col
+}
+
+/// The `packages/<name>` dirs this branch touches — the same set `wwp` watches:
+/// changed against the base branch, plus the working tree, plus untracked files.
+/// Computed with git rather than read off the PR pane, which is only populated
+/// once that pane has loaded.
+fn changed_packages(root: &Path, base: &str) -> Vec<String> {
+    let run = |args: &[&str]| -> Vec<String> {
+        Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(|l| l.to_string()).collect())
+            .unwrap_or_default()
+    };
+    let base_ref = resolve_base_ref(root, base);
+    let mut names: Vec<String> = run(&["diff", "--name-only", &format!("{base_ref}...HEAD")])
+        .into_iter()
+        .chain(run(&["diff", "--name-only", "HEAD"]))
+        .chain(run(&["ls-files", "--others", "--exclude-standard"]))
+        .filter_map(|p| {
+            let rest = p.strip_prefix("packages/")?;
+            let name = rest.split('/').next()?;
+            (!name.is_empty() && rest.contains('/')).then(|| name.to_string())
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Comments quoted out of the agent's answer aren't attached to a file, so they
+/// carry this sentinel path (line 0) instead. Rendered as "agent answer".
+const AGENT_SRC: &str = "<agent answer>";
+
+fn is_agent_src(path: &Path) -> bool {
+    path.components().any(|c| c.as_os_str() == AGENT_SRC)
+}
+
+/// Markdown by extension — the only files that get a rendered view.
+fn is_markdown(path: &Path) -> bool {
+    path.extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .is_some_and(|e| e == "md" || e == "markdown" || e == "mdx")
+}
+
+/// Green under half, amber past it, red when the window is nearly spent.
+fn usage_color(pct: f32) -> u32 {
+    match pct {
+        p if p >= 90.0 => GIT_DELETED,
+        p if p >= 60.0 => GIT_MODIFIED,
+        _ => GIT_NEW,
+    }
 }
 
 /// A short random lowercase-alphanumeric id (e.g. for `wip: <id>` commits),
@@ -1194,6 +1872,65 @@ fn random_id() -> String {
         s.push(CH[(z % CH.len() as u64) as usize] as char);
     }
     s
+}
+
+/// Condense a process's argv into something that fits a pane badge: paths become
+/// basenames, a leading interpreter is dropped (`node …/yarn watch` → `yarn
+/// watch`), flags are cut, and the rest is truncated.
+fn short_cmd(args: &str) -> String {
+    let is_interpreter = |t: &str| {
+        matches!(t, "sh" | "bash" | "zsh" | "fish" | "env" | "sudo" | "npm" | "npx" | "bunx")
+            || t.starts_with("node")
+            || t.starts_with("python")
+            || t.starts_with("ruby")
+            || t.starts_with("perl")
+    };
+    let mut parts: Vec<String> = args
+        .split_whitespace()
+        .filter(|t| !t.starts_with('-')) // flags say little in a badge
+        .map(|t| t.rsplit('/').next().unwrap_or(t).to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    while parts.len() > 1 && is_interpreter(&parts[0]) {
+        parts.remove(0);
+    }
+    let joined = parts.join(" ");
+    if joined.chars().count() > 38 {
+        format!("{}…", joined.chars().take(37).collect::<String>())
+    } else {
+        joined
+    }
+}
+
+/// What each terminal pane is running, keyed by its shell's pid: the pane's
+/// foreground child, condensed. One `ps` for the whole tree, so this costs the
+/// same whether there are two panes or twenty.
+fn running_cmds(shell_pids: &[u32]) -> HashMap<u32, String> {
+    let mut out = HashMap::new();
+    if shell_pids.is_empty() {
+        return out;
+    }
+    let Ok(o) = Command::new("ps").args(["-axo", "pid=,ppid=,args="]).output() else { return out };
+    let text = String::from_utf8_lossy(&o.stdout);
+    // ppid -> (pid, args) children, in ps order (oldest first)
+    let mut kids: HashMap<u32, Vec<(u32, String)>> = HashMap::new();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(pid), Some(ppid)) = (it.next(), it.next()) else { continue };
+        let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) else { continue };
+        let args = it.collect::<Vec<_>>().join(" ");
+        kids.entry(ppid).or_default().push((pid, args));
+    }
+    for &sh in shell_pids {
+        // the shell's own child is the command it's running; nothing → idle shell
+        if let Some((_, args)) = kids.get(&sh).and_then(|v| v.first()) {
+            let label = short_cmd(args);
+            if !label.is_empty() {
+                out.insert(sh, label);
+            }
+        }
+    }
+    out
 }
 
 /// Resident memory of our own process, in MB (via `ps`).
@@ -1241,18 +1978,112 @@ fn git_default_branch(root: &Path) -> String {
     {
         return b;
     }
-    for cand in ["main", "master", "develop"] {
-        let ok = Command::new("git")
-            .args(["rev-parse", "--verify", "--quiet", cand])
-            .current_dir(root)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if ok {
-            return cand.to_string();
+    // origin/HEAD isn't always set (it's only written on clone); probe the usual
+    // names, remote-tracking ref first so a branch we've never checked out counts
+    for cand in ["main", "master", "next", "develop", "trunk"] {
+        for git_ref in [format!("refs/remotes/origin/{cand}"), format!("refs/heads/{cand}")] {
+            let ok = Command::new("git")
+                .args(["rev-parse", "--verify", "--quiet", &git_ref])
+                .current_dir(root)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if ok {
+                return cand.to_string();
+            }
         }
     }
     "main".to_string()
+}
+
+/// What GitHub says about the PR on this branch: base branch, the base tip its
+/// diff is computed against, and how many files it lists. One `gh` call instead
+/// of three, and `base_oid` + `changed_files` are what tell us a stale local
+/// `origin/<base>` is inflating our own file list.
+struct PrMeta {
+    base: String,
+    base_oid: String,
+    changed_files: usize,
+    node_id: String,
+}
+
+fn gh_pr_meta(root: &Path) -> Option<PrMeta> {
+    let out = Command::new("gh")
+        .args(["pr", "view", "--json", "baseRefName,baseRefOid,changedFiles,id"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let base = v.get("baseRefName")?.as_str()?.to_string();
+    if base.is_empty() {
+        return None;
+    }
+    Some(PrMeta {
+        base,
+        base_oid: v.get("baseRefOid").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        changed_files: v.get("changedFiles").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+        node_id: v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+    })
+}
+
+/// True when `rev` is a commit this clone already has.
+fn git_has_commit(root: &Path, rev: &str) -> bool {
+    !rev.is_empty()
+        && Command::new("git")
+            .args(["cat-file", "-e", &format!("{rev}^{{commit}}")])
+            .current_dir(root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+}
+
+/// Fetch just the PR's base branch, so `origin/<base>` — and with it the
+/// merge-base our three-dot diff uses — matches what GitHub is comparing against.
+fn git_fetch_base(root: &Path, base: &str) -> bool {
+    Command::new("git")
+        .args(["fetch", "--no-tags", "--quiet", "origin", base])
+        .current_dir(root)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Why the local file list disagrees with GitHub's, if it does. Two causes,
+/// both from a clone that hasn't fetched: `origin/<base>` sits behind the tip
+/// GitHub diffs against (so our merge-base is too far back and we list every
+/// file that landed on the base since), or the base tip isn't here at all.
+fn pr_stale_note(root: &Path, meta: &PrMeta, ours: usize) -> Option<String> {
+    if meta.base_oid.is_empty() {
+        return None;
+    }
+    let base_ref = resolve_base_ref(root, &meta.base);
+    let local = Command::new("git")
+        .args(["rev-parse", &base_ref])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if local == meta.base_oid {
+        return None;
+    }
+    // the base moved on GitHub; only a *missing* commit or a differing count
+    // actually distorts what we show
+    if !git_has_commit(root, &meta.base_oid) {
+        return Some(format!(
+            "{base_ref} is behind GitHub — showing {ours} files, the PR has {}",
+            meta.changed_files
+        ));
+    }
+    (meta.changed_files > 0 && ours != meta.changed_files).then(|| {
+        format!(
+            "{base_ref} is behind GitHub — showing {ours} files, the PR has {}",
+            meta.changed_files
+        )
+    })
 }
 
 /// The PR's base branch for the current checkout. Prefers GitHub's own answer
@@ -1342,12 +2173,12 @@ fn gh_pr_viewed_files(root: &Path) -> HashSet<PathBuf> {
 }
 
 /// Mark/unmark a file as viewed on the PR via GitHub's GraphQL API.
-fn gh_set_file_viewed(root: &Path, pr_id: &str, path: &str, viewed: bool) {
+fn gh_set_file_viewed(root: &Path, pr_id: &str, path: &str, viewed: bool) -> bool {
     let field = if viewed { "markFileAsViewed" } else { "unmarkFileAsViewed" };
     let query = format!(
         "mutation($id:ID!,$path:String!){{ {field}(input:{{pullRequestId:$id, path:$path}}){{ clientMutationId }} }}"
     );
-    let _ = Command::new("gh")
+    Command::new("gh")
         .args([
             "api",
             "graphql",
@@ -1359,7 +2190,9 @@ fn gh_set_file_viewed(root: &Path, pr_id: &str, path: &str, viewed: bool) {
             &format!("path={path}"),
         ])
         .current_dir(root)
-        .output();
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Resolve a base branch name to the ref to diff against: prefer the remote
@@ -1691,6 +2524,13 @@ enum Cmd {
     ResolveConflicts,
     OpenAdmin,
     SetWorkspaceTitle,
+    ResetWorkspace,
+    ResetWorkspaceClose,
+    TogglePause,
+    AddComment,
+    ShowComments,
+    SendComments,
+    InstallUsageBars,
 }
 
 /// (command, label, icon glyph, shortcut hint)
@@ -1721,6 +2561,13 @@ const PALETTE: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::ResolveConflicts, "Resolve Merge Conflicts", IC_BRANCH, ""),
     (Cmd::OpenAdmin, "Open Admin", IC_BROWSER, ""),
     (Cmd::SetWorkspaceTitle, "Set Workspace Title…", IC_HOME, ""),
+    (Cmd::ResetWorkspace, "Reset Workspace  (default branch + clear title & PR)", IC_HOME, ""),
+    (Cmd::ResetWorkspaceClose, "Reset Workspace & Close", IC_HOME, ""),
+    (Cmd::TogglePause, "Pause / Resume Workspace  (⌥Tab skips paused)", IC_HOME, ""),
+    (Cmd::AddComment, "Comment on This Line…", IC_COMMIT, "⌥C"),
+    (Cmd::ShowComments, "Review Comments…", IC_COMMIT, "⌥⇧C"),
+    (Cmd::SendComments, "Send Comments to Agent", IC_PUSH, "⌥↩ / ⌘⇧S"),
+    (Cmd::InstallUsageBars, "Install Plan Usage Bars (statusline shim)", IC_GRAPH, ""),
 ];
 
 /// A running process row for the Process Manager dialog.
@@ -1926,6 +2773,57 @@ impl PrStatus {
     }
 }
 
+/// A PR's lifecycle state, shown as a small pill next to its number.
+#[derive(Clone, Copy, PartialEq)]
+enum PrState {
+    Draft,
+    Open,
+    Merged,
+    Closed,
+}
+
+impl PrState {
+    fn label(self) -> &'static str {
+        match self {
+            PrState::Draft => "draft",
+            PrState::Open => "open",
+            PrState::Merged => "merged",
+            PrState::Closed => "closed",
+        }
+    }
+
+    fn color(self) -> u32 {
+        match self {
+            PrState::Draft => MUTED,
+            PrState::Open => 0x6aaf6a,   // green
+            PrState::Merged => 0xa371f7, // purple (GitHub's merged color)
+            PrState::Closed => 0xe04141, // red
+        }
+    }
+
+    /// Merged/closed win over `isDraft` (a closed draft reads as closed).
+    fn from_json(v: &serde_json::Value) -> PrState {
+        match v.get("state").and_then(|s| s.as_str()).unwrap_or("OPEN").to_uppercase().as_str() {
+            "MERGED" => PrState::Merged,
+            "CLOSED" => PrState::Closed,
+            _ if v.get("isDraft").and_then(|d| d.as_bool()).unwrap_or(false) => PrState::Draft,
+            _ => PrState::Open,
+        }
+    }
+}
+
+/// The `draft` / `merged` / `closed` pill next to a PR number.
+fn pr_state_pill(state: PrState, size: f32) -> Div {
+    div()
+        .px_1()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(state.color()))
+        .text_size(px(size))
+        .text_color(rgb(state.color()))
+        .child(state.label())
+}
+
 /// Aggregate a PR's `statusCheckRollup` array into a single status.
 fn rollup_status(v: &serde_json::Value) -> PrStatus {
     let Some(arr) = v.get("statusCheckRollup").and_then(|x| x.as_array()).filter(|a| !a.is_empty())
@@ -1959,12 +2857,18 @@ fn rollup_status(v: &serde_json::Value) -> PrStatus {
     }
 }
 
-fn fetch_pr_link(root: &Path, branch: &str) -> Option<(u64, String, PrStatus, String, String)> {
+fn fetch_pr_link(root: &Path, branch: &str) -> Option<(u64, String, PrStatus, String, String, PrState)> {
     if branch.is_empty() {
         return None;
     }
     let out = Command::new("gh")
-        .args(["pr", "view", branch, "--json", "number,url,statusCheckRollup,baseRefName,headRefName"])
+        .args([
+            "pr",
+            "view",
+            branch,
+            "--json",
+            "number,url,statusCheckRollup,baseRefName,headRefName,state,isDraft",
+        ])
         .current_dir(root)
         .output()
         .ok()?;
@@ -1976,7 +2880,7 @@ fn fetch_pr_link(root: &Path, branch: &str) -> Option<(u64, String, PrStatus, St
     let url = v.get("url")?.as_str()?.to_string();
     let base = v.get("baseRefName").and_then(|b| b.as_str()).unwrap_or("").to_string();
     let head = v.get("headRefName").and_then(|b| b.as_str()).unwrap_or("").to_string();
-    Some((number, url, rollup_status(&v), base, head))
+    Some((number, url, rollup_status(&v), base, head, PrState::from_json(&v)))
 }
 
 /// Open milestone titles for the repo, newest first (via `gh api`). Empty when
@@ -2040,6 +2944,513 @@ struct Entry {
     ignored: bool, // git-ignored (or under an ignored dir) → shown dimmed
 }
 
+/// One terminal tab's pane layout: leaves are shells, splits are equal-share
+/// groups (⌘D side by side, ⌘⇧D stacked). A split always *nests* around the
+/// pane being split, so the pane you split is the one cut in half — repeated
+/// splits never shrink the untouched panes.
+enum TermPane {
+    Leaf(Entity<Terminal>),
+    /// `shares` are flex weights, one per kid — dragging a divider moves weight
+    /// between the two panes it separates.
+    Split { horizontal: bool, kids: Vec<TermPane>, shares: Vec<f32> },
+}
+
+impl TermPane {
+    fn leaves(&self, out: &mut Vec<Entity<Terminal>>) {
+        match self {
+            TermPane::Leaf(t) => out.push(t.clone()),
+            TermPane::Split { kids, .. } => kids.iter().for_each(|k| k.leaves(out)),
+        }
+    }
+
+    fn find(&self, id: EntityId) -> Option<&Entity<Terminal>> {
+        match self {
+            TermPane::Leaf(t) => (t.entity_id() == id).then_some(t),
+            TermPane::Split { kids, .. } => kids.iter().find_map(|k| k.find(id)),
+        }
+    }
+
+    /// Top-left-most pane — the fallback focus target.
+    fn first(&self) -> &Entity<Terminal> {
+        match self {
+            TermPane::Leaf(t) => t,
+            TermPane::Split { kids, .. } => kids[0].first(),
+        }
+    }
+
+    /// Replace the leaf holding `id` with a 50/50 split of it and `new`.
+    fn split(&mut self, id: EntityId, horizontal: bool, new: &Entity<Terminal>) -> bool {
+        match self {
+            TermPane::Leaf(t) => {
+                if t.entity_id() != id {
+                    return false;
+                }
+                let old = TermPane::Leaf(t.clone());
+                *self = TermPane::Split {
+                    horizontal,
+                    kids: vec![old, TermPane::Leaf(new.clone())],
+                    shares: vec![0.5, 0.5],
+                };
+                true
+            }
+            TermPane::Split { kids, .. } => kids.iter_mut().any(|k| k.split(id, horizontal, new)),
+        }
+    }
+
+    /// Index path from this node down to the leaf holding `id` (root-first).
+    fn path_to(&self, id: EntityId) -> Option<Vec<usize>> {
+        match self {
+            TermPane::Leaf(t) => (t.entity_id() == id).then(Vec::new),
+            TermPane::Split { kids, .. } => kids.iter().enumerate().find_map(|(i, k)| {
+                let mut p = k.path_to(id)?;
+                p.insert(0, i);
+                Some(p)
+            }),
+        }
+    }
+
+    fn at(&self, path: &[usize]) -> Option<&TermPane> {
+        match path.split_first() {
+            None => Some(self),
+            Some((i, rest)) => match self {
+                TermPane::Leaf(_) => None,
+                TermPane::Split { kids, .. } => kids.get(*i)?.at(rest),
+            },
+        }
+    }
+
+    fn at_mut(&mut self, path: &[usize]) -> Option<&mut TermPane> {
+        match path.split_first() {
+            None => Some(self),
+            Some((i, rest)) => match self {
+                TermPane::Leaf(_) => None,
+                TermPane::Split { kids, .. } => kids.get_mut(*i)?.at_mut(rest),
+            },
+        }
+    }
+
+    /// Leaf on one edge of this subtree: `last` picks the bottom/right-most,
+    /// else the top/left-most. Used to land on the pane nearest the one we left.
+    fn edge_leaf(&self, last: bool) -> &Entity<Terminal> {
+        match self {
+            TermPane::Leaf(t) => t,
+            TermPane::Split { kids, .. } => {
+                let k = if last { kids.last() } else { kids.first() };
+                k.expect("split always has kids").edge_leaf(last)
+            }
+        }
+    }
+
+    /// Drop the pane holding `id`. Returns true when *this* node is that pane and
+    /// the caller should drop it; a split left with one kid collapses into it.
+    fn remove(&mut self, id: EntityId) -> bool {
+        match self {
+            TermPane::Leaf(t) => t.entity_id() == id,
+            TermPane::Split { kids, shares, .. } => {
+                let mut i = 0;
+                while i < kids.len() {
+                    if kids[i].remove(id) {
+                        kids.remove(i);
+                        shares.remove(i);
+                    } else {
+                        i += 1;
+                    }
+                }
+                if kids.len() == 1 {
+                    *self = kids.pop().unwrap();
+                }
+                false
+            }
+        }
+    }
+}
+
+/// Conventional-commit-style types a workspace title can carry: (key, emoji,
+/// label). The emoji becomes the title's prefix, so the topbar shows what kind
+/// of work the workspace is for at a glance.
+const TITLE_TYPES: &[(&str, &str, &str)] = &[
+    ("feat", "✨", "New feature"),
+    ("fix", "🐛", "Bug fix"),
+    ("docs", "📝", "Documentation"),
+    ("style", "🎨", "Code style/formatting"),
+    ("refactor", "♻️", "Code refactoring"),
+    ("perf", "⚡", "Performance improvements"),
+    ("test", "🧪", "Testing"),
+    ("build", "📦", "Build system"),
+    ("ci", "⚙️", "CI/CD"),
+    ("chore", "🧹", "Other changes"),
+    ("bip", "📣", "Build in public"),
+    ("client", "💼", "Client work"),
+    ("release", "🚀", "Release tasks"),
+];
+
+/// Split a stored title back into (type index, description) by its emoji prefix,
+/// so reopening the dialog shows the type that was picked last time.
+fn split_title(title: &str) -> (Option<usize>, String) {
+    for (i, (_, emoji, _)) in TITLE_TYPES.iter().enumerate() {
+        if let Some(rest) = title.strip_prefix(emoji) {
+            return (Some(i), rest.trim().to_string());
+        }
+    }
+    (None, title.to_string())
+}
+
+/// The workspace number in the topbar and the quick-jump keys in the project
+/// switcher: a bare number, fixed-width so a column of them stays aligned.
+fn key_cap(label: impl Into<SharedString>, dim: bool) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .flex_shrink_0()
+        .min_w(px(14.))
+        .h(px(16.))
+        .text_size(px(11.))
+        .text_color(rgb(if dim { MUTED } else { TEXT }))
+        .child(label.into())
+}
+
+/// Solid "FREE" badge — the loud form of the idle state. "Idle" would suggest
+/// someone taking a break; a reset workspace has no task and no one on it, so
+/// the word that matters is that it's available to claim.
+fn idle_badge(size: f32) -> Div {
+    div()
+        .flex_shrink_0()
+        .px_2()
+        .py(px(1.))
+        .rounded_md()
+        .bg(rgb(agent_color(AgentState::Idle)))
+        .text_size(px(size))
+        .text_color(rgb(BG))
+        .child("FREE")
+}
+
+/// Colour an agent state shows up as (pane border, chip, tab dot).
+fn agent_color(s: AgentState) -> u32 {
+    match s {
+        // cyan: not green (that's "checks passing" / "admin up" / "done"), not
+        // amber or blue, and not the purple that marks review comments
+        AgentState::Idle => 0x56c8d8,
+        AgentState::Working => ACCENT,
+        AgentState::Blocked => 0xe0af68, // amber: it wants something from you
+        AgentState::Done => GIT_NEW,
+        AgentState::Failed => GIT_DELETED,
+    }
+}
+
+fn agent_label(s: AgentState) -> &'static str {
+    match s {
+        AgentState::Idle => "free",
+        AgentState::Working => "working",
+        AgentState::Blocked => "needs you",
+        AgentState::Done => "done",
+        AgentState::Failed => "failed",
+    }
+}
+
+/// The review-comment marker: a message glyph from the icon font, optionally
+/// followed by a count. Digits aren't in the icon font, so they're a sibling.
+fn comment_marker(n: usize, size: f32) -> Div {
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(1.))
+        .flex_shrink_0()
+        .text_color(rgb(COMMENT_MARK))
+        .child(div().font_family(ICON_FONT).text_size(px(size)).child(IC_COMMENT));
+    if n > 0 {
+        row = row.child(div().text_size(px(size - 1.0)).child(n.to_string()));
+    }
+    row
+}
+
+/// One button in a comment box's footer. `primary` fills it (the commit action);
+/// the rest are outlined.
+fn rc_button(
+    id: &'static str,
+    label: &'static str,
+    primary: bool,
+    danger: bool,
+) -> gpui::Stateful<gpui::Div> {
+    let fg = if primary { BG } else if danger { MUTED } else { TEXT };
+    div()
+        .id(id)
+        .px_2()
+        .py(px(2.))
+        .rounded_md()
+        .cursor_pointer()
+        .text_size(px(11.))
+        .border_1()
+        .border_color(rgb(if primary { COMMENT_MARK } else { BORDER }))
+        .when(primary, |d| d.bg(rgb(COMMENT_MARK)))
+        .text_color(rgb(fg))
+        .when(!primary && danger, |d| d.hover(|s| s.text_color(rgb(GIT_DELETED)).border_color(rgb(GIT_DELETED))))
+        .when(!primary && !danger, |d| d.hover(|s| s.bg(rgb(HOVER))))
+        .when(primary, |d| d.hover(|s| s.opacity(0.85)))
+        .child(label)
+}
+
+/// Height of an inline note row in the diff window (the editor shows notes in
+/// the right margin instead, so it reserves no row for them).
+const RC_NOTE_H: f32 = 20.0;
+/// Chrome around the comment input: header, padding, borders, button row.
+const RC_BOX_CHROME: f32 = 74.0;
+const RC_LINE_H: f32 = 16.0;
+/// Breathing room between the box and the code above/below it.
+const RC_BOX_PAD: f32 = 6.0;
+/// The input always looks like a text area, never a one-line field.
+const RC_MIN_LINES: usize = 3;
+const RC_MAX_LINES: usize = 20;
+
+/// Visible row count of a comment body, wrapping included, clamped to the box's
+/// range. The box is ~90 chars wide at 12px, the same estimate the thread area
+/// uses — a hard newline count alone under-measures a wrapped line and the last
+/// row gets clipped.
+fn rc_lines(text: &str) -> usize {
+    let rows: usize = text.split('\n').map(|l| 1 + l.chars().count() / 90).sum();
+    rows.clamp(RC_MIN_LINES, RC_MAX_LINES)
+}
+
+/// Rows the thread area takes: one per reply line, capped so a long answer
+/// scrolls inside the box instead of pushing the file apart.
+fn rc_thread_rows(turns: &[ReviewReply]) -> usize {
+    let lines: usize = turns
+        .iter()
+        .map(|r| {
+            // rough wrap: the box is ~80 chars wide at 12px, plus a spacer row
+            r.text.lines().map(|l| 1 + l.chars().count() / 80).sum::<usize>().max(1) + 1
+        })
+        .sum();
+    lines.min(10)
+}
+
+/// Height of the comment box itself (excludes the padding around it).
+fn rc_box_h(text: &str, replies: &[ReviewReply]) -> f32 {
+    RC_BOX_CHROME + rc_lines(text) as f32 * RC_LINE_H + rc_thread_rows(replies) as f32 * RC_LINE_H
+}
+
+/// Pixels to shift the body up so the caret's line stays visible once the note is
+/// taller than the box's cap — without this, typing past 20 lines vanishes.
+fn rc_scroll_off(f: &Field) -> f32 {
+    let (_, end) = clamp_span_str(&f.text, 0, f.caret);
+    let caret_line = f.text[..end].split('\n').count();
+    let visible = rc_lines(&f.text);
+    (caret_line.saturating_sub(visible)) as f32 * RC_LINE_H
+}
+
+/// Total space the editor has to reserve for the box: the box plus its padding.
+fn rc_gap_h(text: &str, replies: &[ReviewReply]) -> f32 {
+    rc_box_h(text, replies) + RC_BOX_PAD * 2.0
+}
+
+/// Where a project's review comments live between runs. Keyed by project path,
+/// like the workspace titles.
+fn review_path(root: &Path) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(
+        PathBuf::from(home)
+            .join(".config/tide/comments")
+            .join(format!("{}.json", usage::project_slug(root))),
+    )
+}
+
+/// Serialise comments with **repo-relative** paths, so a moved or re-cloned
+/// checkout still matches them up.
+fn review_to_json(root: &Path, comments: &[ReviewComment]) -> String {
+    let items: Vec<serde_json::Value> = comments
+        .iter()
+        .map(|c| {
+            let rel = c.path.strip_prefix(root).unwrap_or(&c.path);
+            serde_json::json!({
+                "id": c.id,
+                "path": rel.to_string_lossy(),
+                "line": c.line,
+                "end": c.end,
+                "snippet": c.snippet,
+                "text": c.text,
+                "draft": c.draft,
+                "sent": c.sent,
+                "replies": c
+                    .replies
+                    .iter()
+                    .map(|r| serde_json::json!({ "who": r.who, "text": r.text }))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&items).unwrap_or_else(|_| "[]".into())
+}
+
+fn review_from_json(root: &Path, body: &str) -> Vec<ReviewComment> {
+    let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(body) else { return Vec::new() };
+    items
+        .iter()
+        .filter_map(|v| {
+            let rel = v.get("path")?.as_str()?;
+            let line = v.get("line")?.as_u64()? as usize;
+            let text = v.get("text")?.as_str()?.to_string();
+            if text.trim().is_empty() {
+                return None;
+            }
+            Some(ReviewComment {
+                id: v
+                    .get("id")
+                    .and_then(|i| i.as_str())
+                    .map(|i| i.to_string())
+                    .unwrap_or_else(random_id),
+                path: root.join(rel),
+                line,
+                end: v.get("end").and_then(|e| e.as_u64()).unwrap_or(line as u64) as usize,
+                snippet: v.get("snippet").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                text,
+                draft: v.get("draft").and_then(|d| d.as_bool()).unwrap_or(false),
+                sent: v.get("sent").and_then(|d| d.as_bool()).unwrap_or(false),
+                replies: v
+                    .get("replies")
+                    .and_then(|r| r.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|r| {
+                                Some(ReviewReply {
+                                    who: r.get("who")?.as_str()?.to_string(),
+                                    text: r.get("text")?.as_str()?.to_string(),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+fn load_review(root: &Path) -> Vec<ReviewComment> {
+    review_path(root)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|body| review_from_json(root, &body))
+        .unwrap_or_default()
+}
+
+/// Format `(reference, snippet, note)` triples as the message typed into the
+/// agent's pane: numbered, with the code quoted so the agent sees what was meant
+/// without having to guess which lines moved.
+fn format_review(items: &[ReviewItem]) -> String {
+    let mut out = String::from("Review comments from TIDE — please address each:\n\n");
+    for (i, it) in items.iter().enumerate() {
+        out.push_str(&format!("{}. [{}] {}\n", i + 1, it.id, it.reference));
+        for line in it.snippet.lines().take(12) {
+            out.push_str(&format!("   | {}\n", line.trim_end()));
+        }
+        out.push_str(&format!("   -> {}\n", it.note));
+        // an ongoing thread: the agent sees what was already said, so a follow-up
+        // reads as a conversation instead of a fresh comment
+        for (who, text) in &it.thread {
+            let label = if who == "agent" { "you (agent)" } else { "me" };
+            for (li, line) in text.lines().enumerate() {
+                if li == 0 {
+                    out.push_str(&format!("   {label}: {line}\n"));
+                } else {
+                    out.push_str(&format!("      {line}\n"));
+                }
+            }
+        }
+        out.push('\n');
+    }
+    // each comment is a thread in TIDE; answering by id puts your reply in the
+    // thread instead of only in this transcript
+    out.push_str(
+        "When you've handled one, post a one-or-two-sentence answer back to its thread:\n         curl -s -X POST \"$TIDE_RPC/comment\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n           -d '{\"id\":\"<id in brackets above>\",\"text\":\"<what you did>\"}'\n\nThe reply renders as markdown in TIDE, so use it where it helps: `backticks` for\nidentifiers, paths, and values, **bold** for the one thing that matters most, and\n- bullets when there's more than one point. Prose is fine for a one-liner — don't\ndress up a short answer.\n",
+    );
+    out
+}
+
+/// One comment as handed to the agent: its id, where it points, the code, the
+/// note, and whatever has already been said in its thread.
+struct ReviewItem {
+    id: String,
+    reference: String,
+    snippet: String,
+    note: String,
+    thread: Vec<(String, String)>,
+}
+
+/// A note pinned to a line span of a file, to be handed to the coding agent
+/// later. Held per project and never written to disk — these are meant to be
+/// written, sent, and dropped inside one review pass.
+/// One turn in a comment thread.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReviewReply {
+    /// "you" for a note you added, "agent" for one posted to `/comment`.
+    who: String,
+    text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReviewComment {
+    /// Short id handed to the agent so its answer can find its way back here.
+    id: String,
+    path: PathBuf,
+    /// 1-based, inclusive
+    line: usize,
+    end: usize,
+    /// the code as it read when the note was written (quoted when sending)
+    snippet: String,
+    text: String,
+    /// Written but never committed — kept when the file closes with the box open,
+    /// so an accidental ⌘W doesn't throw the text away. Drafts are listed in the
+    /// review pane but held back when the batch is sent.
+    draft: bool,
+    /// True once the comment has been handed to the agent; it stays in the list
+    /// so replies have somewhere to land.
+    sent: bool,
+    /// The thread: the agent's answers, and any follow-ups you add.
+    replies: Vec<ReviewReply>,
+}
+
+/// An in-flight drag of the divider between `kids[ix]` and `kids[ix + 1]` of the
+/// split at `path`. Sizes come from the panes' painted bounds, so the divider
+/// tracks the cursor regardless of how deeply the split is nested.
+#[derive(Clone)]
+struct PaneDrag {
+    path: Vec<usize>,
+    ix: usize,
+    horizontal: bool,
+    origin: f32,     // cursor position on the split axis when the drag began
+    extent: f32,     // px spanned by the two panes being resized
+    total: f32,      // their combined flex weight (conserved across the drag)
+    start_frac: f32, // kids[ix]'s share of `total` when the drag began
+}
+
+/// A terminal tab: its pane tree plus which pane had focus (so switching tabs
+/// away and back lands on the same shell).
+struct TermTab {
+    panes: TermPane,
+    active: EntityId,
+    /// Name shown on the tab instead of "Terminal N" — set when a tab is opened
+    /// for a specific job (the `admin` watch, say).
+    title: Option<String>,
+    /// ⌘⇧↩: show only the active pane, full dock. The tree is untouched, so
+    /// unzooming restores the layout (and its dragged shares) as it was.
+    zoomed: bool,
+}
+
+impl TermTab {
+    fn new(t: Entity<Terminal>) -> Self {
+        Self { active: t.entity_id(), panes: TermPane::Leaf(t), zoomed: false, title: None }
+    }
+
+    fn terminals(&self) -> Vec<Entity<Terminal>> {
+        let mut v = Vec::new();
+        self.panes.leaves(&mut v);
+        v
+    }
+
+    fn active_terminal(&self) -> &Entity<Terminal> {
+        self.panes.find(self.active).unwrap_or_else(|| self.panes.first())
+    }
+}
+
 /// Run `git status --porcelain` in `root` and map each path to its state.
 fn compute_git(root: &Path) -> HashMap<PathBuf, GitState> {
     let mut map = HashMap::new();
@@ -2080,6 +3491,8 @@ struct Tab {
     path: PathBuf,
     editor: Entity<Editor>,
     scratch: bool, // unsaved in-memory scratch buffer (gone when closed)
+    /// Markdown files can show rendered instead of raw (⌘⇧V / the crumb button).
+    preview: bool,
 }
 
 struct Storm {
@@ -2097,8 +3510,32 @@ struct Storm {
     confirm_focus: FocusHandle,
     // pending revert confirmation: the path awaiting yes/no (git checkout HEAD)
     confirm_revert: Option<PathBuf>,
-    terminals: Vec<Entity<Terminal>>,
-    active_term: usize,
+    term_tabs: Vec<TermTab>,
+    active_term: usize,          // active tab (each tab holds its own pane tree)
+    pane_drag: Option<PaneDrag>, // in-flight pane-divider drag
+    // loopback channel agents in the panes report their state to, and the latest
+    // state per pane (keyed by the pane terminal's EntityId as u64)
+    agent_rpc: Option<rpc::Server>,
+    agent_states: HashMap<u64, (AgentState, String)>,
+    pane_cmds: HashMap<u64, String>, // pane entity id -> the command it's running
+    // ── review comments: notes pinned to lines, sent to the agent in one go ──
+    review: Vec<ReviewComment>,
+    rc_open: bool,          // the "write a comment" prompt
+    rc_focus: FocusHandle,
+    rc_query: Field,
+    rc_target: Option<(PathBuf, usize, usize)>, // path + 1-based line span
+    /// True when the box is writing a *follow-up* in a thread rather than editing
+    /// the original note — the default once an answer has arrived.
+    rc_reply_mode: bool,
+    /// User-dragged height of the thread area in the comment box (`None` = size
+    /// to content), and the in-flight drag: (mouse origin y, height at grab).
+    /// Review-pane rows (by comment id) whose thread is shown in full. Collapsed
+    /// is the default: a long back-and-forth would otherwise fill the pane.
+    review_expanded: HashSet<String>,
+    rc_thread_h: Option<f32>,
+    rc_resize: Option<(f32, f32)>,
+    ws_idle: bool,   // persisted "nobody is on this workspace" marker
+    ws_paused: bool, // persisted "skip me in ⌥Tab" marker
     show_terminal: bool,
     term_width: f32,
     resizing_term: bool,
@@ -2127,13 +3564,23 @@ struct Storm {
     // dir-tree right-click menu: anchor position + the entry it targets
     tree_ctx: Option<(f32, f32)>,
     tree_ctx_path: Option<PathBuf>,
+    /// Which action list the open context menu shows — the dir tree's, or the
+    /// short one a file row in Changes / PR Review gets.
+    tree_ctx_kind: CtxKind,
     tree_ctx_focus: FocusHandle,
     git_status: HashMap<PathBuf, GitState>,
     // pull-request review
     pr_files: Vec<(PathBuf, GitState)>,
     pr_viewed: HashSet<PathBuf>,
+    /// Viewed-state changes made here that GitHub hasn't confirmed yet, as
+    /// `path -> viewed`. A refresh reads the PR's state from `gh`, which lags a
+    /// mutation by a moment; without these the checkbox would flip back.
+    pr_viewed_pending: Arc<Mutex<HashMap<PathBuf, bool>>>,
     pr_collapsed: HashSet<PathBuf>,
     pr_base: String,
+    /// Set when our file list can't be trusted: `origin/<base>` is behind the
+    /// tip GitHub diffs against, so the three-dot merge-base is too far back.
+    pr_stale: Option<String>,
     pr_selected: Option<PathBuf>,
     pr_focus: FocusHandle,
     pr_gen: u64,
@@ -2170,7 +3617,8 @@ struct Storm {
     branch_parent: Option<String>, // branch this one was created from (reflog, best-effort)
     // open PR for the current branch, if any: (number, url). Refetched when the
     // branch changes; `pr_link_branch` is the branch it was last queried for.
-    pr_link: Option<(u64, String, PrStatus, String, String)>, // (number, url, status, base, head)
+    // (number, url, checks status, base, head, lifecycle state)
+    pr_link: Option<(u64, String, PrStatus, String, String, PrState)>,
     pr_link_branch: String,
     mem_mb: u64,
     read_only: bool, // when on, editors block manual edits (nav/select/copy still work)
@@ -2201,6 +3649,7 @@ struct Storm {
     newproj_focus: FocusHandle,
     newproj_path: Field,
     newproj_recents: Vec<PathBuf>, // recent projects, loaded when the dialog opens
+    newproj_titles: HashMap<String, String>, // their custom titles, same load
     newproj_sel: usize,            // highlighted row in the filtered recents list
     // commit message
     commit_msg: Field,
@@ -2311,12 +3760,14 @@ struct Storm {
     // workspace (multi-project) info, pushed down by the Workspace each render
     ws_names: Vec<String>,
     ws_branches: Vec<String>,
+    ws_roots: Vec<PathBuf>, // roots of every open workspace (for "already open")
     ws_active: usize,
     ws_open: bool, // project-switcher dropdown expanded
     // ── native agent panel (ACP) ───────────────────────────────────────────
     agent_open: bool,                // right-side dock visible
-    agent_width: f32,                // dock width
-    resizing_agent: bool,            // dragging the dock divider
+    agent_share: f32,                // fraction of the terminal dock's height
+    resizing_agent: bool,            // dragging the divider under the agent
+    agent_zoomed: bool,              // ⌘⇧↩ on the agent: take the whole dock
     acp: Option<Arc<acp::Acp>>,      // lazily spawned on first open
     acp_polling: bool,               // the drain poll loop is running
     agent_msgs: Vec<AgentMsg>,       // conversation transcript
@@ -2325,7 +3776,46 @@ struct Storm {
     agent_busy: bool,                // a turn is in flight
     agent_input: Field,              // prompt input box
     agent_focus: FocusHandle,        // focus for the dock (routes typing)
-    agent_scroll: ScrollHandle,      // transcript scroll
+    agent_ctx: Option<(u64, u64)>,   // ACP usage_update: (context used, window)
+    agent_sessions: Vec<(String, String)>, // resumable sessions: (id, title)
+    /// A `session/list` answer we asked for in order to resume the newest
+    /// session, rather than to populate the picker.
+    agent_autoresume: bool,
+    /// Whether this workspace already auto-resumed once — reopening the panel
+    /// shouldn't throw away the conversation you're in the middle of.
+    agent_resumed: bool,
+    agent_picker: bool,              // the resume list is open
+    agent_title: Option<String>,     // the adapter's title for this session
+    /// Rows selected in one agent message: `(message, anchor row, current row)`.
+    /// Row granularity on purpose — pixel→byte mapping through gpui's text
+    /// layout was unreliable (it can't address headings, fences or table cells at
+    /// all), and a paragraph is the unit you actually want to ask about.
+    agent_sel: Option<(usize, usize, usize)>,
+    agent_sel_drag: bool,
+    /// True once a drag has actually extended the selection — a bare click
+    /// shouldn't pop the comment box open.
+    agent_sel_moved: bool,
+    /// Where the selection was last touched, in window coordinates: the comment
+    /// box opens there instead of centred over the editor.
+    agent_sel_pos: Option<(f32, f32)>,
+    /// Images pasted into the composer, waiting to go with the next prompt:
+    /// `(mime type, base64 bytes, byte size)`.
+    agent_imgs: Vec<(String, String, usize)>,
+    /// Snippet for a comment whose source isn't a file (the agent's answer).
+    rc_snippet: Option<String>,
+    /// Spinner frame + when the running turn started, for the live "thinking" row.
+    agent_spin: usize,
+    agent_turn_start: Option<std::time::Instant>,
+    /// Prompts typed while a turn was still running, sent in order as each turn
+    /// ends — the same queueing Claude Code does in the terminal.
+    agent_queue: Vec<String>,
+    /// Virtualized transcript state, and the item count it was last told about.
+    agent_list: gpui::ListState,
+    agent_list_len: usize,
+    /// What the ACP panel is doing, in the same vocabulary the terminal panes
+    /// report through the RPC channel — hooks can't see this agent, so the panel
+    /// reports itself.
+    acp_state: Option<AgentState>,
     // ── Git log panel (bottom dock) ────────────────────────────────────────
     git_open: bool,                          // dock visible
     git_height: f32,                         // dock height
@@ -2349,11 +3839,32 @@ struct Storm {
     browser_focus: FocusHandle,
     // wby-next admin health: None = unknown, Some(true/false) = up/down
     admin_up: Option<bool>,
+    /// Pane running the `admin` watch, when it was started from the topbar. Its
+    /// own terminal tab, so the build log is there when it's wanted and out of
+    /// the way when it isn't.
+    admin_pane: Option<u64>,
+    /// Terminal pane running `wwp` (watch the branch's changed packages).
+    watch_pane: Option<u64>,
+    /// Package names the watch button offers, refreshed by the git poll.
+    watch_pkgs: Vec<String>,
+    admin_spin: usize, // spinner frame while an admin build is coming up
+    /// Set when ▶ started the admin: the first time it answers, open it in the
+    /// default browser. Cleared once used, so a later restart-and-recover of the
+    /// same admin doesn't steal focus.
+    admin_autoopen: bool,
+    /// Plan usage windows, as last reported to the statusline shim, and whether
+    /// the topbar chip's detail panel is open.
+    limits: Option<usage::Limits>,
+    limits_open: bool,
     // custom workspace title (persisted); overrides the folder name in the UI
     ws_title: Option<String>,
     title_open: bool,
     title_focus: FocusHandle,
     title_query: Field,
+    title_type: Option<usize>, // index into TITLE_TYPES; None = plain title
+    title_client: Field,       // "who is this for" — optional, persisted
+    title_field: usize,        // 0 = title, 1 = client (⇥ moves between them)
+    ws_client: Option<String>, // the saved client for this workspace
 }
 
 /// Navigation requests a project view sends up to the workspace.
@@ -2399,6 +3910,10 @@ impl Storm {
         expanded.insert(root.clone());
         let browser_default = default_browser_url(&root);
         let ws_title = load_ws_title(&root);
+        let ws_idle = load_ws_idle(&root);
+        let ws_paused = load_ws_paused(&root);
+        let ws_client = load_ws_client(&root);
+        let review = load_review(&root);
         let mut s = Self {
             root,
             expanded,
@@ -2414,8 +3929,10 @@ impl Storm {
             confirm_revert: None,
             pr_files: Vec::new(),
             pr_viewed: HashSet::new(),
+            pr_viewed_pending: Arc::new(Mutex::new(HashMap::new())),
             pr_collapsed: HashSet::new(),
             pr_base: String::new(),
+            pr_stale: None,
             pr_selected: None,
             pr_focus: cx.focus_handle(),
             pr_gen: 0,
@@ -2423,11 +3940,26 @@ impl Storm {
             pr_node_id: None,
             pr_filter: Field::default(),
             pr_filter_focus: cx.focus_handle(),
-            pr_view_filter: PrViewFilter::All,
+            pr_view_filter: PrViewFilter::Unviewed, // start on what's left to review
             pr_rows: Vec::new(),
             pr_shown_files: Vec::new(),
             pr_scroll: UniformListScrollHandle::new(),
-            terminals: Vec::new(),
+            term_tabs: Vec::new(),
+            pane_drag: None,
+            agent_rpc: rpc::Server::start(random_id() + &random_id()),
+            agent_states: HashMap::new(),
+            pane_cmds: HashMap::new(),
+            review,
+            rc_open: false,
+            rc_focus: cx.focus_handle(),
+            rc_query: Field::default(),
+            rc_target: None,
+            rc_reply_mode: false,
+            review_expanded: HashSet::new(),
+            rc_thread_h: None,
+            rc_resize: None,
+            ws_idle,
+            ws_paused,
             active_term: 0,
             show_terminal: true,
             term_width: 900.,
@@ -2453,6 +3985,7 @@ impl Storm {
             editor_ctx_focus: cx.focus_handle(),
             tree_ctx: None,
             tree_ctx_path: None,
+            tree_ctx_kind: CtxKind::Tree,
             tree_ctx_focus: cx.focus_handle(),
             git_status: HashMap::new(),
             finder_open: false,
@@ -2498,6 +4031,7 @@ impl Storm {
             newproj_focus: cx.focus_handle(),
             newproj_path: Field::default(),
             newproj_recents: Vec::new(),
+            newproj_titles: HashMap::new(),
             newproj_sel: 0,
             commit_msg: Field::default(),
             commit_focus: cx.focus_handle(),
@@ -2579,21 +4113,44 @@ impl Storm {
             proc_workspace_only: true,
             proc_ws_pids: Vec::new(),
             ws_names: Vec::new(),
+            ws_roots: Vec::new(),
             ws_branches: Vec::new(),
             ws_active: 0,
             ws_open: false,
-            agent_open: false,
-            agent_width: 380.,
+            // the agent pane is the default right-hand view; it starts zoomed,
+            // so the terminal panes stay out of the way until asked for
+            agent_open: true,
+            // when the terminal is revealed it gets a strip at the bottom, not
+            // half the dock
+            agent_share: 0.78,
             resizing_agent: false,
+            agent_zoomed: true,
             acp: None,
             acp_polling: false,
             agent_msgs: Vec::new(),
             agent_cur: None,
             agent_cur_thought: None,
             agent_busy: false,
-            agent_input: Field::default(),
+            agent_input: Field::multiline(),
             agent_focus: cx.focus_handle(),
-            agent_scroll: ScrollHandle::new(),
+            agent_ctx: None,
+            agent_sessions: Vec::new(),
+            agent_autoresume: false,
+            agent_resumed: false,
+            agent_picker: false,
+            agent_title: None,
+            agent_sel: None,
+            agent_sel_drag: false,
+            agent_sel_moved: false,
+            agent_sel_pos: None,
+            agent_imgs: Vec::new(),
+            rc_snippet: None,
+            agent_spin: 0,
+            agent_turn_start: None,
+            agent_queue: Vec::new(),
+            agent_list: gpui::ListState::new(0, gpui::ListAlignment::Bottom, px(600.)),
+            agent_list_len: 0,
+            acp_state: None,
             git_open: false,
             git_height: 320.,
             resizing_git: false,
@@ -2618,30 +4175,49 @@ impl Storm {
             },
             browser_focus: cx.focus_handle(),
             admin_up: None,
+            admin_pane: None,
+            watch_pane: None,
+            watch_pkgs: Vec::new(),
+            admin_spin: 0,
+            admin_autoopen: false,
+            limits: None,
+            limits_open: false,
             ws_title,
             title_open: false,
             title_focus: cx.focus_handle(),
             title_query: Field::default(),
+            title_type: None,
+            title_client: Field::default(),
+            title_field: 0,
+            ws_client,
         };
         s.ignored = git_ignored_paths(&s.root); // hide git-ignored paths from the tree
         s.expanded.insert(s.root.clone()); // the root node starts expanded
         s.rebuild();
+        // the pinned "You" header is computed from the list's scroll position, so
+        // a scroll has to repaint the pane
+        {
+            let this = cx.entity().downgrade();
+            s.agent_list.set_scroll_handler(move |_ev, _w, cx| {
+                if let Some(this) = this.upgrade() {
+                    this.update(cx, |_, cx| cx.notify());
+                }
+            });
+        }
         s.start_git_poll(cx);
         s.start_caret_blink(cx);
         s.start_admin_health(cx);
+        s.start_usage_poll(cx);
+        s.start_agent_poll(cx);
+        s.start_pane_cmd_poll(cx);
         s.lsp = Lsp::new(&s.root);
+        // One plain shell. Claude Code itself lives in the agent pane now, so
+        // there's no `cc --continue` pane to reserve half the dock for.
         let root = s.root.clone();
-        let term = cx.new(|cx| Terminal::new(root, cx));
-        // optional startup command run in the default terminal (e.g. set
-        // TIDE_TERM_CMD=z to auto-launch zellij). The shell reads this after
-        // sourcing its rc file, so aliases/functions like `z` are defined.
-        if let Ok(cmd) = std::env::var("TIDE_TERM_CMD") {
-            let cmd = cmd.trim();
-            if !cmd.is_empty() {
-                term.read(cx).send_text(&format!("{cmd}\n"));
-            }
-        }
-        s.terminals.push(term);
+        let rpc = s.rpc_env();
+        let shell = cx.new(|cx| Terminal::new(root, rpc, cx));
+        s.sync_comment_gutters(cx); // markers for comments restored from disk
+        s.term_tabs.push(TermTab::new(shell));
         s
     }
 
@@ -2676,18 +4252,327 @@ impl Storm {
         }
     }
 
+    /// `Watch N packages`: runs `wwp` in its own tab. Absent when the branch
+    /// touches no package. Green while the watch is running — click it for the
+    /// log, ⌥click to stop it.
+    fn render_watch_btn(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let pkgs = self.watch_pkgs.clone();
+        if pkgs.is_empty() {
+            return None;
+        }
+        let running = self.watch_terminal(cx).is_some();
+        let n = pkgs.len();
+        let tip_text = if running {
+            format!("Watching:\n{}\n\nclick for its log, ⌥click to stop", pkgs.join("\n"))
+        } else {
+            format!("Run `wwp` to watch:\n{}", pkgs.join("\n"))
+        };
+        Some(
+            div()
+                .id("watch-pkgs")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .h(px(18.))
+                .px_1()
+                .rounded_md()
+                .cursor_pointer()
+                .text_size(px(11.))
+                .text_color(rgb(if running { GIT_NEW } else { MUTED }))
+                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                .child(div().font_family(ICON_FONT).text_size(px(12.)).child(IC_TOOLS))
+                .child(format!("watch {n} package{}", if n == 1 { "" } else { "s" }))
+                .tooltip(move |_w, cx| {
+                    let text = tip_text.clone();
+                    cx.new(|_| TooltipView { text: text.into() }).into()
+                })
+                .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
+                    match (running, ev.modifiers().alt) {
+                        (true, true) => this.stop_watch(cx),
+                        (true, false) => this.show_watch_log(window, cx),
+                        _ => this.start_watch(window, cx),
+                    }
+                })),
+        )
+    }
+
+    /// The admin ▶ control: grey means stopped, a spinner means the build we
+    /// started hasn't answered yet, green means it's serving. Click a running one
+    /// for its log, ⌥click to stop it. Shared by the topbar and the status card,
+    /// which is why the id is a parameter.
+    fn admin_play_btn(&self, id: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
+        let ours = self.admin_terminal(cx).is_some(); // started from here, so stoppable
+        let up = self.admin_up == Some(true);
+        let building = ours && !up;
+        const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        // down → grey ▶; our build coming up → spinner; serving → red ■
+        let (glyph, color) = if building {
+            (SPIN[self.admin_spin % SPIN.len()], GIT_MODIFIED)
+        } else if up {
+            ("■", GIT_DELETED)
+        } else {
+            ("▶", MUTED)
+        };
+        let running = ours || up;
+        div()
+            .id(id)
+            .px_1()
+            .flex_shrink_0()
+            .rounded_md()
+            .cursor_pointer()
+            .text_size(px(11.))
+            .text_color(rgb(color))
+            .hover(|s| s.bg(rgb(HOVER)))
+            .child(glyph)
+            .tooltip(move |_w, cx| {
+                let text = if building {
+                    "admin is building — opens in your browser when it answers; click to stop, ⌥click for its log"
+                } else if up && ours {
+                    "admin is up — click to stop it, ⌥click for its log"
+                } else if up {
+                    "admin is up, but it wasn't started from TIDE"
+                } else {
+                    "Run `admin` in its own terminal tab"
+                };
+                cx.new(|_| TooltipView { text: text.into() }).into()
+            })
+            .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
+                match (running, ev.modifiers().alt) {
+                    // no pane of ours to stop or show: it was started elsewhere
+                    (true, _) if !ours => this.show_flash("Admin wasn't started from TIDE", cx),
+                    (true, true) => this.show_admin_log(window, cx),
+                    (true, false) => this.stop_admin(cx),
+                    _ => this.start_admin(window, cx),
+                }
+            }))
+    }
+
     /// Poll the wby-next admin URL periodically (every ~15s) and cache up/down.
     fn start_admin_health(&self, cx: &mut Context<Self>) {
         let Some(url) = admin_url(&self.root) else { return };
+        let host = url.trim_start_matches("https://").trim_start_matches("http://").to_string();
+        let open_url = url.clone();
         cx.spawn(async move |this, cx| loop {
             let u = url.clone();
             let up = cx.background_executor().spawn(async move { admin_reachable(&u) }).await;
-            if this.update(cx, |this, cx| { this.admin_up = Some(up); cx.notify(); }).is_err() {
+            // while a build we started is still coming up, check often so the
+            // spinner stops promptly; otherwise idle along at 7s
+            let Ok(waiting) = this.update(cx, |this, cx| {
+                let became_up = up && this.admin_up != Some(true);
+                this.admin_up = Some(up);
+                if became_up && this.admin_pane.is_some() {
+                    this.show_flash(&format!("Admin is up — {host}"), cx);
+                    // the build we kicked off just started serving: show it
+                    if std::mem::take(&mut this.admin_autoopen) {
+                        open_browser(&open_url);
+                    }
+                }
+                cx.notify();
+                this.admin_pane.is_some() && !up
+            }) else {
                 break;
-            }
-            cx.background_executor().timer(Duration::from_secs(7)).await;
+            };
+            let wait = if waiting { 2 } else { 7 };
+            cx.background_executor().timer(Duration::from_secs(wait)).await;
         })
         .detach();
+    }
+
+    /// Install the statusline shim that feeds the usage chip: write the script,
+    /// then wrap whatever `statusLine` command `~/.claude/settings.json` already
+    /// has so an existing status line keeps rendering unchanged.
+    fn install_usage_bars(&mut self, cx: &mut Context<Self>) {
+        let Ok(home) = std::env::var("HOME") else {
+            self.show_flash("No HOME — cannot install", cx);
+            return;
+        };
+        let home = PathBuf::from(home);
+        let shim = home.join(".claude/tide-statusline.sh");
+        if let Err(e) = std::fs::write(&shim, usage::STATUSLINE_SHIM) {
+            self.show_flash(&format!("Could not write the shim: {e}"), cx);
+            return;
+        }
+        let _ = Command::new("chmod").arg("+x").arg(&shim).output();
+        let settings = home.join(".claude/settings.json");
+        let text = std::fs::read_to_string(&settings).unwrap_or_else(|_| "{}".to_string());
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::json!({}));
+        let shim_q = format!("\"{}\"", shim.display());
+        let prev = v
+            .get("statusLine")
+            .and_then(|s| s.get("command"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+        if prev.contains("tide-statusline.sh") {
+            self.show_flash("Usage bars already installed", cx);
+            return;
+        }
+        // the old command becomes the shim's argument, stdin and all
+        let cmd = if prev.is_empty() { shim_q.clone() } else { format!("{shim_q} {prev}") };
+        v["statusLine"] = serde_json::json!({ "type": "command", "command": cmd });
+        let Ok(out) = serde_json::to_string_pretty(&v) else { return };
+        if let Err(e) = std::fs::write(&settings, out + "\n") {
+            self.show_flash(&format!("Could not update settings.json: {e}"), cx);
+            return;
+        }
+        self.show_flash("Usage bars installed — restart Claude Code to start reporting", cx);
+        self.start_usage_poll(cx);
+    }
+
+    /// Re-read the statusline dump so the usage chip follows the session. Cheap:
+    /// one small file, and only when it changed.
+    fn start_usage_poll(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            let l = cx.background_executor().spawn(async move { usage::load_limits() }).await;
+            if this
+                .update(cx, |this, cx| {
+                    if this.limits != l {
+                        this.limits = l;
+                        cx.notify();
+                    }
+                })
+                .is_err()
+            {
+                break;
+            }
+            cx.background_executor().timer(Duration::from_secs(15)).await;
+        })
+        .detach();
+    }
+
+    /// Spin the admin button while a build we started is coming up. Runs only for
+    /// the wait itself, so nothing ticks when there's nothing to show.
+    fn start_admin_spinner(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_millis(120)).await;
+            let Ok(spinning) = this.update(cx, |this, cx| {
+                let spinning = this.admin_pane.is_some() && this.admin_up != Some(true);
+                if spinning {
+                    this.admin_spin = this.admin_spin.wrapping_add(1);
+                    cx.notify();
+                }
+                spinning
+            }) else {
+                break;
+            };
+            if !spinning {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// The terminal pane running `admin`, if it's still alive.
+    fn admin_terminal(&self, _cx: &App) -> Option<Entity<Terminal>> {
+        let id = self.admin_pane?;
+        let t = self.all_terminals().into_iter().find(|t| t.entity_id().as_u64() == id)?;
+        // The shell outlives the command, so a pane sitting at its prompt means
+        // admin has exited. `pane_cmds` only lists panes with a child process, so
+        // an entry at all means something is still running there.
+        self.pane_cmds.contains_key(&id).then_some(t)
+    }
+
+    /// Start `admin` in its own terminal tab and leave focus where it was.
+    /// The pane running `wwp`, if it's still alive.
+    fn watch_terminal(&self, _cx: &App) -> Option<Entity<Terminal>> {
+        let id = self.watch_pane?;
+        let t = self.all_terminals().into_iter().find(|t| t.entity_id().as_u64() == id)?;
+        self.pane_cmds.contains_key(&id).then_some(t)
+    }
+
+    /// Run `wwp` in its own terminal tab. It picks the base branch and the
+    /// changed packages itself; we only mirror the list for the label.
+    fn start_watch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(t) = self.watch_terminal(cx) {
+            self.focus_pane(&t, window, cx); // already watching: show me its log
+            return;
+        }
+        let (was_tab, was_terminal) = (self.active_term, self.show_terminal);
+        self.new_terminal(window, cx);
+        let Some(t) = self.focused_pane(window, cx) else { return };
+        t.read(cx).send_text("wwp\n");
+        self.watch_pane = Some(t.entity_id().as_u64());
+        if let Some(tab) = self.term_tabs.get_mut(self.active_term) {
+            tab.title = Some("Watch".into());
+        }
+        // background job: hand focus back where it was
+        if was_tab < self.term_tabs.len() {
+            self.active_term = was_tab;
+        }
+        self.show_terminal = was_terminal;
+        self.focus_active(window, cx);
+        self.show_flash("Watching packages — logs in its own terminal tab", cx);
+        cx.notify();
+    }
+
+    fn show_watch_log(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(t) = self.watch_terminal(cx) {
+            self.focus_pane(&t, window, cx);
+        }
+    }
+
+    fn stop_watch(&mut self, cx: &mut Context<Self>) {
+        let Some(t) = self.watch_terminal(cx) else { return };
+        t.read(cx).send_text("\x03");
+        self.show_flash("Stopped the package watch", cx);
+        cx.notify();
+    }
+
+    fn start_admin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(t) = self.admin_terminal(cx) {
+            // already running: show me its log instead of starting a second one
+            self.focus_pane(&t, window, cx);
+            return;
+        }
+        let (was_tab, was_terminal) = (self.active_term, self.show_terminal);
+        self.new_terminal(window, cx);
+        let Some(t) = self.focused_pane(window, cx) else { return };
+        t.read(cx).send_text("admin\n");
+        self.admin_pane = Some(t.entity_id().as_u64());
+        self.admin_up = None; // unknown until it answers
+        self.admin_spin = 0;
+        self.admin_autoopen = true; // show it as soon as it's actually serving
+        self.start_admin_spinner(cx);
+        if let Some(tab) = self.term_tabs.get_mut(self.active_term) {
+            tab.title = Some("Admin".into());
+        }
+        // hand focus back: this is meant to run in the background
+        if was_tab < self.term_tabs.len() {
+            self.active_term = was_tab;
+        }
+        self.show_terminal = was_terminal;
+        self.focus_active(window, cx);
+        self.show_flash("Started admin — logs in its own terminal tab", cx);
+        cx.notify();
+    }
+
+    /// Jump to the admin tab (its build log).
+    fn show_admin_log(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(t) = self.admin_terminal(cx) else {
+            self.show_flash("admin isn't running", cx);
+            return;
+        };
+        let id = t.entity_id();
+        if let Some(ix) = self
+            .term_tabs
+            .iter()
+            .position(|tab| tab.terminals().iter().any(|p| p.entity_id() == id))
+        {
+            self.active_term = ix;
+        }
+        self.show_terminal = true;
+        self.focus_pane(&t, window, cx);
+        cx.notify();
+    }
+
+    /// Ctrl-C the admin watch (the tab stays, so the log can still be read).
+    fn stop_admin(&mut self, cx: &mut Context<Self>) {
+        let Some(t) = self.admin_terminal(cx) else { return };
+        t.read(cx).send_text("\x03");
+        self.admin_autoopen = false; // a stop cancels the pending browser open
+        self.show_flash("Stopped admin", cx);
+        cx.notify();
     }
 
     /// Re-check admin health now (used by the summary Refresh button).
@@ -2719,80 +4604,385 @@ impl Storm {
     }
 
     fn active_terminal(&self) -> Option<&Entity<Terminal>> {
-        self.terminals.get(self.active_term)
+        self.term_tabs.get(self.active_term).map(|t| t.active_terminal())
+    }
+
+    /// Every shell in the dock — all panes of all tabs.
+    fn all_terminals(&self) -> Vec<Entity<Terminal>> {
+        self.term_tabs.iter().flat_map(|t| t.terminals()).collect()
+    }
+
+    /// The pane the user is actually in: the focused leaf of the active tab,
+    /// falling back to that tab's last-active pane.
+    fn focused_pane(&self, window: &Window, cx: &App) -> Option<Entity<Terminal>> {
+        let tab = self.term_tabs.get(self.active_term)?;
+        Some(
+            tab.terminals()
+                .into_iter()
+                .find(|t| t.read(cx).focus_handle.is_focused(window))
+                .unwrap_or_else(|| tab.active_terminal().clone()),
+        )
+    }
+
+    fn focus_pane(&mut self, t: &Entity<Terminal>, window: &mut Window, cx: &mut Context<Self>) {
+        self.agent_zoomed = false; // a pane can't take focus while the agent covers it
+        if let Some(tab) = self.term_tabs.get_mut(self.active_term) {
+            tab.active = t.entity_id();
+        }
+        let fh = t.read(cx).focus_handle.clone();
+        window.focus(&fh, cx);
+    }
+
+    /// `(url, token)` handed to every pane shell so agents can report back.
+    fn rpc_env(&self) -> Option<(String, String)> {
+        self.agent_rpc.as_ref().map(|s| (s.url(), s.token.clone()))
+    }
+
+    /// Drain agent reports into `agent_states` a few times a second.
+    fn start_agent_poll(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_millis(250)).await;
+            let alive = this
+                .update(cx, |this, cx| {
+                    let (reports, replies) = match this.agent_rpc.as_ref() {
+                        Some(s) => (s.drain(), s.drain_replies()),
+                        None => (Vec::new(), Vec::new()),
+                    };
+                    if !replies.is_empty() {
+                        let mut landed = 0usize;
+                        for r in replies {
+                            if let Some(c) = this.review.iter_mut().find(|c| c.id == r.id) {
+                                c.replies.push(ReviewReply { who: "agent".into(), text: r.text });
+                                landed += 1;
+                            }
+                        }
+                        if landed > 0 {
+                            this.save_review();
+                            this.show_flash(
+                                &format!("{landed} answer{} in review threads", if landed == 1 { "" } else { "s" }),
+                                cx,
+                            );
+                            cx.notify();
+                        }
+                    }
+                    if reports.is_empty() {
+                        return;
+                    }
+                    for r in reports {
+                        // an idle report is about the workspace, not one pane
+                        if r.state.is_idle() {
+                            this.agent_states.clear();
+                            this.ws_idle = true;
+                            save_ws_idle(&this.root, true);
+                            continue;
+                        }
+                        // anything else means someone is on this workspace again
+                        if this.ws_idle {
+                            this.ws_idle = false;
+                            save_ws_idle(&this.root, false);
+                        }
+                        // no pane in the report (someone curl'd by hand) → pin it
+                        // on the active pane so it still shows up somewhere
+                        let pane = r.pane.or_else(|| {
+                            this.term_tabs.get(this.active_term).map(|t| t.active.as_u64())
+                        });
+                        if let Some(pane) = pane {
+                            this.agent_states.insert(pane, (r.state, r.summary));
+                        }
+                    }
+                    cx.notify();
+                })
+                .is_ok();
+            if !alive {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// Track what each pane is running, so a badge can say it without you having
+    /// to read the scrollback. One `ps` per tick for every pane.
+    fn start_pane_cmd_poll(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+            let Ok(panes) = this.update(cx, |this, cx| {
+                this.all_terminals()
+                    .into_iter()
+                    .filter_map(|t| t.read(cx).child_pid().map(|pid| (t.entity_id().as_u64(), pid)))
+                    .collect::<Vec<_>>()
+            }) else {
+                break;
+            };
+            let pids: Vec<u32> = panes.iter().map(|(_, p)| *p).collect();
+            let cmds = cx.background_executor().spawn(async move { running_cmds(&pids) }).await;
+            let ok = this
+                .update(cx, |this, cx| {
+                    let next: HashMap<u64, String> = panes
+                        .iter()
+                        .filter_map(|(id, pid)| cmds.get(pid).map(|c| (*id, c.clone())))
+                        .collect();
+                    if next != this.pane_cmds {
+                        this.pane_cmds = next;
+                        cx.notify();
+                    }
+                })
+                .is_ok();
+            if !ok {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// Reported state of one pane.
+    fn pane_state(&self, t: &Entity<Terminal>) -> Option<(AgentState, &str)> {
+        self.agent_states.get(&t.entity_id().as_u64()).map(|(s, m)| (*s, m.as_str()))
+    }
+
+    /// The most attention-hungry state across a tab's panes (for its tab dot).
+    /// Idle doesn't earn a dot — a row of grey dots on every tab says nothing.
+    fn tab_state(&self, tab: &TermTab) -> Option<AgentState> {
+        tab.terminals()
+            .iter()
+            .filter_map(|t| self.pane_state(t).map(|(s, _)| s))
+            .filter(|s| !s.is_idle())
+            .max_by_key(|s| s.priority())
+    }
+
+    /// Whole-project roll-up: the loudest agent state across every pane of every
+    /// terminal tab. Drives the status screen row and the project switcher dot.
+    /// Only live panes count, so a closed pane's leftover state never shows.
+    fn agent_rollup(&self) -> Option<(AgentState, String)> {
+        self.term_tabs
+            .iter()
+            .flat_map(|t| t.terminals())
+            .filter_map(|t| self.pane_state(&t).map(|(s, m)| (s, m.to_string())))
+            // the ACP panel counts as one more agent in this workspace
+            .chain(self.acp_state.map(|s| (s, String::new())))
+            .max_by_key(|(s, _)| s.priority())
+            // nothing live to report → fall back to the persisted idle marker,
+            // which is how a workspace marked idle elsewhere shows up here
+            .or_else(|| self.ws_idle.then(|| (AgentState::Idle, String::new())))
     }
 
     /// Ensure at least one terminal exists; returns the active one's handle.
     fn ensure_terminal(&mut self, cx: &mut Context<Self>) {
-        if self.terminals.is_empty() {
-            let root = self.root.clone();
-            self.terminals.push(cx.new(|cx| Terminal::new(root, cx)));
+        if self.term_tabs.is_empty() {
+            let (root, rpc) = (self.root.clone(), self.rpc_env());
+            let t = cx.new(|cx| Terminal::new(root, rpc, cx));
+            self.term_tabs.push(TermTab::new(t));
             self.active_term = 0;
         }
     }
 
     fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let root = self.root.clone();
-        self.terminals.push(cx.new(|cx| Terminal::new(root, cx)));
-        self.active_term = self.terminals.len() - 1;
+        let (root, rpc) = (self.root.clone(), self.rpc_env());
+        let t = cx.new(|cx| Terminal::new(root, rpc, cx));
+        self.term_tabs.push(TermTab::new(t.clone()));
+        self.active_term = self.term_tabs.len() - 1;
         self.show_terminal = true;
-        let fh = self.terminals[self.active_term].read(cx).focus_handle.clone();
-        window.focus(&fh, cx);
+        self.focus_pane(&t, window, cx);
         cx.notify();
+    }
+
+    /// ⌘D / ⌘⇧D: halve the focused pane — a fresh shell lands beside it
+    /// (`horizontal`) or below it — and takes focus.
+    fn split_terminal(&mut self, horizontal: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.hide_browser(); // terminal + browser share the right dock
+        self.show_terminal = true;
+        self.ensure_terminal(cx);
+        let Some(target) = self.focused_pane(window, cx).map(|t| t.entity_id()) else { return };
+        let (root, rpc) = (self.root.clone(), self.rpc_env());
+        let new = cx.new(|cx| Terminal::new(root, rpc, cx));
+        let tab = &mut self.term_tabs[self.active_term];
+        tab.zoomed = false; // a new split has to be visible to make sense
+        if !tab.panes.split(target, horizontal, &new) {
+            // stale focus target (shouldn't happen) — don't leave an orphan shell
+            new.update(cx, |t, _| t.kill());
+            return;
+        }
+        self.focus_pane(&new, window, cx);
+        cx.notify();
+    }
+
+    /// ⌘⇧↩: blow the focused pane up to the whole dock (and back).
+    fn act_toggle_zoom(&mut self, _: &ToggleTermZoom, window: &mut Window, cx: &mut Context<Self>) {
+        // the agent is zoomable in its own right — it's half of the dock
+        if AGENT_PANEL && self.agent_open && self.agent_focus.is_focused(window) {
+            self.agent_zoomed = !self.agent_zoomed;
+            cx.notify();
+            return;
+        }
+        let Some(cur) = self.focused_pane(window, cx) else { return };
+        let ix = self.active_term;
+        let Some(tab) = self.term_tabs.get_mut(ix) else { return };
+        tab.active = cur.entity_id();
+        tab.zoomed = !tab.zoomed;
+        self.focus_pane(&cur, window, cx);
+        cx.notify();
+    }
+
+    /// ⌘←/→/↑/↓: move focus to the neighbouring pane. Walks up the pane tree to
+    /// the nearest split on the requested axis and takes the sibling next to us,
+    /// then descends to that subtree's nearest edge pane. While zoomed there is
+    /// no geometry to walk, so the arrows just cycle panes in tree order
+    /// (left/up = previous, right/down = next, wrapping around).
+    fn move_pane_focus(&mut self, horizontal: bool, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // The agent UI sits above the panes in the same dock, so vertical moves
+        // cross into it: ⌘↓ from the agent lands on the top-left pane, and ⌘↑
+        // from a pane with nothing above it goes back to the agent.
+        let agent_shown = AGENT_PANEL && self.agent_open;
+        if agent_shown && !horizontal && self.agent_focus.is_focused(window) {
+            if forward {
+                if let Some(tab) = self.term_tabs.get(self.active_term) {
+                    let target = tab.panes.edge_leaf(false).clone();
+                    self.agent_zoomed = false;
+                    self.focus_pane(&target, window, cx);
+                    cx.notify();
+                }
+            }
+            return; // ⌘↑ from the agent has nowhere to go
+        }
+        let Some(cur) = self.focused_pane(window, cx).map(|t| t.entity_id()) else { return };
+        let Some(tab) = self.term_tabs.get(self.active_term) else { return };
+        if tab.zoomed {
+            let panes = tab.terminals();
+            let n = panes.len();
+            if n < 2 {
+                return;
+            }
+            let at = panes.iter().position(|t| t.entity_id() == cur).unwrap_or(0);
+            let next = if forward { (at + 1) % n } else { (at + n - 1) % n };
+            let target = panes[next].clone();
+            self.focus_pane(&target, window, cx);
+            cx.notify();
+            return;
+        }
+        let Some(mut path) = tab.panes.path_to(cur) else { return };
+        let at_top = !horizontal && !forward;
+        while let Some(ix) = path.pop() {
+            let Some(TermPane::Split { horizontal: axis, kids, .. }) = tab.panes.at(&path) else { break };
+            if *axis != horizontal {
+                continue; // wrong axis — keep climbing
+            }
+            let next = if forward { ix + 1 } else { ix.wrapping_sub(1) };
+            if let Some(sib) = kids.get(next).filter(|_| forward || ix > 0) {
+                let target = sib.edge_leaf(!forward).clone();
+                self.focus_pane(&target, window, cx);
+                cx.notify();
+                return;
+            }
+        }
+        // nothing above this pane inside the tab → the agent is what's up there
+        if at_top && agent_shown {
+            self.focus_agent(window, cx);
+        }
+    }
+
+    /// Move focus into the agent UI (and make sure it's running).
+    fn focus_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_terminal = true;
+        self.agent_open = true;
+        self.ensure_acp(cx);
+        self.autoresume_agent(cx);
+        self.agent_list.scroll_to_end();
+        window.focus(&self.agent_focus, cx);
+        cx.notify();
+    }
+
+    fn act_pane_left(&mut self, _: &FocusPaneLeft, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_pane_focus(true, false, window, cx);
+    }
+
+    fn act_pane_right(&mut self, _: &FocusPaneRight, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_pane_focus(true, true, window, cx);
+    }
+
+    fn act_pane_up(&mut self, _: &FocusPaneUp, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_pane_focus(false, false, window, cx);
+    }
+
+    fn act_pane_down(&mut self, _: &FocusPaneDown, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_pane_focus(false, true, window, cx);
+    }
+
+    fn act_split_term_right(&mut self, _: &SplitTermRight, window: &mut Window, cx: &mut Context<Self>) {
+        self.split_terminal(true, window, cx);
+    }
+
+    fn act_split_term_down(&mut self, _: &SplitTermDown, window: &mut Window, cx: &mut Context<Self>) {
+        self.split_terminal(false, window, cx);
     }
 
     fn act_new_terminal(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {
         self.new_terminal(window, cx);
     }
 
+    /// ⌘W in the terminal: close the focused pane; the last pane closes the tab.
     fn act_close_terminal(&mut self, _: &CloseTerminalTab, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.terminals.is_empty() {
-            self.close_terminal(self.active_term, window, cx);
+        if self.term_tabs.is_empty() {
+            return;
         }
+        if self.term_tabs[self.active_term].terminals().len() <= 1 {
+            self.close_terminal(self.active_term, window, cx);
+            return;
+        }
+        let Some(target) = self.focused_pane(window, cx) else { return };
+        target.update(cx, |t, _| t.kill());
+        let id = target.entity_id();
+        let tab = &mut self.term_tabs[self.active_term];
+        tab.panes.remove(id);
+        tab.zoomed = false;
+        let next = tab.panes.first().clone();
+        self.focus_pane(&next, window, cx);
+        cx.notify();
     }
 
     fn act_close_other_terminals(&mut self, _: &CloseOtherTerminals, window: &mut Window, cx: &mut Context<Self>) {
-        if self.terminals.is_empty() {
+        if self.term_tabs.is_empty() {
             return;
         }
-        let keep = self.terminals.remove(self.active_term);
-        for t in &self.terminals {
+        let keep = self.term_tabs.remove(self.active_term);
+        for t in self.all_terminals() {
             t.update(cx, |t, _| t.kill());
         }
-        self.terminals.clear();
-        self.terminals.push(keep);
+        self.term_tabs.clear();
+        self.term_tabs.push(keep);
         self.active_term = 0;
-        let fh = self.terminals[0].read(cx).focus_handle.clone();
-        window.focus(&fh, cx);
+        let t = self.term_tabs[0].active_terminal().clone();
+        self.focus_pane(&t, window, cx);
         cx.notify();
     }
 
     fn switch_terminal(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if ix < self.terminals.len() {
+        if ix < self.term_tabs.len() {
             self.active_term = ix;
-            let fh = self.terminals[ix].read(cx).focus_handle.clone();
-            window.focus(&fh, cx);
+            let t = self.term_tabs[ix].active_terminal().clone();
+            self.focus_pane(&t, window, cx);
             cx.notify();
         }
     }
 
+    /// Close a whole tab (every pane in it).
     fn close_terminal(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if ix >= self.terminals.len() {
+        if ix >= self.term_tabs.len() {
             return;
         }
-        self.terminals[ix].update(cx, |t, _| t.kill());
-        self.terminals.remove(ix);
-        if self.active_term >= self.terminals.len() && !self.terminals.is_empty() {
-            self.active_term = self.terminals.len() - 1;
+        for t in self.term_tabs[ix].terminals() {
+            t.update(cx, |t, _| t.kill());
+        }
+        self.term_tabs.remove(ix);
+        if self.active_term >= self.term_tabs.len() && !self.term_tabs.is_empty() {
+            self.active_term = self.term_tabs.len() - 1;
         } else if ix < self.active_term {
             self.active_term = self.active_term.saturating_sub(1);
         }
-        if self.terminals.is_empty() {
+        if self.term_tabs.is_empty() {
             self.show_terminal = false;
             self.focus_active(window, cx);
         } else {
-            let fh = self.terminals[self.active_term].read(cx).focus_handle.clone();
-            window.focus(&fh, cx);
+            let t = self.term_tabs[self.active_term].active_terminal().clone();
+            self.focus_pane(&t, window, cx);
         }
         cx.notify();
     }
@@ -2806,10 +4996,21 @@ impl Storm {
                 break;
             };
             let root2 = root.clone();
-            let (status, branch, mem, ignored) = cx
+            let base = this.update(cx, |this, _| this.pr_base.clone()).unwrap_or_default();
+            let (status, branch, mem, ignored, (idle, paused), pkgs) = cx
                 .background_executor()
                 .spawn(async move {
-                    (compute_git(&root2), git_branch(&root2), process_mem_mb(), git_ignored_paths(&root2))
+                    let base = if base.is_empty() { git_default_branch(&root2) } else { base };
+                    (
+                        compute_git(&root2),
+                        git_branch(&root2),
+                        process_mem_mb(),
+                        git_ignored_paths(&root2),
+                        // another TIDE instance (or a script) may have marked this
+                        // workspace idle or paused since the last tick
+                        (load_ws_idle(&root2), load_ws_paused(&root2)),
+                        changed_packages(&root2, &base),
+                    )
                 })
                 .await;
             // refetch the PR link only when the branch actually changed — the
@@ -2829,6 +5030,9 @@ impl Storm {
                     this.git_status = status;
                     this.branch = branch.clone();
                     this.mem_mb = mem;
+                    this.watch_pkgs = pkgs;
+                    this.ws_idle = idle;
+                    this.ws_paused = paused;
                     if let Some(parent) = parent_update {
                         this.branch_parent = parent;
                     }
@@ -2910,10 +5114,19 @@ impl Storm {
         self.tabs.get(self.active).map(|t| &t.path)
     }
 
+    /// Headline name for this workspace: its custom title, or "Untitled" — the
+    /// folder name is always shown next to it, so the fallback says "nobody has
+    /// named this one" instead of repeating the folder.
     fn project_name(&self) -> String {
-        if let Some(t) = self.ws_title.as_ref().filter(|t| !t.trim().is_empty()) {
-            return t.clone();
-        }
+        self.ws_title
+            .as_ref()
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "Untitled".into())
+    }
+
+    fn folder_name(&self) -> String {
         self.root
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -2942,6 +5155,7 @@ impl Storm {
             if key == "escape" {
                 self.tree_ctx = None;
                 self.tree_ctx_path = None;
+                self.tree_ctx_kind = CtxKind::Tree;
                 cx.notify();
             } else if let Ok(n) = key.parse::<usize>() {
                 if n >= 1 {
@@ -3417,7 +5631,7 @@ impl Storm {
         // synthetic path just for the tab label; the editor itself has no path
         // (so save() is a no-op — nothing hits disk)
         let path = PathBuf::from(format!("scratch {n}"));
-        self.tabs.push(Tab { path, editor: editor.clone(), scratch: true });
+        self.tabs.push(Tab { path, editor: editor.clone(), scratch: true, preview: false });
         self.active = self.tabs.len() - 1;
         window.focus(&editor.read(cx).focus_handle.clone(), cx);
         cx.notify();
@@ -3448,6 +5662,15 @@ impl Storm {
                 }
             })
             .detach();
+            // the gutter "+" (click, or drag over a range) asks for a comment box
+            cx.subscribe_in(&editor, window, |this, _ed, ev: &CommentRequest, window, cx| {
+                let (line, end) = (ev.line, ev.end);
+                if let Some(tab) = this.tabs.get(this.active) {
+                    let path = tab.path.clone();
+                    this.begin_comment(path, line, end, window, cx);
+                }
+            })
+            .detach();
             // clicking the read-only hint's "enable EDIT" link flips edit mode
             cx.subscribe(&editor, |this, _ed, _ev: &ToggleReadOnly, cx| {
                 if this.read_only {
@@ -3455,11 +5678,15 @@ impl Storm {
                 }
             })
             .detach();
-            self.tabs.push(Tab { path: path.clone(), editor, scratch: false });
+            // a markdown file opens rendered; ⌘⇧V flips it back to the source
+            let preview = is_markdown(&path);
+            self.tabs.push(Tab { path: path.clone(), editor, scratch: false, preview });
             self.active = self.tabs.len() - 1;
         }
         self.tree_selected = Some(path.clone());
         self.reveal_in_tree(&path);
+        // a freshly created editor knows nothing about pending comments on its file
+        self.sync_comment_gutters(cx);
         self.focus_active(window, cx);
     }
 
@@ -3509,6 +5736,58 @@ impl Storm {
         cx.notify();
     }
 
+    /// Drop every collapsed ancestor of `path` from a dir-collapse set (relative
+    /// keys, plus the root `""`), so a revealed row is actually on screen.
+    /// Chain-compressed nodes are keyed by their deepest path, which is still an
+    /// ancestor prefix, so this clears those too.
+    fn expand_ancestors(collapsed: &mut HashSet<PathBuf>, path: &Path, root: &Path) {
+        collapsed.remove(Path::new(""));
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        let mut cur = PathBuf::new();
+        for comp in rel.parent().unwrap_or(Path::new("")).components() {
+            cur = cur.join(comp);
+            collapsed.remove(&cur);
+        }
+    }
+
+    fn reveal_active_in_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.active_path().cloned() else { return };
+        if !self.git_status.contains_key(&path) {
+            self.show_flash("Not in Changes — file is unmodified", cx);
+            return;
+        }
+        self.left_view = LeftView::Changes;
+        self.show_left = true;
+        Self::expand_ancestors(&mut self.commit_collapsed, &path, &self.root);
+        self.commit_selected = Some(path);
+        window.focus(&self.changes_focus, cx);
+        cx.notify();
+    }
+
+    fn reveal_active_in_pr(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.active_path().cloned() else { return };
+        if !self.pr_files.iter().any(|(p, _)| p == &path) {
+            self.show_flash("Not in this PR", cx);
+            return;
+        }
+        self.left_view = LeftView::PullRequest;
+        self.show_left = true;
+        // a name or viewed-state filter would hide the row we just revealed
+        if !self.rel(&path).to_lowercase().contains(&self.pr_filter.text.to_lowercase()) {
+            self.pr_filter.set(String::new());
+        }
+        let viewed = self.pr_viewed.contains(&path);
+        if (viewed && self.pr_view_filter == PrViewFilter::Unviewed)
+            || (!viewed && self.pr_view_filter == PrViewFilter::Viewed)
+        {
+            self.pr_view_filter = PrViewFilter::All;
+        }
+        Self::expand_ancestors(&mut self.pr_collapsed, &path, &self.root);
+        self.pr_selected = Some(path);
+        window.focus(&self.pr_focus, cx);
+        cx.notify();
+    }
+
     fn switch_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix < self.tabs.len() {
             if ix != self.active {
@@ -3533,6 +5812,7 @@ impl Storm {
             return;
         }
         self.save_tab(ix, cx); // auto-save before closing
+        self.stash_comment_draft(ix, cx); // don't lose an open comment box
         self.tabs.remove(ix);
         if self.active >= self.tabs.len() && !self.tabs.is_empty() {
             self.active = self.tabs.len() - 1;
@@ -3570,6 +5850,23 @@ impl Storm {
 
     fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.save_tab(self.active, cx); // leaving the editor → auto-save
+        let agent_holds_dock = AGENT_PANEL && self.agent_open && self.show_terminal;
+        if agent_holds_dock {
+            // the dock is the agent's; this toggles the terminal strip under it
+            // rather than hiding the agent along with it
+            self.agent_zoomed = !self.agent_zoomed;
+            if self.agent_zoomed {
+                self.focus_agent(window, cx);
+            } else {
+                self.ensure_terminal(cx);
+                if let Some(t) = self.active_terminal() {
+                    let fh = t.read(cx).focus_handle.clone();
+                    window.focus(&fh, cx);
+                }
+            }
+            cx.notify();
+            return;
+        }
         self.show_terminal = !self.show_terminal;
         if self.show_terminal {
             self.hide_browser(); // terminal + browser share the right dock
@@ -3709,6 +6006,20 @@ impl Storm {
     /// Clipboard text (for paste into chrome inputs).
     /// Drive a [`Field`] from a keystroke, bridging the system clipboard for
     /// cmd+v (read) and cmd+c/cmd+x (write). One place for every chrome input.
+    /// True when this keystroke will also arrive as text through the input
+    /// handler (`insertText:`). Boxes that register an `input_sink` must not
+    /// insert it on the key path too, or every character lands twice — the same
+    /// double-typing the terminal hit.
+    fn text_comes_via_input_handler(ks: &Keystroke) -> bool {
+        let m = &ks.modifiers;
+        !m.platform
+            && !m.control
+            && !m.function
+            && ks.key_char.as_deref().is_some_and(|c| {
+                !c.is_empty() && !c.chars().any(|ch| ch.is_control())
+            })
+    }
+
     fn field_input(
         field: &mut Field,
         ks: &Keystroke,
@@ -3796,9 +6107,23 @@ impl Storm {
 
     fn open_title_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.title_open = true;
-        self.title_query.set(self.ws_title.clone().unwrap_or_default());
+        let (ty, desc) = split_title(self.ws_title.as_deref().unwrap_or(""));
+        self.title_type = ty;
+        self.title_query.set(desc);
+        self.title_client.set(self.ws_client.clone().unwrap_or_default());
+        self.title_field = 0;
         window.focus(&self.title_focus, cx);
         cx.notify();
+    }
+
+    /// `<emoji> <description>`, or just the description with no type picked.
+    fn composed_title(&self) -> String {
+        let desc = self.title_query.text.trim();
+        match self.title_type.and_then(|i| TITLE_TYPES.get(i)) {
+            Some((_, emoji, _)) if !desc.is_empty() => format!("{emoji} {desc}"),
+            Some((_, emoji, _)) => (*emoji).to_string(),
+            None => desc.to_string(),
+        }
     }
 
     fn title_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -3808,22 +6133,79 @@ impl Storm {
                 self.focus_active(window, cx);
             }
             "enter" => {
-                let t = self.title_query.text.trim().to_string();
+                let t = self.composed_title();
                 self.ws_title = (!t.is_empty()).then(|| t.clone());
                 save_ws_title(&self.root, if t.is_empty() { None } else { Some(&t) });
+                let c = self.title_client.text.trim().to_string();
+                self.ws_client = (!c.is_empty()).then(|| c.clone());
+                save_ws_client(&self.root, if c.is_empty() { None } else { Some(&c) });
                 self.title_open = false;
                 self.focus_active(window, cx);
             }
+            // ⇥ moves between the title and the client (types are chips, or a
+            // "fix:" prefix in the title)
+            "tab" => self.title_field = 1 - self.title_field,
             _ => {
-                Self::field_input(&mut self.title_query, &ev.keystroke, cx, |_| true);
+                if self.title_field == 1 {
+                    Self::field_input(&mut self.title_client, &ev.keystroke, cx, |_| true);
+                } else {
+                    Self::field_input(&mut self.title_query, &ev.keystroke, cx, |_| true);
+                    self.consume_type_prefix();
+                }
             }
         }
         cx.notify();
     }
 
+    /// Typing `fix:` (or `ci: `) picks that type and drops the prefix from the
+    /// description — the fast path when you already know the type you want.
+    fn consume_type_prefix(&mut self) {
+        let text = self.title_query.text.clone();
+        let Some((head, rest)) = text.split_once(':') else { return };
+        let key = head.trim().to_lowercase();
+        if let Some(i) = TITLE_TYPES.iter().position(|(k, _, _)| *k == key) {
+            self.title_type = Some(i);
+            self.title_query.set(rest.trim_start().to_string());
+        }
+    }
+
     fn render_title_prompt(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let w = 360.0_f32;
+        let w = 460.0_f32;
         let left = ((self.win_width - w) / 2.0).max(0.);
+        // type chips: emoji + key, the picked one outlined
+        let mut types = div().flex().flex_row().flex_wrap().gap_1().mx_3().mb_2();
+        for (i, (key, emoji, label)) in TITLE_TYPES.iter().enumerate() {
+            let on = self.title_type == Some(i);
+            let tip_text: SharedString = format!("{key} — {label}").into();
+            types = types.child(
+                div()
+                    .id(("title-type", i))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .px_1p5()
+                    .py(px(2.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(rgb(if on { SELECTED_BG } else { BG }))
+                    .border_1()
+                    .border_color(rgb(if on { ACCENT } else { BORDER }))
+                    .text_size(px(10.))
+                    .text_color(rgb(if on { SEL_TEXT } else { MUTED }))
+                    .child(div().text_size(px(11.)).child(*emoji))
+                    .child(*key)
+                    .tooltip(move |_w, cx| {
+                        cx.new(|_| TooltipView { text: tip_text.clone() }).into()
+                    })
+                    .on_click(cx.listener(move |this, _e, window, cx| {
+                        this.title_type = if this.title_type == Some(i) { None } else { Some(i) };
+                        window.focus(&this.title_focus, cx); // keep typing in the field
+                        cx.notify();
+                    })),
+            );
+        }
+        let preview = self.composed_title();
         div()
             .absolute()
             .top(px(120.))
@@ -3844,20 +6226,68 @@ impl Storm {
                     .py_2()
                     .text_size(px(11.))
                     .text_color(rgb(MUTED))
-                    .child("Workspace title  (empty = folder name)"),
+                    .child("Workspace title  ·  type \"fix:\" to pick a type  ·  ⇥ title/client  ·  ↩ saves"),
             )
+            .child(types)
             .child(
                 div()
                     .mx_3()
-                    .mb_3()
                     .px_2()
                     .py_1()
                     .bg(rgb(BG))
                     .border_1()
                     .border_color(rgb(BORDER))
                     .rounded_md()
+                    .border_color(rgb(if self.title_field == 0 { ACCENT } else { BORDER }))
                     .text_color(rgb(TEXT))
-                    .child(self.title_query.render(self.caret(), SELECTION)),
+                    .child(self.title_query.render(self.caret_if(self.title_field == 0), SELECTION)),
+            )
+            // who the work is for — optional, and only shown on the workspace when set
+            .child(
+                div()
+                    .mx_3()
+                    .mt_2()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(div().w(px(44.)).text_size(px(10.)).text_color(rgb(MUTED)).child("Client"))
+                    .child(
+                        div()
+                            .id("title-client")
+                            .flex_grow(1.0)
+                            .px_2()
+                            .py_1()
+                            .bg(rgb(BG))
+                            .border_1()
+                            .border_color(rgb(if self.title_field == 1 { ACCENT } else { BORDER }))
+                            .rounded_md()
+                            .text_size(px(12.))
+                            .cursor_pointer()
+                            .text_color(rgb(TEXT))
+                            .child(if self.title_client.is_empty() && self.title_field != 1 {
+                                div().text_color(rgb(MUTED)).child("optional — e.g. Acme")
+                            } else {
+                                self.title_client.render(self.caret_if(self.title_field == 1), SELECTION)
+                            })
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                this.title_field = 1;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            // what the topbar will show (empty = falls back to the folder name)
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(10.))
+                    .text_color(rgb(if preview.is_empty() { LINE_NUMBER } else { MUTED }))
+                    .child(if preview.is_empty() {
+                        "empty = Untitled".to_string()
+                    } else {
+                        format!("→ {preview}")
+                    }),
             )
     }
 
@@ -4077,6 +6507,37 @@ impl Storm {
     }
 
     /// cmd+shift+t: prompt for an arbitrary shell command to run.
+    fn act_set_ws_title(&mut self, _: &SetWsTitle, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_title_prompt(window, cx);
+    }
+
+    fn act_add_comment(&mut self, _: &AddComment, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_comment_prompt(window, cx);
+    }
+
+    fn act_show_comments(&mut self, _: &ShowComments, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_comment_list(window, cx);
+    }
+
+    fn act_send_comments(&mut self, _: &SendComments, window: &mut Window, cx: &mut Context<Self>) {
+        self.send_review(window, cx);
+    }
+
+    /// ⌘R: re-query the branch's PR (and the admin health dot) right now — the
+    /// same thing the status screen's ↻ Refresh button does. The background poll
+    /// only refetches the PR when the branch changes, so a PR opened or a check
+    /// finished since then wouldn't show up on its own.
+    fn act_refresh_pr(&mut self, _: &RefreshPr, _window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_pr_link(cx);
+        self.check_admin_now(cx);
+        // with the review pane open, also re-diff the changed files
+        if self.show_left && self.left_view == LeftView::PullRequest {
+            self.load_pr(cx);
+        }
+        self.show_flash("Refreshing PR status…", cx);
+        cx.notify();
+    }
+
     fn act_run_command(&mut self, _: &RunCommand, window: &mut Window, cx: &mut Context<Self>) {
         self.runc_open = true;
         self.runc_query.clear();
@@ -4143,6 +6604,8 @@ impl Storm {
         self.newproj_open = true;
         self.newproj_path.clear();
         self.newproj_recents = load_recent_projects();
+        // titles come off disk once, on open — not per frame
+        self.newproj_titles = load_ws_titles();
         self.newproj_sel = 0;
         window.focus(&self.newproj_focus, cx);
         cx.notify();
@@ -4392,10 +6855,25 @@ impl Storm {
             }
         }
         let pr_viewed = if pr_mode { self.pr_viewed.clone() } else { HashSet::new() };
+        // added/modified/deleted colours for the sidebar: the PR's own file states
+        // in review mode, the working tree's otherwise
+        let states: HashMap<PathBuf, GitState> = if pr_mode {
+            self.pr_files.iter().cloned().collect()
+        } else {
+            self.git_status.clone()
+        };
         let root = self.root.clone();
         let storm = cx.entity().downgrade();
         let main = cx.active_window();
-        let bounds = Bounds::centered(None, size(px(1660.), px(820.)), cx);
+        // 1.5× the old 1660×820 default, clamped to the display so it can't open
+        // bigger than the screen on a laptop
+        let (mut w, mut h) = (2490.0_f32, 1230.0_f32);
+        if let Some(d) = cx.primary_display() {
+            let b = d.bounds();
+            w = w.min(f32::from(b.size.width) * 0.95);
+            h = h.min(f32::from(b.size.height) * 0.95);
+        }
+        let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -4409,8 +6887,8 @@ impl Storm {
             move |_, cx| {
                 cx.new(|cx| {
                     DiffWindow::new(
-                        root, files, idx, old, new_rev, pr_mode, pr_viewed, filter_text, pr_view,
-                        storm, main, cx,
+                        root, files, idx, old, new_rev, pr_mode, pr_viewed, states, filter_text,
+                        pr_view, storm, main, cx,
                     )
                 })
             },
@@ -4449,22 +6927,39 @@ impl Storm {
         let gen = self.pr_gen;
         let root = self.root.clone();
         cx.spawn(async move |this, cx| {
-            let (base, files, node_id, viewed) = cx
+            let (base, files, node_id, viewed, stale) = cx
                 .background_executor()
                 .spawn(async move {
-                    let base = git_pr_base(&root);
+                    let meta = gh_pr_meta(&root);
+                    let base = meta.as_ref().map(|m| m.base.clone()).unwrap_or_else(|| git_pr_base(&root));
                     let files = git_pr_files(&root, &base);
-                    let node_id = gh_pr_node_id(&root);
+                    let node_id = match meta.as_ref().map(|m| m.node_id.clone()).filter(|s| !s.is_empty()) {
+                        Some(id) => Some(id),
+                        None => gh_pr_node_id(&root),
+                    };
                     // restore the "viewed" state from the actual PR on GitHub
                     let viewed = gh_pr_viewed_files(&root);
-                    (base, files, node_id, viewed)
+                    let stale = meta.as_ref().and_then(|m| pr_stale_note(&root, m, files.len()));
+                    (base, files, node_id, viewed, stale)
                 })
                 .await;
             this.update(cx, |this, cx| {
                 if this.pr_gen == gen {
                     this.pr_base = base;
                     this.pr_files = files;
+                    this.pr_stale = stale;
                     this.pr_node_id = node_id;
+                    let mut viewed = viewed;
+                    // keep marks gh hasn't caught up with yet
+                    if let Ok(pending) = this.pr_viewed_pending.lock() {
+                        for (path, want) in pending.iter() {
+                            if *want {
+                                viewed.insert(path.clone());
+                            } else {
+                                viewed.remove(path);
+                            }
+                        }
+                    }
                     this.pr_viewed = viewed;
                     this.pr_loading = false;
                     cx.notify();
@@ -4480,6 +6975,42 @@ impl Storm {
             self.pr_viewed.insert(path.clone());
         }
         self.push_pr_viewed(&[path]);
+    }
+
+    /// Directory keys of a file set, as the flattened trees use them (the parent
+    /// chain of every file, plus the root).
+    fn dir_keys(files: impl Iterator<Item = PathBuf>, root: &Path) -> HashSet<PathBuf> {
+        let mut out = HashSet::new();
+        out.insert(PathBuf::from(""));
+        for f in files {
+            let rel = f.strip_prefix(root).unwrap_or(&f).to_path_buf();
+            let mut cur = PathBuf::new();
+            for comp in rel.parent().unwrap_or(Path::new("")).components() {
+                cur = cur.join(comp);
+                out.insert(cur.clone());
+            }
+        }
+        out
+    }
+
+    /// Collapse or expand every directory in the PR tree.
+    fn pr_collapse_all(&mut self, collapse: bool, cx: &mut Context<Self>) {
+        self.pr_collapsed = if collapse {
+            Self::dir_keys(self.pr_files.iter().map(|(p, _)| p.clone()), &self.root)
+        } else {
+            HashSet::new()
+        };
+        cx.notify();
+    }
+
+    /// Collapse or expand every directory in the Changes tree.
+    fn changes_collapse_all(&mut self, collapse: bool, cx: &mut Context<Self>) {
+        self.commit_collapsed = if collapse {
+            Self::dir_keys(self.git_status.keys().cloned(), &self.root)
+        } else {
+            HashSet::new()
+        };
+        cx.notify();
     }
 
     fn toggle_pr_collapsed(&mut self, key: PathBuf) {
@@ -4510,19 +7041,55 @@ impl Storm {
         }
         let Some(pr_id) = self.pr_node_id.clone() else { return };
         let root = self.root.clone();
-        // (repo-relative path, viewed-now) for each file
-        let items: Vec<(String, bool)> = paths
+        // (absolute path, repo-relative path, viewed-now) for each file
+        let items: Vec<(PathBuf, String, bool)> = paths
             .iter()
-            .map(|p| (self.rel(p), self.pr_viewed.contains(p)))
+            .map(|p| (p.clone(), self.rel(p), self.pr_viewed.contains(p)))
             .collect();
+        if let Ok(mut pending) = self.pr_viewed_pending.lock() {
+            for (abs, _, viewed) in &items {
+                pending.insert(abs.clone(), *viewed);
+            }
+        }
+        let pending = self.pr_viewed_pending.clone();
         std::thread::spawn(move || {
-            for (path, viewed) in items {
-                gh_set_file_viewed(&root, &pr_id, &path, viewed);
+            for (abs, path, viewed) in items {
+                if gh_set_file_viewed(&root, &pr_id, &path, viewed) {
+                    // confirmed: gh is now the source of truth for this file
+                    if let Ok(mut p) = pending.lock() {
+                        if p.get(&abs) == Some(&viewed) {
+                            p.remove(&abs);
+                        }
+                    }
+                }
             }
         });
     }
 
     /// Open the base..HEAD diff for a PR file in a separate window.
+    /// Fetch the PR's base branch and reload the file list. The only fix for a
+    /// stale `origin/<base>`; no working tree is touched.
+    fn fetch_pr_base(&mut self, cx: &mut Context<Self>) {
+        let (root, base) = (self.root.clone(), self.pr_base.clone());
+        if base.is_empty() {
+            return;
+        }
+        self.pr_loading = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let b = base.clone();
+            let ok = cx.background_executor().spawn(async move { git_fetch_base(&root, &b) }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.show_flash(
+                    &if ok { format!("Fetched origin/{base}") } else { format!("Could not fetch origin/{base}") },
+                    cx,
+                );
+                this.load_pr(cx);
+            });
+        })
+        .detach();
+    }
+
     fn open_pr_diff(&mut self, path: PathBuf, _window: &mut Window, cx: &mut Context<Self>) {
         let files: Vec<PathBuf> = self.pr_files.iter().map(|(p, _)| p.clone()).collect();
         let Some(idx) = files.iter().position(|p| p == &path) else { return };
@@ -4546,28 +7113,17 @@ impl Storm {
             self.refresh_pr_link(cx); // also re-sync the topbar PR link
             return;
         }
+        // alt+c: comment on the selected file as a whole (same as right-click)
+        if ks.modifiers.alt && !ks.modifiers.platform && ks.key == "c" {
+            if let Some(p) = self.pr_selected.clone().filter(|p| p.is_file()) {
+                self.begin_comment(p, 0, 0, window, cx);
+            }
+            return;
+        }
         // cmd+shift+c: copy the selected file/folder's repo-relative reference
         if ks.modifiers.platform && ks.modifiers.shift && ks.key == "c" {
             if let Some(p) = self.pr_selected.clone() {
                 self.copy_reference(&p, cx);
-            }
-            return;
-        }
-        // cmd+shift+s: mark the selected file viewed, or all files under a
-        // selected folder
-        if ks.modifiers.platform && ks.modifiers.shift && ks.key == "s" {
-            if let Some(sel) = self.pr_selected.clone() {
-                let targets: Vec<PathBuf> = if self.pr_files.iter().any(|(p, _)| p == &sel) {
-                    vec![sel]
-                } else {
-                    self.pr_files
-                        .iter()
-                        .filter(|(p, _)| p.starts_with(&sel))
-                        .map(|(p, _)| p.clone())
-                        .collect()
-                };
-                self.toggle_pr_viewed_all(&targets);
-                cx.notify();
             }
             return;
         }
@@ -4940,8 +7496,13 @@ impl Storm {
     /// Commit-pane list keys: cmd+shift+c copies the selected file/folder ref.
     /// Open a file picked in the changes pane and collapse the pane (so the
     /// editor takes the space), like dismissing a dialog.
-    fn open_commit_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_left = false;
+    /// Open a file from the Changes pane. `close_pane` is for Enter (jump away to
+    /// work on it); F4 keeps the pane open so you can keep walking the list, the
+    /// same way the PR pane behaves.
+    fn open_commit_file(&mut self, path: PathBuf, close_pane: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if close_pane {
+            self.show_left = false;
+        }
         self.open_file(path, window, cx);
     }
 
@@ -4984,11 +7545,12 @@ impl Storm {
             }
             return;
         }
-        // F4 / enter opens the selected file and closes the changes pane
+        // F4 opens the file and stays; Enter opens it and gets out of the way
         if (ks.key == "f4" || ks.key == "enter") && !ks.modifiers.shift {
+            let close_pane = ks.key == "enter";
             if let Some(p) = self.commit_selected.clone() {
                 if p.is_file() {
-                    self.open_commit_file(p, window, cx);
+                    self.open_commit_file(p, close_pane, window, cx);
                 }
             }
             return;
@@ -5123,7 +7685,474 @@ impl Storm {
                 }
             }
             Cmd::SetWorkspaceTitle => self.open_title_prompt(window, cx),
+            Cmd::AddComment => self.open_comment_prompt(window, cx),
+            Cmd::ShowComments => self.open_comment_list(window, cx),
+            Cmd::SendComments => self.send_review(window, cx),
+            Cmd::InstallUsageBars => self.install_usage_bars(cx),
+            Cmd::TogglePause => self.toggle_pause(cx),
+            Cmd::ResetWorkspace => self.reset_workspace(cx),
+            // reset, then hand the workspace back — the git work keeps running in
+            // its own thread, so closing here doesn't cancel the checkout/pull
+            Cmd::ResetWorkspaceClose => {
+                self.reset_workspace(cx);
+                cx.emit(ProjectNav::Remove(self.ws_active));
+            }
         }
+    }
+
+    /// Fresh start on a workspace: back to the default branch with everything
+    /// pulled (`next`), custom title dropped, and PR state cleared — the branch
+    /// we're moving to has no PR yet, so keeping the old chip is just wrong.
+    /// Park this workspace: ⌥Tab stops landing on it until it's resumed.
+    fn toggle_pause(&mut self, cx: &mut Context<Self>) {
+        self.ws_paused = !self.ws_paused;
+        save_ws_paused(&self.root, self.ws_paused);
+        let msg = if self.ws_paused { "Workspace paused — ⌥Tab skips it" } else { "Workspace resumed" };
+        self.show_flash(msg, cx);
+        cx.notify();
+    }
+
+    fn reset_workspace(&mut self, cx: &mut Context<Self>) {
+        self.ws_title = None;
+        save_ws_title(&self.root, None);
+        self.ws_client = None;
+        save_ws_client(&self.root, None);
+        self.title_type = None;
+        // reports describe work on the branch we're leaving — drop them and mark
+        // the workspace idle (persisted, so other TIDE instances see it too)
+        self.agent_states.clear();
+        self.review.clear();
+        self.save_review();
+        self.ws_idle = true;
+        save_ws_idle(&self.root, true);
+        self.pr_link = None;
+        self.pr_link_branch.clear(); // forces the git poll to re-query
+        self.branch_parent = None;
+        self.pr_files.clear();
+        self.pr_rows.clear();
+        self.pr_viewed.clear();
+        self.pr_selected = None;
+        // whatever this repo calls its default branch — `next` in webiny-js,
+        // `main`/`master` elsewhere — rather than one hardcoded name
+        let default_branch = git_default_branch(&self.root);
+        self.run_command(format!("git checkout {default_branch} && git pull --no-rebase"), cx);
+        cx.notify();
+    }
+
+
+    // ── review comments ─────────────────────────────────────────────────────
+
+    /// Open the comment prompt for the caret's line (or the selected span) in the
+    /// active editor. Editing an existing comment on the same span reuses it.
+    fn open_comment_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            self.show_flash("Open a file to comment on it", cx);
+            return;
+        };
+        let path = tab.path.clone();
+        let (a, b) = tab.editor.read(cx).selected_lines();
+        self.begin_comment(path, a, b, window, cx);
+    }
+
+    /// Open the box on `path:a-b`. A thread that already has turns opens ready
+    /// for the next reply; a fresh line opens ready for the note. Every entry
+    /// point (⌥C, the margin chip, the gutter "+") goes through here so they
+    /// can't drift apart.
+    /// `a == 0` (and `b == 0`) is a whole-file comment: no gutter span, no
+    /// snippet, and the box opens centred instead of pinned to a line.
+    fn begin_comment(
+        &mut self,
+        path: PathBuf,
+        a: usize,
+        b: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let found = self.review.iter().find(|c| c.path == path && c.line == a && c.end == b);
+        let has_thread = found.is_some_and(|c| !c.replies.is_empty());
+        let text = if has_thread { String::new() } else { found.map(|c| c.text.clone()).unwrap_or_default() };
+        self.rc_reply_mode = has_thread;
+        // an existing comment keeps the snippet it was saved with
+        if found.is_some() {
+            self.rc_snippet = None;
+        }
+        self.rc_target = Some((path, a, b));
+        self.rc_query.multiline = true; // ↩ saves, ⇧↩ adds a line
+        self.rc_query.set(text);
+        self.rc_open = true;
+        self.sync_comment_gutters(cx); // reserve the space the box will sit in
+        // a fresh note wants the caret; an existing thread opens for reading
+        // first (GitHub-style) — click the reply area to start typing
+        if !has_thread {
+            window.focus(&self.rc_focus, cx);
+        }
+        cx.notify();
+    }
+
+    /// Shorten a thread turn for the collapsed review row. Whole sentences would
+    /// be nicer, but a hard cap is what keeps every row the same order of size.
+    fn clip_turn(text: &str) -> String {
+        const MAX: usize = 180;
+        if text.chars().count() <= MAX {
+            return text.to_string();
+        }
+        format!("{}…", text.chars().take(MAX).collect::<String>().trim_end())
+    }
+
+    /// Extra height the user dragged onto the thread area, over what its content
+    /// would take. The editor reserves the box's gap, so this has to be added
+    /// there too or a resized box overlaps the code below it.
+    fn rc_thread_extra(&self, replies: &[ReviewReply]) -> f32 {
+        if replies.is_empty() {
+            return 0.0; // no thread area on screen to stretch
+        }
+        self.rc_thread_h
+            .map(|h| (h - rc_thread_rows(replies) as f32 * RC_LINE_H).max(0.))
+            .unwrap_or(0.)
+    }
+
+    fn rc_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        match ks.key.as_str() {
+            "escape" => self.cancel_comment(window, cx),
+            // a bare ↩ commits; ⇧↩ / ⌘↩ add a line (handled by the field below)
+            "enter" if !ks.modifiers.shift && !ks.modifiers.platform => {
+                self.commit_comment(window, cx)
+            }
+            _ => {
+                if Self::text_comes_via_input_handler(ks) {
+                    return; // the input handler inserts it
+                }
+                let edit = Self::field_input(&mut self.rc_query, ks, cx, |_| true);
+                if edit == Edit::Changed {
+                    self.sync_comment_gutters(cx); // the box grew or shrank
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Store (or update, or delete when emptied) the comment being written.
+    fn save_comment(&mut self, cx: &mut Context<Self>) {
+        let Some((path, a, b)) = self.rc_target.clone() else { return };
+        let text = self.rc_query.text.trim().to_string();
+        let snippet = if let Some(q) = self.rc_snippet.clone() {
+            q // quoted from the agent's answer, not read off a file
+        } else if a == 0 {
+            String::new() // whole-file note: there's no line to quote
+        } else {
+            self.tabs
+                .iter()
+                .find(|t| t.path == path)
+                .map(|t| t.editor.read(cx).lines_text(a, b))
+                .unwrap_or_default()
+        };
+        self.set_comment(path, a, b, snippet, text, false, cx);
+    }
+
+    /// If the comment box is open on the tab about to close, keep its text as a
+    /// draft instead of dropping it on the floor.
+    fn stash_comment_draft(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(ix) else { return };
+        let Some((path, a, b)) = self.rc_target.clone() else { return };
+        if !self.rc_open || path != tab.path {
+            return;
+        }
+        let text = self.rc_query.text.trim().to_string();
+        self.rc_open = false;
+        if text.is_empty() {
+            return;
+        }
+        let snippet = tab.editor.read(cx).lines_text(a, b);
+        self.set_comment(path, a, b, snippet, text, true, cx);
+        self.show_flash("Comment kept as draft", cx);
+    }
+
+    /// Save the box and close it (↩ / the primary button). In reply mode the
+    /// text becomes your turn in the thread and the comment goes back into the
+    /// send queue, so ⌥↩ carries the follow-up to the agent.
+    fn commit_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.rc_open = false;
+        if self.rc_reply_mode {
+            let text = self.rc_query.text.trim().to_string();
+            if let (Some((path, a, b)), false) = (self.rc_target.clone(), text.is_empty()) {
+                if let Some(c) = self
+                    .review
+                    .iter_mut()
+                    .find(|c| c.path == path && c.line == a && c.end == b)
+                {
+                    c.replies.push(ReviewReply { who: "you".into(), text });
+                    c.sent = false; // your turn goes out with the next send
+                    c.draft = false;
+                }
+                self.save_review();
+                self.show_flash("Reply queued — ⌥↩ sends it", cx);
+            }
+            self.rc_reply_mode = false;
+            self.sync_comment_gutters(cx);
+        } else {
+            self.save_comment(cx); // also re-syncs gaps + gutter markers
+        }
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    /// Done discussing: drop the thread.
+    fn resolve_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((path, a, b)) = self.rc_target.clone() else { return };
+        self.rc_open = false;
+        self.rc_reply_mode = false;
+        self.review.retain(|c| !(c.path == path && c.line == a && c.end == b));
+        self.sync_comment_gutters(cx);
+        self.save_review();
+        self.show_flash("Thread resolved", cx);
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    /// Close the box, leaving the note as it was (esc / the Cancel button).
+    fn cancel_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.rc_snippet = None;
+        self.rc_open = false;
+        self.sync_comment_gutters(cx); // give the reserved space back
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    /// Drop the note the open box is editing (⌫ in the pane does the same thing
+    /// from the list side).
+    fn delete_open_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((path, a, b)) = self.rc_target.clone() else { return };
+        self.rc_open = false;
+        self.set_comment(path, a, b, String::new(), String::new(), false, cx);
+        self.focus_active(window, cx);
+    }
+
+    /// Pin `text` to `path:a-b` (empty text removes it). Shared by the editor's
+    /// inline box and the diff window, which owns no comment state of its own.
+    fn set_comment(
+        &mut self,
+        path: PathBuf,
+        a: usize,
+        b: usize,
+        snippet: String,
+        text: String,
+        draft: bool,
+        cx: &mut Context<Self>,
+    ) {
+        // editing a comment keeps its id and thread — only the text changes
+        let existing = self
+            .review
+            .iter()
+            .find(|c| c.path == path && c.line == a && c.end == b)
+            .map(|c| (c.id.clone(), c.sent, c.replies.clone()));
+        self.review.retain(|c| !(c.path == path && c.line == a && c.end == b));
+        if text.is_empty() {
+            self.sync_comment_gutters(cx);
+            self.save_review();
+            self.show_flash("Comment removed", cx);
+            cx.notify();
+            return;
+        }
+        let (id, sent, replies) = existing.unwrap_or_else(|| (random_id(), false, Vec::new()));
+        self.review.push(ReviewComment { id, path, line: a, end: b, snippet, text, draft, sent, replies });
+        self.review.sort_by(|x, y| x.path.cmp(&y.path).then(x.line.cmp(&y.line)));
+        self.sync_comment_gutters(cx);
+        self.save_review();
+        let n = self.review.len();
+        self.show_flash(&format!("{n} comment{} pending", if n == 1 { "" } else { "s" }), cx);
+        cx.notify();
+    }
+
+    /// Write the comment list out so an accidental quit doesn't lose it. Called
+    /// from every path that mutates `review`.
+    fn save_review(&self) {
+        let Some(path) = review_path(&self.root) else { return };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if self.review.is_empty() {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        let _ = std::fs::write(path, review_to_json(&self.root, &self.review));
+    }
+
+    /// Review comments pinned to `path` (for the per-file markers in the Changes
+    /// and PR panes).
+    fn comment_count(&self, path: &Path) -> usize {
+        self.review.iter().filter(|c| c.path == path).count()
+    }
+
+    /// Tell each open editor which of its lines carry comments (gutter marker)
+    /// and how much blank space to insert for the notes and the open input box,
+    /// so the code moves down instead of being covered.
+    fn sync_comment_gutters(&mut self, cx: &mut Context<Self>) {
+        let editing = self.rc_open.then(|| self.rc_target.clone()).flatten();
+        for tab in &self.tabs {
+            // spans, not individual lines: the editor draws one icon plus a bar
+            // down the side of each range
+            let mut spans: Vec<(usize, usize)> = self
+                .review
+                .iter()
+                .filter(|c| c.path == tab.path && c.line > 0) // 0 = whole file
+                .map(|c| (c.line, c.end))
+                .collect();
+            spans.sort();
+            // only the open box needs space carved out; saved notes sit in the
+            // right margin beside their line, so they push nothing down
+            let mut gaps: Vec<(usize, f32)> = Vec::new();
+            if let Some((p, a, b)) = &editing {
+                if p == &tab.path && *a > 0 {
+                    // the box's own line: stack it under any note already there
+                    let replies = self
+                        .review
+                        .iter()
+                        .find(|c| &c.path == p && c.line == *a && c.end == *b)
+                        .map(|c| c.replies.clone())
+                        .unwrap_or_default();
+                    let h = rc_gap_h(&self.rc_query.text, &replies) + self.rc_thread_extra(&replies);
+                    match gaps.iter_mut().find(|(l, _)| l == b) {
+                        Some(g) => g.1 += h,
+                        None => gaps.push((*b, h)),
+                    }
+                }
+            }
+            gaps.sort_by_key(|(l, _)| *l);
+            // the span being written keeps its bar until it's saved or dropped
+            let pending = editing
+                .as_ref()
+                .filter(|(p, _, _)| p == &tab.path)
+                .map(|(_, a, b)| (*a, *b));
+            tab.editor.update(cx, |e, cx| {
+                if e.comment_spans != spans || e.inline_gaps != gaps || e.pending_span != pending {
+                    e.comment_spans = spans;
+                    e.inline_gaps = gaps;
+                    e.pending_span = pending;
+                    cx.notify();
+                }
+            });
+        }
+    }
+
+    /// The pane to hand the comments to: one running an agent (`claude`, `cc`) in
+    /// the active terminal tab, else that tab's focused pane.
+    fn agent_pane(&self, _cx: &App) -> Option<Entity<Terminal>> {
+        let tab = self.term_tabs.get(self.active_term)?;
+        let panes = tab.terminals();
+        panes
+            .iter()
+            .find(|t| {
+                self.pane_cmds
+                    .get(&t.entity_id().as_u64())
+                    .is_some_and(|c| c.starts_with("claude") || c.starts_with("cc"))
+            })
+            .cloned()
+            .or_else(|| Some(tab.active_terminal().clone()))
+            .filter(|_| !panes.is_empty())
+    }
+
+    /// The message handed to the agent: a numbered list of `path:line` + the code
+    /// as quoted context + the note.
+    fn review_message(&self) -> String {
+        let items: Vec<ReviewItem> = self
+            .review
+            .iter()
+            .filter(|c| !c.draft && !c.sent)
+            .map(|c| {
+                let reference = if is_agent_src(&c.path) {
+                    "your own earlier answer (quoted below)".to_string()
+                } else if c.line == 0 {
+                    format!("{} (whole file)", self.rel(&c.path))
+                } else if c.end > c.line {
+                    format!("{}:{}-{}", self.rel(&c.path), c.line, c.end)
+                } else {
+                    format!("{}:{}", self.rel(&c.path), c.line)
+                };
+                ReviewItem {
+                    id: c.id.clone(),
+                    reference,
+                    snippet: c.snippet.clone(),
+                    note: c.text.clone(),
+                    thread: c.replies.iter().map(|r| (r.who.clone(), r.text.clone())).collect(),
+                }
+            })
+            .collect();
+        format_review(&items)
+    }
+
+    /// Type the comments into the agent's pane and submit them.
+    fn send_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ready = self.review.iter().filter(|c| !c.draft && !c.sent).count();
+        if ready == 0 {
+            let msg = if self.review.is_empty() {
+                "No comments to send"
+            } else {
+                "Only drafts — open one and press Comment to make it ready"
+            };
+            self.show_flash(msg, cx);
+            return;
+        }
+        let msg = self.review_message();
+        // the agent pane is the agent now; a terminal pane is the fallback for
+        // when the ACP adapter can't run (no npx on PATH)
+        self.show_terminal = true;
+        if AGENT_PANEL {
+            self.agent_open = true;
+            self.ensure_acp(cx);
+        }
+        let sent_to_panel = AGENT_PANEL && self.acp.is_some();
+        let pane = if sent_to_panel { None } else { self.agent_pane(cx) };
+        if sent_to_panel {
+            self.send_agent_prompt(msg, cx);
+        } else if let Some(pane) = pane.clone() {
+            pane.read(cx).send_paste(&msg);
+            pane.read(cx).send_text("\r");
+        } else {
+            self.show_flash("Nowhere to send: no agent pane and no terminal", cx);
+            return;
+        }
+        let n = ready;
+        let drafts = self.review.iter().filter(|c| c.draft).count();
+        // the comments stay: each one is a thread now, waiting for its answer
+        for c in self.review.iter_mut().filter(|c| !c.draft) {
+            c.sent = true;
+        }
+        self.sync_comment_gutters(cx);
+        self.save_review();
+        match pane {
+            Some(pane) => self.focus_pane(&pane, window, cx),
+            None => self.focus_agent(window, cx),
+        }
+        let note = if drafts > 0 { format!(" · {drafts} draft(s) kept") } else { String::new() };
+        self.show_flash(&format!("Sent {n} comment{}{note}", if n == 1 { "" } else { "s" }), cx);
+        cx.notify();
+    }
+
+    /// Flip the active markdown tab between rendered and raw.
+    fn toggle_md_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        if !is_markdown(&tab.path) {
+            self.show_flash("Not a markdown file", cx);
+            return;
+        }
+        tab.preview = !tab.preview;
+        if !tab.preview {
+            self.focus_active(window, cx); // back to the editor, caret and all
+        }
+        cx.notify();
+    }
+
+    fn act_md_preview(&mut self, _: &ToggleMdPreview, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_md_preview(window, cx);
+    }
+
+    /// Show the review-comments pane in the left dock (⌥⇧C / the activity icon).
+    fn open_comment_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.left_view = LeftView::Review;
+        self.show_left = true;
+        self.focus_active(window, cx);
+        cx.notify();
     }
 
     // ── merge conflicts ─────────────────────────────────────────────────────────
@@ -5239,7 +8268,7 @@ impl Storm {
     /// Reload the process list + this workspace's terminal shell pids.
     fn reload_processes(&mut self, cx: &mut Context<Self>) {
         self.proc_list = list_processes();
-        self.proc_ws_pids = self.terminals.iter().filter_map(|t| t.read(cx).child_pid()).collect();
+        self.proc_ws_pids = self.all_terminals().iter().filter_map(|t| t.read(cx).child_pid()).collect();
     }
 
     /// Filtered + sorted process rows. Scope: this workspace's terminals →
@@ -5553,8 +8582,11 @@ impl Storm {
             self.term_width = (self.win_width - f32::from(ev.position.x)).clamp(200., max_w);
             cx.notify();
         } else if self.resizing_agent {
-            // dock sits left of the 44px right activity bar; divider is on its left edge
-            self.agent_width = (self.win_width - 44. - f32::from(ev.position.x)).clamp(280., 900.);
+            // the agent sits on top of the terminal panes; this divider splits the
+            // dock vertically, so the share follows the cursor's y within it
+            let top = 44.0; // topbar
+            let h = (self.win_height - top).max(1.0);
+            self.agent_share = ((f32::from(ev.position.y) - top) / h).clamp(0.15, 0.85);
             cx.notify();
         } else if self.resizing_git {
             // bottom dock: divider on its top edge; drag up grows it
@@ -5599,6 +8631,28 @@ impl Storm {
                 (f32::from(ev.position.y) - top - FIND_HEAD_H).clamp(80.0, content_h - 80.0);
             self.find_split = results_h / content_h;
             cx.notify();
+        } else if let Some((origin, start)) = self.rc_resize {
+            // drag the comment box's bottom edge: taller thread area, more of the
+            // agent's answer on screen at once
+            let h = (start + (f32::from(ev.position.y) - origin)).clamp(40.0, 600.0);
+            self.rc_thread_h = Some(h);
+            self.sync_comment_gutters(cx); // the editor's reserved gap grows with it
+            cx.notify();
+        } else if let Some(d) = self.pane_drag.clone() {
+            // move weight between the two panes the divider separates, keeping
+            // their combined share (so the rest of the tab doesn't shift)
+            let pos = if d.horizontal { f32::from(ev.position.x) } else { f32::from(ev.position.y) };
+            let frac = (d.start_frac + (pos - d.origin) / d.extent).clamp(0.08, 0.92);
+            let tab_ix = self.active_term;
+            if let Some(tab) = self.term_tabs.get_mut(tab_ix) {
+                if let Some(TermPane::Split { shares, .. }) = tab.panes.at_mut(&d.path) {
+                    if d.ix + 1 < shares.len() {
+                        shares[d.ix] = d.total * frac;
+                        shares[d.ix + 1] = d.total * (1. - frac);
+                    }
+                }
+            }
+            cx.notify();
         }
     }
 
@@ -5610,6 +8664,9 @@ impl Storm {
             || self.find_resize.is_some()
             || self.find_moving
             || self.find_split_dragging
+            || self.pane_drag.is_some()
+            || self.rc_resize.is_some()
+            || self.agent_sel_drag
         {
             self.resizing = false;
             self.resizing_term = false;
@@ -5618,7 +8675,11 @@ impl Storm {
             self.find_resize = None;
             self.find_moving = false;
             self.find_split_dragging = false;
-            for t in &self.terminals {
+            self.pane_drag = None;
+            self.rc_resize = None;
+            self.agent_sel_drag = false;
+            self.agent_sel_moved = false;
+            for t in self.all_terminals() {
                 t.update(cx, |t, _| t.defer_resize = false);
             }
             cx.notify();
@@ -5633,6 +8694,113 @@ impl Storm {
     }
 }
 
+/// A zero-size overlay whose only job is to register `ElementInputHandler` for
+/// `focus` during paint — `window.handle_input` is paint-phase only, and a plain
+/// div gives us no paint hook.
+fn input_sink(focus: FocusHandle, storm: Entity<Storm>) -> impl IntoElement {
+    gpui::canvas(
+        |_, _, _| (),
+        move |bounds, _, window, cx| {
+            window.handle_input(&focus, ElementInputHandler::new(bounds, storm.clone()), cx);
+        },
+    )
+    .absolute()
+    .size_full()
+}
+
+/// Dictation, IME, and the emoji picker deliver text through macOS's
+/// `insertText:`, never as key events — so the chrome inputs need a real input
+/// handler or a dictated sentence arrives as a single stray character.
+impl Storm {
+    fn focused_field(&mut self, window: &Window) -> Option<&mut Field> {
+        if self.agent_focus.is_focused(window) {
+            return Some(&mut self.agent_input);
+        }
+        if self.rc_focus.is_focused(window) {
+            return Some(&mut self.rc_query);
+        }
+        None
+    }
+}
+
+impl EntityInputHandler for Storm {
+    fn text_for_range(
+        &mut self,
+        _range: std::ops::Range<usize>,
+        _actual: &mut Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        None
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::UTF16Selection> {
+        // an empty selection is enough to mark this a live text destination
+        Some(gpui::UTF16Selection { range: 0..0, reversed: false })
+    }
+
+    fn marked_text_range(
+        &self,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        None
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {}
+
+    fn replace_text_in_range(
+        &mut self,
+        _range: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let new_text = new_text.to_string();
+        if let Some(f) = self.focused_field(window) {
+            f.insert_text(&new_text);
+            self.sync_comment_gutters(cx); // the comment box may have grown
+            cx.notify();
+        }
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        _new_selected: Option<std::ops::Range<usize>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // mid-composition IME text: insert it as-is, same as the terminal does
+        self.replace_text_in_range(range, new_text, window, cx);
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range: std::ops::Range<usize>,
+        bounds: Bounds<gpui::Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<gpui::Pixels>> {
+        Some(bounds) // IME candidates sit over the input itself
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<gpui::Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
 // ── render ───────────────────────────────────────────────────────────────
 
 impl Render for Storm {
@@ -5640,7 +8808,7 @@ impl Render for Storm {
         let win = window.viewport_size();
         self.win_width = f32::from(win.width);
         self.win_height = f32::from(win.height);
-        let show_term = self.show_terminal && !self.terminals.is_empty();
+        let show_term = self.show_terminal && !self.term_tabs.is_empty();
 
         // Focus the root once so global shortcuts (cmd+shift+o, cmd+l, opt+f12)
         // dispatch even before any file/tab is open.
@@ -5690,6 +8858,7 @@ impl Render for Storm {
                 LeftView::Files => self.render_tree(window, cx).into_any_element(),
                 LeftView::Changes => self.render_changes(window, cx).into_any_element(),
                 LeftView::PullRequest => self.render_pr(window, cx).into_any_element(),
+                LeftView::Review => self.render_review_pane(cx).into_any_element(),
             })
         } else {
             None
@@ -5711,8 +8880,8 @@ impl Render for Storm {
         middle = middle.child(self.render_editor_wrap(center, cx));
 
         if show_term {
-            let term = self.terminals[self.active_term].clone();
-            let term_tabs = self.render_term_tabs(cx);
+            let panes = self.render_term_panes(window, cx);
+            let tab_bar = self.render_term_tabs(cx);
             middle = middle
                 .child(
                     div()
@@ -5725,24 +8894,72 @@ impl Render for Storm {
                             MouseButton::Left,
                             cx.listener(|this, _ev, _window, cx| {
                                 this.resizing_term = true;
-                                for t in &this.terminals {
+                                for t in this.all_terminals() {
                                     t.update(cx, |t, _| t.defer_resize = true);
                                 }
                                 cx.notify();
                             }),
                         ),
                 )
-                .child(
-                    div()
+                .child({
+                    // the dock is one column: the agent UI on top (when open),
+                    // then the terminal tabs and their panes. ⌘↑/⌘↓ walk between
+                    // them as if the agent were another pane.
+                    let show_agent = AGENT_PANEL && self.agent_open;
+                    let mut dock = div()
                         .w(px(self.term_width))
                         .h_full()
                         .flex_shrink_0()
                         .flex()
                         .flex_col()
-                        .bg(rgb(PANEL_BG))
-                        .child(term_tabs)
-                        .child(div().flex_grow(1.0).child(term)),
-                );
+                        .bg(rgb(PANEL_BG));
+                    if show_agent {
+                        let agent = self.render_agent(window, cx);
+                        let share = if self.agent_zoomed { 1.0 } else { self.agent_share };
+                        dock = dock.child(
+                            div()
+                                .flex_grow(share)
+                                .flex_basis(relative(0.))
+                                .min_h(px(0.))
+                                .overflow_hidden()
+                                .child(agent),
+                        );
+                        if !self.agent_zoomed {
+                            dock = dock.child(
+                                div()
+                                    .h(px(4.))
+                                    .w_full()
+                                    .flex_shrink_0()
+                                    .bg(rgb(if self.resizing_agent { ACCENT } else { BORDER }))
+                                    .cursor(CursorStyle::ResizeUpDown)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _ev, _window, cx| {
+                                            this.resizing_agent = true;
+                                            for t in this.all_terminals() {
+                                                t.update(cx, |t, _| t.defer_resize = true);
+                                            }
+                                            cx.notify();
+                                        }),
+                                    ),
+                            );
+                        }
+                    }
+                    if !(show_agent && self.agent_zoomed) {
+                        let rest = if show_agent { 1.0 - self.agent_share } else { 1.0 };
+                        dock = dock.child(
+                            div()
+                                .flex_grow(rest)
+                                .flex_basis(relative(0.))
+                                .min_h(px(0.))
+                                .flex()
+                                .flex_col()
+                                .child(tab_bar)
+                                .child(div().flex_grow(1.0).flex().min_h(px(0.)).child(panes)),
+                        );
+                    }
+                    dock
+                });
         }
         // browser shares the right dock with the terminal (never both — the
         // toggles are mutually exclusive); its WebView floats over the dock
@@ -5768,26 +8985,6 @@ impl Render for Storm {
         } else if let Some(b) = &self.browser {
             b.set_visible(false); // dock closed → hide the floating WebView
         }
-        if self.agent_open {
-            let agent = self.render_agent(window, cx);
-            middle = middle
-                .child(
-                    div()
-                        .w(px(4.))
-                        .h_full()
-                        .flex_shrink_0()
-                        .bg(rgb(if self.resizing_agent { ACCENT } else { BORDER }))
-                        .cursor(CursorStyle::ResizeLeftRight)
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _ev, _window, cx| {
-                                this.resizing_agent = true;
-                                cx.notify();
-                            }),
-                        ),
-                )
-                .child(agent);
-        }
         middle = middle.child(act_right);
 
         let mut root = div()
@@ -5808,6 +9005,13 @@ impl Render for Storm {
             .on_action(cx.listener(Self::act_new_terminal))
             .on_action(cx.listener(Self::act_close_terminal))
             .on_action(cx.listener(Self::act_close_other_terminals))
+            .on_action(cx.listener(Self::act_split_term_right))
+            .on_action(cx.listener(Self::act_split_term_down))
+            .on_action(cx.listener(Self::act_toggle_zoom))
+            .on_action(cx.listener(Self::act_pane_left))
+            .on_action(cx.listener(Self::act_pane_right))
+            .on_action(cx.listener(Self::act_pane_up))
+            .on_action(cx.listener(Self::act_pane_down))
             .on_action(cx.listener(Self::act_goto_commit))
             .on_action(cx.listener(Self::act_show_diff))
             .on_action(cx.listener(Self::act_find_in_files))
@@ -5818,6 +9022,13 @@ impl Render for Storm {
             .on_action(cx.listener(Self::act_open_on_github))
             .on_action(cx.listener(Self::act_push_dialog))
             .on_action(cx.listener(Self::act_run_command))
+            .on_action(cx.listener(Self::act_set_ws_title))
+            .on_action(cx.listener(Self::act_refresh_pr))
+            .on_action(cx.listener(Self::act_add_comment))
+            .on_action(cx.listener(Self::act_show_comments))
+            .on_action(cx.listener(Self::act_send_comments))
+            .on_action(cx.listener(Self::act_md_preview))
+            .on_action(cx.listener(Self::act_quote_agent_sel))
             .on_action(cx.listener(Self::act_new_project))
             .on_action(cx.listener(Self::act_new_scratch))
             .on_action(cx.listener(Self::act_fetch))
@@ -5847,6 +9058,17 @@ impl Render for Storm {
         }
         if self.br_open {
             root = root.child(self.render_branch_prompt(cx));
+        }
+        if !self.review.is_empty() {
+            root = root.child(self.render_inline_notes(cx));
+        }
+        let rc_inline = self
+            .rc_target
+            .as_ref()
+            .is_some_and(|(p, _, _)| is_agent_src(p));
+        if self.rc_open && !rc_inline {
+            let rc_focused = self.rc_focus.is_focused(window);
+            root = root.child(self.render_comment_prompt(rc_focused, false, cx));
         }
         if self.title_open {
             root = root.child(self.render_title_prompt(cx));
@@ -5895,6 +9117,9 @@ impl Render for Storm {
         }
         if self.ws_open {
             root = root.child(self.render_project_dropdown(cx));
+        }
+        if self.limits_open {
+            root = root.children(self.render_usage_overlay(cx));
         }
         if self.run_active && !self.run_open {
             root = root.child(self.render_run_toast(cx));
@@ -5963,7 +9188,7 @@ impl Storm {
     /// branch (the real branch name) instead of the useless literal "HEAD".
     fn branch_label(&self) -> String {
         if self.branch == "HEAD" {
-            if let Some((_, _, _, _, head)) = &self.pr_link {
+            if let Some((_, _, _, _, head, _)) = &self.pr_link {
                 if !head.is_empty() {
                     return head.clone();
                 }
@@ -5972,7 +9197,29 @@ impl Storm {
         self.branch.clone()
     }
 
+    /// A branch tag pill that copies the branch name to the clipboard on click.
+    fn branch_tag(name: &str, id: &'static str, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let copied = name.to_string();
+        branch_name_el(name)
+            .id(id)
+            .cursor_pointer()
+            .hover(|s| s.opacity(0.8))
+            .tooltip(tip("Click to copy branch name"))
+            .on_click(cx.listener(move |this, _e, _w, cx| {
+                if !copied.is_empty() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()));
+                    this.show_flash("Branch name copied", cx);
+                }
+            }))
+    }
+
     fn render_topbar(&self, project: String, cx: &mut Context<Self>) -> impl IntoElement {
+        // the real folder, shown grayed next to a custom title (redundant otherwise)
+        let folder = self
+            .root
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .filter(|n| *n != project);
         let mut bar = div()
             .h(px(44.)) // match the activity-bar width
             .flex_shrink_0() // never let a tall panel squeeze the top bar
@@ -5993,46 +9240,148 @@ impl Storm {
                     .flex_row()
                     .items_center()
                     .gap_3()
+                    // title chip + its edit pencil, kept tight together (the
+                    // container's gap_3 spaces them from the branch group)
                     .child(
                         div()
-                            .id("project-switcher")
                             .flex()
                             .flex_row()
                             .items_center()
                             .gap_1()
-                            .px_1()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(HOVER)))
-                            .text_color(rgb(TEXT))
-                            .text_size(px(12.))
-                            .child(project)
-                            .child(div().text_color(rgb(MUTED)).text_size(px(9.)).child("▾"))
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.ws_open = !this.ws_open;
-                                cx.notify();
-                            })),
-                    )
-                    // edit workspace title
-                    .child(
-                        div()
-                            .id("edit-ws-title")
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .h(px(18.))
-                            .px_1()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .text_size(px(11.))
-                            .text_color(rgb(MUTED))
-                            .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                            .child("✎")
-                            .tooltip(|_w, cx| cx.new(|_| TooltipView { text: "Set workspace title".into() }).into())
-                            .on_click(cx.listener(|this, _e, window, cx| this.open_title_prompt(window, cx))),
+                            // workspace number (1-based position in the project
+                            // switcher) — same key-cap as the switcher's ⌘E rows
+                            .child(
+                                key_cap(format!("{}", self.ws_active + 1), true)
+                                    .id("ws-number")
+                                    .tooltip(|_w, cx| {
+                                        cx.new(|_| TooltipView {
+                                            text: "Workspace number  ·  ⌘E to switch".into(),
+                                        })
+                                        .into()
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .id("project-switcher")
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    .px_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(HOVER)))
+                                    .text_color(rgb(TEXT))
+                                    .text_size(px(12.))
+                                    .child(project)
+                                    .when_some(folder, |d, f| {
+                                        d.child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .text_size(px(10.))
+                                                .text_color(rgb(LINE_NUMBER))
+                                                .child(f),
+                                        )
+                                    })
+                                    // who this work is for, when it's client work
+                                    .when_some(self.ws_client.clone(), |d, c| {
+                                        d.child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .px_1()
+                                                .rounded_md()
+                                                .bg(rgb(HOVER))
+                                                .text_size(px(9.))
+                                                .text_color(rgb(FOLDER_ICON))
+                                                .child(c),
+                                        )
+                                    })
+                                    .child(div().text_color(rgb(MUTED)).text_size(px(9.)).child("▾"))
+                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                        this.ws_open = !this.ws_open;
+                                        cx.notify();
+                                    })),
+                            )
+                            // edit workspace title
+                            .child(
+                                div()
+                                    .id("edit-ws-title")
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .h(px(18.))
+                                    .px_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(MUTED))
+                                    .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                    .child("✎")
+                                    .tooltip(|_w, cx| {
+                                        cx.new(|_| TooltipView { text: "Set workspace title".into() }).into()
+                                    })
+                                    .on_click(cx.listener(|this, _e, window, cx| this.open_title_prompt(window, cx))),
+                            )
+                            // pause: keep this workspace out of the ⌥Tab rotation
+                            .child({
+                                let paused = self.ws_paused;
+                                div()
+                                    .id("ws-pause")
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .h(px(18.))
+                                    .px_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(if paused { GIT_MODIFIED } else { MUTED }))
+                                    .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                    .child(if paused { "❙❙ PAUSED" } else { "❙❙" })
+                                    .tooltip(move |_w, cx| {
+                                        let text = if paused {
+                                            "Paused — ⌥Tab skips this workspace. Click to resume."
+                                        } else {
+                                            "Pause: keep this workspace out of the ⌥Tab rotation"
+                                        };
+                                        cx.new(|_| TooltipView { text: text.into() }).into()
+                                    })
+                                    .on_click(cx.listener(|this, _e, _w, cx| this.toggle_pause(cx)))
+                            })
+                            // agent state for this workspace: the loud badge when
+                            // nothing's running, a dot + word otherwise
+                            .when_some(self.agent_rollup(), |d, (s, _)| {
+                                if s.is_idle() {
+                                    d.child(idle_badge(9.))
+                                } else {
+                                    d.child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap_1()
+                                            .ml_1()
+                                            .child(
+                                                div()
+                                                    .w(px(6.))
+                                                    .h(px(6.))
+                                                    .rounded_full()
+                                                    .flex_shrink_0()
+                                                    .bg(rgb(agent_color(s))),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(10.))
+                                                    .text_color(rgb(agent_color(s)))
+                                                    .child(agent_label(s)),
+                                            ),
+                                    )
+                                }
+                            }),
                     )
                     .when(!self.branch.is_empty(), |d| {
-                        d.child(
+                        d.child(div().w(px(1.)).h(px(16.)).mx_1().bg(rgb(BORDER))) // separator
+                            .child(
                             div()
                                 .flex()
                                 .flex_row()
@@ -6045,7 +9394,7 @@ impl Storm {
                                 .when_some(
                                     self.pr_link
                                         .as_ref()
-                                        .map(|(_, _, _, b, _)| b.clone())
+                                        .map(|(_, _, _, b, _, _)| b.clone())
                                         .filter(|b| !b.is_empty())
                                         .or_else(|| self.branch_parent.clone()),
                                     |d, target| {
@@ -6056,7 +9405,7 @@ impl Storm {
                                                 .items_center()
                                                 .gap_1()
                                                 .text_size(px(11.))
-                                                .child(branch_name_el(&target, LINE_NUMBER))
+                                                .child(Self::branch_tag(&target, "copy-base-branch", cx))
                                                 .child(div().text_color(rgb(LINE_NUMBER)).child("←")),
                                         )
                                     },
@@ -6068,40 +9417,12 @@ impl Storm {
                                         .items_center()
                                         .gap_1()
                                         .child(div().text_color(rgb(MUTED)).child("⎇"))
-                                        .child(branch_name_el(&self.branch_label(), MUTED)),
-                                )
-                                // copy-to-clipboard button for the branch name
-                                .child(
-                                    div()
-                                        .id("copy-branch")
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .h(px(18.))
-                                        .px_1()
-                                        .font_family(ICON_FONT)
-                                        .text_size(px(12.))
-                                        .rounded_md()
-                                        .cursor_pointer()
-                                        .text_color(rgb(MUTED))
-                                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                                        .child(IC_COPY)
-                                        .tooltip(|_w, cx| {
-                                            cx.new(|_| TooltipView { text: "Copy branch name".into() }).into()
-                                        })
-                                        .on_click(cx.listener(|this, _e, _w, cx| {
-                                            if !this.branch.is_empty() {
-                                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                                    this.branch.clone(),
-                                                ));
-                                                this.show_flash("Branch name copied", cx);
-                                            }
-                                        })),
+                                        .child(Self::branch_tag(&self.branch_label(), "copy-branch", cx)),
                                 ),
                         )
                     })
                     // PR link for the current branch, if one exists → opens it
-                    .when_some(self.pr_link.clone(), |d, (num, url, status, _base, _head)| {
+                    .when_some(self.pr_link.clone(), |d, (num, url, status, _base, _head, state)| {
                         d.child(
                             div()
                                 .id("pr-link")
@@ -6124,6 +9445,8 @@ impl Storm {
                                 )
                                 .child(div().font_family(ICON_FONT).text_size(px(11.)).child(IC_PR))
                                 .child(format!("#{}", num))
+                                // draft / merged / closed pill (open needs no label)
+                                .when(state != PrState::Open, |d| d.child(pr_state_pill(state, 10.)))
                                 .on_click(cx.listener(move |_this, _e, _w, _cx| {
                                     let _ = Command::new("open").arg(&url).spawn();
                                 })),
@@ -6158,10 +9481,21 @@ impl Storm {
                                 .on_click(cx.listener(|this, _e, _w, cx| this.refresh_pr_link(cx))),
                         )
                     })
-                    // Open Admin (wby-next* only): opens admin{N}.localhost
+                    // Open Admin (wby-next* only): the host opens admin{N}.localhost
+                    // in the default browser; the ▶ beside it carries up/down
                     .when_some(admin_url(&self.root), |d, url| {
+                        // the play button carries the up/down colour now; this is
+                        // just the hover text on the host itself
+                        let up = self.admin_up == Some(true);
+                        let tip = if up {
+                            "Admin is up  ·  click to open  ·  ⌘R to re-check"
+                        } else {
+                            "Admin is down  ·  click to start it  ·  ⌘R to re-check"
+                        };
                         d.child(div().w(px(1.)).h(px(16.)).mx_1().bg(rgb(BORDER))) // separator
-                            .child(
+                            // host + ▶ read as one control, so they sit tight
+                            // together instead of a container gap apart
+                            .child(div().flex().flex_row().items_center().gap(px(2.)).child(
                             div()
                                 .id("open-admin")
                                 .flex()
@@ -6173,27 +9507,45 @@ impl Storm {
                                 .rounded_md()
                                 .cursor_pointer()
                                 .text_size(px(11.))
-                                .text_color(rgb(MUTED))
+                                // green once it's actually serving
+                                .text_color(rgb(if up { GIT_NEW } else { MUTED }))
                                 .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
                                 .child(div().font_family(ICON_FONT).text_size(px(12.)).child(IC_BROWSER))
                                 .child(url.trim_start_matches("https://").trim_start_matches("http://").to_string())
-                                .tooltip(|_w, cx| cx.new(|_| TooltipView { text: "Open Admin".into() }).into())
-                                .on_click(move |_e, _w, _cx| open_browser(&url)),
+                                .tooltip(move |_w, cx| cx.new(|_| TooltipView { text: tip.into() }).into())
+                                // a dead admin has nothing to show: clicking the
+                                // host starts it instead of opening a failed page
+                                .on_click(cx.listener(move |this, _e, window, cx| {
+                                    if up {
+                                        open_browser(&url);
+                                    } else if this.admin_terminal(cx).is_some() {
+                                        this.show_admin_log(window, cx); // already building
+                                    } else {
+                                        this.start_admin(window, cx);
+                                    }
+                                })),
                         )
-                    }),
+                        .child(self.admin_play_btn("admin-run", cx)))
+                    })
+                    // watch the branch's changed packages (`wwp`), beside admin
+                    .children(self.render_watch_btn(cx)),
             );
         // right: read-only toggle + memory (moved here from the old bottom bar).
         // The flex_1 spacer keeps the left group left-aligned and pushes these right.
-        let ro = self.read_only;
         bar = bar.child(div().flex_1()).child(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap_3()
-                .child(
+                .children(self.render_usage_chip(cx))
+                .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(format!("{} MB", self.mem_mb)))
+                // last item in the bar, hard against the right edge
+                .child({
+                    let ro = self.read_only;
                     div()
                         .id("ro-toggle")
+                        .flex_shrink_0()
                         .px_1p5()
                         .rounded_md()
                         .cursor_pointer()
@@ -6205,9 +9557,8 @@ impl Storm {
                         .tooltip(|_w, cx| {
                             cx.new(|_| TooltipView { text: "Toggle read-only / edit mode".into() }).into()
                         })
-                        .on_click(cx.listener(|this, _e, _w, cx| this.toggle_read_only(cx))),
-                )
-                .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(format!("{} MB", self.mem_mb))),
+                        .on_click(cx.listener(|this, _e, _w, cx| this.toggle_read_only(cx)))
+                }),
         );
         bar
     }
@@ -6319,6 +9670,7 @@ impl Storm {
         let files_active = self.show_left && self.left_view == LeftView::Files;
         let changes_active = self.show_left && self.left_view == LeftView::Changes;
         let pr_active = self.show_left && self.left_view == LeftView::PullRequest;
+        let review_active = self.show_left && self.left_view == LeftView::Review;
         div()
             .w(px(44.))
             .flex_shrink_0()
@@ -6359,6 +9711,15 @@ impl Storm {
                 }
                 cx.notify();
             })))
+            .child(activity_icon("act-review", IC_COMMENT, "Review Comments  (⌥⇧C)", review_active, self.review.len(), cx.listener(|this, _ev, _w, cx| {
+                if this.show_left && this.left_view == LeftView::Review {
+                    this.show_left = false;
+                } else {
+                    this.left_view = LeftView::Review;
+                    this.show_left = true;
+                }
+                cx.notify();
+            })))
             // push Run + Git to the bottom-left corner
             .child(div().flex_grow(1.0))
             .child(activity_icon("act-run", IC_RUN, "Run console", self.run_open, 0, cx.listener(|this, _ev, _w, cx| {
@@ -6382,7 +9743,7 @@ impl Storm {
             .bg(rgb(PANEL_BG))
             .border_l_1()
             .border_color(rgb(BORDER))
-            .child(activity_icon("act-term", IC_TERMINAL, "Terminal  (⌥F12)", self.show_terminal, 0, cx.listener(|this, _ev, window, cx| {
+            .child(activity_icon("act-term", IC_TERMINAL, "Terminal  (⌥F12)", self.show_terminal && !(AGENT_PANEL && self.agent_open && self.agent_zoomed), 0, cx.listener(|this, _ev, window, cx| {
                 this.toggle_terminal(window, cx);
             })))
             .when(BROWSER_PANEL, |d| d.child(activity_icon("act-browser", IC_BROWSER, "Browser", self.browser_open, 0, cx.listener(|this, _ev, window, cx| {
@@ -6391,6 +9752,211 @@ impl Storm {
             .when(AGENT_PANEL, |d| d.child(activity_icon("act-agent", IC_TOOLS, "Agent  (⌘⇧A)", self.agent_open, 0, cx.listener(|this, _ev, window, cx| {
                 this.toggle_agent(window, cx);
             }))))
+    }
+
+    /// The active tab's pane tree.
+    fn render_term_panes(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(tab) = self.term_tabs.get(self.active_term) else {
+            return div().into_any_element();
+        };
+        // zoomed: the active pane alone, full dock — the tree stays as it is
+        if tab.zoomed {
+            let only = TermPane::Leaf(tab.active_terminal().clone());
+            return self.render_term_pane(&only, Vec::new(), 1.0, false, window, cx);
+        }
+        let split = tab.terminals().len() > 1;
+        self.render_term_pane(&tab.panes, Vec::new(), 1.0, split, window, cx)
+    }
+
+    /// One node of the pane tree. Panes are flex children with basis 0 and grow =
+    /// their share, so a split starts 50/50 and free space always divides by the
+    /// current shares (which the dividers drag).
+    fn render_term_pane(
+        &self,
+        pane: &TermPane,
+        path: Vec<usize>,
+        weight: f32,
+        split: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // this node's share of the parent axis, allowed to shrink below content
+        let share = move |d: Div| d.flex_grow(weight).flex_basis(relative(0.)).min_w(px(0.)).min_h(px(0.));
+        match pane {
+            TermPane::Leaf(t) => {
+                let id = t.entity_id();
+                // outline the focused pane, but only once there's more than one
+                let focused = split && t.read(cx).focus_handle.contains_focused(window, cx);
+                // whatever the agent in this pane last reported about itself
+                // (idle is deliberately silent here — it means "nothing going on")
+                let state = self
+                    .pane_state(t)
+                    .filter(|(s, _)| !s.is_idle())
+                    .map(|(s, m)| (s, m.to_string()));
+                let border = match (focused, state.as_ref()) {
+                    (true, _) => ACCENT,
+                    (false, Some((s, _))) => agent_color(*s),
+                    (false, None) => BORDER,
+                };
+                share(div())
+                    .relative()
+                    .overflow_hidden()
+                    .when(split || state.is_some(), |d| d.border_1().border_color(rgb(border)))
+                    .child(t.clone())
+                    // after the terminal: children paint in order, so the chip has
+                    // to come last to sit on top of the grid instead of under it
+                    .when_some(state, |d, (s, msg)| {
+                        d.child(self.render_agent_chip(id.as_u64(), s, &msg, cx))
+                    })
+                    // what this pane is running, bottom-right (the agent chip sits
+                    // top-right, so they never collide) — tells you which pane is
+                    // which at a glance
+                    .when_some(self.pane_cmds.get(&id.as_u64()).cloned(), |d, cmd| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .bottom(px(2.))
+                                .right(px(4.))
+                                .px_1()
+                                .rounded_md()
+                                .bg(rgb(POPUP_BG))
+                                .text_size(px(9.))
+                                .text_color(rgb(MUTED))
+                                .child(cmd),
+                        )
+                    })
+                    // clicking a pane makes it this tab's focus target
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _window, cx| {
+                            let ix = this.active_term;
+                            if let Some(tab) = this.term_tabs.get_mut(ix) {
+                                tab.active = id;
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element()
+            }
+            TermPane::Split { horizontal, kids, shares } => {
+                let horizontal = *horizontal;
+                let mut group = share(div()).flex();
+                group = if horizontal { group.flex_row() } else { group.flex_col() };
+                for (i, kid) in kids.iter().enumerate() {
+                    if i > 0 {
+                        group = group.child(self.render_pane_divider(
+                            kids, shares, &path, i, horizontal, cx,
+                        ));
+                    }
+                    let mut kid_path = path.clone();
+                    kid_path.push(i);
+                    let w = shares.get(i).copied().unwrap_or(1.0);
+                    group = group.child(self.render_term_pane(kid, kid_path, w, split, window, cx));
+                }
+                group.into_any_element()
+            }
+        }
+    }
+
+    /// Status chip floating in a pane's top-right corner: what the agent running
+    /// there last reported. Click it to acknowledge (clears the state).
+    fn render_agent_chip(&self, pane: u64, state: AgentState, msg: &str, cx: &mut Context<Self>) -> AnyElement {
+        let color = agent_color(state);
+        div()
+            .id(SharedString::from(format!("agent-chip-{pane}")))
+            .absolute()
+            .top(px(3.))
+            .right(px(3.))
+            .max_w(px(260.))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py(px(2.))
+            .rounded_md()
+            .bg(rgb(POPUP_BG))
+            .border_1()
+            .border_color(rgb(color))
+            .cursor_pointer()
+            .tooltip(|_w, cx| cx.new(|_| TooltipView { text: "Click to clear".into() }).into())
+            .child(div().w(px(6.)).h(px(6.)).rounded_full().flex_shrink_0().bg(rgb(color)))
+            .child(
+                div()
+                    .text_size(px(9.))
+                    .text_color(rgb(color))
+                    .flex_shrink_0()
+                    .child(agent_label(state)),
+            )
+            .when(!msg.is_empty(), |d| {
+                d.child(div().text_size(px(9.)).text_color(rgb(MUTED)).truncate().child(msg.to_string()))
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _ev, _w, cx| {
+                    this.agent_states.remove(&pane);
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .into_any_element()
+    }
+
+    /// Draggable divider between `kids[i - 1]` and `kids[i]`. The drag span comes
+    /// from the two subtrees' painted bounds (their outermost leaves), so it is
+    /// exact for nested splits too; a first frame with no bounds yet just isn't
+    /// draggable.
+    fn render_pane_divider(
+        &self,
+        kids: &[TermPane],
+        shares: &[f32],
+        path: &[usize],
+        i: usize,
+        horizontal: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (near, far) = (kids[i - 1].edge_leaf(false), kids[i].edge_leaf(true));
+        let extent = match (near.read(cx).bounds(), far.read(cx).bounds()) {
+            (Some(a), Some(b)) if horizontal => f32::from(b.right() - a.left()),
+            (Some(a), Some(b)) => f32::from(b.bottom() - a.top()),
+            _ => 0.,
+        };
+        let total = shares[i - 1] + shares[i];
+        let start_frac = if total > 0. { shares[i - 1] / total } else { 0.5 };
+        let drag = PaneDrag {
+            path: path.to_vec(),
+            ix: i - 1,
+            horizontal,
+            origin: 0., // filled in on mouse-down from the cursor position
+            extent,
+            total,
+            start_frac,
+        };
+        let active = self.pane_drag.as_ref().is_some_and(|d| d.path == drag.path && d.ix == drag.ix);
+        let id = SharedString::from(format!("term-div-{path:?}-{i}"));
+        let d = div()
+            .id(id)
+            .flex_shrink_0()
+            .bg(rgb(if active { ACCENT } else { BORDER }))
+            .hover(|s| s.bg(rgb(ACCENT)))
+            .cursor(if horizontal { CursorStyle::ResizeLeftRight } else { CursorStyle::ResizeUpDown })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
+                    if drag.extent <= 0. {
+                        return;
+                    }
+                    let origin = if drag.horizontal { ev.position.x } else { ev.position.y };
+                    this.pane_drag = Some(PaneDrag { origin: f32::from(origin), ..drag.clone() });
+                    // live PTY resizes while dragging make full-screen apps flood
+                    // output — resize once on release instead
+                    for t in this.all_terminals() {
+                        t.update(cx, |t, _| t.defer_resize = true);
+                    }
+                    cx.notify();
+                }),
+            );
+        if horizontal { d.w(px(4.)).h_full().into_any_element() } else { d.h(px(4.)).w_full().into_any_element() }
     }
 
     fn render_term_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -6404,7 +9970,7 @@ impl Storm {
             .border_color(rgb(BORDER))
             .overflow_hidden();
 
-        for ix in 0..self.terminals.len() {
+        for ix in 0..self.term_tabs.len() {
             let active = ix == self.active_term;
             bar = bar.child(
                 div()
@@ -6418,13 +9984,36 @@ impl Storm {
                     .border_color(rgb(BORDER))
                     .when(active, |d| d.bg(rgb(BG)))
                     .when(!active, |d| d.hover(|s| s.bg(rgb(HOVER))))
+                    // agent state roll-up for this tab's panes (worst wins), so a
+                    // background tab can still say "needs you"
+                    .when_some(self.tab_state(&self.term_tabs[ix]), |d, s| {
+                        d.child(
+                            div()
+                                .w(px(6.))
+                                .h(px(6.))
+                                .rounded_full()
+                                .flex_shrink_0()
+                                .bg(rgb(agent_color(s))),
+                        )
+                    })
                     .child(
                         div()
                             .id(("term-tab", ix))
                             .cursor_pointer()
                             .text_size(px(11.))
                             .text_color(rgb(if active { TEXT } else { MUTED }))
-                            .child(format!("Terminal {}", ix + 1))
+                            .child({
+                                let tab = &self.term_tabs[ix];
+                                let zoom = if tab.zoomed { " ⤢" } else { "" };
+                                let name = tab
+                                    .title
+                                    .clone()
+                                    .unwrap_or_else(|| format!("Terminal {}", ix + 1));
+                                match tab.terminals().len() {
+                                    1 => format!("{name}{zoom}"),
+                                    n => format!("{name} ({n}){zoom}"), // n panes
+                                }
+                            })
                             .on_click(cx.listener(move |this, _e, window, cx| {
                                 this.switch_terminal(ix, window, cx);
                             })),
@@ -6446,7 +10035,7 @@ impl Storm {
         }
 
         // "+" new terminal
-        bar.child(
+        let bar = bar.child(
             div()
                 .id("term-add")
                 .px_3()
@@ -6461,7 +10050,35 @@ impl Storm {
                 .on_click(cx.listener(|this, _e, window, cx| {
                     this.new_terminal(window, cx);
                 })),
-        )
+        );
+
+        // send pending review comments straight from here — the agent pane is
+        // right below this bar, so this is where you are when you want to send
+        let ready = self.review.iter().filter(|c| !c.draft).count();
+        bar.when(ready > 0, |b| {
+            b.child(div().flex_grow(1.0)).child(
+                div()
+                    .id("term-send-comments")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .mr_2()
+                    .px_1p5()
+                    .py(px(1.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(rgb(COMMENT_MARK))
+                    .text_size(px(10.))
+                    .text_color(rgb(COMMENT_MARK))
+                    .hover(|s| s.bg(rgba(COMMENT_TINT)))
+                    .child(div().font_family(ICON_FONT).text_size(px(11.)).child(IC_COMMENT))
+                    .child(format!("Send {ready} comment{}", if ready == 1 { "" } else { "s" }))
+                    .tooltip(tip("Send review comments to the agent  (⌥↩)"))
+                    .on_click(cx.listener(|this, _e, window, cx| this.send_review(window, cx))),
+            )
+        })
     }
 
     /// Bottom-right status toast for a running/finished command. Click to open
@@ -6515,6 +10132,158 @@ impl Storm {
                 this.run_active = false;
                 cx.notify();
             }))
+    }
+
+    /// Plan usage: a small percentage chip in the topbar. Clicking it opens
+    /// `render_usage_overlay`, which is drawn at the root. `None` until the
+    /// statusline shim has run (see `docs/usage-bars.md`) — a missing reading is
+    /// not a 0% reading.
+    fn render_usage_chip(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let l = self.limits.clone()?;
+        // both windows on the chip — session first, then weekly — so the common
+        // case needs no click; each keeps its own colour
+        let pct = |w: &Option<usage::Window>| match w {
+            Some(w) => (format!("{}%", w.pct.round() as i64), usage_color(w.pct)),
+            None => ("—".to_string(), MUTED),
+        };
+        let (five_txt, five_color) = pct(&l.five_hour);
+        let (week_txt, week_color) = pct(&l.seven_day);
+        // the tooltip is where the numbers get their names
+        let line = |label: &str, w: &Option<usage::Window>| match w {
+            Some(w) if w.resets_at > 0 => format!(
+                "{label}: {}%  ·  resets {}",
+                w.pct.round() as i64,
+                usage::fmt_reset(w.resets_at)
+            ),
+            Some(w) => format!("{label}: {}%", w.pct.round() as i64),
+            None => format!("{label}: no reading yet"),
+        };
+        let tip_text = format!(
+            "{}\n{}",
+            line("Session (5 hours)", &l.five_hour),
+            line("Weekly", &l.seven_day)
+        );
+        let open = self.limits_open;
+        Some(
+            div()
+                .id("usage-chip")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .px_1p5()
+                .rounded_md()
+                .cursor_pointer()
+                .text_size(px(11.))
+                .when(open, |d| d.bg(rgb(HOVER)))
+                .hover(|s| s.bg(rgb(HOVER)))
+                .child(div().font_family(ICON_FONT).text_size(px(11.)).text_color(rgb(MUTED)).child(IC_GRAPH))
+                .child(div().text_color(rgb(five_color)).child(five_txt))
+                .child(div().text_color(rgb(LINE_NUMBER)).child("/"))
+                .child(div().text_color(rgb(week_color)).child(week_txt))
+                .tooltip(move |_w, cx| {
+                    let text = tip_text.clone();
+                    cx.new(|_| TooltipView { text: text.into() }).into()
+                })
+                .on_click(cx.listener(|this, _e, _w, cx| {
+                    this.limits_open = !this.limits_open;
+                    cx.notify();
+                })),
+        )
+    }
+
+    /// The chip's detail panel, rendered at the root so nothing paints over it —
+    /// inside the topbar it was drawn before the editor and disappeared behind it.
+    /// A transparent backdrop takes the dismissing click.
+    fn render_usage_overlay(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let l = self.limits.clone()?;
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .id("usage-backdrop")
+                .child(self.render_usage_panel(&l))
+                .on_click(cx.listener(|this, _e, _w, cx| {
+                    this.limits_open = false;
+                    cx.notify();
+                })),
+        )
+    }
+
+    fn render_usage_panel(&self, l: &usage::Limits) -> impl IntoElement {
+        let row = |label: &'static str, w: &Option<usage::Window>, color: u32| {
+            let w = w.clone();
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .child(
+                            div()
+                                .flex_grow(1.0)
+                                .text_size(px(10.))
+                                .text_color(rgb(MUTED))
+                                .child(label),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .text_color(rgb(match &w {
+                                    Some(w) => usage_color(w.pct),
+                                    None => MUTED,
+                                }))
+                                .child(match &w {
+                                    Some(w) => format!("{}%", w.pct.round() as i64),
+                                    None => "—".to_string(),
+                                }),
+                        ),
+                )
+                // the bar: a filled track, so the number has a shape to go with it
+                .child(
+                    div()
+                        .h(px(5.))
+                        .w_full()
+                        .rounded_md()
+                        .bg(rgb(BORDER))
+                        .child(
+                            div()
+                                .h_full()
+                                .w(relative(w.as_ref().map(|w| w.pct / 100.0).unwrap_or(0.0)))
+                                .rounded_md()
+                                .bg(rgb(color)),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(rgb(LINE_NUMBER))
+                        .child(match &w {
+                            Some(w) if w.resets_at > 0 => format!("resets {}", usage::fmt_reset(w.resets_at)),
+                            Some(_) => String::new(),
+                            None => "no reading yet".to_string(),
+                        }),
+                )
+        };
+        div()
+            .absolute()
+            .top(px(46.))
+            .right(px(12.))
+            .w(px(260.))
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .bg(rgb(POPUP_BG))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .rounded_md()
+            .shadow_lg()
+            .child(row("SESSION", &l.five_hour, ACCENT))
+            .child(row("WEEKLY", &l.seven_day, GIT_MODIFIED))
     }
 
     /// The read-only Run console: a bottom dock streaming command output.
@@ -6851,13 +10620,17 @@ impl Storm {
                                     .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
                                         this.commit_selected = Some(path_open.clone());
                                         if ev.click_count() >= 2 {
-                                            this.open_commit_file(path_open.clone(), window, cx);
+                                            this.open_commit_file(path_open.clone(), true, window, cx);
                                         } else {
                                             window.focus(&this.changes_focus, cx);
                                         }
                                         cx.notify();
                                     })),
-                            ),
+                            )
+                            // pending review comments on this file
+                            .when(self.comment_count(&path) > 0, |d| {
+                                d.child(comment_marker(self.comment_count(&path), 11.))
+                            }),
                     );
                 }
             }
@@ -6908,10 +10681,16 @@ impl Storm {
                     )
                     .child(div().font_family(ICON_FONT).text_size(px(12.)).text_color(rgb(MUTED)).child(IC_SEARCH))
                     .child(if self.commit_filter.is_empty() {
-                        div().text_size(px(12.)).text_color(rgb(MUTED)).child(format!("Filter files…{}", self.caret_if(filter_focused)))
+                        div().flex_grow(1.0).text_size(px(12.)).text_color(rgb(MUTED)).child(format!("Filter files…{}", self.caret_if(filter_focused)))
                     } else {
-                        div().text_size(px(12.)).text_color(rgb(TEXT)).child(self.commit_filter.render(self.caret_if(filter_focused), SELECTION))
-                    }),
+                        div().flex_grow(1.0).text_size(px(12.)).text_color(rgb(TEXT)).child(self.commit_filter.render(self.caret_if(filter_focused), SELECTION))
+                    })
+                    .child(self.tree_fold_btns(
+                        "changes-collapse",
+                        "changes-expand",
+                        |this, c, cx| this.changes_collapse_all(c, cx),
+                        cx,
+                    )),
             )
             // checked-state segmented control
             .child(
@@ -7223,6 +11002,7 @@ impl Storm {
                 let (badge, badge_color) = ext_badge(&path);
                 let path_check = path.clone();
                 let path_click = path.clone();
+                let path_ctx = path.clone();
                 div()
                     .id(("pr-file-row", ix))
                     .flex()
@@ -7245,6 +11025,15 @@ impl Storm {
                         }
                         cx.notify();
                     }))
+                    // right-click: comment on the file as a whole
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                            this.pr_selected = Some(path_ctx.clone());
+                            let pos = (f32::from(ev.position.x), f32::from(ev.position.y));
+                            this.open_review_ctx(path_ctx.clone(), pos, window, cx);
+                        }),
+                    )
                     .child(div().w(px(16.)))
                     .child(
                         div()
@@ -7271,6 +11060,16 @@ impl Storm {
                             .text_color(rgb(if is_sel { SEL_TEXT } else { color }))
                             .child(name),
                     )
+                    // pending review comments on this file
+                    .when(self.comment_count(&path) > 0, |d| {
+                        d.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(px(10.))
+                                .text_color(rgb(COMMENT_MARK))
+                                .child(format!("✎{}", self.comment_count(&path))),
+                        )
+                    })
                     .into_any_element()
             }
         }
@@ -7386,8 +11185,65 @@ impl Storm {
                         format!("PULL REQUEST  ·  vs {}", self.pr_base)
                     })
                     .child(div().flex_grow(1.0))
+                    .child(self.tree_fold_btns("pr-collapse", "pr-expand", |this, c, cx| this.pr_collapse_all(c, cx), cx))
+                    // re-diff against the base: ⌘R refreshes the PR chip and the
+                    // admin dot, but the file list is loaded separately
+                    .child(
+                        div()
+                            .id("pr-refresh")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h(px(20.))
+                            .px_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_size(px(12.))
+                            .text_color(rgb(if self.pr_loading { ACCENT } else { MUTED }))
+                            .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                            .child("↻") // same glyph as the status screen's Refresh
+                            .tooltip(|_w, cx| {
+                                cx.new(|_| TooltipView { text: "Reload changed files  (⌘R)".into() }).into()
+                            })
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                this.refresh_pr_link(cx);
+                                this.load_pr(cx);
+                            })),
+                    )
                     .child(self.collapse_left_btn(cx)),
             )
+            // stale-base warning: the list is wrong until origin/<base> is fetched
+            .when_some(self.pr_stale.clone(), |d, note| {
+                d.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_1()
+                        .border_b_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgba(0xe0af6820))
+                        .text_size(px(11.))
+                        .text_color(rgb(GIT_MODIFIED))
+                        .child(div().flex_shrink_0().child("⚠"))
+                        .child(div().flex_grow(1.0).min_w(px(0.)).child(note))
+                        .child(
+                            div()
+                                .id("pr-fetch-base")
+                                .flex_shrink_0()
+                                .px_1()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(GIT_MODIFIED))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(HOVER)))
+                                .child("Fetch")
+                                .on_click(cx.listener(|this, _e, _w, cx| this.fetch_pr_base(cx))),
+                        ),
+                )
+            })
             // filter bar (copy button here copies the currently-filtered files)
             .child(
                 div()
@@ -7444,6 +11300,652 @@ impl Storm {
                 list.into_any_element()
             })
             .child(progress)
+    }
+
+
+    /// The "write a comment" prompt. Parked directly under the line it belongs to
+    /// when that line is on screen (so you keep your place in the code), centred
+    /// only as a fallback — a different file's tab, or a scrolled-out line.
+    /// `inline`: drop the absolute positioning and fill the width of whatever
+    /// contains it, so the box takes part in layout and pushes content down —
+    /// what the editor's gap does for a file, done structurally for the
+    /// transcript.
+    fn render_comment_prompt(
+        &mut self,
+        rc_focused: bool,
+        inline: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let head = match &self.rc_target {
+            // there's no file to name here; say what's being commented on and
+            // which rows of the answer it covers
+            Some((p, a, b)) if is_agent_src(p) => {
+                let where_ = if b > a { format!("lines {a}-{b}") } else { format!("line {a}") };
+                let what = if self.rc_reply_mode { "Thread on the answer" } else { "Comment on the answer" };
+                format!("{what}  ·  {where_}")
+            }
+            Some((p, 0, _)) => format!("{}  ·  whole file", self.rel(p)),
+            Some((p, a, b)) if b > a => format!("{}:{}-{}", self.rel(p), a, b),
+            Some((p, a, _)) => format!("{}:{}", self.rel(p), a),
+            None => String::new(),
+        };
+        // the line's own rect, if the comment belongs to the file on screen
+        let anchor = self.rc_target.as_ref().filter(|(_, a, _)| *a > 0).and_then(|(path, _, b)| {
+            let tab = self.tabs.get(self.active)?;
+            if &tab.path != path {
+                return None;
+            }
+            tab.editor.read(cx).line_screen_rect(*b)
+        });
+        let notes_above = 0.0;
+        // a comment on the agent's answer belongs beside that answer, so it opens
+        // at the point the selection was made
+        let agent_anchor = self
+            .rc_target
+            .as_ref()
+            .filter(|(p, _, _)| is_agent_src(p))
+            .and_then(|_| self.agent_sel_pos);
+        let (left, top, w) = match (anchor, agent_anchor) {
+            (Some((x, y, avail, h)), _) => (
+                x + RC_BOX_PAD,
+                y + h + notes_above + RC_BOX_PAD,
+                (avail - RC_BOX_PAD * 2.0).clamp(220.0, 760.0),
+            ),
+            (None, Some((mx, my))) => {
+                let w = (self.term_width - 24.0).clamp(320.0, 640.0);
+                let left = (mx - 24.0).clamp(0.0, (self.win_width - w - 8.0).max(0.0));
+                let top = (my + 18.0).min((self.win_height - 220.0).max(60.0));
+                (left, top, w)
+            }
+            (None, None) => (((self.win_width - 520.0) / 2.0).max(0.), 120.0, 520.0),
+        };
+        // the conversation so far: the note, then every turn in the thread. In
+        // reply mode the note belongs up here as the first message, not in the
+        // input — the input is for what you're about to say.
+        let comment = self.rc_target.as_ref().and_then(|(p, a, b)| {
+            self.review.iter().find(|c| &c.path == p && c.line == *a && c.end == *b)
+        });
+        let has_thread = comment.is_some_and(|c| !c.replies.is_empty());
+        let mut replies: Vec<ReviewReply> = Vec::new();
+        if has_thread {
+            if let Some(c) = comment {
+                if self.rc_reply_mode {
+                    replies.push(ReviewReply { who: "you".into(), text: c.text.clone() });
+                }
+                replies.extend(c.replies.iter().cloned());
+            }
+        }
+        let thread_h = self.rc_thread_h.unwrap_or(rc_thread_rows(&replies) as f32 * RC_LINE_H);
+        let box_h = rc_box_h(&self.rc_query.text, &replies) + self.rc_thread_extra(&replies);
+        let body_h = rc_lines(&self.rc_query.text) as f32 * RC_LINE_H;
+        // is this box editing a note that already exists?
+        let existing_note = self
+            .rc_target
+            .as_ref()
+            .is_some_and(|(p, a, b)| {
+                self.review.iter().any(|c| &c.path == p && c.line == *a && c.end == *b)
+            });
+        div()
+            .when(!inline, |d| d.absolute().top(px(top)).left(px(left)).w(px(w)))
+            // `relative` only when it isn't already absolutely positioned —
+            // setting it on an absolute box overrides that, dropping the box into
+            // the layout flow and squeezing the whole window
+            .when(inline, |d| d.relative().w_full().my_1())
+            .child(input_sink(self.rc_focus.clone(), cx.entity()))
+            // the estimate is a floor: let the box grow if the text wraps further
+            .min_h(px(box_h))
+            .bg(rgb(PANEL_BG))
+            .border_1()
+            .border_color(rgb(COMMENT_MARK)) // amber, matching the gutter marker
+            .rounded_md()
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .overflow_hidden() // a long note must not spill over the code
+            .track_focus(&self.rc_focus)
+            .on_key_down(cx.listener(Self::rc_key))
+            // the box sits over the editor: swallow the wheel so scrolling inside
+            // it never moves the code behind it
+            .on_scroll_wheel(|_e, _w, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .px_2()
+                    .pt_1()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(div().text_size(px(10.)).text_color(rgb(COMMENT_MARK)).child(head))
+                    .child(div().flex_grow(1.0))
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(rgb(LINE_NUMBER))
+                            .child("↩ save · ⇧↩ newline · esc cancel"),
+                    ),
+            )
+            // the answers, read here rather than in the terminal transcript
+            .when(!replies.is_empty(), |d| {
+                d.child(
+                    div()
+                        .id("rc-thread")
+                        .mx_2()
+                        .mt_1()
+                        .px_2()
+                        .h(px(thread_h))
+                        .overflow_y_scroll()
+                        // the wheel belongs to this list, not the code behind it
+                        .on_scroll_wheel(|_e, _w, cx| cx.stop_propagation())
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .children(replies.iter().map(|r| {
+                            let agent = r.who == "agent";
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(1.))
+                                .pl_2()
+                                .border_l_2()
+                                .border_color(rgb(if agent { GIT_NEW } else { COMMENT_MARK }))
+                                .child(
+                                    div()
+                                        .text_size(px(10.))
+                                        .text_color(rgb(if agent { GIT_NEW } else { COMMENT_MARK }))
+                                        .child(if agent { "Agent" } else { "You" }),
+                                )
+                                // the agent writes markdown; render it as such
+                                .child(md_text(&r.text, 12.0, TEXT).min_w(px(0.)))
+                        })),
+                )
+            })
+            .child(
+                div()
+                    .mx_2()
+                    .mb_2()
+                    .mt_1()
+                    .px_2()
+                    .py_1()
+                    // grow with the text (wrapping included) instead of clipping;
+                    // the cap is what makes a long note scroll inside the box
+                    .min_h(px(body_h + 8.0))
+                    .max_h(px(RC_MAX_LINES as f32 * RC_LINE_H + 8.0))
+                    .line_height(px(RC_LINE_H))
+                    .bg(rgb(BG))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .rounded_md()
+                    .overflow_hidden()
+                    .text_size(px(12.))
+                    .text_color(rgb(TEXT))
+                    // the box can open unfocused (an existing thread): clicking
+                    // the reply area is what starts typing
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _e, window, cx| {
+                            window.focus(&this.rc_focus, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .child({
+                        // no caret until the field holds focus, or an unfocused
+                        // box looks like it's taking keystrokes
+                        let caret = self.caret_if(rc_focused);
+                        if self.rc_reply_mode && self.rc_query.is_empty() {
+                            div()
+                                .text_color(rgb(MUTED))
+                                .child(format!("Reply to the agent…{caret}"))
+                        } else {
+                            div()
+                                .mt(px(-rc_scroll_off(&self.rc_query)))
+                                .child(self.rc_query.render(caret, SELECTION))
+                        }
+                    }),
+            )
+            // footer: the actions, spelled out rather than keyboard-only
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .mx_2()
+                    .mb_2()
+                    .when(existing_note, |d| {
+                        d.child(rc_button("rc-delete", "Delete", false, true).on_click(cx.listener(
+                            |this, _e, window, cx| this.delete_open_comment(window, cx),
+                        )))
+                    })
+                    .child(div().flex_grow(1.0))
+                    .child(rc_button("rc-cancel", "Cancel", false, false).on_click(cx.listener(
+                        |this, _e, window, cx| this.cancel_comment(window, cx),
+                    )))
+                    .child(
+                        rc_button(
+                            "rc-save",
+                            match (self.rc_reply_mode, existing_note) {
+                                (true, _) => "Reply",
+                                (false, true) => "Update",
+                                (false, false) => "Comment",
+                            },
+                            true,
+                            false,
+                        )
+                        .on_click(cx.listener(|this, _e, window, cx| this.commit_comment(window, cx))),
+                    )
+                    // a thread that's been talked through is resolved, not deleted —
+                    // last in the row, since it's what ends the conversation
+                    .when(!replies.is_empty(), |d| {
+                        d.child(
+                            // rc_button already carries the hover style — setting
+                            // another one panics in gpui
+                            rc_button("rc-resolve", "Resolve", false, false)
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
+                                .border_color(rgb(GIT_NEW))
+                                .child(
+                                    div()
+                                        .font_family(ICON_FONT)
+                                        .text_size(px(10.))
+                                        .text_color(rgb(GIT_NEW))
+                                        .child(IC_CHECK),
+                                )
+                                .on_click(cx.listener(|this, _e, window, cx| {
+                                    this.resolve_comment(window, cx)
+                                })),
+                        )
+                    }),
+            )
+            // drag the bottom edge to make the box (and its thread) taller
+            .child(
+                div()
+                    .id("rc-resize")
+                    .h(px(5.))
+                    .flex_shrink_0()
+                    .cursor(CursorStyle::ResizeUpDown)
+                    .bg(rgb(if self.rc_resize.is_some() { ACCENT } else { PANEL_BG }))
+                    .hover(|s| s.bg(rgb(ACCENT)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
+                            this.rc_resize = Some((f32::from(ev.position.y), thread_h));
+                            cx.notify();
+                        }),
+                    ),
+            )
+    }
+
+    /// Saved notes for the file on screen, parked in the right margin beside the
+    /// **first** line of their span — that's the line you were looking at when you
+    /// wrote it. A multi-line note shows as many lines as its span covers, so it
+    /// never spills past the code it belongs to.
+    fn render_inline_notes(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut layer = div().absolute().top(px(0.)).left(px(0.));
+        let Some(tab) = self.tabs.get(self.active) else { return layer };
+        let path = tab.path.clone();
+        // several notes can share a first line; that one shows with a count
+        let mut by_line: Vec<(usize, usize, String, usize, usize)> = Vec::new();
+        for c in self.review.iter().filter(|c| c.path == path) {
+            match by_line.iter_mut().find(|(l, _, _, _, _)| *l == c.line) {
+                Some((_, _, _, extra, answers)) => {
+                    *extra += 1;
+                    *answers += c.replies.len();
+                }
+                None => by_line.push((c.line, c.end, c.text.clone(), 0, c.replies.len())),
+            }
+        }
+        if by_line.is_empty() {
+            return layer;
+        }
+        let editor = tab.editor.clone();
+        // start the column just past the longest line on screen
+        let anchor = editor.read(cx).notes_anchor_x();
+        for (i, (line, end, text, extra, answers)) in by_line.into_iter().enumerate() {
+            let Some((x, y, avail, h)) = editor.read(cx).line_screen_rect(line) else { continue };
+            let start = anchor.unwrap_or(x + avail * 0.55).max(x);
+            let w = (x + avail - start).max(140.0);
+            // as many rows as the span is tall, capped by the note's own length
+            let span_rows = end.saturating_sub(line) + 1;
+            let all: Vec<&str> = text.lines().collect();
+            let shown = all.len().min(span_rows.max(1));
+            let clipped = all.len() > shown;
+            let mut body = div().flex().flex_col().flex_grow(1.0).min_w(px(0.));
+            for (li, l) in all.iter().take(shown).enumerate() {
+                let last_shown = li + 1 == shown;
+                let text = if clipped && last_shown { format!("{l} …") } else { (*l).to_string() };
+                body = body.child(div().h(px(h)).truncate().child(text));
+            }
+            layer = layer.child(
+                div()
+                    .id(("inline-note", i))
+                    .absolute()
+                    .top(px(y))
+                    .left(px(start))
+                    .w(px(w))
+                    .h(px(h * shown as f32))
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap_1()
+                    .px_1()
+                    .rounded_md()
+                    .overflow_hidden()
+                    .bg(rgba(COMMENT_TINT))
+                    .border_l_2()
+                    .border_color(rgb(COMMENT_MARK))
+                    .cursor_pointer()
+                    .text_size(px(11.))
+                    .text_color(rgb(COMMENT_MARK))
+                    .hover(|s| s.bg(rgba(COMMENT_TINT_HOVER)))
+                    .child(
+                        div()
+                            .h(px(h))
+                            .flex()
+                            .items_center()
+                            .flex_shrink_0()
+                            .font_family(ICON_FONT)
+                            .text_size(px(10.))
+                            .child(IC_COMMENT),
+                    )
+                    .child(body)
+                    // an answer is waiting — click the chip to read it
+                    .when(answers > 0, |d| {
+                        d.child(
+                            div()
+                                .h(px(h))
+                                .flex()
+                                .items_center()
+                                .flex_shrink_0()
+                                .text_color(rgb(GIT_NEW))
+                                .child(format!("✓{answers}")),
+                        )
+                    })
+                    .when(extra > 0, |d| {
+                        d.child(div().h(px(h)).flex().items_center().flex_shrink_0().child(format!("+{extra}")))
+                    })
+                    .on_click(cx.listener(move |this, _e, window, cx| {
+                        // open this thread: reply if it has answers, else edit
+                        if let Some(tab) = this.tabs.get(this.active) {
+                            let path = tab.path.clone();
+                            this.begin_comment(path, line, end, window, cx);
+                        }
+                    })),
+            );
+        }
+        layer
+    }
+
+    /// The review-comments pane: every pending note, and one button that hands
+    /// the whole batch to the agent.
+    fn render_review_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let width = px(self.tree_width);
+        let n = self.review.iter().filter(|c| !c.draft && !c.sent).count();
+        let drafts = self.review.iter().filter(|c| c.draft).count();
+        let answered = self.review.iter().filter(|c| !c.replies.is_empty()).count();
+        let waiting = self.review.iter().filter(|c| c.sent && c.replies.is_empty()).count();
+        let mut list = div().flex().flex_col().min_h(px(0.)).id("review-list").overflow_y_scroll();
+        for (i, c) in self.review.iter().enumerate() {
+            let head = if is_agent_src(&c.path) {
+                if c.end > c.line {
+                    format!("the agent's answer  ·  lines {}-{}", c.line, c.end)
+                } else {
+                    format!("the agent's answer  ·  line {}", c.line)
+                }
+            } else if c.line == 0 {
+                format!("{}  ·  whole file", self.rel(&c.path))
+            } else if c.end > c.line {
+                format!("{}:{}-{}", self.rel(&c.path), c.line, c.end)
+            } else {
+                format!("{}:{}", self.rel(&c.path), c.line)
+            };
+            let is_draft = c.draft;
+            let sent = c.sent;
+            let replies = c.replies.clone();
+            let (path, line, end) = (c.path.clone(), c.line, c.end);
+            // long threads collapse to the last two turns; the row stays scannable
+            let expanded = self.review_expanded.contains(&c.id);
+            let hidden = if expanded { 0 } else { replies.len().saturating_sub(2) };
+            let cid = c.id.clone();
+            list = list.child(
+                div()
+                    .id(("review-row", i))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(HOVER)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_grow(1.0)
+                                    .truncate()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(COMMENT_MARK))
+                                    .child(head),
+                            )
+                            // where this thread stands
+                            .when_some(
+                                match (is_draft, sent, replies.is_empty()) {
+                                    (true, _, _) => Some(("draft", MUTED)),
+                                    (_, true, false) => Some(("answered", GIT_NEW)),
+                                    (_, true, true) => Some(("sent", GIT_MODIFIED)),
+                                    // unsent with a thread = your reply is queued
+                                    (_, false, false) => Some(("your turn", COMMENT_MARK)),
+                                    _ => None,
+                                },
+                                |d, (label, color)| {
+                                    d.child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .px_1()
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(rgb(color))
+                                            .text_size(px(9.))
+                                            .text_color(rgb(color))
+                                            .child(label),
+                                    )
+                                },
+                            )
+                            // a discussed thread is resolved; ✕ still deletes
+                            .when(!replies.is_empty(), |d| {
+                                let (p2, l2, e2) = (path.clone(), line, end);
+                                d.child(
+                                    div()
+                                        .id(("review-resolve", i))
+                                        .px_1()
+                                        .flex_shrink_0()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .text_size(px(9.))
+                                        .text_color(rgb(GIT_NEW))
+                                        .hover(|s| s.bg(rgb(HOVER)))
+                                        .child("resolve")
+                                        .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
+                                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                                            this.review.retain(|c| {
+                                                !(c.path == p2 && c.line == l2 && c.end == e2)
+                                            });
+                                            this.sync_comment_gutters(cx);
+                                            this.save_review();
+                                            this.show_flash("Thread resolved", cx);
+                                            cx.notify();
+                                        })),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id(("review-del", i))
+                                    .px_1()
+                                    .flex_shrink_0()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(MUTED))
+                                    .hover(|s| s.text_color(rgb(GIT_DELETED)))
+                                    .child("✕")
+                                    .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
+                                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                                        this.review.retain(|c| {
+                                            !(c.path == path && c.line == line && c.end == end)
+                                        });
+                                        this.sync_comment_gutters(cx);
+                                        this.save_review();
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(div().text_size(px(12.)).text_color(rgb(TEXT)).child(if expanded {
+                        c.text.clone()
+                    } else {
+                        Self::clip_turn(&c.text)
+                    }))
+                    // how many turns are folded away, and the switch to unfold them
+                    .when(hidden > 0 || (expanded && replies.len() > 2), |d| {
+                        let cid = cid.clone();
+                        d.child(
+                            div()
+                                .id(("review-thread-toggle", i))
+                                .px_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .text_size(px(9.))
+                                .text_color(rgb(MUTED))
+                                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                .child(if hidden > 0 {
+                                    format!("▸ {hidden} earlier turn{}", if hidden == 1 { "" } else { "s" })
+                                } else {
+                                    "▾ collapse thread".to_string()
+                                })
+                                .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
+                                .on_click(cx.listener(move |this, _e, _w, cx| {
+                                    if !this.review_expanded.remove(&cid) {
+                                        this.review_expanded.insert(cid.clone());
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    // the thread: answers the agent posted back to this comment
+                    .children(replies.iter().skip(hidden).map(|r| {
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_1()
+                            .pl_2()
+                            .border_l_2()
+                            .border_color(rgb(if r.who == "agent" { GIT_NEW } else { COMMENT_MARK }))
+                            .text_size(px(11.))
+                            .text_color(rgb(MUTED))
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_color(rgb(if r.who == "agent" { GIT_NEW } else { COMMENT_MARK }))
+                                    .child(if r.who == "agent" { "agent" } else { "you" }),
+                            )
+                            .child(
+                                md_text(
+                                    &if expanded { r.text.clone() } else { Self::clip_turn(&r.text) },
+                                    11.0,
+                                    MUTED,
+                                )
+                                .flex_grow(1.0),
+                            )
+                    }))
+                    // click the row to open the file at that line *and* its thread,
+                    // so the conversation is right there instead of one click away
+                    .on_click(cx.listener(move |this, _e, window, cx| {
+                        let Some((p, l, e)) =
+                            this.review.get(i).map(|c| (c.path.clone(), c.line, c.end))
+                        else {
+                            return;
+                        };
+                        this.open_file(p.clone(), window, cx);
+                        if let Some(tab) = this.tabs.get(this.active) {
+                            tab.editor.update(cx, |ed, cx| ed.goto(l.saturating_sub(1), 0, cx));
+                        }
+                        this.begin_comment(p, l, e, window, cx);
+                    })),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .w(width)
+            .h_full()
+            .bg(rgb(BG))
+            .child(
+                div()
+                    .h(px(32.))
+                    .px_3()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .text_size(px(12.))
+                    .text_color(rgb(MUTED))
+                    .child({
+                        let mut parts = Vec::new();
+                        if n > 0 {
+                            parts.push(format!("{n} ready"));
+                        }
+                        if waiting > 0 {
+                            parts.push(format!("{waiting} sent"));
+                        }
+                        if answered > 0 {
+                            parts.push(format!("{answered} answered"));
+                        }
+                        if drafts > 0 {
+                            parts.push(format!("{drafts} draft"));
+                        }
+                        if parts.is_empty() {
+                            "REVIEW COMMENTS".to_string()
+                        } else {
+                            format!("REVIEW COMMENTS  ·  {}", parts.join(" · "))
+                        }
+                    })
+                    .child(div().flex_grow(1.0))
+                    .child(self.collapse_left_btn(cx)),
+            )
+            // send-to-agent button, disabled-looking when there's nothing to send
+            .child(
+                div()
+                    .id("review-send")
+                    .mx_3()
+                    .mb_2()
+                    .py_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(if n > 0 { COMMENT_MARK } else { BORDER }))
+                    .text_size(px(11.))
+                    .text_color(rgb(if n > 0 { COMMENT_MARK } else { MUTED }))
+                    .when(n > 0, |d| d.cursor_pointer().hover(|s| s.bg(rgba(COMMENT_TINT))))
+                    .child(format!("Send {n} to agent  ·  ⌥↩"))
+                    .on_click(cx.listener(|this, _e, window, cx| this.send_review(window, cx))),
+            )
+            .child(if self.review.is_empty() {
+                div()
+                    .flex_grow(1.0)
+                    .px_3()
+                    .text_size(px(12.))
+                    .text_color(rgb(MUTED))
+                    .child("No comments yet. ⌥C on a line in the editor or the diff.")
+                    .into_any_element()
+            } else {
+                list.flex_grow(1.0).into_any_element()
+            })
     }
 
     /// A transparent resize handle for the find dialog; caller positions/sizes it.
@@ -7540,22 +12042,50 @@ impl Storm {
             .text_size(px(11.))
             .child(div().font_family(ICON_FONT).text_color(rgb(FOLDER_ICON)).child(IC_FOLDER))
             .child(div().text_color(rgb(MUTED)).truncate().child(format!("in {}", scope_label)))
-            .when(!globs.is_empty(), |d| {
+            // positives and negatives read very differently — showing them in one
+            // joined list hid whether an exclusion was actually picked up
+            .when(globs.iter().any(|g| !g.starts_with('!')), |d| {
+                let pos: Vec<&str> = globs.iter().filter(|g| !g.starts_with('!')).map(|g| g.as_str()).collect();
                 d.child(
                     div()
                         .text_color(rgb(ACCENT))
                         .truncate()
-                        .child(format!("· files {}", globs.join(", "))),
+                        .child(format!("· files {}", pos.join(", "))),
                 )
             })
-            .when(!excludes.is_empty(), |d| {
+            // path exclusions (whole subtrees skipped)
+            .when(globs.iter().any(|g| g.starts_with('!')), |d| {
+                let neg: Vec<String> = globs
+                    .iter()
+                    .filter_map(|g| g.strip_prefix('!'))
+                    // show `**/dist/**` as `dist` — the form you typed
+                    .map(|g| g.trim_start_matches("**/").trim_end_matches("/**").to_string())
+                    .collect();
                 d.child(
                     div()
                         .text_color(rgb(GIT_DELETED))
                         .truncate()
-                        .child(format!("· excluding {}", excludes.join(", "))),
+                        .child(format!("· not {}", neg.join(", "))),
                 )
-            });
+            })
+            // text exclusions (matching lines dropped) — only tokens that aren't
+            // already covered by the path list, so nothing is listed twice
+            .when(
+                excludes.iter().any(|e| !globs.contains(&format!("!**/{e}/**"))),
+                |d| {
+                    let text: Vec<&str> = excludes
+                        .iter()
+                        .filter(|e| !globs.contains(&format!("!**/{e}/**")))
+                        .map(|e| e.as_str())
+                        .collect();
+                    d.child(
+                        div()
+                            .text_color(rgb(GIT_DELETED))
+                            .truncate()
+                            .child(format!("· lines without {}", text.join(", "))),
+                    )
+                },
+            );
 
         // ── results list (height = draggable split fraction of the area below
         //    the header; the rest goes to the preview) ──
@@ -8712,9 +13242,11 @@ impl Storm {
     /// full-window transparent backdrop dismisses it on any outside click.
     /// The editor context-menu actions, in display order. Shared by the menu
     /// renderer and the keyboard handler so the numbers always line up.
-    fn editor_ctx_actions() -> [(&'static str, fn(&mut Self, &mut Window, &mut Context<Self>)); 5] {
+    fn editor_ctx_actions() -> [(&'static str, fn(&mut Self, &mut Window, &mut Context<Self>)); 8] {
         [
             ("Reveal in Dir Tree", |this, window, cx| this.reveal_active_in_tree(window, cx)),
+            ("Reveal in Changes", |this, window, cx| this.reveal_active_in_changes(window, cx)),
+            ("Reveal in PR Review", |this, window, cx| this.reveal_active_in_pr(window, cx)),
             ("Copy Full Path", |this, _w, cx| {
                 if let Some(p) = this.active_path().cloned() {
                     cx.write_to_clipboard(ClipboardItem::new_string(p.to_string_lossy().to_string()));
@@ -8732,6 +13264,7 @@ impl Storm {
                     window.focus(&this.confirm_focus, cx);
                 }
             }),
+            ("Comment on This Line", |this, window, cx| this.open_comment_prompt(window, cx)),
             ("Close Tab", |this, window, cx| this.close_tab(this.active, window, cx)),
         ]
     }
@@ -8836,9 +13369,33 @@ impl Storm {
             .child(menu)
     }
 
-    /// Dir-tree right-click actions. Operate on `tree_ctx_path`.
-    fn tree_ctx_actions() -> [(&'static str, fn(&mut Self, &mut Window, &mut Context<Self>)); 7] {
-        [
+    /// Right-click actions for the open menu. Operate on `tree_ctx_path`.
+    fn tree_ctx_actions(kind: CtxKind) -> Vec<(&'static str, fn(&mut Self, &mut Window, &mut Context<Self>))> {
+        if kind == CtxKind::AgentSel {
+            return vec![
+                ("Comment on Selection", |this, window, cx| {
+                    this.quote_agent_selection(window, cx)
+                }),
+                ("Copy", |this, _w, cx| {
+                    if let Some(t) = this.agent_selected_text(cx) {
+                        cx.write_to_clipboard(ClipboardItem::new_string(t));
+                        this.show_flash("Copied", cx);
+                    }
+                }),
+                ("Clear Selection", |this, _w, cx| {
+                    this.agent_sel = None;
+                    cx.notify();
+                }),
+            ];
+        }
+        if kind == CtxKind::ReviewFile {
+            return vec![("Comment on Whole File", |this, window, cx| {
+                if let Some(p) = this.tree_ctx_path.clone() {
+                    this.begin_comment(p, 0, 0, window, cx);
+                }
+            })];
+        }
+        vec![
             ("New File", |this, window, cx| this.open_new_file_prompt(window, cx)),
             ("Reveal in Finder", |this, _w, _cx| {
                 if let Some(p) = this.tree_ctx_path.clone() {
@@ -8881,11 +13438,21 @@ impl Storm {
         ]
     }
 
+    /// Open the file-level context menu for `path` at the click position.
+    fn open_review_ctx(&mut self, path: PathBuf, pos: (f32, f32), window: &mut Window, cx: &mut Context<Self>) {
+        self.tree_ctx = Some(pos);
+        self.tree_ctx_path = Some(path);
+        self.tree_ctx_kind = CtxKind::ReviewFile;
+        window.focus(&self.tree_ctx_focus, cx);
+        cx.notify();
+    }
+
     fn tree_ctx_run(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let actions = Self::tree_ctx_actions();
+        let actions = Self::tree_ctx_actions(self.tree_ctx_kind);
         if let Some((_, run)) = actions.get(idx) {
-            run(self, window, cx);
             self.tree_ctx = None;
+            self.tree_ctx_kind = CtxKind::Tree;
+            run(self, window, cx);
             self.tree_ctx_path = None;
             cx.notify();
         }
@@ -8896,6 +13463,7 @@ impl Storm {
         if key == "escape" {
             self.tree_ctx = None;
             self.tree_ctx_path = None;
+            self.tree_ctx_kind = CtxKind::Tree;
             cx.notify();
             return;
         }
@@ -8907,8 +13475,12 @@ impl Storm {
     }
 
     fn render_tree_ctx_menu(&self, pos: (f32, f32), cx: &mut Context<Self>) -> impl IntoElement {
-        let actions = Self::tree_ctx_actions();
-        let menu_w = 200.0_f32;
+        let actions = Self::tree_ctx_actions(self.tree_ctx_kind);
+        let menu_w = match self.tree_ctx_kind {
+            CtxKind::ReviewFile => 220.0_f32,
+            CtxKind::AgentSel => 210.0_f32,
+            CtxKind::Tree => 200.0_f32,
+        };
         let row_h = 28.0_f32;
         let menu_h = actions.len() as f32 * row_h + 10.0;
         let left = pos.0.min((self.win_width - menu_w - 8.0).max(0.));
@@ -9453,6 +14025,14 @@ impl Storm {
                 let dir = p.parent().map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
                 let path = p.clone();
                 let sel = i == self.newproj_sel;
+                // compare canonicalised, so ~/dev/x and a symlinked path match
+                let canon = |q: &Path| std::fs::canonicalize(q).unwrap_or_else(|_| q.to_path_buf());
+                let already_open = self.ws_roots.iter().any(|r| canon(r) == canon(p));
+                let title = self
+                    .newproj_titles
+                    .get(&p.to_string_lossy().to_string())
+                    .filter(|t| !t.trim().is_empty())
+                    .cloned();
                 recents = recents.child(
                     div()
                         .id(("newproj-recent", i))
@@ -9467,7 +14047,35 @@ impl Storm {
                         .when(!sel, |d| d.hover(|s| s.bg(rgb(HOVER))))
                         .child(div().font_family(ICON_FONT).text_size(px(12.)).text_color(rgb(FOLDER_ICON)).child(IC_FOLDER))
                         .child(div().flex_shrink_0().text_size(px(12.)).text_color(rgb(if sel { SEL_TEXT } else { TEXT })).child(name))
+                        // the workspace title tells you which piece of work lives
+                        // in this folder — the whole point of picking one
+                        .when_some(title, |d, t| {
+                            d.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .max_w(px(240.))
+                                    .text_size(px(11.))
+                                    .truncate()
+                                    .text_color(rgb(if sel { SEL_TEXT } else { ACCENT }))
+                                    .child(t),
+                            )
+                        })
                         .child(div().flex_grow(1.0).text_size(px(11.)).text_color(rgb(MUTED)).truncate().child(dir))
+                        // already one of the open workspaces → picking it just
+                        // switches to it rather than opening a second copy
+                        .when(already_open, |d| {
+                            d.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .px_1p5()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(rgb(if sel { SEL_TEXT } else { MUTED }))
+                                    .text_size(px(9.))
+                                    .text_color(rgb(if sel { SEL_TEXT } else { MUTED }))
+                                    .child("already open"),
+                            )
+                        })
                         .on_click(cx.listener(move |this, _e, _w, cx| {
                             this.newproj_open = false;
                             cx.emit(ProjectNav::OpenPath(path.clone()));
@@ -9551,6 +14159,8 @@ impl Storm {
         self.agent_open = !self.agent_open;
         if self.agent_open {
             self.ensure_acp(cx);
+            self.autoresume_agent(cx);
+            self.agent_list.scroll_to_end(); // reopen at the end
             window.focus(&self.agent_focus, cx);
         } else {
             self.focus_active(window, cx);
@@ -9558,10 +14168,70 @@ impl Storm {
         cx.notify();
     }
 
+    /// On the panel's first open, pick up where the last session left off: ask
+    /// for the project's sessions and load the newest one when the answer lands.
+    /// The adapter's handshake already opened a fresh session, which stands if
+    /// there's nothing to resume.
+    fn autoresume_agent(&mut self, cx: &mut Context<Self>) {
+        if self.agent_resumed || self.agent_autoresume {
+            return;
+        }
+        if let Some(acp) = self.acp.clone() {
+            self.agent_autoresume = true;
+            acp.list_sessions(&self.root);
+            cx.notify();
+        }
+    }
+
+    /// Ask the adapter what's resumable and show the list.
+    fn open_agent_picker(&mut self, cx: &mut Context<Self>) {
+        self.ensure_acp(cx);
+        if let Some(acp) = self.acp.clone() {
+            acp.list_sessions(&self.root);
+        }
+        self.agent_picker = true;
+        cx.notify();
+    }
+
+    /// Drop the current conversation and start a fresh session.
+    fn new_agent_session(&mut self, cx: &mut Context<Self>) {
+        self.ensure_acp(cx);
+        self.agent_resumed = true; // an explicit new session outranks auto-resume
+        self.agent_autoresume = false;
+        self.reset_agent_transcript();
+        if let Some(acp) = self.acp.clone() {
+            acp.new_session(&self.root);
+        }
+        cx.notify();
+    }
+
+    fn reset_agent_transcript(&mut self) {
+        self.acp_state = None;
+        self.agent_queue.clear();
+        self.agent_imgs.clear();
+        self.agent_list.scroll_to_end(); // a replayed session opens at its end
+        self.agent_picker = false;
+        self.agent_msgs.clear();
+        self.agent_cur = None;
+        self.agent_cur_thought = None;
+        self.agent_ctx = None;
+        self.agent_title = None;
+        self.agent_busy = false;
+    }
+
+    /// Resume a session: the transcript is rebuilt from the adapter's replay.
+    fn resume_agent_session(&mut self, id: String, cx: &mut Context<Self>) {
+        self.reset_agent_transcript();
+        if let Some(acp) = self.acp.clone() {
+            acp.load_session(&self.root, &id);
+        }
+        cx.notify();
+    }
+
     /// Spawn the ACP adapter on first use and start the event drain poll.
     fn ensure_acp(&mut self, cx: &mut Context<Self>) {
         if self.acp.is_none() {
-            self.acp = acp::Acp::new(&self.root);
+            self.acp = acp::Acp::new(&self.root, self.rpc_env());
             if self.acp.is_none() {
                 self.agent_msgs.push(AgentMsg::Tool {
                     id: String::new(),
@@ -9601,6 +14271,27 @@ impl Storm {
         use acp::AcpEvent::*;
         match ev {
             Ready => {} // session ready; input was already accepting text
+            Usage { used, size } => self.agent_ctx = Some((used, size)),
+            // a replayed turn from session/load
+            User(t) => {
+                self.agent_cur = None;
+                self.agent_cur_thought = None;
+                self.agent_msgs.push(AgentMsg::User(t));
+            }
+            Sessions(list) => {
+                self.agent_sessions = list;
+                // this answer was for the auto-resume, not the picker
+                if std::mem::take(&mut self.agent_autoresume) {
+                    self.agent_resumed = true;
+                    if let Some((id, _)) = self.agent_sessions.first().cloned() {
+                        self.reset_agent_transcript();
+                        if let Some(acp) = self.acp.clone() {
+                            acp.load_session(&self.root, &id);
+                        }
+                    }
+                }
+            }
+            Title(t) => self.agent_title = Some(t),
             Text(t) => {
                 self.agent_cur_thought = None; // real answer began → close the reasoning bubble
                 match self.agent_cur {
@@ -9642,11 +14333,18 @@ impl Storm {
             }
             TurnEnd => {
                 self.agent_busy = false;
+                self.agent_turn_start = None;
+                self.acp_state = Some(AgentState::Done);
                 self.agent_cur = None;
                 self.agent_cur_thought = None;
+                self.agent_next_queued();
             }
             Error(e) => {
+                // a failed turn drops the queue: those prompts assumed the turn
+                // they were typed behind actually happened
+                self.agent_queue.clear();
                 self.agent_busy = false;
+                self.acp_state = Some(AgentState::Failed);
                 self.agent_cur = None;
                 self.agent_cur_thought = None;
                 self.agent_msgs.push(AgentMsg::Tool { id: String::new(), title: e, status: "failed".into() });
@@ -9655,23 +14353,117 @@ impl Storm {
     }
 
     fn agent_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // pane navigation belongs to the dock, not to the message box
         let ks = &ev.keystroke;
+        if self.agent_picker && ks.key == "escape" {
+            self.agent_picker = false;
+            cx.notify();
+            return;
+        }
+        if ks.modifiers.platform {
+            match ks.key.as_str() {
+                // the dock stacks vertically, so only ⌘↑/⌘↓ move between panes —
+                // ⌘←/⌘→ belong to the composer (line start/end, ⇧ to select)
+                "down" | "up" => {
+                    let forward = ks.key == "down";
+                    self.move_pane_focus(false, forward, window, cx);
+                    return;
+                }
+                "enter" if ks.modifiers.shift => {
+                    self.agent_zoomed = !self.agent_zoomed;
+                    cx.notify();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        let ks = &ev.keystroke;
+        // ctrl+j adds a line, ctrl+c interrupts the turn — terminal muscle memory
+        if ks.modifiers.control {
+            match ks.key.as_str() {
+                "j" => {
+                    self.agent_input.newline();
+                    cx.notify();
+                    return;
+                }
+                "c" => {
+                    self.interrupt_agent(cx);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // ⌘V with an image on the clipboard attaches it to the next prompt
+        if ks.key == "v" && ks.modifiers.platform && !ks.modifiers.alt {
+            if self.attach_clipboard_image(cx) {
+                return;
+            }
+        }
+        // ⌥C quotes the selected agent text into the composer; ⌘C copies it
+        if ks.key == "c" && ks.modifiers.alt && !ks.modifiers.platform {
+            self.quote_agent_selection(window, cx);
+            return;
+        }
+        if ks.key == "c" && ks.modifiers.platform && self.agent_sel.is_some() {
+            if let Some(t) = self.agent_selected_text(cx) {
+                cx.write_to_clipboard(ClipboardItem::new_string(t));
+                self.show_flash("Copied", cx);
+                return;
+            }
+        }
         match ks.key.as_str() {
+            // a selection is what escape drops first
+            "escape" if self.agent_sel.is_some() => {
+                self.agent_sel = None;
+                cx.notify();
+            }
             "escape" => {
                 self.agent_open = false;
                 self.focus_active(window, cx);
             }
-            "enter" => {
+            // ↩ sends; the field's own newline handling is bypassed here
+            "enter" if !ks.modifiers.shift => {
                 let text = self.agent_input.text.trim().to_string();
-                if text.is_empty() {
+                if text.is_empty() && self.agent_imgs.is_empty() {
                     return;
                 }
                 self.agent_input.clear();
                 self.send_agent_prompt(text, cx);
             }
-            _ => {
-                Self::field_input(&mut self.agent_input, ks, cx, |_| true);
+            "enter" => {
+                self.agent_input.newline(); // ⇧↩ too, since it costs nothing
             }
+            _ => {
+                // printable text arrives through the input handler instead
+                if !Self::text_comes_via_input_handler(ks) {
+                    Self::field_input(&mut self.agent_input, ks, cx, |_| true);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Stop the turn in flight (ctrl+c / the Stop button). The adapter ends the
+    /// turn on its side; we drop the busy state right away so the UI responds.
+    fn interrupt_agent(&mut self, cx: &mut Context<Self>) {
+        if !self.agent_busy {
+            return;
+        }
+        if let Some(acp) = self.acp.clone() {
+            acp.cancel();
+        }
+        let dropped = self.agent_queue.len();
+        self.agent_queue.clear();
+        if dropped > 0 {
+            self.show_flash(&format!("Interrupted — dropped {dropped} queued message(s)"), cx);
+        }
+        self.agent_busy = false;
+        self.agent_turn_start = None;
+        self.acp_state = None;
+        self.agent_cur = None;
+        self.agent_cur_thought = None;
+        if dropped == 0 {
+            self.show_flash("Interrupted", cx);
         }
         cx.notify();
     }
@@ -9679,15 +14471,344 @@ impl Storm {
     fn send_agent_prompt(&mut self, text: String, cx: &mut Context<Self>) {
         self.ensure_acp(cx);
         let Some(acp) = self.acp.clone() else { return };
-        acp.prompt(&text);
-        self.agent_msgs.push(AgentMsg::User(text));
+        // a turn is already running: hold this one and send it when that ends,
+        // rather than firing a second session/prompt at the adapter
+        if self.agent_busy {
+            self.agent_queue.push(text);
+            self.agent_list.scroll_to_end();
+            cx.notify();
+            return;
+        }
+        let imgs: Vec<(String, String)> =
+            self.agent_imgs.drain(..).map(|(m, d, _)| (m, d)).collect();
+        acp.prompt_with(&text, &imgs);
+        let label = if imgs.is_empty() {
+            text
+        } else {
+            format!("{text}\n\n[{} image(s) attached]", imgs.len())
+        };
+        self.agent_msgs.push(AgentMsg::User(label));
+        self.agent_turn_start = Some(std::time::Instant::now());
+        self.start_agent_spinner(cx);
+        // same signal a terminal agent's UserPromptSubmit hook sends
+        self.acp_state = Some(AgentState::Working);
+        if self.ws_idle {
+            self.ws_idle = false;
+            save_ws_idle(&self.root, false);
+        }
+        self.agent_list.scroll_to_end(); // your own turn always scrolls into view
         self.agent_cur = None;
         self.agent_cur_thought = None;
         self.agent_busy = true;
         cx.notify();
     }
 
+    /// An agent message, rendered row by row so a row's text can be selected and
+    /// quoted back at the agent. Fences and tables fall through to the plain
+    /// renderer — selecting inside a code block is what the editor is for.
+    fn render_agent_md(
+        &mut self,
+        msg: usize,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let rows = md_prepare(text);
+        let cpath = self.agent_comment_path(msg);
+        // rows that already carry a comment (1-based spans), and the row the open
+        // box belongs under
+        let commented: Vec<(usize, usize, bool)> = self
+            .review
+            .iter()
+            .filter(|c| c.path == cpath)
+            .map(|c| (c.line, c.end, !c.replies.is_empty()))
+            .collect();
+        let box_after = self
+            .rc_open
+            .then(|| self.rc_target.clone())
+            .flatten()
+            .filter(|(p, _, _)| *p == cpath)
+            .map(|(_, _, b)| b.saturating_sub(1));
+        let sel = self.agent_sel.filter(|(m, _, _)| *m == msg).map(|(_, a, b)| (a.min(b), a.max(b)));
+        let selected = |i: usize| sel.is_some_and(|(a, b)| i >= a && i <= b);
+        // one wrapper per row: press anchors the selection, moving over a row
+        // while dragging extends to it
+        let wrap = |i: usize, inner: AnyElement, cx: &mut Context<Self>| {
+            div()
+                .child(inner)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
+                        this.agent_sel = Some((msg, i, i));
+                        this.agent_sel_drag = true;
+                        this.agent_sel_moved = false;
+                        this.agent_sel_pos =
+                            Some((f32::from(ev.position.x), f32::from(ev.position.y)));
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                        // right-clicking outside the current selection selects
+                        // just this row, so the menu always has a target
+                        let inside = this
+                            .agent_sel
+                            .is_some_and(|(m, a, b)| m == msg && i >= a.min(b) && i <= a.max(b));
+                        if !inside {
+                            this.agent_sel = Some((msg, i, i));
+                        }
+                        this.tree_ctx = Some((f32::from(ev.position.x), f32::from(ev.position.y)));
+                        this.tree_ctx_path = None;
+                        this.tree_ctx_kind = CtxKind::AgentSel;
+                        window.focus(&this.tree_ctx_focus, cx);
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _w, cx| {
+                    if !this.agent_sel_drag {
+                        return;
+                    }
+                    if let Some((m, a, b)) = this.agent_sel {
+                        if m == msg && b != i {
+                            this.agent_sel = Some((m, a, i));
+                            this.agent_sel_moved = true;
+                            this.agent_sel_pos =
+                                Some((f32::from(ev.position.x), f32::from(ev.position.y)));
+                            cx.notify();
+                        }
+                    }
+                }))
+                .into_any_element()
+        };
+        // build every row first, then stitch: selected runs go inside one
+        // container so the purple bar down their left edge is continuous
+        let mut built: Vec<(usize, AnyElement)> = Vec::new();
+        let mut i = 0;
+        while i < rows.len() {
+            if rows[i].cells.is_some() {
+                let first = i;
+                let mut grid = div()
+                    .my_1()
+                    .flex()
+                    .flex_col()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .rounded_md()
+                    .overflow_hidden();
+                while i < rows.len() && rows[i].cells.is_some() {
+                    grid = grid.child(md_row_el(&rows[i], selected(first)));
+                    i += 1;
+                }
+                built.push((first, wrap(first, grid.into_any_element(), cx)));
+                continue;
+            }
+            let row = &rows[i];
+            // the marker sits in the reserved left gutter, once per span, exactly
+            // like the editor's gutter icon — click it to open that thread
+            let span = commented.iter().find(|(a, b, _)| i + 1 >= *a && i + 1 <= *b).copied();
+            let gutter = match span {
+                Some((a, b, answered)) if a == i + 1 => {
+                    let p = cpath.clone();
+                    div()
+                        .id(("agent-comment-mark", msg * 10_000 + i))
+                        .w(px(16.))
+                        .flex_shrink_0()
+                        .font_family(ICON_FONT)
+                        .text_size(px(11.))
+                        .cursor_pointer()
+                        .text_color(rgb(if answered { GIT_NEW } else { COMMENT_MARK }))
+                        .hover(|s| s.text_color(rgb(TEXT)))
+                        .child(IC_COMMENT)
+                        .tooltip(tip("Open this thread"))
+                        .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _e, window, cx| {
+                            this.begin_comment(p.clone(), a, b, window, cx);
+                        }))
+                        .into_any_element()
+                }
+                // every row reserves the column, so nothing shifts sideways
+                _ => div().w(px(16.)).flex_shrink_0().into_any_element(),
+            };
+            let inner = div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .child(gutter)
+                .child(
+                    div()
+                        .flex_grow(1.0)
+                        .min_w(px(0.))
+                        .text_size(px(row.size.max(1.0)))
+                        .child(md_row_el(row, selected(i))),
+                )
+                .into_any_element();
+            built.push((i, wrap(i, inner, cx)));
+            i += 1;
+        }
+        // a row's left bar: purple while it's selected or carries a comment, and
+        // tinted only while selected. The 2px border is always laid out, so
+        // nothing moves sideways when it lights up.
+        let has_comment =
+            |i: usize| commented.iter().any(|(a, b, _)| i + 1 >= *a && i + 1 <= *b);
+        let bar = |i: usize| (selected(i), has_comment(i));
+        let mut col = div().flex().flex_col().gap(px(4.)).text_color(rgb(TEXT));
+        let mut k = 0;
+        while k < built.len() {
+            let (on, marked) = bar(built[k].0);
+            let mut group = div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .pl_1()
+                .border_l_2()
+                .when(on, |d| d.bg(rgba(COMMENT_TINT)))
+                .border_color(rgb(COMMENT_MARK))
+                .when(!on && !marked, |d| d.border_color(rgba(0x00000000)));
+            while k < built.len() && bar(built[k].0) == (on, marked) {
+                let ix = built[k].0;
+                let (_, el) = std::mem::replace(&mut built[k], (usize::MAX, div().into_any_element()));
+                group = group.child(el);
+                if box_after == Some(ix) {
+                    let focused = self.rc_focus.is_focused(window);
+                    group = group.child(self.render_comment_prompt(focused, true, cx).into_any_element());
+                }
+                k += 1;
+            }
+            col = col.child(group);
+        }
+        col.into_any_element()
+    }
+
+    /// Where a comment on message `msg` is filed. The message index rides in the
+    /// path so two answers can both have a commented row 3.
+    fn agent_comment_path(&self, msg: usize) -> PathBuf {
+        self.root.join(AGENT_SRC).join(msg.to_string())
+    }
+
+    /// The currently selected agent text: the selected rows, in order.
+    fn agent_selected_text(&self, cx: &App) -> Option<String> {
+        let (msg, a, b) = self.agent_sel?;
+        let _ = cx;
+        let text = match self.agent_msgs.get(msg)? {
+            AgentMsg::Agent(t) | AgentMsg::Thought(t) => t.clone(),
+            _ => return None,
+        };
+        let rows = md_prepare(&text);
+        let (a, b) = (a.min(b), a.max(b).min(rows.len().saturating_sub(1)));
+        let picked: Vec<String> = rows[a..=b]
+            .iter()
+            .filter(|r| !r.gap)
+            .map(|r| match &r.cells {
+                // a table row reads back as its cells, tab-separated
+                Some(cells) => {
+                    cells.iter().map(|c| c.text.to_string()).collect::<Vec<_>>().join("\t")
+                }
+                None => r.text.to_string(),
+            })
+            .collect();
+        let out = picked.join("\n");
+        (!out.trim().is_empty()).then_some(out)
+    }
+
+    fn act_quote_agent_sel(
+        &mut self,
+        _: &QuoteAgentSel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.quote_agent_selection(window, cx);
+    }
+
+    /// Pull an image off the clipboard into the pending attachments. Returns
+    /// false when the clipboard holds no image, so the caller can paste text.
+    fn attach_clipboard_image(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(item) = cx.read_from_clipboard() else { return false };
+        let Some(img) = item.entries().iter().find_map(|e| match e {
+            gpui::ClipboardEntry::Image(i) => Some(i.clone()),
+            _ => None,
+        }) else {
+            return false;
+        };
+        // the adapter takes base64 in the prompt itself, so a huge paste would
+        // land in the transcript as megabytes of text
+        const MAX: usize = 6 * 1024 * 1024;
+        if img.bytes.len() > MAX {
+            self.show_flash("That image is too large to attach (over 6 MB)", cx);
+            return true;
+        }
+        let mime = img.format.mime_type().to_string();
+        self.agent_imgs.push((mime, acp::base64(&img.bytes), img.bytes.len()));
+        self.show_flash("Image attached — send when ready", cx);
+        cx.notify();
+        true
+    }
+
+    /// ⌥C in the agent pane: comment on the selected answer text. Opens the same
+    /// box the editor uses and files the note into the review queue, so it goes
+    /// back to the agent with everything else.
+    fn quote_agent_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = self.agent_selected_text(cx) else {
+            self.show_flash("Select some of the agent's text first", cx);
+            return;
+        };
+        let Some((msg, a, b)) = self.agent_sel else { return };
+        self.agent_sel = None;
+        // the box's snippet is the quote; there's no file line to read it from
+        self.rc_snippet = Some(text);
+        // rows are 1-based here, so 0 stays free for "the whole answer"
+        let (first, last) = (a.min(b) + 1, a.max(b) + 1);
+        let path = self.agent_comment_path(msg);
+        self.begin_comment(path, first, last, window, cx);
+    }
+
+    /// Animate the "thinking" row while a turn is in flight. Runs only for the
+    /// duration of the turn, so nothing ticks when the agent is idle.
+    fn start_agent_spinner(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_millis(120)).await;
+            let Ok(busy) = this.update(cx, |this, cx| {
+                if this.agent_busy {
+                    this.agent_spin = this.agent_spin.wrapping_add(1);
+                    cx.notify();
+                }
+                this.agent_busy
+            }) else {
+                break;
+            };
+            if !busy {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// Send the next queued prompt, if any. Called when a turn ends.
+    fn agent_next_queued(&mut self) {
+        if self.agent_queue.is_empty() {
+            return;
+        }
+        let text = self.agent_queue.remove(0);
+        if let Some(acp) = self.acp.clone() {
+            acp.prompt(&text);
+            self.agent_msgs.push(AgentMsg::User(text));
+            self.agent_turn_start = Some(std::time::Instant::now());
+            self.acp_state = Some(AgentState::Working);
+            self.agent_cur = None;
+            self.agent_cur_thought = None;
+            self.agent_busy = true;
+            self.agent_list.scroll_to_end();
+        }
+    }
+
     fn render_agent(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The pane is open from startup, so nobody had to toggle it — start the
+        // adapter and resume the last session the first time it's actually drawn.
+        // Lazy on purpose: only the workspace you're looking at spawns an adapter.
+        if self.acp.is_none() {
+            self.ensure_acp(cx);
+            self.autoresume_agent(cx);
+        }
         // header
         let header = div()
             .h(px(34.))
@@ -9707,79 +14828,420 @@ impl Storm {
                     .items_center()
                     .gap_2()
                     .child(div().font_family(ICON_FONT).text_size(px(14.)).text_color(rgb(ICON)).child(IC_TOOLS))
-                    .child(div().text_size(px(12.)).text_color(rgb(TEXT)).child("Agent")),
+                    .child(div().text_size(px(12.)).text_color(rgb(TEXT)).child("Agent"))
+                    // the adapter's own title for the session, once it has one
+                    .when_some(self.agent_title.clone(), |d, t| {
+                        d.child(div().text_size(px(11.)).text_color(rgb(MUTED)).truncate().child(t))
+                    })
+                    // context bar straight from ACP's usage_update
+                    .when_some(self.agent_ctx, |d, (used, size)| {
+                        let pct = if size > 0 { (used * 100 / size).min(100) } else { 0 };
+                        d.child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(rgb(if pct >= 80 { GIT_DELETED } else { LINE_NUMBER }))
+                                .child(format!("ctx {} / {} · {pct}%", usage::short(used), usage::short(size))),
+                        )
+                    }),
             )
             .child(
                 div()
-                    .id("agent-close")
-                    .px_1()
-                    .cursor_pointer()
-                    .text_size(px(13.))
-                    .text_color(rgb(MUTED))
-                    .hover(|s| s.text_color(rgb(TEXT)))
-                    .child("✕")
-                    .on_click(cx.listener(|this, _e, window, cx| this.toggle_agent(window, cx))),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    // resume an earlier session for this project (ACP session/list
+                    // + session/load; Claude Code's own /resume isn't available
+                    // over the protocol)
+                    .child(
+                        div()
+                            .id("agent-resume")
+                            .px_1p5()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_size(px(11.))
+                            .text_color(rgb(MUTED))
+                            .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                            .child("↻ Resume")
+                            .tooltip(tip("Resume an earlier session in this project"))
+                            .on_click(cx.listener(|this, _e, _w, cx| this.open_agent_picker(cx))),
+                    )
+                    .child(
+                        div()
+                            .id("agent-new")
+                            .px_1p5()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_size(px(11.))
+                            .text_color(rgb(MUTED))
+                            .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                            .child("+ New")
+                            .tooltip(tip("Start a fresh session"))
+                            .on_click(cx.listener(|this, _e, _w, cx| this.new_agent_session(cx))),
+                    )
+                    .child(
+                        div()
+                            .id("agent-close")
+                            .px_1()
+                            .cursor_pointer()
+                            .text_size(px(13.))
+                            .text_color(rgb(MUTED))
+                            .hover(|s| s.text_color(rgb(TEXT)))
+                            .child("✕")
+                            .on_click(cx.listener(|this, _e, window, cx| this.toggle_agent(window, cx))),
+                    ),
             );
 
         // transcript
-        let mut list = div()
-            .id("agent-transcript")
-            .flex_grow(1.0)
-            .min_h(px(0.))
-            .overflow_y_scroll()
-            .track_scroll(&self.agent_scroll)
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p_3();
-
-        if self.agent_msgs.is_empty() {
+        // Virtualized: only the messages on screen are built, so a long session
+        // costs the same to render as a short one. `ListAlignment::Bottom` is the
+        // chat-log behaviour — it follows the tail until you scroll away.
+        // rows = messages + the "thinking" row + one row per queued prompt
+        let count = self.agent_msgs.len() + usize::from(self.agent_busy) + self.agent_queue.len();
+        if count != self.agent_list_len {
+            if count > self.agent_list_len {
+                // appended: splice keeps the scroll where it is, and a reader
+                // parked at the end keeps following the tail
+                self.agent_list.splice(self.agent_list_len..self.agent_list_len, count - self.agent_list_len);
+            } else {
+                self.agent_list.reset(count); // a new or replayed session
+            }
+            self.agent_list_len = count;
+        }
+        // which of my messages the answer on screen belongs to: the last User
+        // message at or above the first visible item, pinned as a header once it
+        // has scrolled out of view
+        let top_ix = self.agent_list.logical_scroll_top().item_ix;
+        let pinned = (top_ix > 0)
+            .then(|| {
+                self.agent_msgs[..top_ix.min(self.agent_msgs.len())]
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(i, m)| match m {
+                        AgentMsg::User(t) => Some((i, t.clone())),
+                        _ => None,
+                    })
+            })
+            .flatten();
+        let list = if count == 0 {
             let starting = self.acp.as_ref().map(|a| !a.is_ready()).unwrap_or(false);
             let hint = if starting {
                 "Starting agent…"
             } else {
                 "Ask Claude about this project. It can read and edit files in the working tree."
             };
-            list = list.child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(hint));
-        }
-        for m in &self.agent_msgs {
-            list = list.child(render_agent_msg(m));
-        }
-        if self.agent_busy {
-            list = list.child(
-                div().text_size(px(12.)).text_color(rgb(MUTED)).child("● thinking…"),
-            );
-        }
+            div()
+                .flex_grow(1.0)
+                .min_h(px(0.))
+                .p_3()
+                .text_size(px(12.))
+                .text_color(rgb(MUTED))
+                .child(hint)
+                .into_any_element()
+        } else {
+            gpui::list(
+                self.agent_list.clone(),
+                cx.processor(|this: &mut Self, ix: usize, window: &mut Window, cx: &mut Context<Self>| {
+                    if let Some(m) = this.agent_msgs.get(ix) {
+                        // agent prose is selectable, so it can be quoted back
+                        if let AgentMsg::Agent(t) = m {
+                            let t = t.clone();
+                            return div()
+                                .px_3()
+                                .py_1()
+                                .child(this.render_agent_md(ix, &t, window, cx))
+                                .into_any_element();
+                        }
+                        return div().px_3().py_1().child(render_agent_msg(m)).into_any_element();
+                    }
+                    let after = ix - this.agent_msgs.len();
+                    // the "thinking" row sits between the transcript and the queue
+                    if this.agent_busy && after == 0 {
+                        const SPIN: [&str; 10] =
+                            ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                        let secs = this
+                            .agent_turn_start
+                            .map(|t| t.elapsed().as_secs())
+                            .unwrap_or(0);
+                        let elapsed = if secs >= 60 {
+                            format!("{}m {}s", secs / 60, secs % 60)
+                        } else {
+                            format!("{secs}s")
+                        };
+                        return div()
+                            .px_3()
+                            .py_1()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .text_size(px(12.))
+                            .child(
+                                div()
+                                    .text_color(rgb(ACCENT))
+                                    .child(SPIN[this.agent_spin % SPIN.len()]),
+                            )
+                            .child(div().text_color(rgb(MUTED)).child("thinking…"))
+                            .child(div().text_color(rgb(LINE_NUMBER)).child(elapsed))
+                            .into_any_element();
+                    }
+                    let qi = after - usize::from(this.agent_busy);
+                    match this.agent_queue.get(qi).cloned() {
+                        Some(text) => div()
+                            .px_3()
+                            .py_1()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(MUTED))
+                                    .child("You  ·  queued"),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(rgb(SELECTED_BG))
+                                    .text_size(px(14.5))
+                                    .text_color(rgb(MUTED))
+                                    .child(text),
+                            )
+                            .into_any_element(),
+                        None => div().into_any_element(),
+                    }
+                }),
+            )
+            .flex_grow(1.0)
+            .min_h(px(0.))
+            .into_any_element()
+        };
+        // The pinned "You" row is a real row above the list, not an overlay: a
+        // `List` needs a definite height from its parent, and wrapping it in a
+        // relative box collapsed it to nothing.
+        let pinned_row = pinned.map(|(ix, text)| {
+            let one_line = text.replace('\n', " ");
+            div()
+                .id("agent-pinned")
+                .flex_shrink_0()
+                .px_3()
+                .py_1()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .bg(rgb(SELECTED_BG))
+                .border_b_1()
+                .border_color(rgb(ACCENT))
+                .cursor_pointer()
+                .text_size(px(11.))
+                .text_color(rgb(SEL_TEXT))
+                .child(div().flex_shrink_0().text_color(rgb(MUTED)).child("You"))
+                .child(div().flex_grow(1.0).min_w(px(0.)).truncate().child(one_line))
+                .tooltip(tip("Jump back to this message"))
+                // click it to go back to where that turn started
+                .on_click(cx.listener(move |this, _e, _w, cx| {
+                    this.agent_list.scroll_to_reveal_item(ix);
+                    cx.notify();
+                }))
+                .into_any_element()
+        });
 
-        // input box
+        // input: a text area (grows with the prompt, capped), with the turn's
+        // Stop button beside it while the agent is working
+        let focused = self.agent_focus.is_focused(window);
+        // 4 rows minimum: the box shouldn't read as a one-line field pinned to
+        // the very bottom of the pane
+        let rows = self.agent_input.text.split('\n').count().clamp(4, 14) as f32;
+        let busy = self.agent_busy;
+        // one box, full width: the text on top, controls along its bottom edge
+        // (the way Claude's own composer does it)
         let input = div()
             .flex_shrink_0()
-            .m_2()
+            .relative()
+            .child(input_sink(self.agent_focus.clone(), cx.entity()))
+            .mx_2()
+            .mt_2()
+            .mb_3()
             .px_2()
             .py_1()
             .bg(rgb(BG))
             .border_1()
-            .border_color(rgb(if self.agent_focus.is_focused(window) { ACCENT } else { BORDER }))
+            .border_color(rgb(if focused { ACCENT } else { BORDER }))
             .rounded_md()
-            .text_size(px(13.))
-            .text_color(rgb(TEXT))
-            .child(if self.agent_input.text.is_empty() {
-                div().text_color(rgb(MUTED)).child("Message the agent…  (Enter to send)")
-            } else {
-                self.agent_input.render(self.caret(), SELECTION)
-            });
-
-        div()
-            .w(px(self.agent_width))
-            .h_full()
-            .flex_shrink_0()
             .flex()
             .flex_col()
+            // pasted images waiting to go with the next message
+            .when(!self.agent_imgs.is_empty(), |d| {
+                let mut row = div().mb_1().flex().flex_row().flex_wrap().gap_1();
+                for (i, (mime, _, size)) in self.agent_imgs.iter().enumerate() {
+                    let kind = mime.rsplit('/').next().unwrap_or("image").to_uppercase();
+                    let kb = (*size as f32 / 1024.0).round() as usize;
+                    row = row.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .px_1p5()
+                            .rounded_md()
+                            .bg(rgb(CURRENT_LINE))
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .text_size(px(10.))
+                            .text_color(rgb(MUTED))
+                            .child(format!("🖼 {kind}  ·  {kb} KB"))
+                            .child(
+                                div()
+                                    .id(("agent-img-drop", i))
+                                    .px_1()
+                                    .cursor_pointer()
+                                    .hover(|s| s.text_color(rgb(GIT_DELETED)))
+                                    .child("✕")
+                                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                                        if i < this.agent_imgs.len() {
+                                            this.agent_imgs.remove(i);
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    );
+                }
+                d.child(row)
+            })
+            .child(
+                div()
+                    .min_h(px(rows * 20.0))
+                    .max_h(px(14.0 * 20.0))
+                    .overflow_hidden()
+                    .line_height(px(20.))
+                    .text_size(px(14.))
+                    .text_color(rgb(TEXT))
+                    // clicking anywhere in the box starts typing
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _e, window, cx| {
+                            window.focus(&this.agent_focus, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .child(if self.agent_input.text.is_empty() {
+                        div()
+                            .text_color(rgb(MUTED))
+                            .child(format!("Message the agent…{}", self.caret_if(focused)))
+                    } else {
+                        self.agent_input.render(self.caret_if(focused), SELECTION)
+                    }),
+            )
+            // bottom row inside the box: the key legend, and Stop while a turn runs
+            .child(
+                div()
+                    .h(px(20.))
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(rgb(LINE_NUMBER))
+                            .child("↩ send  ·  ⌃J newline  ·  ⌘V paste image  ·  ⌥C comment on selection  ·  ⌃C stop"),
+                    )
+                    .child(div().flex_grow(1.0))
+                    .when(busy, |d| {
+                        d.child(
+                            div()
+                                .id("agent-stop")
+                                .flex_shrink_0()
+                                .px_1p5()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .text_size(px(11.))
+                                .border_1()
+                                .border_color(rgb(GIT_DELETED))
+                                .text_color(rgb(GIT_DELETED))
+                                .hover(|s| s.bg(rgb(HOVER)))
+                                .child("■ Stop")
+                                .tooltip(tip("Interrupt the agent  (⌃C)"))
+                                .on_click(cx.listener(|this, _e, _w, cx| this.interrupt_agent(cx))),
+                        )
+                    }),
+            );
+
+        // the resume list replaces the transcript while it's open
+        let picker = self.agent_picker.then(|| {
+            let mut col = div()
+                .id("agent-sessions")
+                .flex_grow(1.0)
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col();
+            col = col.child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .child(if self.agent_sessions.is_empty() {
+                        "Loading sessions…".to_string()
+                    } else {
+                        format!("{} session(s) in this project", self.agent_sessions.len())
+                    }),
+            );
+            for (i, (id, title)) in self.agent_sessions.iter().enumerate() {
+                let sid = id.clone();
+                col = col.child(
+                    div()
+                        .id(("agent-session", i))
+                        .px_3()
+                        .py_1()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(HOVER)))
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(rgb(TEXT))
+                                .truncate()
+                                .child(title.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(rgb(LINE_NUMBER))
+                                .child(id.chars().take(8).collect::<String>()),
+                        )
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            this.resume_agent_session(sid.clone(), cx);
+                        })),
+                );
+            }
+            col
+        });
+
+        // sized by the dock that hosts it (a share of the dock's height)
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .min_h(px(0.))
             .bg(rgb(PANEL_BG))
             .track_focus(&self.agent_focus)
+            .key_context("Agent")
             .on_key_down(cx.listener(Self::agent_key))
             .child(header)
-            .child(list)
+            // the pinned row only shows with the transcript, never over the picker
+            .children(if picker.is_some() { None } else { pinned_row })
+            .child(match picker {
+                Some(p) => p.into_any_element(),
+                None => list.into_any_element(),
+            })
             .child(input)
     }
 }
@@ -9798,23 +15260,19 @@ fn render_agent_msg(m: &AgentMsg) -> impl IntoElement {
                     .py_1()
                     .rounded_md()
                     .bg(rgb(SELECTED_BG))
-                    .text_size(px(13.))
+                    // same size as the agent's prose (md_doc's body size)
+                    .text_size(px(14.5))
                     .text_color(rgb(SEL_TEXT))
                     .child(t.clone()),
             )
             .into_any_element(),
-        AgentMsg::Agent(t) => div()
-            .text_size(px(13.))
-            .text_color(rgb(TEXT))
-            .child(t.clone())
-            .into_any_element(),
+        // the model answers in markdown — headings, `code`, and bullets included
+        AgentMsg::Agent(t) => md_doc(t).into_any_element(),
         AgentMsg::Thought(t) => div()
             .pl_2()
             .border_l_2()
             .border_color(rgb(BORDER))
-            .text_size(px(12.))
-            .text_color(rgb(MUTED))
-            .child(t.clone())
+            .child(md_text(t, 12.0, MUTED))
             .into_any_element(),
         AgentMsg::Tool { title, status, .. } => {
             let (glyph, color) = match status.as_str() {
@@ -10439,7 +15897,14 @@ fn admin_reachable(url: &str) -> bool {
     Command::new("curl")
         .args(["-sk", "--max-time", "3", "-o", "/dev/null", "-w", "%{http_code}", url])
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().unwrap_or(0) > 0)
+        .map(|o| {
+            let code = String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().unwrap_or(0);
+            // Only a 2xx/3xx means the app is actually serving. The portless proxy
+            // always answers on these hosts, with its own 404 ("No app registered
+            // for adminN.localhost") when nothing is running and 502 when the
+            // target crashed — both are "down", so any-response-is-up was wrong.
+            (200..400).contains(&code)
+        })
         .unwrap_or(false)
 }
 
@@ -10721,6 +16186,48 @@ impl Storm {
             }))
     }
 
+    /// "collapse all" / "expand all" for a file tree pane.
+    fn tree_fold_btns(
+        &self,
+        id_collapse: &'static str,
+        id_expand: &'static str,
+        collapse: impl Fn(&mut Self, bool, &mut Context<Self>) + Clone + 'static,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let expand = collapse.clone();
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .id(id_collapse)
+                    .px_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                    .child("⇤")
+                    .tooltip(tip("Collapse all"))
+                    .on_click(cx.listener(move |this, _e, _w, cx| collapse(this, true, cx))),
+            )
+            .child(
+                div()
+                    .id(id_expand)
+                    .px_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                    .child("⇥")
+                    .tooltip(tip("Expand all"))
+                    .on_click(cx.listener(move |this, _e, _w, cx| expand(this, false, cx))),
+            )
+    }
+
     fn collapse_left_btn(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("panel-collapse")
@@ -10779,6 +16286,7 @@ impl Storm {
                                 let git = this.git_status.get(&entry.path).copied();
                                 let name = entry.name.clone();
                                 let dimmed = entry.ignored; // git-ignored → faded
+                                let comments = if is_dir { 0 } else { this.comment_count(&entry.path) };
                                 let ctx_path = entry.path.clone(); // for the right-click menu
                                 let fg = if is_open {
                                     rgb(SEL_TEXT)
@@ -10840,7 +16348,9 @@ impl Storm {
                                             .text_color(rgb(icon_color))
                                             .child(icon),
                                     )
-                                    .child(div().text_color(fg).child(name))
+                                    .child(div().flex_grow(1.0).truncate().text_color(fg).child(name))
+                                    // review comments pinned in this file
+                                    .when(comments > 0, |d| d.child(comment_marker(comments, 11.)))
                                     .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
                                         window.focus(&this.tree_focus, cx); // route cmd+c/v to the tree
                                         if ev.click_count() >= 2 {
@@ -10935,10 +16445,47 @@ impl Storm {
                             })),
                     )
                 })
-                .child(div().flex_grow(1.0)); // spacer keeps path + copy left-aligned
+                .child(div().flex_grow(1.0)) // spacer keeps path + copy left-aligned
+                // markdown: raw source or rendered, per tab
+                .when(is_markdown(&self.tabs[self.active].path), |d| {
+                    let preview = self.tabs[self.active].preview;
+                    d.child(
+                        div()
+                            .id("crumb-md")
+                            .flex_shrink_0()
+                            .px_1p5()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_size(px(11.))
+                            .border_1()
+                            .border_color(rgb(if preview { COMMENT_MARK } else { BORDER }))
+                            .text_color(rgb(if preview { COMMENT_MARK } else { MUTED }))
+                            .hover(|s| s.bg(rgb(HOVER)))
+                            .child(if preview { "Rendered" } else { "Raw" })
+                            .tooltip(tip("Markdown: rendered / raw  (⌘⇧V)"))
+                            .on_click(cx.listener(|this, _e, window, cx| {
+                                this.toggle_md_preview(window, cx)
+                            })),
+                    )
+                });
             col = col.child(crumb);
-            let editor = self.tabs[self.active].editor.clone();
-            col = col.child(div().flex_grow(1.0).min_h(px(0.)).child(editor));
+            let tab = &self.tabs[self.active];
+            if tab.preview && is_markdown(&tab.path) {
+                // rendered view reads the buffer, so unsaved edits show up too
+                let body = tab.editor.read(cx).text();
+                col = col.child(
+                    div()
+                        .id("md-preview")
+                        .flex_grow(1.0)
+                        .min_h(px(0.))
+                        .overflow_y_scroll()
+                        .bg(rgb(BG))
+                        .child(md_doc(&body).px_4().py_3()),
+                );
+            } else {
+                let editor = tab.editor.clone();
+                col = col.child(div().flex_grow(1.0).min_h(px(0.)).child(editor));
+            }
         } else {
             col = col.child(self.render_status(cx));
         }
@@ -10974,7 +16521,30 @@ impl Storm {
                     .flex_row()
                     .items_center()
                     .justify_between()
-                    .child(div().text_size(px(18.)).text_color(rgb(TEXT)).child(project))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(18.))
+                                    .text_color(rgb(TEXT))
+                                    .child(project),
+                            )
+                            // grayed folder path — a custom title otherwise hides it
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(LINE_NUMBER))
+                                    .child(tilde_path(&self.root)),
+                            ),
+                    )
                     .child(
                         div()
                             .id("status-refresh")
@@ -10999,11 +16569,11 @@ impl Storm {
             .child(
                 row(IC_BRANCH, ACCENT)
                     .child(div().text_size(px(13.)).text_color(rgb(MUTED)).child("On branch"))
-                    .child(branch_name_el(&branch, TEXT).text_size(px(13.))),
+                    .child(branch_name_el(&branch).text_size(px(13.))),
             );
 
         // pull request
-        if let Some((num, url, status, base, _head)) = self.pr_link.clone() {
+        if let Some((num, url, status, base, _head, state)) = self.pr_link.clone() {
             let (status_text, status_color) = match status {
                 PrStatus::Passing => ("checks passing", status.color()),
                 PrStatus::Pending => ("checks running", status.color()),
@@ -11026,8 +16596,10 @@ impl Storm {
                                 let _ = Command::new("open").arg(&open_url).spawn();
                             })),
                     )
+                    // lifecycle state: draft / open / merged / closed
+                    .child(pr_state_pill(state, 11.))
                     .child(div().text_size(px(13.)).text_color(rgb(MUTED)).child("→"))
-                    .child(branch_name_el(&base, TEXT).text_size(px(13.)))
+                    .child(branch_name_el(&base).text_size(px(13.)))
                     .child(div().w(px(6.)).flex_shrink_0().text_size(px(12.)).text_color(rgb(status_color)).child("●"))
                     .child(div().text_size(px(12.)).text_color(rgb(status_color)).child(status_text)),
             );
@@ -11065,30 +16637,104 @@ impl Storm {
                 ),
         );
 
-        // admin (wby-next* only): health dot + clickable host → opens the browser
+        // admin (wby-next* only): clickable host + the same ▶ the topbar has.
+        // The button's colour already says up/down, so no separate dot.
         if let Some(url) = admin_url(&self.root) {
             let host = url.trim_start_matches("https://").trim_start_matches("http://").to_string();
-            let (dot, up_txt) = match self.admin_up {
-                Some(true) => (GIT_NEW, "up"),
-                Some(false) => (GIT_DELETED, "down"),
-                None => (MUTED, "checking…"),
-            };
             let open = url.clone();
             card = card.child(
                 row(IC_BROWSER, ACCENT)
-                    .child(
+                    .child({
+                        let up = self.admin_up == Some(true);
                         div()
                             .id("status-admin")
                             .cursor_pointer()
                             .text_size(px(13.))
-                            .text_color(rgb(ACCENT))
+                            .text_color(rgb(if up { GIT_NEW } else { ACCENT }))
                             .hover(|s| s.underline())
                             .child(host)
-                            .on_click(move |_e, _w, _cx| open_browser(&open)),
-                    )
-                    .child(div().w(px(6.)).flex_shrink_0().text_size(px(12.)).text_color(rgb(dot)).child("●"))
-                    .child(div().text_size(px(12.)).text_color(rgb(dot)).child(up_txt)),
+                            .on_click(cx.listener(move |this, _e, window, cx| {
+                                if up {
+                                    open_browser(&open);
+                                } else if this.admin_terminal(cx).is_some() {
+                                    this.show_admin_log(window, cx);
+                                } else {
+                                    this.start_admin(window, cx);
+                                }
+                            }))
+                    })
+                    .child(self.admin_play_btn("status-admin-run", cx)),
             );
+        }
+
+        // who the work is for
+        if let Some(client) = self.ws_client.clone() {
+            card = card.child(
+                row(IC_HOME, FOLDER_ICON)
+                    .child(div().text_size(px(13.)).text_color(rgb(MUTED)).child("Client"))
+                    .child(div().text_size(px(13.)).text_color(rgb(TEXT)).child(client)),
+            );
+        }
+
+        // pending review comments (nothing pending → no row)
+        if !self.review.is_empty() {
+            let ready = self.review.iter().filter(|c| !c.draft).count();
+            let drafts = self.review.len() - ready;
+            let label = match (ready, drafts) {
+                (r, 0) => format!("{r} pending comment{}", if r == 1 { "" } else { "s" }),
+                (0, d) => format!("{d} draft comment{}", if d == 1 { "" } else { "s" }),
+                (r, d) => format!("{r} pending · {d} draft"),
+            };
+            card = card.child(
+                row(IC_COMMENT, COMMENT_MARK)
+                    .child(
+                        div()
+                            .id("status-review")
+                            .cursor_pointer()
+                            .text_size(px(13.))
+                            .text_color(rgb(COMMENT_MARK))
+                            .hover(|s| s.underline())
+                            .child(label)
+                            .tooltip(tip("Open the review-comments pane"))
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                this.left_view = LeftView::Review;
+                                this.show_left = true;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(MUTED))
+                            .child(if ready > 0 { "⌥↩ sends them" } else { "open one to make it ready" }),
+                    ),
+            );
+        }
+
+        // agent state reported from a terminal pane (nothing reported → no row)
+        if let Some((state, msg)) = self.agent_rollup() {
+            let color = agent_color(state);
+            let mut r = row(IC_TERMINAL, color);
+            if state.is_idle() {
+                // same solid badge as the switcher — and the point is nobody is
+                // on this workspace, not that some agent stopped
+                r = r
+                    .child(idle_badge(10.))
+                    .child(div().text_size(px(13.)).text_color(rgb(MUTED)).child("no work assigned"));
+            } else {
+                r = r
+                    .child(div().w(px(6.)).flex_shrink_0().text_size(px(12.)).text_color(rgb(color)).child("●"))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(rgb(color))
+                            .child(format!("Agent {}", agent_label(state))),
+                    );
+                if !msg.is_empty() {
+                    r = r.child(div().text_size(px(12.)).text_color(rgb(MUTED)).truncate().child(msg));
+                }
+            }
+            card = card.child(r);
         }
 
         div()
@@ -11209,11 +16855,16 @@ struct Workspace {
     switcher_open: bool,
     switcher_sel: usize, // index into the *filtered* list
     switcher_focus: FocusHandle,
-    switcher_query: String, // type-to-filter text
+    switcher_query: Field, // type-to-filter text (full input: caret, selection, word motion)
     // opened via alt-tab (cmd+tab style): keep advancing on tab; commit on opt release
     switcher_quick: bool,
-    // last Claude Code session label per project root (loaded async on open)
-    session_labels: HashMap<PathBuf, String>,
+    // blinking caret for the switcher's filter input
+    caret_on: bool,
+    switcher_scroll: ScrollHandle, // the row list scrolls when it outgrows the panel
+    /// Project indices whose agent is mid-turn when ⌘Q was pressed; `Some` shows
+    /// the "are you sure" panel instead of quitting.
+    quit_busy: Option<Vec<usize>>,
+    quit_focus: FocusHandle,
 }
 
 impl Workspace {
@@ -11226,20 +16877,46 @@ impl Workspace {
             switcher_open: false,
             switcher_sel: 0,
             switcher_focus: cx.focus_handle(),
-            switcher_query: String::new(),
+            switcher_query: Field::default(),
             switcher_quick: false,
-            session_labels: HashMap::new(),
+            caret_on: true,
+            switcher_scroll: ScrollHandle::new(),
+            quit_busy: None,
+            quit_focus: cx.focus_handle(),
         };
-        // open every passed root as its own workspace; first one is active
+        // open every passed root as its own workspace
         for root in roots {
             ws.add_project(root, cx);
         }
-        ws.active = 0;
+        // start on the first workspace that isn't parked; a paused one is only
+        // the landing spot when every workspace is paused
+        ws.active = ws
+            .projects
+            .iter()
+            .position(|p| !p.read(cx).ws_paused)
+            .unwrap_or(0);
         // Slow repaint so per-project topbar state (branch names, attention dots)
         // pushed up from the child views stays current.
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_secs(3)).await;
             if this.update(cx, |_, cx| cx.notify()).is_err() {
+                break;
+            }
+        })
+        .detach();
+        // caret blink for the switcher's filter input; only repaints while the
+        // dialog is actually open
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_millis(530)).await;
+            let ok = this
+                .update(cx, |this, cx| {
+                    this.caret_on = !this.caret_on;
+                    if this.switcher_open {
+                        cx.notify();
+                    }
+                })
+                .is_ok();
+            if !ok {
                 break;
             }
         })
@@ -11275,7 +16952,14 @@ impl Workspace {
         self.projects.push(storm);
         self.active = self.projects.len() - 1;
         self.focus_pending = true;
+        self.persist_session(cx);
         cx.notify();
+    }
+
+    /// Remember the open workspaces (in order) so a bare `tide` reopens them.
+    fn persist_session(&self, cx: &App) {
+        let roots: Vec<PathBuf> = self.projects.iter().map(|p| p.read(cx).root.clone()).collect();
+        save_session(&roots);
     }
 
     /// Close the workspace at `idx`. Keeps at least one open (the window would
@@ -11291,6 +16975,7 @@ impl Workspace {
         }
         self.switcher_sel = self.switcher_sel.min(self.projects.len() - 1);
         self.focus_pending = true;
+        self.persist_session(cx);
         cx.notify();
     }
 
@@ -11312,6 +16997,7 @@ impl Workspace {
             .position(|p| p.entity_id() == active_id)
             .unwrap_or(0);
         self.switcher_sel = dst;
+        self.persist_session(cx);
         cx.notify();
     }
 
@@ -11327,22 +17013,29 @@ impl Workspace {
     /// highlight by `dir`; each further alt-tab advances again. Releasing opt
     /// commits the highlighted project (see `switcher_modifiers`).
     fn switcher_step(&mut self, dir: i32, window: &mut Window, cx: &mut Context<Self>) {
-        let n = self.projects.len();
-        if n <= 1 {
+        if self.projects.len() <= 1 {
             return;
         }
         if !self.switcher_open {
             self.switcher_open = true;
             self.switcher_query.clear();
             self.switcher_quick = true;
-            // start from the project after (or before) the active one
-            self.switcher_sel = ((self.active as i32 + dir).rem_euclid(n as i32)) as usize;
-            self.load_session_labels(cx);
             window.focus(&self.switcher_focus, cx);
+            // quick-switch only walks unpaused workspaces; start from the one
+            // after (or before) the active one within that list
+            let rotation = self.switcher_matches(cx);
+            let here = rotation.iter().position(|&i| i == self.active);
+            let len = rotation.len().max(1) as i32;
+            self.switcher_sel = match here {
+                Some(pos) => ((pos as i32 + dir).rem_euclid(len)) as usize,
+                // the active workspace is paused, so it isn't in the rotation
+                None => if dir >= 0 { 0 } else { (len - 1) as usize },
+            };
         } else {
             let len = self.switcher_matches(cx).len().max(1);
             self.switcher_sel = ((self.switcher_sel as i32 + dir).rem_euclid(len as i32)) as usize;
         }
+        self.switcher_scroll.scroll_to_item(self.switcher_sel);
         cx.notify();
     }
 
@@ -11378,44 +17071,29 @@ impl Workspace {
         self.switcher_quick = false;
         self.switcher_query.clear();
         self.switcher_sel = self.active;
-        self.load_session_labels(cx);
+        self.switcher_scroll.scroll_to_item(self.switcher_sel);
         window.focus(&self.switcher_focus, cx);
         cx.notify();
     }
 
-    /// Read each project's most recent Claude Code session label off-thread and
-    /// cache it (shown under the project in the switcher).
-    fn load_session_labels(&mut self, cx: &mut Context<Self>) {
-        let roots: Vec<PathBuf> = self.projects.iter().map(|p| p.read(cx).root.clone()).collect();
-        cx.spawn(async move |this, cx| {
-            let labels = cx
-                .background_executor()
-                .spawn(async move {
-                    roots
-                        .into_iter()
-                        .filter_map(|r| last_session_label(&r).map(|l| (r, l)))
-                        .collect::<HashMap<PathBuf, String>>()
-                })
-                .await;
-            this.update(cx, |this, cx| {
-                this.session_labels = labels;
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
     /// Project indices matching the type-to-filter query (name or branch).
     fn switcher_matches(&self, cx: &App) -> Vec<usize> {
-        let q = self.switcher_query.to_lowercase();
+        let q = self.switcher_query.text.to_lowercase();
         (0..self.projects.len())
             .filter(|&i| {
+                // ⌥Tab's rotation excludes paused workspaces entirely; ⌘E lists
+                // them (marked, and skipped by ↑↓) so they can be resumed
+                if self.switcher_quick && self.projects[i].read(cx).ws_paused {
+                    return false;
+                }
                 if q.is_empty() {
                     return true;
                 }
                 let s = self.projects[i].read(cx);
-                s.project_name().to_lowercase().contains(&q) || s.branch.to_lowercase().contains(&q)
+                // match the folder too: untitled workspaces have no name to type
+                s.project_name().to_lowercase().contains(&q)
+                    || s.folder_name().to_lowercase().contains(&q)
+                    || s.branch.to_lowercase().contains(&q)
             })
             .collect()
     }
@@ -11442,28 +17120,29 @@ impl Workspace {
                     self.switch_to(pi, cx);
                 }
             }
-            "down" | "right" => {
+            // ↑↓ walk every row, paused or not — ⌘E is where you go to pick one
+            // deliberately; only ⌥Tab's rotation skips paused workspaces.
+            // ←→ belong to the text field (caret motion)
+            "down" => {
                 let n = filtered.len();
                 if n > 0 {
                     self.switcher_sel = (self.switcher_sel + 1) % n; // wrap to first
                 }
+                self.switcher_scroll.scroll_to_item(self.switcher_sel);
                 cx.notify();
             }
-            "up" | "left" => {
+            "up" => {
                 let n = filtered.len();
                 if n > 0 {
                     self.switcher_sel = (self.switcher_sel + n - 1) % n; // wrap to last
                 }
-                cx.notify();
-            }
-            "backspace" => {
-                self.switcher_query.pop();
-                self.switcher_sel = 0;
+                self.switcher_scroll.scroll_to_item(self.switcher_sel);
                 cx.notify();
             }
             _ => {
                 // quick-jump when the filter is empty: 1-9, then 0, -, = (10, 11, 12)
-                if self.switcher_query.is_empty() {
+                let m = &ev.keystroke.modifiers;
+                if self.switcher_query.is_empty() && !m.platform && !m.control && !m.alt {
                     let target = match key {
                         "0" => Some(9),
                         "-" => Some(10),
@@ -11478,14 +17157,18 @@ impl Workspace {
                         return;
                     }
                 }
-                // otherwise type-to-filter: append a single printable char
-                let mut chars = key.chars();
-                if let (Some(c), None) = (chars.next(), chars.next()) {
-                    if !c.is_control() {
-                        self.switcher_query.push(c);
-                        self.switcher_sel = 0;
-                        cx.notify();
-                    }
+                // everything else is ordinary text editing — the shared Field
+                // handles space, opt+arrows, ⌘A/C/V/X, ⌘Z, word deletes, …
+                let clip = cx.read_from_clipboard().and_then(|i| i.text());
+                let edit = self.switcher_query.key(&ev.keystroke, clip, |_| true);
+                if let Some(text) = self.switcher_query.take_copy() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+                if edit == Edit::Changed {
+                    self.switcher_sel = 0; // a new filter starts at the top row
+                }
+                if edit != Edit::None {
+                    cx.notify();
                 }
             }
         }
@@ -11517,14 +17200,242 @@ impl Workspace {
     }
 }
 
+impl Workspace {
+    /// Workspaces whose agent is mid-turn — a terminal pane that reported
+    /// `working`, or the ACP panel with a prompt in flight.
+    fn busy_workspaces(&self, cx: &App) -> Vec<usize> {
+        self.projects
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                let s = p.read(cx);
+                s.agent_busy || matches!(s.agent_rollup(), Some((AgentState::Working, _)))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// ⌘Q: save the tab in front, then quit — unless an agent is still working,
+    /// in which case ask first. Comments, titles, and the session list are
+    /// already written as they change, so there's nothing else to flush.
+    fn act_quit(&mut self, _: &QuitApp, window: &mut Window, cx: &mut Context<Self>) {
+        let busy = self.busy_workspaces(cx);
+        if busy.is_empty() {
+            self.quit_now(cx);
+            return;
+        }
+        self.quit_busy = Some(busy);
+        window.focus(&self.quit_focus, cx);
+        cx.notify();
+    }
+
+    fn quit_now(&mut self, cx: &mut Context<Self>) {
+        if let Some(p) = self.projects.get(self.active) {
+            p.update(cx, |s, cx| s.save_tab(s.active, cx));
+        }
+        cx.quit();
+    }
+
+    /// Keys while the quit prompt is up: ↩ quits, esc keeps working.
+    fn quit_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match ev.keystroke.key.as_str() {
+            "enter" => self.quit_now(cx),
+            "escape" => {
+                self.quit_busy = None;
+                self.focus_pending = true;
+                window.focus(&self.focus, cx);
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    /// One row per still-working workspace, in the same shape ⌘E uses: number
+    /// key-cap, state dot, folder icon, title + path, branch line.
+    fn render_quit_confirm(&self, busy: &[usize], cx: &mut Context<Self>) -> impl IntoElement {
+        let n = busy.len();
+        let mut rows = div().flex().flex_col().gap_1();
+        for &i in busy {
+            let Some(p) = self.projects.get(i) else { continue };
+            let (name, branch, root, state, target) = {
+                let s = p.read(cx);
+                let target = s
+                    .pr_link
+                    .as_ref()
+                    .map(|(_, _, _, b, _, _)| b.clone())
+                    .filter(|b| !b.is_empty())
+                    .or_else(|| s.branch_parent.clone());
+                let state = s.agent_rollup().map(|(st, _)| st).unwrap_or(AgentState::Working);
+                (s.project_name(), s.branch.clone(), s.root.clone(), state, target)
+            };
+            rows = rows.child(
+                div()
+                    .id(("quit-busy", i))
+                    .w_full()
+                    .py_2()
+                    .px_3()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(0x34373c)).border_color(rgb(ACCENT)))
+                    // click a row to go look at what it's doing, dialog dismissed
+                    .on_click(cx.listener(move |this, _e, window, cx| {
+                        this.quit_busy = None;
+                        this.active = i;
+                        this.focus_pending = true;
+                        window.focus(&this.focus, cx);
+                        cx.notify();
+                    }))
+                    .child(key_cap(format!("{}", i + 1), true))
+                    .child(
+                        div()
+                            .w(px(7.))
+                            .h(px(7.))
+                            .rounded_full()
+                            .flex_shrink_0()
+                            .bg(rgb(agent_color(state))),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .font_family(ICON_FONT)
+                            .text_size(px(13.))
+                            .text_color(rgb(FOLDER_ICON))
+                            .child(IC_FOLDER),
+                    )
+                    .child(
+                        div()
+                            .flex_grow(1.0)
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .min_w(px(0.))
+                                    .overflow_hidden()
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_size(px(13.))
+                                            .text_color(rgb(TEXT))
+                                            .child(name),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_size(px(10.))
+                                            .text_color(rgb(LINE_NUMBER))
+                                            .child(tilde_path(&root)),
+                                    ),
+                            )
+                            .when(!branch.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_1()
+                                        .min_w(px(0.))
+                                        .overflow_hidden()
+                                        .text_size(px(10.))
+                                        .when_some(target, |d, t| {
+                                            d.child(branch_name_el(&t).flex_shrink_0()).child(
+                                                div().flex_shrink_0().text_color(rgb(LINE_NUMBER)).child("←"),
+                                            )
+                                        })
+                                        .child(branch_name_el(&branch).flex_shrink_0()),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(10.))
+                            .text_color(rgb(agent_color(state)))
+                            .child(agent_label(state)),
+                    ),
+            );
+        }
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000088))
+            .child(
+                div()
+                    .w(px(560.))
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .bg(rgb(PANEL_BG))
+                    .border_1()
+                    .border_color(rgb(GIT_MODIFIED))
+                    .rounded_lg()
+                    .shadow_lg()
+                    .track_focus(&self.quit_focus)
+                    .on_key_down(cx.listener(Self::quit_key))
+                    .child(div().text_size(px(14.)).text_color(rgb(TEXT)).child(format!(
+                        "{n} workspace{} still working",
+                        if n == 1 { "" } else { "s" }
+                    )))
+                    .child(rows)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(div().flex_grow(1.0))
+                            .child(rc_button("quit-cancel", "Keep working", false, false).on_click(
+                                cx.listener(|this, _e, window, cx| {
+                                    this.quit_busy = None;
+                                    window.focus(&this.focus, cx);
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(rc_button("quit-ok", "Quit anyway", true, false).on_click(
+                                cx.listener(|this, _e, _w, cx| this.quit_now(cx)),
+                            )),
+                    ),
+            )
+    }
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.active;
         // push the project list into the active view so its dropdown can show it
-        let names: Vec<String> = self.projects.iter().map(|p| p.read(cx).project_name()).collect();
+        // the ▾ dropdown has no path column, so an untitled project shows its
+        // folder there rather than a wall of "Untitled" rows
+        let names: Vec<String> = self
+            .projects
+            .iter()
+            .map(|p| {
+                let s = p.read(cx);
+                match s.ws_title.as_ref().filter(|t| !t.trim().is_empty()) {
+                    Some(t) => t.clone(),
+                    None => s.folder_name(),
+                }
+            })
+            .collect();
         let branches: Vec<String> = self.projects.iter().map(|p| p.read(cx).branch.clone()).collect();
+        let roots: Vec<PathBuf> = self.projects.iter().map(|p| p.read(cx).root.clone()).collect();
         self.projects[active].update(cx, |s, _| {
             s.ws_names = names;
+            s.ws_roots = roots;
             s.ws_branches = branches;
             s.ws_active = active;
         });
@@ -11559,24 +17470,41 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::prev_project))
             .on_action(cx.listener(Self::open_project_action))
             .on_action(cx.listener(Self::show_projects))
+            .on_action(cx.listener(Self::act_quit))
             .child(self.projects[active].clone());
+
+        if let Some(busy) = self.quit_busy.clone() {
+            root = root.child(self.render_quit_confirm(&busy, cx));
+        }
 
         if self.switcher_open {
             let win = window.viewport_size();
             let w = 520.0_f32;
             let filtered = self.switcher_matches(cx);
-            // center the dialog on screen (estimated height from the row count)
-            let est_h = 46.0 + filtered.len() as f32 * 68.0 + 12.0;
+            // The panel is anchored (fixed top, so the input never moves under the
+            // cursor while typing) and sizes itself to its content up to a cap —
+            // no row-height estimate to get wrong, and the list only scrolls when
+            // it genuinely doesn't fit.
             let left = ((f32::from(win.width) - w) / 2.0).max(0.);
-            let top = (((f32::from(win.height) - est_h) / 2.0).max(40.)).min(f32::from(win.height) - 80.);
+            let top = (f32::from(win.height) * 0.12).max(56.0);
+            let max_h = (f32::from(win.height) - top - 56.0).max(200.0);
             // vertical list, one full-width row per matching project
             let mut grid = div().flex().flex_col().gap_1().px_2().pb_2();
             for (pos, &i) in filtered.iter().enumerate() {
-                let (name, branch, root) = {
+                let paused = self.projects[i].read(cx).ws_paused;
+                let client = self.projects[i].read(cx).ws_client.clone();
+                let (name, branch, root, agent, target) = {
                     let s = self.projects[i].read(cx);
-                    (s.project_name(), s.branch.clone(), s.root.clone())
+                    // same target as the topbar: the PR's base branch, else the
+                    // reflog's best guess at what this branch came off
+                    let target = s
+                        .pr_link
+                        .as_ref()
+                        .map(|(_, _, _, b, _, _)| b.clone())
+                        .filter(|b| !b.is_empty())
+                        .or_else(|| s.branch_parent.clone());
+                    (s.project_name(), s.branch.clone(), s.root.clone(), s.agent_rollup(), target)
                 };
-                let session = self.session_labels.get(&root).cloned();
                 let sel = pos == self.switcher_sel;
                 let multi = self.projects.len() > 1;
                 let idx = i;
@@ -11588,13 +17516,17 @@ impl Render for Workspace {
                     11 => "=".to_string(),
                     _ => String::new(),
                 };
+                let free = agent.as_ref().is_some_and(|(s, _)| s.is_idle());
                 let label_drag = name.clone();
                 grid = grid.child(
                     div()
                         .id(("ws-switch", i))
                         .relative()
                         .w_full()
-                        .h(px(64.))
+                        // min, not fixed: a row with an agent-state line is taller,
+                        // and a fixed height clipped it into the row below
+                        .min_h(px(64.))
+                        .py_2()
                         .px_3()
                         .flex()
                         .flex_row()
@@ -11616,15 +17548,21 @@ impl Render for Workspace {
                         .on_drop(cx.listener(move |this, d: &DraggedProject, _w, cx| {
                             this.reorder_projects(d.0, idx, cx);
                         }))
-                        // number badge (sequential over the filtered list)
-                        .child(
-                            div()
-                                .w(px(14.))
-                                .flex_shrink_0()
-                                .text_size(px(11.))
-                                .text_color(rgb(if sel { SEL_TEXT } else { MUTED }))
-                                .child(format!("{}", num)),
-                        )
+                        // quick-jump key (sequential over the filtered list) — same
+                        // key-cap as the workspace number in the top-left topbar
+                        .child(key_cap(num.clone(), !sel))
+                        // agent state reported from this project's terminal panes
+                        // (idle gets the loud pill on the right instead of a dot)
+                        .when_some(agent.clone().filter(|(s, _)| !s.is_idle()), |d, (s, _)| {
+                            d.child(
+                                div()
+                                    .w(px(7.))
+                                    .h(px(7.))
+                                    .rounded_full()
+                                    .flex_shrink_0()
+                                    .bg(rgb(agent_color(s))),
+                            )
+                        })
                         // folder icon
                         .child(
                             div()
@@ -11642,33 +17580,121 @@ impl Render for Workspace {
                                 .flex()
                                 .flex_col()
                                 .gap(px(2.))
+                                // title + the real folder path (grayed), since a
+                                // custom workspace title hides which folder it is
                                 .child(
                                     div()
-                                        .text_size(px(13.))
-                                        .truncate()
-                                        .text_color(rgb(if sel { SEL_TEXT } else { TEXT }))
-                                        .child(name),
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_2()
+                                        .min_w(px(0.))
+                                        // clip on the row, not per child: a `truncate()`
+                                        // child inside an items_center flex row collapses
+                                        // to zero width here
+                                        .overflow_hidden()
+                                        .child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .text_size(px(13.))
+                                                .text_color(rgb(if sel { SEL_TEXT } else { TEXT }))
+                                                .child(name),
+                                        )
+                                        .when_some(client, |d, c| {
+                                            d.child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .px_1()
+                                                    .rounded_md()
+                                                    .bg(rgb(HOVER))
+                                                    .text_size(px(9.))
+                                                    .text_color(rgb(FOLDER_ICON))
+                                                    .child(c),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .text_size(px(10.))
+                                                .text_color(rgb(if sel { SEL_TEXT } else { LINE_NUMBER }))
+                                                .child(tilde_path(&root)),
+                                        ),
                                 )
-                                .when(!branch.is_empty(), |d| {
+                                // a free workspace is a clean slot: its branch is
+                                // whatever `next` left and it has no live session,
+                                // so both lines are noise
+                                .when(!branch.is_empty() && !free, |d| {
                                     d.child(
                                         div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap_1()
+                                            .min_w(px(0.))
+                                            .overflow_hidden()
                                             .text_size(px(10.))
-                                            .truncate()
-                                            .text_color(rgb(if sel { SEL_TEXT } else { MUTED }))
-                                            .child(format!("⎇ {}", branch)),
+                                            // base ← head, GitHub's order, same as
+                                            // the topbar shows for the open project
+                                            .when_some(target, |d, t| {
+                                                d.child(branch_name_el(&t).flex_shrink_0())
+                                                    .child(
+                                                        div()
+                                                            .flex_shrink_0()
+                                                            .text_color(rgb(LINE_NUMBER))
+                                                            .child("←"),
+                                                    )
+                                            })
+                                            .child(div().flex_shrink_0().text_color(rgb(MUTED)).child("⎇"))
+                                            .child(
+                                                branch_name_el(&branch)
+                                                    .flex_shrink_0(),
+                                            ),
                                     )
                                 })
-                                // last Claude Code session (if any)
-                                .when_some(session, |d, s| {
+                                // what the agent last reported, so the dot's colour
+                                // isn't the only thing you have to go on
+                                .when_some(agent.clone().filter(|(s, _)| !s.is_idle()), |d, (st, msg)| {
+                                    let text = if msg.is_empty() {
+                                        format!("● {}", agent_label(st))
+                                    } else {
+                                        format!("● {} · {msg}", agent_label(st))
+                                    };
                                     d.child(
                                         div()
                                             .text_size(px(10.))
                                             .truncate()
-                                            .text_color(rgb(if sel { SEL_TEXT } else { LINE_NUMBER }))
-                                            .child(format!("✳ {}", s)),
+                                            .text_color(rgb(agent_color(st)))
+                                            .child(text),
                                     )
                                 }),
                         )
+                        // idle = free to grab. A grey word doesn't carry that, so
+                        // it gets a solid badge at the end of the row instead.
+                        .when(free, |d| d.child(idle_badge(9.)))
+                        // paused: skipped by ⌥Tab and by ↑↓ here. Click the badge
+                        // to resume it without opening the workspace first.
+                        .when(paused, |d| {
+                            d.child(
+                                div()
+                                    .id(("ws-resume", i))
+                                    .flex_shrink_0()
+                                    .px_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .border_1()
+                                    .border_color(rgb(GIT_MODIFIED))
+                                    .text_size(px(9.))
+                                    .text_color(rgb(GIT_MODIFIED))
+                                    .hover(|s| s.bg(rgb(GIT_MODIFIED)).text_color(rgb(BG)))
+                                    .child("PAUSED")
+                                    .tooltip(tip("Paused — click to resume"))
+                                    .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
+                                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                                        this.projects[i].update(cx, |s, cx| s.toggle_pause(cx));
+                                        cx.notify();
+                                    })),
+                            )
+                        })
                         // close button (hidden with one project left)
                         .when(multi, |d| {
                             d.child(
@@ -11705,24 +17731,84 @@ impl Render for Workspace {
                         })),
                 );
             }
-            let header = if self.switcher_query.is_empty() {
-                div()
-                    .px_3()
-                    .py_1()
-                    .text_size(px(11.))
-                    .text_color(rgb(MUTED))
-                    .child("Switch Project  ·  type to filter  ·  ↑↓ move  ·  enter to open")
-            } else {
-                div()
-                    .px_3()
-                    .py_1()
-                    .flex()
-                    .flex_row()
-                    .gap_2()
-                    .text_size(px(12.))
-                    .child(div().text_color(rgb(MUTED)).child("Filter:"))
-                    .child(div().text_color(rgb(TEXT)).child(format!("{}▏", self.switcher_query)))
-            };
+            // tally across every project (not just the filtered rows) so the
+            // header answers "what's the state of my fleet" at a glance
+            let mut tally: Vec<(AgentState, usize)> = Vec::new();
+            for p in &self.projects {
+                if let Some((s, _)) = p.read(cx).agent_rollup() {
+                    match tally.iter_mut().find(|(t, _)| *t == s) {
+                        Some((_, n)) => *n += 1,
+                        None => tally.push((s, 1)),
+                    }
+                }
+            }
+            tally.sort_by_key(|(s, _)| std::cmp::Reverse(s.priority()));
+            let mut counts = div().flex().flex_row().items_center().gap_2();
+            for (s, n) in tally {
+                counts = counts.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .w(px(6.))
+                                .h(px(6.))
+                                .rounded_full()
+                                .flex_shrink_0()
+                                .bg(rgb(agent_color(s))),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(agent_color(s)))
+                                .child(format!("{n} {}", agent_label(s))),
+                        ),
+                );
+            }
+            let empty = self.switcher_query.is_empty();
+            let header = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .px_3()
+                .py_1()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        // a real input box: caret, selection, word motion, ⌘A/V…
+                        .child(
+                            div()
+                                .flex_grow(1.0)
+                                .min_w(px(0.))
+                                .px_2()
+                                .py_1()
+                                .bg(rgb(BG))
+                                .border_1()
+                                .border_color(rgb(BORDER))
+                                .rounded_md()
+                                .text_size(px(12.))
+                                .text_color(rgb(TEXT))
+                                .child(
+                                    self.switcher_query
+                                        .render(if self.caret_on { "▏" } else { " " }, SELECTION),
+                                ),
+                        )
+                        .child(counts),
+                )
+                // always rendered (dimmer once you're typing) — a hint line that
+                // appears and disappears would resize the header under the caret
+                .child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(rgb(if empty { MUTED } else { LINE_NUMBER }))
+                        .child("type to filter  ·  ↑↓ move  ·  ↩ open  ·  1-9 jump"),
+                );
             let panel = div()
                 .absolute()
                 .top(px(top))
@@ -11733,13 +17819,25 @@ impl Render for Workspace {
                 .border_color(rgb(ACCENT))
                 .rounded_md()
                 .shadow_lg()
+                // grows with its content, never past the window
+                .max_h(px(max_h))
                 .flex()
                 .flex_col()
                 .py_1()
+                .overflow_hidden()
                 .track_focus(&self.switcher_focus)
                 .on_key_down(cx.listener(Self::switcher_key))
                 .child(header)
-                .child(grid);
+                .child(
+                    div()
+                        .id("ws-switch-list")
+                        // shrinkable, not growable: the list takes the height it
+                        // needs and only scrolls once the panel hits its cap
+                        .min_h(px(0.))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.switcher_scroll)
+                        .child(grid),
+                );
             root = root.child(panel);
         }
 
@@ -11788,11 +17886,24 @@ struct DiffWindow {
     // fraction of the diff area given to the left pane (draggable divider)
     pane_split: f32,
     resizing_pane: bool,
+    // file-tree sidebar width, and whether its divider is being dragged
+    sidebar_w: f32,
+    resizing_sidebar: bool,
     // PR-review mode: sidebar gains viewed checkboxes, progress, viewed-filter
     pr_mode: bool,
     pr_filter: PrViewFilter,
     pr_hidden: HashSet<usize>, // file indices filtered out by pr_filter (this render)
     pr_viewed: HashSet<PathBuf>, // local snapshot (avoids reading Storm mid-update)
+    states: HashMap<PathBuf, GitState>, // git status per file, for name colours
+    comment_counts: HashMap<PathBuf, usize>, // review comments per file (sidebar)
+    // review comments on the file being shown: (line, text), pulled from Storm
+    comments: Vec<(usize, String)>,
+    rc_open: bool,           // inline comment input under a row
+    rc_row: usize,           // the diff row it's attached to
+    rc_line: usize,          // that row's file line
+    rc_query: Field,
+    rc_focus: FocusHandle,
+    rc_replies: Vec<ReviewReply>, // thread of the comment the box is editing
 }
 
 /// One visible row in the Diff window's file-tree sidebar.
@@ -11812,6 +17923,7 @@ impl DiffWindow {
         new_rev: Option<String>,
         pr_mode: bool,
         pr_viewed: HashSet<PathBuf>,
+        states: HashMap<PathBuf, GitState>,
         filter_text: String,
         pr_view: PrViewFilter,
         storm: WeakEntity<Storm>,
@@ -11832,6 +17944,13 @@ impl DiffWindow {
                 .update(cx, |this: &mut DiffWindow, cx| {
                     if this.caret.is_some() {
                         this.caret_on = !this.caret_on;
+                        cx.notify();
+                    }
+                    // keep the inline notes in step with the main window, where a
+                    // comment may have been added or sent while this window is open
+                    let before = this.comments.len();
+                    this.load_comments(cx);
+                    if this.comments.len() != before {
                         cx.notify();
                     }
                 })
@@ -11873,11 +17992,263 @@ impl DiffWindow {
             filter_focus: cx.focus_handle(),
             pane_split: 0.5,
             resizing_pane: false,
+            // wide enough for deep monorepo paths without dragging every time
+            sidebar_w: 420.,
+            resizing_sidebar: false,
             pr_mode,
             pr_filter: pr_view,
             pr_hidden: HashSet::new(),
             pr_viewed,
+            states,
+            comment_counts: HashMap::new(),
+            comments: Vec::new(),
+            rc_open: false,
+            rc_row: 0,
+            rc_line: 0,
+            rc_query: Field::default(),
+            rc_focus: cx.focus_handle(),
+            rc_replies: Vec::new(),
         }
+    }
+
+    /// Pull this file's review comments from the main window, so they can be
+    /// drawn under their rows. Cheap: a read of an in-memory Vec.
+    fn load_comments(&mut self, cx: &mut Context<Self>) {
+        let path = self.files[self.idx].clone();
+        let (list, counts) = self
+            .storm
+            .read_with(cx, |s, _| {
+                let list = s
+                    .review
+                    .iter()
+                    .filter(|c| c.path == path)
+                    .map(|c| (c.end, c.text.clone()))
+                    .collect::<Vec<_>>();
+                // counts for every file, so the sidebar can mark them
+                let mut counts: HashMap<PathBuf, usize> = HashMap::new();
+                for c in &s.review {
+                    *counts.entry(c.path.clone()).or_insert(0) += 1;
+                }
+                (list, counts)
+            })
+            .unwrap_or_default();
+        self.comments = list;
+        self.comment_counts = counts;
+    }
+
+    /// Open the inline comment box under the caret's row.
+    fn open_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rows.is_empty() {
+            return;
+        }
+        // with no caret yet (nothing clicked since the window opened), comment on
+        // the first row in view rather than doing nothing
+        let row = self
+            .caret
+            .map(|(_, r, _)| r)
+            .or(self.sel.as_ref().map(|s| s.head.0))
+            .unwrap_or_else(|| self.right_scroll.top_item().min(self.rows.len() - 1));
+        if self.caret.is_none() {
+            self.caret = Some((DiffSide::Right, row, 0));
+        }
+        let (line, _) = self.cursor_file_pos();
+        self.rc_row = row;
+        self.rc_line = line;
+        let existing = self
+            .comments
+            .iter()
+            .find(|(l, _)| *l == line)
+            .map(|(_, t)| t.clone())
+            .unwrap_or_default();
+        let path = self.files[self.idx].clone();
+        self.rc_replies = self
+            .storm
+            .read_with(cx, |s, _| {
+                s.review
+                    .iter()
+                    .find(|c| c.path == path && c.end == line)
+                    .map(|c| c.replies.clone())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        self.rc_query.multiline = true; // ↩ save, ⇧↩ newline
+        self.rc_query.set(existing);
+        self.rc_open = true;
+        // same rule as the editor's box: an existing thread opens for reading,
+        // a fresh note takes the caret straight away
+        if self.rc_replies.is_empty() {
+            window.focus(&self.rc_focus, cx);
+        }
+        cx.notify();
+    }
+
+    /// Hand the note to the main window's review list (the diff window owns no
+    /// state of its own here — Storm is where comments live and get sent from).
+    fn save_comment(&mut self, cx: &mut Context<Self>) {
+        let path = self.files[self.idx].clone();
+        let line = self.rc_line;
+        let text = self.rc_query.text.trim().to_string();
+        let snippet = self
+            .rows
+            .get(self.rc_row)
+            .map(|r| diff_side_text(r, DiffSide::Right))
+            .filter(|t| !t.trim().is_empty())
+            .or_else(|| self.rows.get(self.rc_row).map(|r| diff_side_text(r, DiffSide::Left)))
+            .unwrap_or_default();
+        let _ = self.storm.update(cx, |s, cx| {
+            s.set_comment(path, line, line, snippet, text, false, cx);
+        });
+        self.load_comments(cx);
+    }
+
+    /// The inline comment input, rendered as a row inside the right pane.
+    fn render_diff_comment_box(&mut self, rc_focused: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let body_h = rc_lines(&self.rc_query.text) as f32 * RC_LINE_H;
+        let replies = self.rc_replies.clone();
+        let thread_h = rc_thread_rows(&replies) as f32 * RC_LINE_H;
+        let has_note = self.comments.iter().any(|(l, _)| *l == self.rc_line);
+        div()
+            .min_h(px(rc_box_h(&self.rc_query.text, &replies)))
+            .w_full()
+            .mx(px(RC_BOX_PAD))
+            .my(px(RC_BOX_PAD))
+            .px_2()
+            .py_1()
+            .bg(rgb(PANEL_BG))
+            .border_1()
+            .border_color(rgb(COMMENT_MARK))
+            .rounded_md()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .overflow_hidden()
+            .track_focus(&self.rc_focus)
+            .on_key_down(cx.listener(Self::rc_key))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(10.))
+                    .child(div().text_color(rgb(COMMENT_MARK)).child(format!("comment on line {}", self.rc_line)))
+                    .child(div().flex_grow(1.0))
+                    .child(div().text_color(rgb(LINE_NUMBER)).child("↩ save · ⇧↩ newline · esc cancel")),
+            )
+            .when(!replies.is_empty(), |d| {
+                d.child(
+                    div()
+                        .id("diff-rc-thread")
+                        .h(px(thread_h))
+                        .overflow_y_scroll()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .children(replies.iter().map(|r| {
+                            let agent = r.who == "agent";
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap_1()
+                                .pl_1()
+                                .border_l_2()
+                                .border_color(rgb(if agent { GIT_NEW } else { COMMENT_MARK }))
+                                .text_size(px(12.))
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_color(rgb(if agent { GIT_NEW } else { COMMENT_MARK }))
+                                        .child(if agent { "agent" } else { "you" }),
+                                )
+                                .child(md_text(&r.text, 12.0, TEXT).flex_grow(1.0))
+                        })),
+                )
+            })
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    // grow with the text (wrapping included) instead of clipping;
+                    // the cap is what makes a long note scroll inside the box
+                    .min_h(px(body_h + 8.0))
+                    .max_h(px(RC_MAX_LINES as f32 * RC_LINE_H + 8.0))
+                    .line_height(px(RC_LINE_H))
+                    .bg(rgb(BG))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .rounded_md()
+                    .overflow_hidden()
+                    .text_size(px(12.))
+                    .text_color(rgb(TEXT))
+                    // opens unfocused on an existing thread: click here to type
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this: &mut DiffWindow, _e, window, cx| {
+                            window.focus(&this.rc_focus, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .mt(px(-rc_scroll_off(&self.rc_query)))
+                            .child(self.rc_query.render(if rc_focused { "▏" } else { "" }, SELECTION)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .when(has_note, |d| {
+                        d.child(rc_button("diff-rc-delete", "Delete", false, true).on_click(
+                            cx.listener(|this, _e, window, cx| {
+                                this.rc_query.set(String::new());
+                                this.save_comment(cx); // empty text removes it
+                                this.rc_open = false;
+                                window.focus(&this.focus, cx);
+                                cx.notify();
+                            }),
+                        ))
+                    })
+                    .child(div().flex_grow(1.0))
+                    .child(rc_button("diff-rc-cancel", "Cancel", false, false).on_click(cx.listener(
+                        |this, _e, window, cx| {
+                            this.rc_open = false;
+                            window.focus(&this.focus, cx);
+                            cx.notify();
+                        },
+                    )))
+                    .child(
+                        rc_button("diff-rc-save", if has_note { "Update" } else { "Comment" }, true, false)
+                            .on_click(cx.listener(|this, _e, window, cx| {
+                                this.save_comment(cx);
+                                this.rc_open = false;
+                                window.focus(&this.focus, cx);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn rc_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match ev.keystroke.key.as_str() {
+            "escape" => {
+                self.rc_open = false;
+                window.focus(&self.focus, cx);
+            }
+            "enter" if !ev.keystroke.modifiers.shift && !ev.keystroke.modifiers.platform => {
+                self.save_comment(cx);
+                self.rc_open = false;
+                window.focus(&self.focus, cx);
+            }
+            _ => {
+                let clip = cx.read_from_clipboard().and_then(|i| i.text());
+                self.rc_query.key(&ev.keystroke, clip, |_| true);
+            }
+        }
+        cx.notify();
     }
 
     /// Flatten `files` into a directory tree (respecting collapsed dirs) for the
@@ -11931,6 +18302,11 @@ impl DiffWindow {
     /// Keystrokes while the sidebar filter input is focused. Esc clears/close,
     /// Enter jumps to the first matching file.
     fn filter_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // ⌥C belongs to the diff, not to the filter text
+        if ev.keystroke.modifiers.alt && ev.keystroke.key == "c" {
+            self.open_comment(window, cx);
+            return;
+        }
         let ks = &ev.keystroke;
         if ks.key == "escape" {
             if self.filter.is_empty() {
@@ -12013,6 +18389,8 @@ impl DiffWindow {
             self.sel = None;
             self.caret = None;
             self.pending_scroll = true; // jump to the first change in the new file
+            self.rc_open = false;
+            self.load_comments(cx); // notes follow the file being shown
             self.recompute_matches();
             cx.notify();
         }
@@ -12170,10 +18548,20 @@ impl DiffWindow {
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
-        // when the search or sidebar-filter input has focus, let its own key
-        // handler own the keystroke (events bubble up to this root otherwise)
+        // alt+c comments on the caret's line — checked before the input-focus
+        // bail-out below, or it would never fire while the file filter has focus
+        // (which it usually does after opening the window). Not while the comment
+        // box itself has focus: there ⌥C is just text.
+        if ks.modifiers.alt && ks.key == "c" && !(self.rc_open && self.rc_focus.is_focused(window)) {
+            self.open_comment(window, cx);
+            return;
+        }
+        // when one of the inputs has focus, let its own handler own the keystroke
+        // (events bubble up to this root otherwise, so ⌘A would select the whole
+        // file behind the comment box instead of the text being typed)
         if (self.search_open && self.search_focus.is_focused(window))
             || self.filter_focus.is_focused(window)
+            || (self.rc_open && self.rc_focus.is_focused(window))
         {
             return;
         }
@@ -12402,6 +18790,16 @@ impl Render for DiffWindow {
                     .child(format!("{} difference{}", diffs, if diffs == 1 { "" } else { "s" })),
             )
             .child(
+                // the review-comment affordance isn't discoverable otherwise
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(if self.comments.is_empty() { LINE_NUMBER } else { COMMENT_MARK }))
+                    .child(match self.comments.len() {
+                        0 => "⌥C comment".to_string(),
+                        n => format!("{n} comments · ⌥C comment"),
+                    }),
+            )
+            .child(
                 div()
                     .id("dw-close")
                     .px_2()
@@ -12444,10 +18842,15 @@ impl Render for DiffWindow {
                 }),
             )
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
+                if this.resizing_sidebar {
+                    this.sidebar_w = f32::from(ev.position.x).clamp(160., 640.);
+                    cx.notify();
+                    return;
+                }
                 if this.resizing_pane {
                     // drag the divider: split = cursor x within the diff area
                     // (which starts after the sidebar, when one is shown)
-                    let sidebar_w = if this.files.len() > 1 { 260.0 } else { 0.0 };
+                    let sidebar_w = if this.files.len() > 1 { this.sidebar_w + 4.0 } else { 0.0 };
                     let area_w = (f32::from(window.viewport_size().width) - sidebar_w).max(1.0);
                     let x = f32::from(ev.position.x) - sidebar_w;
                     this.pane_split = (x / area_w).clamp(0.15, 0.85);
@@ -12467,8 +18870,9 @@ impl Render for DiffWindow {
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _e, _w, cx| {
                 this.dragging = false;
-                if this.resizing_pane {
+                if this.resizing_pane || this.resizing_sidebar {
                     this.resizing_pane = false;
+                    this.resizing_sidebar = false;
                     cx.notify();
                 }
             }))
@@ -12488,8 +18892,21 @@ impl Render for DiffWindow {
 
         // two panes with a draggable divider between them (pane_split = left share)
         let split = self.pane_split;
-        let left_pane = diff_pane(&self.rows, DiffSide::Left, &self.left_scroll, self.char_w, self.sel.as_ref(), &self.left_styles, &self.matches, self.cur_match, self.caret, self.caret_on);
-        let right_pane = diff_pane(&self.rows, DiffSide::Right, &self.right_scroll, self.char_w, self.sel.as_ref(), &self.right_styles, &self.matches, self.cur_match, self.caret, self.caret_on);
+        // visible width of each pane: comment widgets are sized to this so they
+        // stay fully on screen instead of extending into the scrollable width
+        let sidebar = if self.files.len() > 1 { self.sidebar_w + 4.0 } else { 0.0 };
+        let area_w = (f32::from(window.viewport_size().width) - sidebar - 4.0).max(120.0);
+        let (left_vis, right_vis) = (area_w * split - 10.0, area_w * (1.0 - split) - 10.0);
+        // the inline comment box lives in the right pane, under its row
+        let comment_box = self
+            .rc_open
+            .then(|| {
+                let replies = self.rc_replies.clone();
+                let focused = self.rc_focus.is_focused(window);
+                (self.rc_row, rc_gap_h(&self.rc_query.text, &replies), self.render_diff_comment_box(focused, cx))
+            });
+        let left_pane = diff_pane(&self.rows, DiffSide::Left, &self.left_scroll, self.char_w, self.sel.as_ref(), &self.left_styles, &self.matches, self.cur_match, self.caret, self.caret_on, &[], None, left_vis.max(120.0));
+        let right_pane = diff_pane(&self.rows, DiffSide::Right, &self.right_scroll, self.char_w, self.sel.as_ref(), &self.right_styles, &self.matches, self.cur_match, self.caret, self.caret_on, &self.comments, comment_box, right_vis.max(120.0));
         let divider = div()
             .w(px(4.))
             .h_full()
@@ -12782,14 +19199,29 @@ impl Render for DiffWindow {
                                 .flex_grow(1.0)
                                 .truncate()
                                 .text_size(px(13.))
+                                // colour file names by git status, like the trees
+                                // in the main window
                                 .text_color(rgb(if sel {
                                     SEL_TEXT
                                 } else if is_dir {
                                     DIR
                                 } else {
-                                    TEXT
+                                    match row.file_idx.and_then(|i| self.files.get(i)).and_then(|p| self.states.get(p)) {
+                                        Some(GitState::New) => GIT_NEW,
+                                        Some(GitState::Modified) => GIT_MODIFIED,
+                                        Some(GitState::Deleted) => GIT_DELETED,
+                                        None => TEXT,
+                                    }
                                 }))
                                 .child(row.label),
+                        )
+                        // review comments on this file
+                        .when_some(
+                            row.file_idx
+                                .and_then(|i| self.files.get(i))
+                                .map(|p| self.comment_counts.get(p).copied().unwrap_or(0))
+                                .filter(|n| *n > 0),
+                            |d, n| d.child(comment_marker(n, 11.)),
                         )
                         // dir file count on the right
                         .when_some(dir_count, |d, n| {
@@ -12810,7 +19242,7 @@ impl Render for DiffWindow {
             // sidebar: fixed filter + chips on top, scrolling list, progress pinned
             // at the bottom
             let sidebar = div()
-                .w(px(260.))
+                .w(px(self.sidebar_w))
                 .flex_shrink_0()
                 .h_full()
                 .flex()
@@ -12823,6 +19255,21 @@ impl Render for DiffWindow {
                 .children(chips)
                 .child(list)
                 .children(progress);
+            // draggable edge between the sidebar and the two diff panes
+            let sidebar_divider = div()
+                .w(px(4.))
+                .h_full()
+                .flex_shrink_0()
+                .bg(rgb(if self.resizing_sidebar { ACCENT } else { BORDER }))
+                .cursor(CursorStyle::ResizeLeftRight)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _e: &MouseDownEvent, _w, cx| {
+                        this.resizing_sidebar = true;
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                );
             // body added directly as a flex child so it keeps a bounded height
             // (scroll panes need that); a non-flex wrapper here breaks scrolling
             let content = div()
@@ -12831,6 +19278,7 @@ impl Render for DiffWindow {
                 .flex_grow(1.0)
                 .min_h(px(0.))
                 .child(sidebar)
+                .child(sidebar_divider)
                 .child(body);
             col.child(content)
         } else {
@@ -13017,14 +19465,81 @@ impl Render for MergeWindow {
     }
 }
 
+/// Order paths the way a person reads them: `wby-next2` before `wby-next10`.
+/// A plain sort (and shell glob expansion) puts 10 right after 1, which then
+/// shows up as the workspace numbering in the switcher.
+fn natural_key(p: &Path) -> Vec<(u64, String)> {
+    let s = p.to_string_lossy().to_string();
+    let mut out = Vec::new();
+    let mut chars = s.chars().peekable();
+    let mut text = String::new();
+    while let Some(c) = chars.next() {
+        if c.is_ascii_digit() {
+            let mut n = c.to_digit(10).unwrap() as u64;
+            while let Some(d) = chars.peek().and_then(|c| c.to_digit(10)) {
+                n = n.saturating_mul(10).saturating_add(d as u64);
+                chars.next();
+            }
+            out.push((n, std::mem::take(&mut text)));
+        } else {
+            text.push(c);
+        }
+    }
+    if !text.is_empty() {
+        out.push((u64::MAX, text)); // trailing text sorts after any number run
+    }
+    out
+}
+
+/// Resolve one CLI argument to project directories. `~` is expanded, and a
+/// `*`/`?` pattern is matched against its parent directory's entries — so
+/// `tide 'wby-next*'` works even when the shell didn't expand it (quoted, or
+/// run from a directory where nothing matched).
+fn resolve_arg(arg: &str) -> Vec<PathBuf> {
+    let expanded = match arg.strip_prefix("~/") {
+        Some(rest) => std::env::var("HOME").map(|h| PathBuf::from(h).join(rest)).unwrap_or_else(|_| PathBuf::from(arg)),
+        None => PathBuf::from(arg),
+    };
+    let as_str = expanded.to_string_lossy().to_string();
+    if !(as_str.contains('*') || as_str.contains('?')) {
+        return std::fs::canonicalize(&expanded).ok().filter(|p| p.is_dir()).into_iter().collect();
+    }
+    let parent = expanded.parent().filter(|p| !p.as_os_str().is_empty()).map(|p| p.to_path_buf());
+    let dir = parent.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let pattern = expanded.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let mut hits: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .filter(|p| {
+            p.file_name()
+                .map(|n| glob_match(&pattern, &n.to_string_lossy()))
+                .unwrap_or(false)
+        })
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .collect();
+    hits.sort_by_key(|p| natural_key(p));
+    hits
+}
+
 fn main() {
-    // each CLI arg is a project root opened as its own workspace; default to cwd
+    // Each CLI arg is a project root (globs allowed) opened as its own
+    // workspace. With no args, reopen last session's workspaces; if there is no
+    // session yet, fall back to the current directory.
     let roots: Vec<PathBuf> = {
-        let mut v: Vec<PathBuf> = std::env::args()
-            .skip(1)
-            .filter_map(|a| std::fs::canonicalize(&a).ok())
-            .filter(|p| p.is_dir())
-            .collect();
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let mut v: Vec<PathBuf> = args.iter().flat_map(|a| resolve_arg(a)).collect();
+        // a single glob arg is already naturally sorted; a shell-expanded list
+        // isn't (wby-next10 lands after wby-next1), so sort when it looks like one
+        if args.len() > 1 {
+            v.sort_by_key(|p| natural_key(p));
+        }
+        v.dedup();
+        if v.is_empty() && args.is_empty() {
+            v = load_session();
+        }
         if v.is_empty() {
             v.push(std::env::current_dir().unwrap());
         }
@@ -13095,6 +19610,9 @@ fn main() {
             KeyBinding::new("cmd-shift-z", Redo, Some("Editor")),
             // line ops
             KeyBinding::new("cmd-backspace", DeleteLine, Some("Editor")),
+            // duplicate line / toggle comment (Editor beats the global cmd-d)
+            KeyBinding::new("cmd-d", DupLine, Some("Editor")),
+            KeyBinding::new("cmd-/", ToggleComment, Some("Editor")),
             KeyBinding::new("alt-shift-up", MoveLineUp, Some("Editor")),
             KeyBinding::new("alt-shift-down", MoveLineDown, Some("Editor")),
             // terminal toggle (global)
@@ -13110,7 +19628,7 @@ fn main() {
             // jump to commit pane with the active file checked (global)
             KeyBinding::new("cmd-k", GotoCommit, None),
             KeyBinding::new("cmd-shift-k", PushDialog, None),
-            KeyBinding::new("cmd-shift-t", RunCommand, None),
+            KeyBinding::new("cmd-shift-t", SetWsTitle, None),
             // find in files (global)
             KeyBinding::new("cmd-shift-f", FindInFiles, None),
             // git branches/actions popup (global)
@@ -13131,8 +19649,31 @@ fn main() {
             KeyBinding::new("cmd-o", NewProject, None),
             KeyBinding::new("cmd-shift-n", NewScratch, None),
             KeyBinding::new("cmd-e", ShowProjects, None),
+            // review comments: pin one to a line, list them, send the batch
+            KeyBinding::new("alt-c", AddComment, None),
+            // the agent pane's ⌥C quotes the selected answer text instead of
+            // starting a review comment (deeper context wins)
+            KeyBinding::new("alt-c", QuoteAgentSel, Some("Agent")),
+            KeyBinding::new("alt-shift-c", ShowComments, None),
+            KeyBinding::new("alt-enter", SendComments, None),
+            KeyBinding::new("cmd-shift-s", SendComments, None),
+            KeyBinding::new("cmd-q", QuitApp, None),
+            KeyBinding::new("cmd-shift-v", ToggleMdPreview, None),
+            // refresh PR status + admin health (topbar chip and status screen)
+            KeyBinding::new("cmd-r", RefreshPr, None),
             // diff (opens in its own window)
             KeyBinding::new("cmd-d", ShowDiff, None),
+            // terminal pane splits — listed after the global cmd-d so they win
+            // while a terminal has focus (later binding takes precedence)
+            KeyBinding::new("cmd-d", SplitTermRight, Some("Terminal")),
+            KeyBinding::new("cmd-shift-d", SplitTermDown, Some("Terminal")),
+            // zoom the focused pane to the whole dock
+            KeyBinding::new("cmd-shift-enter", ToggleTermZoom, Some("Terminal")),
+            // pane navigation (while zoomed these cycle prev/next instead)
+            KeyBinding::new("cmd-left", FocusPaneLeft, Some("Terminal")),
+            KeyBinding::new("cmd-right", FocusPaneRight, Some("Terminal")),
+            KeyBinding::new("cmd-up", FocusPaneUp, Some("Terminal")),
+            KeyBinding::new("cmd-down", FocusPaneDown, Some("Terminal")),
         ]);
 
         let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
@@ -13150,4 +19691,147 @@ fn main() {
         .unwrap();
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod short_cmd_tests {
+    use super::*;
+
+    #[test]
+    fn interpreters_and_paths_are_stripped() {
+        assert_eq!(short_cmd("node /usr/local/bin/yarn webiny-server watch admin"), "yarn webiny-server watch admin");
+        assert_eq!(short_cmd("/Users/adrian/.local/bin/claude --dangerously-skip-permissions --continue"), "claude");
+        assert_eq!(short_cmd("/bin/zsh"), "zsh"); // a bare shell keeps its name
+        assert_eq!(short_cmd("npm exec webiny-mcp serve"), "exec webiny-mcp serve");
+    }
+
+    #[test]
+    fn long_commands_are_truncated_to_fit_a_badge() {
+        // flags are dropped, so the length has to come from real arguments
+        let out = short_cmd("yarn webiny watch api website admin graphql headless-cms file-manager");
+        assert!(out.chars().count() <= 38, "{out}");
+        assert!(out.ends_with('…'), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    #[test]
+    fn message_numbers_items_and_quotes_the_code() {
+        let items = vec![
+            ReviewItem {
+                id: "ab12c".into(),
+                reference: "src/foo.ts:42".into(),
+                snippet: "const x = doThing()".into(),
+                note: "memoize this".into(),
+                thread: Vec::new(),
+            },
+            ReviewItem {
+                id: "de34f".into(),
+                reference: "src/bar.rs:10-11".into(),
+                snippet: "fn a() {\n    b();\n}".into(),
+                note: "extract".into(),
+                thread: Vec::new(),
+            },
+        ];
+        let msg = format_review(&items);
+        assert!(msg.starts_with("Review comments from TIDE"), "{msg}");
+        assert!(msg.contains("1. [ab12c] src/foo.ts:42\n   | const x = doThing()\n   -> memoize this"), "{msg}");
+        // the id is what lets an answer find its way back to this thread
+        assert!(msg.contains("$TIDE_RPC/comment"), "{msg}");
+        // every snippet line is quoted, so the agent can't confuse code with notes
+        assert!(msg.contains("2. [de34f] src/bar.rs:10-11\n   | fn a() {\n   |     b();\n   | }\n   -> extract"), "{msg}");
+    }
+
+    /// A follow-up has to carry what was already said, or the agent answers the
+    /// original note again instead of the new question.
+    #[test]
+    fn a_thread_is_included_so_a_follow_up_reads_as_a_conversation() {
+        let msg = format_review(&[ReviewItem {
+            id: "t1".into(),
+            reference: "a.tsx:45".into(),
+            snippet: "value: String(option.value),".into(),
+            note: "what about undefined?".into(),
+            thread: vec![
+                ("agent".into(), "!= null covers both".into()),
+                ("you".into(), "then why the extra guard?".into()),
+            ],
+        }]);
+        assert!(msg.contains("   you (agent): != null covers both"), "{msg}");
+        assert!(msg.contains("   me: then why the extra guard?"), "{msg}");
+    }
+
+    #[test]
+    fn a_long_snippet_is_capped() {
+        let snippet = (0..40).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let msg = format_review(&[ReviewItem {
+            id: "x9".into(),
+            reference: "f.rs:1-40".into(),
+            snippet,
+            note: "too big".into(),
+            thread: Vec::new(),
+        }]);
+        assert_eq!(msg.lines().filter(|l| l.starts_with("   | ")).count(), 12);
+    }
+}
+
+#[cfg(test)]
+mod review_persist_tests {
+    use super::*;
+
+    fn sample(root: &Path) -> Vec<ReviewComment> {
+        vec![
+            ReviewComment {
+                id: "aaa11".into(),
+                path: root.join("src/main.rs"),
+                line: 42,
+                end: 42,
+                snippet: "let x = 1;".into(),
+                text: "memoize".into(),
+                draft: false,
+                sent: true,
+                replies: vec![ReviewReply { who: "agent".into(), text: "done, memoized".into() }],
+            },
+            ReviewComment {
+                id: "bbb22".into(),
+                path: root.join("src/lib.rs"),
+                line: 7,
+                end: 9,
+                snippet: "fn a() {}".into(),
+                text: "half-written".into(),
+                draft: true,
+                sent: false,
+                replies: Vec::new(),
+            },
+        ]
+    }
+
+    #[test]
+    fn round_trips_through_json() {
+        let root = Path::new("/Users/x/dev/proj");
+        let json = review_to_json(root, &sample(root));
+        assert_eq!(review_from_json(root, &json), sample(root));
+    }
+
+    #[test]
+    fn paths_are_stored_relative_so_a_moved_checkout_still_matches() {
+        let json = review_to_json(Path::new("/old/place"), &sample(Path::new("/old/place")));
+        assert!(!json.contains("/old/place"), "{json}");
+        let moved = review_from_json(Path::new("/new/place"), &json);
+        assert_eq!(moved[0].path, Path::new("/new/place/src/main.rs"));
+        assert!(moved[1].draft);
+    }
+
+    #[test]
+    fn junk_and_empty_notes_are_dropped_not_fatal() {
+        let root = Path::new("/p");
+        assert!(review_from_json(root, "not json").is_empty());
+        let json = r#"[{"path":"a.rs","line":1,"text":"  "},{"path":"b.rs","line":2,"text":"keep"}]"#;
+        let out = review_from_json(root, json);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "keep");
+        assert_eq!(out[0].end, 2); // end defaults to line
+    }
 }

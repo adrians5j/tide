@@ -1,6 +1,6 @@
 //! Native ACP (Agent Client Protocol) client.
 //!
-//! Spawns Zed's `@zed-industries/claude-code-acp` adapter as a subprocess and
+//! Spawns the `@agentclientprotocol/claude-agent-acp` adapter as a subprocess and
 //! talks to it over stdio using **newline-delimited JSON-RPC 2.0** (one complete
 //! JSON object per line — NOT LSP `Content-Length` framing).
 //!
@@ -25,6 +25,22 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Standard base64 (with padding) — image attachments have to reach the adapter
+/// as text, and pulling in a crate for 20 lines isn't worth it.
+pub fn base64(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(A[(n >> 18) as usize & 63] as char);
+        out.push(A[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { A[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { A[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
 /// One thing that happened in the agent conversation, drained by the UI poll.
 pub enum AcpEvent {
     /// Session established; the client is now accepting prompts.
@@ -39,6 +55,14 @@ pub enum AcpEvent {
     ToolStatus { id: String, status: String },
     /// The current prompt turn finished.
     TurnEnd,
+    /// A user turn replayed by `session/load` (resuming an earlier session).
+    User(String),
+    /// Sessions available for this project, newest first: `(id, title)`.
+    Sessions(Vec<(String, String)>),
+    /// Context consumed by this session so far: `(used, window)` in tokens.
+    Usage { used: u64, size: u64 },
+    /// The adapter's title for the session (its summary of the first prompt).
+    Title(String),
     /// Something went wrong (handshake failed, prompt errored, adapter died).
     Error(String),
 }
@@ -49,6 +73,7 @@ pub struct Acp {
     next_id: AtomicI64,
     session: Arc<Mutex<Option<String>>>,
     queued: Arc<Mutex<Vec<String>>>, // prompts sent before the session existed
+    list_id: Arc<Mutex<Option<i64>>>, // id of the in-flight session/list request
     events: Arc<Mutex<Vec<AcpEvent>>>,
     dirty: Arc<AtomicBool>,
     ready: Arc<AtomicBool>,
@@ -58,9 +83,14 @@ pub struct Acp {
 impl Acp {
     /// Spawn the adapter for `root` and kick off the handshake on a background
     /// thread. Returns None if the adapter can't be launched (no node/npx).
-    pub fn new(root: &Path) -> Option<Arc<Acp>> {
+    /// `rpc` is TIDE's control channel `(url, token)`; the adapter inherits it,
+    /// so the agent's own Bash calls can post review-thread answers back to us
+    /// exactly like a terminal agent does.
+    pub fn new(root: &Path, rpc: Option<(String, String)>) -> Option<Arc<Acp>> {
         let mut cmd = Command::new("npx");
-        cmd.args(["-y", "@zed-industries/claude-code-acp"])
+        // renamed from @zed-industries/claude-code-acp, which is deprecated and
+        // frozen at 0.16
+        cmd.args(["-y", "@agentclientprotocol/claude-agent-acp"])
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -70,6 +100,11 @@ impl Acp {
         cmd.env_remove("CLAUDECODE");
         cmd.env_remove("CLAUDE_CODE_ENTRYPOINT");
         cmd.env_remove("CLAUDE_CODE_SSE_PORT");
+        if let Some((url, token)) = rpc {
+            cmd.env("TIDE_RPC", url);
+            cmd.env("TIDE_TOKEN", token);
+            cmd.env("TIDE_ROOT", root.to_string_lossy().to_string());
+        }
 
         let mut child = cmd.spawn().ok()?;
         let stdin = Arc::new(Mutex::new(child.stdin.take()?));
@@ -80,6 +115,7 @@ impl Acp {
             next_id: AtomicI64::new(1),
             session: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(Vec::new())),
+            list_id: Arc::new(Mutex::new(None)),
             events: Arc::new(Mutex::new(Vec::new())),
             dirty: Arc::new(AtomicBool::new(false)),
             ready: Arc::new(AtomicBool::new(false)),
@@ -165,9 +201,16 @@ impl Acp {
     /// Send a user turn. If the session isn't established yet, the prompt is
     /// queued and flushed once `session/new` returns.
     pub fn prompt(&self, text: &str) {
+        self.prompt_with(text, &[]);
+    }
+
+    /// Send a user turn with image attachments: `(mime type, base64 bytes)`.
+    /// Images are dropped if the session isn't up yet — only the text is queued,
+    /// since the queue is a plain string list.
+    pub fn prompt_with(&self, text: &str, images: &[(String, String)]) {
         let sid = self.session.lock().ok().and_then(|s| s.clone());
         match sid {
-            Some(sid) => self.send_prompt(&sid, text),
+            Some(sid) => self.send_prompt_with(&sid, text, images),
             None => {
                 if let Ok(mut q) = self.queued.lock() {
                     q.push(text.to_string());
@@ -176,15 +219,80 @@ impl Acp {
         }
     }
 
+    /// Interrupt the turn in flight (ACP `session/cancel`, a notification — the
+    /// adapter answers by ending the turn, which arrives as `TurnEnd`). No-op
+    /// when no session exists yet.
+    pub fn cancel(&self) {
+        let Some(sid) = self.session.lock().ok().and_then(|s| s.clone()) else { return };
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": { "sessionId": sid }
+        }));
+    }
+
+    /// Start a fresh session, discarding the current one.
+    pub fn new_session(&self, root: &Path) {
+        self.ready.store(false, Ordering::Relaxed);
+        if let Ok(mut sid) = self.session.lock() {
+            *sid = None;
+        }
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "id": self.take_id(),
+            "method": "session/new",
+            "params": { "cwd": root.to_string_lossy(), "mcpServers": [] }
+        }));
+    }
+
+    /// Ask for this project's sessions. The answer arrives as `Sessions`.
+    pub fn list_sessions(&self, root: &Path) {
+        let id = self.take_id();
+        if let Ok(mut l) = self.list_id.lock() {
+            *l = Some(id);
+        }
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "session/list",
+            "params": { "cwd": root.to_string_lossy() }
+        }));
+    }
+
+    /// Resume `session_id`: the adapter replays its history as `User`/`Text`
+    /// events, then the session accepts new prompts as usual.
+    pub fn load_session(&self, root: &Path, session_id: &str) {
+        self.ready.store(false, Ordering::Relaxed);
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "id": self.take_id(),
+            "method": "session/load",
+            "params": {
+                "sessionId": session_id,
+                "cwd": root.to_string_lossy(),
+                "mcpServers": []
+            }
+        }));
+    }
+
     fn send_prompt(&self, sid: &str, text: &str) {
+        self.send_prompt_with(sid, text, &[]);
+    }
+
+    fn send_prompt_with(&self, sid: &str, text: &str, images: &[(String, String)]) {
+        // images first: the question usually refers to what's in them
+        let mut blocks: Vec<Value> = images
+            .iter()
+            .map(|(mime, data)| json!({ "type": "image", "mimeType": mime, "data": data }))
+            .collect();
+        if !text.is_empty() || blocks.is_empty() {
+            blocks.push(json!({ "type": "text", "text": text }));
+        }
         self.send(json!({
             "jsonrpc": "2.0",
             "id": self.take_id(),
             "method": "session/prompt",
-            "params": {
-                "sessionId": sid,
-                "prompt": [{ "type": "text", "text": text }]
-            }
+            "params": { "sessionId": sid, "prompt": blocks }
         }));
     }
 
@@ -314,6 +422,24 @@ impl Acp {
                     .to_string();
                 self.push(AcpEvent::Tool { id, title, status });
             }
+            "user_message_chunk" => {
+                if let Some(t) = update
+                    .get("content")
+                    .and_then(|c| c.get("text"))
+                    .and_then(|t| t.as_str())
+                {
+                    self.push(AcpEvent::User(t.to_string()));
+                }
+            }
+            "usage_update" => {
+                let get = |k: &str| update.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+                self.push(AcpEvent::Usage { used: get("used"), size: get("size") });
+            }
+            "session_info_update" => {
+                if let Some(t) = update.get("title").and_then(|t| t.as_str()) {
+                    self.push(AcpEvent::Title(t.to_string()));
+                }
+            }
             "tool_call_update" => {
                 let id = update
                     .get("toolCallId")
@@ -338,6 +464,34 @@ impl Acp {
             return;
         }
         let Some(result) = msg.get("result") else { return };
+        // session/list answer (matched by the id we recorded when asking)
+        let is_list = msg
+            .get("id")
+            .and_then(|i| i.as_i64())
+            .zip(self.list_id.lock().ok().and_then(|l| *l))
+            .map(|(a, b)| a == b)
+            .unwrap_or(false);
+        if is_list {
+            let sessions = result
+                .get("sessions")
+                .and_then(|s| s.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|s| {
+                            let id = s.get("sessionId")?.as_str()?.to_string();
+                            let title = s
+                                .get("title")
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("(untitled)")
+                                .to_string();
+                            Some((id, title))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            self.push(AcpEvent::Sessions(sessions));
+            return;
+        }
         if let Some(sid) = result.get("sessionId").and_then(|s| s.as_str()) {
             *self.session.lock().unwrap() = Some(sid.to_string());
             self.ready.store(true, Ordering::Relaxed);
@@ -395,4 +549,20 @@ fn write_text(path: &str, content: &str) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     std::fs::write(path, content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::base64;
+
+    #[test]
+    fn base64_matches_the_reference_encoding() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foob"), "Zm9vYg==");
+        // bytes above 0x7f must not sign-extend
+        assert_eq!(base64(&[0xff, 0xfe, 0xfd]), "//79");
+    }
 }

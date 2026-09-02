@@ -38,5 +38,12 @@ pub const DIFF_REMOVE_BG: u32 = 0x3a2526;
 pub const SEARCH_MATCH_BG: u32 = 0x4d4023;
 pub const SEARCH_CURRENT_BG: u32 = 0x3a4768;
 
+// ── review comments (gutter marker, inline notes, boxes, counts) ───────────
+// Purple: amber means "agent needs you", green is added/passing, blue is the UI
+// accent, and the free-workspace badge moved to cyan so this hue is unshared.
+pub const COMMENT_MARK: u32 = 0xbb9af7;
+pub const COMMENT_TINT: u32 = 0xbb9af722; // 13% wash behind inline notes
+pub const COMMENT_TINT_HOVER: u32 = 0xbb9af733;
+
 // ── same-word occurrence highlight (selecting a word marks its twins) ────────
 pub const WORD_MATCH_BG: u32 = 0x33414d;
