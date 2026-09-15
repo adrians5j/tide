@@ -23,6 +23,7 @@ mod term;
 mod acp;
 mod browser;
 mod diff;
+mod build;
 mod lsp;
 mod md;
 mod rpc;
@@ -60,9 +61,11 @@ const IC_FOLDER: &str = "\u{ea83}";
 const IC_COPY: &str = "\u{ebcc}";
 const IC_CHECK: &str = "\u{eab2}";
 const IC_TRASH: &str = "\u{ea81}";
-const IC_BROWSER: &str = "\u{eb48}"; // codicon "globe"
+const IC_BROWSER: &str = "\u{eb01}"; // codicon "globe"
 const IC_COMMENT: &str = "\u{ea6b}"; // codicon "comment"
+const IC_AGENT: &str = "\u{ec4f}"; // codicon "chat-sparkle" — the agent pane
 const IC_GRAPH: &str = "\u{ebe2}"; // codicon "graph-line" — plan usage
+const IC_GEAR: &str = "\u{eb51}"; // codicon "gear" — the agent's own settings
 // The codicon font is renamed to "Segoe Fluent Icons" because GPUI refuses to
 // load any font lacking an 'm' glyph — except that one specially-cased name.
 const ICON_FONT: &str = "Segoe Fluent Icons";
@@ -90,14 +93,71 @@ actions!(
 
 /// One entry in the agent conversation transcript.
 enum AgentMsg {
-    /// Something the user typed.
-    User(String),
+    /// Something the user typed, and whatever was attached to it. The images
+    /// outlive the composer: `[Image #1]` in the prose says where a picture
+    /// went, and the chips under the bubble say what it was.
+    User { text: String, imgs: Vec<SentImage> },
     /// Streamed assistant text (mutated in place as chunks arrive).
     Agent(String),
     /// Streamed assistant reasoning ("thinking"), shown dimmed.
     Thought(String),
-    /// A tool call the agent ran: title + latest status.
-    Tool { id: String, title: String, status: String },
+    /// A tool call the agent ran: title (for Bash, the command itself), latest
+    /// status, what the adapter said about it (a description before it runs, the
+    /// output after), and when it started, so a long one can show its age.
+    Tool {
+        id: String,
+        title: String,
+        status: String,
+        detail: String,
+        started: std::time::Instant,
+    },
+}
+
+/// The live `@` mention in front of the caret: where its `@` sits and what has
+/// been typed after it. A mention starts a word (never an e-mail's `a@b`) and
+/// ends at the first space, so `@wby` is live and `@wby next` is plain text
+/// again.
+fn mention_span(text: &str, caret: usize) -> Option<(usize, String)> {
+    let head = text.get(..caret)?;
+    let i = head.rfind('@')?;
+    let starts_word = head[..i].chars().next_back().map_or(true, |c| c.is_whitespace() || c == '(');
+    if !starts_word || head[i + 1..].contains(char::is_whitespace) {
+        return None;
+    }
+    Some((i, head[i + 1..].to_string()))
+}
+
+/// The adapter titles a session from its first prompt — which, for the first
+/// prompt of a session, carries TIDE's hidden briefing. That makes a title out
+/// of the briefing's opening line, so it's dropped rather than shown. Anything
+/// else is kept to its first line, clipped to a header's worth of words.
+fn session_title(raw: &str) -> Option<String> {
+    let line = raw.lines().find(|l| !l.trim().is_empty())?.trim();
+    // the briefing's two possible openings (the house-rules line comes first
+    // when the repo has an AGENTS.md / CLAUDE.md)
+    if line.starts_with("You are running inside TIDE")
+        || line.starts_with("Read AGENTS.md")
+        || line.starts_with("Read CLAUDE.md")
+    {
+        return None;
+    }
+    let mut out: String = line.chars().take(70).collect();
+    if line.chars().count() > 70 {
+        out.push('…');
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// One `@` completion candidate in the agent composer.
+#[derive(Clone)]
+struct Mention {
+    /// What lands in the text, `@` included.
+    token: String,
+    /// Dimmed, right of the token: a workspace's title, a file's folder.
+    detail: String,
+    /// What the agent gets in place of the token. `None` for a candidate that
+    /// already says everything (a file path).
+    expand: Option<String>,
 }
 
 #[derive(Clone)]
@@ -122,8 +182,9 @@ fn highlighter() -> &'static syntax::Highlighter {
 }
 
 const FIND_CAP: usize = 500;
-/// Height above the find dialog's results: title 24 + search 42 + scope 22.
-const FIND_HEAD_H: f32 = 88.0;
+/// Height above the find dialog's results: title 24 + search 42 + scope 22 +
+/// the syntax legend 20.
+const FIND_HEAD_H: f32 = 108.0;
 
 /// Which edges a find-dialog resize drag is moving (for window-style resizing).
 #[derive(Clone, Copy, Default)]
@@ -154,6 +215,21 @@ fn parse_search_query(q: &str) -> SearchQuery {
             format!("**/{s}/**")
         }
     };
+    // `api-core*` names a *directory* far more often than a file (files carry
+    // an extension), and a `--glob` only matches the entry itself — so a
+    // pattern whose last segment has no dot also gets its subtree form. Both go
+    // to ripgrep, which ORs its positive globs, so a file by that name still
+    // matches.
+    let subtree_form = |g: &str| -> Option<String> {
+        let g = g.trim_end_matches('/');
+        let last = g.rsplit('/').next().unwrap_or(g);
+        if last.contains('.') || g.ends_with("/**") {
+            return None;
+        }
+        // a pattern with no slash names an entry anywhere, so its subtree form
+        // needs the `**/` lead that a rooted pattern already has
+        Some(if g.contains('/') { format!("{g}/**") } else { format!("**/{g}/**") })
+    };
     let mut include = Vec::new();
     let mut excludes = Vec::new();
     let mut globs = Vec::new();
@@ -162,6 +238,9 @@ fn parse_search_query(q: &str) -> SearchQuery {
         if tok.len() > 1 && (tok.starts_with('-') || tok.starts_with('!')) {
             let inner = &tok[1..];
             if is_glob(inner) {
+                if let Some(sub) = subtree_form(inner) {
+                    globs.push(format!("!{sub}"));
+                }
                 globs.push(format!("!{inner}"));
             } else if inner.contains('/') || inner.contains('.') {
                 // looks like text or an explicit path (`-context.container`):
@@ -175,6 +254,9 @@ fn parse_search_query(q: &str) -> SearchQuery {
             }
         } else if is_glob(tok) {
             globs.push(tok.to_string());
+            if let Some(sub) = subtree_form(tok) {
+                globs.push(sub);
+            }
         } else {
             include.push(tok);
         }
@@ -243,6 +325,37 @@ mod search_query_tests {
         let in_src = PathBuf::from("packages/event-handler-core/src/features/events/createHandler.ts");
         assert!(!file_matches_globs(&in_tests, &globs));
         assert!(file_matches_globs(&in_src, &globs));
+    }
+
+    /// `api-core*` is a folder name, and a glob only ever matches the entry it
+    /// names — so the subtree form goes along with it, or the search finds
+    /// nothing at all (a folder has no lines to match).
+    #[test]
+    fn a_folder_pattern_covers_what_is_inside_it() {
+        let globs = parse_search_query("expiresAt **/api-core*").globs;
+        assert!(globs.contains(&"**/api-core*".to_string()), "{globs:?}");
+        assert!(globs.contains(&"**/api-core*/**".to_string()), "{globs:?}");
+        let inside = PathBuf::from("packages/api-core-sql/src/expiry.ts");
+        let elsewhere = PathBuf::from("packages/api-file-manager/src/expiry.ts");
+        assert!(file_matches_globs(&inside, &globs));
+        assert!(!file_matches_globs(&elsewhere, &globs));
+        // a bare folder pattern works the same way
+        let globs = parse_search_query("expiresAt api-core*").globs;
+        assert!(file_matches_globs(&inside, &globs), "{globs:?}");
+        // an extension is a file pattern and stays one
+        let globs = parse_search_query("expiresAt *.ts").globs;
+        assert_eq!(globs, vec!["*.ts".to_string()]);
+    }
+
+    /// The negative side needs the same treatment: `-api-core*` has to prune the
+    /// subtree, not just a file that happens to be named that.
+    #[test]
+    fn an_excluded_folder_pattern_prunes_the_subtree() {
+        let globs = parse_search_query("expiresAt -api-core*").globs;
+        let inside = PathBuf::from("packages/api-core-sql/src/expiry.ts");
+        let elsewhere = PathBuf::from("packages/api-file-manager/src/expiry.ts");
+        assert!(!file_matches_globs(&inside, &globs), "{globs:?}");
+        assert!(file_matches_globs(&elsewhere, &globs), "{globs:?}");
     }
 
     /// Exclusions stack, and a hyphenated package name is still one bare token
@@ -542,6 +655,32 @@ fn load_ws_titles() -> HashMap<String, String> {
 fn load_ws_title(root: &Path) -> Option<String> {
     load_ws_titles().remove(&root.to_string_lossy().to_string())
 }
+/// The title each folder *last* carried, kept when a workspace is reset so the
+/// Open Project list can still say what that folder was used for.
+fn ws_last_titles_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".config/tide/workspace-titles-last.json"))
+}
+
+fn load_ws_last_titles() -> HashMap<String, String> {
+    ws_last_titles_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_ws_last_title(root: &Path, title: &str) {
+    let Some(path) = ws_last_titles_path() else { return };
+    let mut m = load_ws_last_titles();
+    m.insert(root.to_string_lossy().to_string(), title.to_string());
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(s) = serde_json::to_string_pretty(&m) {
+        let _ = std::fs::write(path, s);
+    }
+}
+
 /// Set (or clear, if empty) the custom title for `root` and persist.
 fn save_ws_title(root: &Path, title: Option<&str>) {
     let Some(path) = ws_titles_path() else { return };
@@ -549,9 +688,15 @@ fn save_ws_title(root: &Path, title: Option<&str>) {
     let key = root.to_string_lossy().to_string();
     match title.map(str::trim).filter(|t| !t.is_empty()) {
         Some(t) => {
+            save_ws_last_title(root, t);
             m.insert(key, t.to_string());
         }
         None => {
+            // reset: the name is gone from the topbar, but remember it for ⌘O
+            if let Some(prev) = m.get(&key).filter(|p| !p.trim().is_empty()) {
+                let prev = prev.clone();
+                save_ws_last_title(root, &prev);
+            }
             m.remove(&key);
         }
     }
@@ -560,6 +705,45 @@ fn save_ws_title(root: &Path, title: Option<&str>) {
     }
     if let Ok(s) = serde_json::to_string_pretty(&m) {
         let _ = std::fs::write(path, s);
+    }
+}
+
+/// A workspace whose agent was deliberately started over (a reset, or ⌃N).
+/// The adapter only remembers a session once it carries messages, so the fresh
+/// empty one isn't in `session/list` — without this flag the next launch would
+/// auto-resume the very conversation the reset was meant to end. Cleared the
+/// moment the new session gets a prompt, since from then on it's the newest one
+/// anyway.
+fn ws_fresh_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".config/tide/agent-fresh.json"))
+}
+fn load_ws_fresh_set() -> HashSet<String> {
+    ws_fresh_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .map(|v| v.into_iter().collect())
+        .unwrap_or_default()
+}
+fn load_ws_fresh(root: &Path) -> bool {
+    load_ws_fresh_set().contains(&root.to_string_lossy().to_string())
+}
+fn save_ws_fresh(root: &Path, fresh: bool) {
+    let Some(path) = ws_fresh_path() else { return };
+    let mut set = load_ws_fresh_set();
+    let key = root.to_string_lossy().to_string();
+    if fresh {
+        set.insert(key);
+    } else if !set.remove(&key) {
+        return; // nothing to write: it wasn't marked
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut list: Vec<String> = set.into_iter().collect();
+    list.sort();
+    if let Ok(body) = serde_json::to_string_pretty(&list) {
+        let _ = std::fs::write(path, body);
     }
 }
 
@@ -1721,7 +1905,60 @@ fn md_row_el(row: &MdRow, selected: bool) -> AnyElement {
 /// `selected` drops the inline-code chip backgrounds: they're opaque and would
 /// paint over the row's selection highlight, leaving `code` words looking
 /// unselected inside a selected line.
+/// gpui's `compute_runs` walks highlight ranges in order and assumes they don't
+/// overlap: out-of-order or overlapping ranges shift every run after them, which
+/// is how a link's underline ended up on the prose next to it. Flatten to
+/// sorted, non-overlapping runs, merging the styles that cover each stretch.
+fn merged_highlights(
+    spans: Vec<(std::ops::Range<usize>, gpui::HighlightStyle)>,
+) -> Vec<(std::ops::Range<usize>, gpui::HighlightStyle)> {
+    let mut bounds: Vec<usize> = Vec::with_capacity(spans.len() * 2);
+    for (r, _) in &spans {
+        bounds.push(r.start);
+        bounds.push(r.end);
+    }
+    bounds.sort_unstable();
+    bounds.dedup();
+    let mut out: Vec<(std::ops::Range<usize>, gpui::HighlightStyle)> = Vec::new();
+    for w in bounds.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if a >= b {
+            continue;
+        }
+        // later spans win per field, which is why links (pushed last) keep their
+        // colour over an inline-code style underneath
+        let mut style: Option<gpui::HighlightStyle> = None;
+        for (r, st) in &spans {
+            if r.start <= a && r.end >= b {
+                style = Some(match style {
+                    Some(acc) => acc.highlight(*st),
+                    None => *st,
+                });
+            }
+        }
+        if let Some(style) = style {
+            // extend the previous run when the style is identical
+            match out.last_mut() {
+                Some((pr, pst)) if pr.end == a && *pst == style => pr.end = b,
+                _ => out.push((a..b, style)),
+            }
+        }
+    }
+    out
+}
+
 fn md_styled_sel(row: &MdRow, bold: bool, selected: bool) -> gpui::StyledText {
+    md_styled_links(row, bold, selected, &[])
+}
+
+/// As `md_styled_sel`, plus `links` drawn underlined in the accent colour — the
+/// file references the transcript makes clickable.
+fn md_styled_links(
+    row: &MdRow,
+    bold: bool,
+    selected: bool,
+    links: &[std::ops::Range<usize>],
+) -> gpui::StyledText {
     let mut hl: Vec<(std::ops::Range<usize>, gpui::HighlightStyle)> = row
         .highlights
         .iter()
@@ -1743,10 +1980,28 @@ fn md_styled_sel(row: &MdRow, bold: bool, selected: bool) -> gpui::StyledText {
             },
         ));
     }
-    let mono: Vec<(std::ops::Range<usize>, SharedString)> =
+    for r in links {
+        if row.text.is_char_boundary(r.start) && row.text.is_char_boundary(r.end.min(row.text.len()))
+        {
+            hl.push((
+                r.start..r.end.min(row.text.len()),
+                gpui::HighlightStyle {
+                    color: Some(rgb(ACCENT).into()),
+                    underline: Some(gpui::UnderlineStyle {
+                        thickness: px(1.),
+                        color: Some(rgb(ACCENT).into()),
+                        wavy: false,
+                    }),
+                    ..Default::default()
+                },
+            ));
+        }
+    }
+    let mut mono: Vec<(std::ops::Range<usize>, SharedString)> =
         row.mono.iter().cloned().map(|r| (r, SharedString::from("Menlo"))).collect();
+    mono.sort_by_key(|(r, _)| r.start);
     gpui::StyledText::new(row.text.clone())
-        .with_highlights(hl)
+        .with_highlights(merged_highlights(hl))
         .with_font_family_overrides(mono)
 }
 
@@ -1828,12 +2083,120 @@ fn changed_packages(root: &Path, base: &str) -> Vec<String> {
     names
 }
 
+/// An image pasted into the agent composer: what the adapter needs (mime type
+/// and base64) plus the decoded bytes, so the chip can show it and hovering can
+/// preview it.
+#[derive(Clone)]
+struct PastedImage {
+    mime: String,
+    b64: String,
+    bytes: usize,
+    image: Arc<gpui::Image>,
+    /// The token written into the message text (`Image #1`), so the chip and the
+    /// prose refer to the same picture — Claude Code does the same thing.
+    label: String,
+}
+
+/// A picture that went out with a message. The base64 the wire needed is not
+/// kept — only what it takes to show the chip again.
+#[derive(Clone)]
+struct SentImage {
+    label: String,
+    mime: String,
+    bytes: usize,
+    image: Arc<gpui::Image>,
+}
+
+/// Tooltip that shows a pasted image at a readable size.
+struct ImagePreview {
+    image: Arc<gpui::Image>,
+}
+
+impl Render for ImagePreview {
+    fn render(&mut self, _w: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .p_1()
+            .bg(rgb(POPUP_BG))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .rounded_md()
+            .shadow_lg()
+            .child(gpui::img(self.image.clone()).max_w(px(840.)).max_h(px(640.)))
+    }
+}
+
+/// The `[Image #3]` token ending at `caret` (a trailing space counts as part of
+/// it), as `(start, end, label)`. Used to make backspace remove the whole token
+/// — and its attachment — rather than one character of it.
+fn image_token_before(text: &str, caret: usize) -> Option<(usize, usize, String)> {
+    let end = caret.min(text.len());
+    let head = text.get(..end)?;
+    let head = head.strip_suffix(' ').unwrap_or(head);
+    let head = head.strip_suffix(']')?;
+    let open = head.rfind('[')?;
+    let label = head.get(open + 1..)?;
+    is_atomic_label(label).then(|| (open, end, label.to_string()))
+}
+
+/// Labels the composer treats as one unit: pasted images and collapsed pastes.
+fn is_atomic_label(label: &str) -> bool {
+    label.starts_with("Image #") || label.starts_with("Pasted text #")
+}
+
+/// The `[Image #3]` token starting at `caret`, as `(start, end)`.
+fn image_token_after(text: &str, caret: usize) -> Option<(usize, usize)> {
+    let start = caret.min(text.len());
+    let tail = text.get(start..)?;
+    if !tail.starts_with("[Image #") && !tail.starts_with("[Pasted text #") {
+        return None;
+    }
+    let close = tail.find(']')?;
+    let mut end = start + close + 1;
+    if text.get(end..).is_some_and(|r| r.starts_with(' ')) {
+        end += 1; // the space the paste added travels with it
+    }
+    Some((start, end))
+}
+
+/// The `[Image #3]` token that `caret` sits strictly inside, as `(start, end)`.
+/// Word motions (⌥←/⌥→) land mid-token otherwise, which puts the caret in the
+/// middle of something that behaves like one character.
+fn image_token_around(text: &str, caret: usize) -> Option<(usize, usize)> {
+    let mut at = 0usize;
+    loop {
+        let rest = text.get(at..)?;
+        let rel = match (rest.find("[Image #"), rest.find("[Pasted text #")) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => break,
+        };
+        let start = at + rel;
+        let Some(close) = text.get(start..)?.find(']') else { break };
+        let mut end = start + close + 1;
+        if text.get(end..).is_some_and(|r| r.starts_with(' ')) {
+            end += 1;
+        }
+        if caret > start && caret < end {
+            return Some((start, end));
+        }
+        at = end;
+    }
+    None
+}
+
 /// Comments quoted out of the agent's answer aren't attached to a file, so they
 /// carry this sentinel path (line 0) instead. Rendered as "agent answer".
 const AGENT_SRC: &str = "<agent answer>";
 
 fn is_agent_src(path: &Path) -> bool {
     path.components().any(|c| c.as_os_str() == AGENT_SRC)
+}
+
+/// Which transcript message a comment on the answer belongs to — the index the
+/// sentinel path carries as its last segment.
+fn agent_msg_index(path: &Path) -> Option<usize> {
+    is_agent_src(path).then(|| path.file_name()?.to_str()?.parse().ok()).flatten()
 }
 
 /// Markdown by extension — the only files that get a rendered view.
@@ -2483,6 +2846,9 @@ enum GitAction {
 enum GitItem {
     Action(GitAction, &'static str, &'static str), // action, label, icon
     Branch(String),
+    /// Typing a bare number offers that PR: checking it out asks `gh` for the
+    /// head branch, so you never have to look the name up first.
+    Pr(u64),
 }
 
 /// Per-branch actions, shown in a submenu when you press enter on a branch in
@@ -2503,6 +2869,8 @@ enum Cmd {
     OpenPr,
     CreatePr,
     Build,
+    InstallBuild,
+    BuildPreview,
     GitAdd,
     Pull,
     Fetch,
@@ -2526,10 +2894,12 @@ enum Cmd {
     SetWorkspaceTitle,
     ResetWorkspace,
     ResetWorkspaceClose,
+    ResetWorkspacePause,
     TogglePause,
     AddComment,
     ShowComments,
     SendComments,
+    OpenRepository,
     InstallUsageBars,
 }
 
@@ -2542,12 +2912,14 @@ const PALETTE: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::MyPrs, "My PRs", IC_PR, ""),
     (Cmd::ReleasePrs, "Release PRs", IC_PR, ""),
     (Cmd::CheckoutNext, "Checkout / Pull Next", IC_HOME, ""),
-    (Cmd::Build, "Build", IC_TOOLS, ""),
+    (Cmd::Build, "Build", IC_TOOLS, "⌘⇧B"),
+    (Cmd::InstallBuild, "Install and Build", IC_TOOLS, ""),
+    (Cmd::BuildPreview, "What Needs Rebuilding", IC_TOOLS, ""),
     (Cmd::GitAdd, "Git Add", IC_ADD, ""),
     (Cmd::Pull, "Pull", IC_HOME, ""),
     (Cmd::Fetch, "Fetch", IC_HOME, ""),
     (Cmd::NewBranch, "New Branch", IC_BRANCH, ""),
-    (Cmd::Commit, "Commit…", IC_COMMIT, "⌘K"),
+    (Cmd::Commit, "Commit…", IC_COMMIT, ""),
     (Cmd::GitPopup, "Branches & Git Actions", IC_BRANCH, "⌥B"),
     (Cmd::ShowDiff, "Show Diff", IC_PR, "⌘D"),
     (Cmd::ToggleTerminal, "Toggle Terminal", IC_TERMINAL, "⌥F12"),
@@ -2561,12 +2933,14 @@ const PALETTE: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::ResolveConflicts, "Resolve Merge Conflicts", IC_BRANCH, ""),
     (Cmd::OpenAdmin, "Open Admin", IC_BROWSER, ""),
     (Cmd::SetWorkspaceTitle, "Set Workspace Title…", IC_HOME, ""),
-    (Cmd::ResetWorkspace, "Reset Workspace  (default branch + clear title & PR)", IC_HOME, ""),
+    (Cmd::ResetWorkspace, "Reset Workspace", IC_HOME, ""),
     (Cmd::ResetWorkspaceClose, "Reset Workspace & Close", IC_HOME, ""),
+    (Cmd::ResetWorkspacePause, "Reset Workspace & Pause", IC_HOME, ""),
     (Cmd::TogglePause, "Pause / Resume Workspace  (⌥Tab skips paused)", IC_HOME, ""),
     (Cmd::AddComment, "Comment on This Line…", IC_COMMIT, "⌥C"),
     (Cmd::ShowComments, "Review Comments…", IC_COMMIT, "⌥⇧C"),
-    (Cmd::SendComments, "Send Comments to Agent", IC_PUSH, "⌥↩ / ⌘⇧S"),
+    (Cmd::SendComments, "Send Comments to Agent", IC_PUSH, "⌥↩ / ⌘F12"),
+    (Cmd::OpenRepository, "Open Repository or Project…  (clones a GitHub URL into ~/dev)", IC_FILES, "⌘O"),
     (Cmd::InstallUsageBars, "Install Plan Usage Bars (statusline shim)", IC_GRAPH, ""),
 ];
 
@@ -3095,6 +3469,28 @@ fn split_title(title: &str) -> (Option<usize>, String) {
     (None, title.to_string())
 }
 
+/// A title an agent proposed, given the same type prefix a human picks in the
+/// title dialog: `fix: sql date bug` → `🐛 sql date bug`. Conventional-commit
+/// scopes (`fix(api):`) are accepted and dropped. A title that already carries
+/// an emoji, or whose prefix isn't one of ours, is left exactly as sent.
+fn typed_title(proposed: &str) -> String {
+    let t = proposed.trim();
+    if split_title(t).0.is_some() {
+        return t.to_string();
+    }
+    let Some((head, rest)) = t.split_once(':') else { return t.to_string() };
+    let key = head.trim().to_ascii_lowercase();
+    let key = key.split('(').next().unwrap_or(&key).trim();
+    let Some((_, emoji, _)) = TITLE_TYPES.iter().find(|(k, _, _)| *k == key) else {
+        return t.to_string();
+    };
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return t.to_string();
+    }
+    format!("{emoji} {rest}")
+}
+
 /// The workspace number in the topbar and the quick-jump keys in the project
 /// switcher: a bare number, fixed-width so a column of them stays aligned.
 fn key_cap(label: impl Into<SharedString>, dim: bool) -> Div {
@@ -3197,8 +3593,12 @@ const RC_NOTE_H: f32 = 20.0;
 /// Chrome around the comment input: header, padding, borders, button row.
 const RC_BOX_CHROME: f32 = 74.0;
 const RC_LINE_H: f32 = 16.0;
-/// Breathing room between the box and the code above/below it.
+/// Inset from the line's left edge, so the box doesn't start hard against the
+/// gutter.
 const RC_BOX_PAD: f32 = 6.0;
+/// Breathing room above and below the box: the code it pushes apart shouldn't
+/// look glued to its border.
+const RC_BOX_VPAD: f32 = 12.0;
 /// The input always looks like a text area, never a one-line field.
 const RC_MIN_LINES: usize = 3;
 const RC_MAX_LINES: usize = 20;
@@ -3241,7 +3641,160 @@ fn rc_scroll_off(f: &Field) -> f32 {
 
 /// Total space the editor has to reserve for the box: the box plus its padding.
 fn rc_gap_h(text: &str, replies: &[ReviewReply]) -> f32 {
-    rc_box_h(text, replies) + RC_BOX_PAD * 2.0
+    rc_box_h(text, replies) + RC_BOX_VPAD * 2.0
+}
+
+/// A repo reference typed into the Open Project dialog: a GitHub URL, an SSH
+/// remote, or `owner/repo`. Returns `(clone target, folder name)`.
+fn parse_repo_ref(input: &str) -> Option<(String, String)> {
+    let raw = input.trim().trim_end_matches('/');
+    if raw.is_empty() || raw.contains(char::is_whitespace) {
+        return None;
+    }
+    // git@host:owner/repo(.git)
+    if let Some((_, path)) = raw.split_once(':').filter(|_| raw.starts_with("git@")) {
+        let name = path.rsplit('/').next()?.trim_end_matches(".git");
+        return (!name.is_empty()).then(|| (raw.to_string(), name.to_string()));
+    }
+    if let Some(rest) = raw.strip_prefix("https://").or_else(|| raw.strip_prefix("http://")) {
+        let mut parts = rest.split('/');
+        let host = parts.next()?;
+        let owner = parts.next()?;
+        // a URL deeper than the repo (/tree/main/src/…) still names the repo
+        let repo = parts.next()?.trim_end_matches(".git");
+        if host.is_empty() || owner.is_empty() || repo.is_empty() {
+            return None;
+        }
+        return Some((format!("https://{host}/{owner}/{repo}.git"), repo.to_string()));
+    }
+    // owner/repo — only when it isn't a path on this machine
+    let (owner, repo) = raw.split_once('/')?;
+    let looks_like_path = raw.starts_with('~')
+        || raw.starts_with('.')
+        || repo.contains('/')
+        || PathBuf::from(raw).exists();
+    let ok = !looks_like_path
+        && !owner.is_empty()
+        && !repo.is_empty()
+        && raw.chars().all(|c| c.is_alphanumeric() || "._-/".contains(c));
+    ok.then(|| (format!("https://github.com/{owner}/{repo}.git"), repo.trim_end_matches(".git").to_string()))
+}
+
+/// Where a cloned repo lands: alongside the projects already there.
+fn clone_root() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    PathBuf::from(home).join("dev")
+}
+
+/// A file reference inside agent prose: `Icon.tsx:14`, `Icon.tsx:14,25`, or
+/// `packages/api-aco/src/x.ts:31`. Returns the byte range in `text`, the path as
+/// written, and the first line number.
+#[derive(Clone, Debug, PartialEq)]
+struct FileRef {
+    range: std::ops::Range<usize>,
+    path: String,
+    line: usize,
+}
+
+/// What a link in the transcript points at.
+#[derive(Clone)]
+enum LinkTarget {
+    /// A file in the project, at a line (0 = no line given).
+    File(String, usize),
+    Url(String),
+}
+
+/// Scan `text` for `http(s)://…` runs. A URL ends at whitespace, and trailing
+/// sentence punctuation is left out of it — `see https://x.com/a.` links `a`,
+/// not `a.` — but a closing bracket is kept when the URL opened one.
+fn url_spans(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let b = text.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        let rest = &text[i..];
+        if !(rest.starts_with("http://") || rest.starts_with("https://")) {
+            i += 1;
+            while i < b.len() && !text.is_char_boundary(i) {
+                i += 1;
+            }
+            continue;
+        }
+        let mut end = i + rest.find(char::is_whitespace).unwrap_or(rest.len());
+        // `(https://x)` and `<https://x>` are wrappers, not part of the address
+        while end > i {
+            let last = text[i..end].chars().next_back().unwrap_or(' ');
+            let unbalanced = last == ')' && !text[i..end].contains('(');
+            if matches!(last, '.' | ',' | ';' | ':' | '!' | '?' | '"' | '\'' | '>' | ']' | '}')
+                || unbalanced
+            {
+                end -= last.len_utf8();
+            } else {
+                break;
+            }
+        }
+        // "https://" on its own isn't a link
+        if text[i..end].len() > "https://".len() {
+            out.push(i..end);
+        }
+        i = end.max(i + 1);
+    }
+    out
+}
+
+/// Scan `text` for file references. Deliberately narrow: something that looks
+/// like a filename with an extension, optionally followed by `:line`. Prose like
+/// "3 files" or "10:30" never matches, since a path needs a dot-extension.
+fn file_refs(text: &str) -> Vec<FileRef> {
+    const EXTS: &[&str] = &[
+        "ts", "tsx", "js", "jsx", "mjs", "cjs", "rs", "toml", "json", "md", "css", "scss", "html",
+        "yml", "yaml", "sh", "py", "go", "java", "sql", "txt", "lock", "env",
+    ];
+    let b = text.as_bytes();
+    let is_path_char = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-' | b'/' | b'@');
+    let mut out: Vec<FileRef> = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        if !is_path_char(b[i]) || (i > 0 && is_path_char(b[i - 1])) {
+            i += 1;
+            continue;
+        }
+        // the run of path-ish characters starting here
+        let start = i;
+        let mut end = i;
+        while end < b.len() && is_path_char(b[end]) {
+            end += 1;
+        }
+        i = end;
+        let word = &text[start..end];
+        let word = word.trim_end_matches('.'); // sentence punctuation
+        let end = start + word.len();
+        let Some(dot) = word.rfind('.') else { continue };
+        let ext = &word[dot + 1..];
+        if !EXTS.contains(&ext) || word.starts_with('.') && !word[1..].contains('.') {
+            continue;
+        }
+        // optional ":line" (and a second number after a comma, which we ignore)
+        let mut ref_end = end;
+        let mut line = 0usize;
+        if text[end..].starts_with(':') {
+            let digits: String = text[end + 1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty() {
+                line = digits.parse().unwrap_or(0);
+                ref_end = end + 1 + digits.len();
+                // `Icon.tsx:14,25` — a second line number belongs to the same ref
+                if text[ref_end..].starts_with(',') {
+                    let more: String =
+                        text[ref_end + 1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if !more.is_empty() {
+                        ref_end += 1 + more.len();
+                    }
+                }
+            }
+        }
+        out.push(FileRef { range: start..ref_end, path: word.to_string(), line });
+    }
+    out
 }
 
 /// Where a project's review comments live between runs. Keyed by project path,
@@ -3271,6 +3824,7 @@ fn review_to_json(root: &Path, comments: &[ReviewComment]) -> String {
                 "text": c.text,
                 "draft": c.draft,
                 "sent": c.sent,
+                "resolved": c.resolved,
                 "replies": c
                     .replies
                     .iter()
@@ -3306,6 +3860,7 @@ fn review_from_json(root: &Path, body: &str) -> Vec<ReviewComment> {
                 text,
                 draft: v.get("draft").and_then(|d| d.as_bool()).unwrap_or(false),
                 sent: v.get("sent").and_then(|d| d.as_bool()).unwrap_or(false),
+                resolved: v.get("resolved").and_then(|d| d.as_bool()).unwrap_or(false),
                 replies: v
                     .get("replies")
                     .and_then(|r| r.as_array())
@@ -3335,8 +3890,23 @@ fn load_review(root: &Path) -> Vec<ReviewComment> {
 /// Format `(reference, snippet, note)` triples as the message typed into the
 /// agent's pane: numbered, with the code quoted so the agent sees what was meant
 /// without having to guess which lines moved.
-fn format_review(items: &[ReviewItem]) -> String {
-    let mut out = String::from("Review comments from TIDE — please address each:\n\n");
+fn format_review(items: &[ReviewItem], note: &str) -> String {
+    let mut out = String::new();
+    // a general note reads first: it's the frame the line comments sit in
+    if !note.trim().is_empty() {
+        out.push_str("Review from TIDE.\n\n");
+        for line in note.trim().lines() {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push('\n');
+        if items.is_empty() {
+            return out;
+        }
+        out.push_str("Comments on specific lines — please address each:\n\n");
+    } else {
+        out.push_str("Review comments from TIDE — please address each:\n\n");
+    }
     for (i, it) in items.iter().enumerate() {
         out.push_str(&format!("{}. [{}] {}\n", i + 1, it.id, it.reference));
         for line in it.snippet.lines().take(12) {
@@ -3406,6 +3976,9 @@ struct ReviewComment {
     sent: bool,
     /// The thread: the agent's answers, and any follow-ups you add.
     replies: Vec<ReviewReply>,
+    /// Done with: hidden from the open list and from everything that counts
+    /// comments, but kept, so a thread resolved too early can be reopened.
+    resolved: bool,
 }
 
 /// An in-flight drag of the divider between `kids[ix]` and `kids[ix + 1]` of the
@@ -3527,13 +4100,19 @@ struct Storm {
     /// True when the box is writing a *follow-up* in a thread rather than editing
     /// the original note — the default once an answer has arrived.
     rc_reply_mode: bool,
+    /// The review pane is showing the resolved threads instead of the open ones.
+    review_resolved_tab: bool,
     /// User-dragged height of the thread area in the comment box (`None` = size
     /// to content), and the in-flight drag: (mouse origin y, height at grab).
     /// Review-pane rows (by comment id) whose thread is shown in full. Collapsed
     /// is the default: a long back-and-forth would otherwise fill the pane.
     review_expanded: HashSet<String>,
     rc_thread_h: Option<f32>,
-    rc_resize: Option<(f32, f32)>,
+    /// Drag on the box's bottom edge or corner: `(origin x, origin y, width at
+    /// grab, thread height at grab, corner)`. The corner drags both axes.
+    rc_resize: Option<(f32, f32, f32, f32, bool)>,
+    /// User-set box width (corner drag); `None` sizes to the pane.
+    rc_width: Option<f32>,
     ws_idle: bool,   // persisted "nobody is on this workspace" marker
     ws_paused: bool, // persisted "skip me in ⌥Tab" marker
     show_terminal: bool,
@@ -3547,7 +4126,13 @@ struct Storm {
     run_running: bool,
     run_active: bool, // a command is running or just finished (toast visible)
     run_failed: bool,
-    run_spin: usize, // spinner frame
+    run_spin: usize,
+    /// Live progress for `yarn build --json` runs; `None` for anything else.
+    run_progress: Option<build::Progress>,
+    /// What a build would do, as of the last check (`yarn build --preview
+    /// --json`). `None` until asked; refreshed after a build finishes.
+    build_preview: Option<build::Preview>,
+    build_checking: bool,
     run_gen: u64,
     run_buf: Arc<Mutex<Vec<String>>>, // appended by the reader thread
     run_dirty: Arc<AtomicBool>,
@@ -3586,6 +4171,9 @@ struct Storm {
     pr_gen: u64,
     pr_loading: bool,
     pr_node_id: Option<String>, // PR GraphQL node id, for marking files viewed
+    /// `/viewed` batches that arrived before the PR's file list was loaded; they
+    /// are applied as soon as it is.
+    pr_viewed_queued: Vec<rpc::Viewed>,
     pr_filter: Field,
     pr_filter_focus: FocusHandle,
     pr_view_filter: PrViewFilter,
@@ -3604,6 +4192,12 @@ struct Storm {
     finder_dirs_mode: bool,
     all_files: Vec<PathBuf>,
     all_dirs: Vec<PathBuf>,
+    // memoized `path as written -> real file` for agent-transcript references,
+    // so styling a link doesn't rescan the file list on every frame
+    ref_hits: HashMap<String, Option<PathBuf>>,
+    // the file index is scanned lazily (the finder, or the first transcript
+    // reference that needs resolving); true once that scan has been kicked off
+    files_scanned: bool,
     // go-to-line dialog
     goto_open: bool,
     goto_focus: FocusHandle,
@@ -3650,6 +4244,7 @@ struct Storm {
     newproj_path: Field,
     newproj_recents: Vec<PathBuf>, // recent projects, loaded when the dialog opens
     newproj_titles: HashMap<String, String>, // their custom titles, same load
+    newproj_last_titles: HashMap<String, String>, // titles those folders used to have
     newproj_sel: usize,            // highlighted row in the filtered recents list
     // commit message
     commit_msg: Field,
@@ -3760,6 +4355,9 @@ struct Storm {
     // workspace (multi-project) info, pushed down by the Workspace each render
     ws_names: Vec<String>,
     ws_branches: Vec<String>,
+    /// Each workspace's rolled-up agent state, pushed down by the parent so the
+    /// topbar can show the same tally the ⌘E switcher does.
+    ws_states: Vec<Option<AgentState>>,
     ws_roots: Vec<PathBuf>, // roots of every open workspace (for "already open")
     ws_active: usize,
     ws_open: bool, // project-switcher dropdown expanded
@@ -3768,6 +4366,9 @@ struct Storm {
     agent_share: f32,                // fraction of the terminal dock's height
     resizing_agent: bool,            // dragging the divider under the agent
     agent_zoomed: bool,              // ⌘⇧↩ on the agent: take the whole dock
+    /// ⌘⇧↩ on a terminal pane: the mirror image — the panes take the whole dock
+    /// and the agent is hidden until it's toggled back.
+    term_zoomed: bool,
     acp: Option<Arc<acp::Acp>>,      // lazily spawned on first open
     acp_polling: bool,               // the drain poll loop is running
     agent_msgs: Vec<AgentMsg>,       // conversation transcript
@@ -3784,7 +4385,12 @@ struct Storm {
     /// Whether this workspace already auto-resumed once — reopening the panel
     /// shouldn't throw away the conversation you're in the middle of.
     agent_resumed: bool,
+    /// The agent was started over here (reset, or ⌃N) and hasn't been prompted
+    /// since. Persisted, so a restart doesn't resume what was thrown away.
+    agent_fresh: bool,
     agent_picker: bool,              // the resume list is open
+    /// The briefing panel: what TIDE tells the agent before your first prompt.
+    agent_brief_open: bool,
     agent_title: Option<String>,     // the adapter's title for this session
     /// Rows selected in one agent message: `(message, anchor row, current row)`.
     /// Row granularity on purpose — pixel→byte mapping through gpui's text
@@ -3792,23 +4398,55 @@ struct Storm {
     /// all), and a paragraph is the unit you actually want to ask about.
     agent_sel: Option<(usize, usize, usize)>,
     agent_sel_drag: bool,
+    /// Row a press landed on, before any movement: `(message, row)`. Holding it
+    /// here keeps a plain click free for the file links inside the row.
+    agent_sel_armed: Option<(usize, usize)>,
     /// True once a drag has actually extended the selection — a bare click
     /// shouldn't pop the comment box open.
     agent_sel_moved: bool,
     /// Where the selection was last touched, in window coordinates: the comment
     /// box opens there instead of centred over the editor.
     agent_sel_pos: Option<(f32, f32)>,
-    /// Images pasted into the composer, waiting to go with the next prompt:
-    /// `(mime type, base64 bytes, byte size)`.
-    agent_imgs: Vec<(String, String, usize)>,
+    /// Images pasted into the composer, waiting to go with the next prompt.
+    agent_imgs: Vec<PastedImage>,
+    /// Numbers the `[Image #N]` tokens; never reused within a session so a
+    /// dropped attachment can't renumber the ones already typed.
+    agent_img_seq: usize,
+    /// Long pastes, collapsed to a `[Pasted text #N +M lines]` token in the box
+    /// and expanded again when the message is sent.
+    agent_pastes: HashMap<usize, String>,
+    agent_paste_seq: usize,
+    /// A general note for the whole review — the PR-review body, not tied to a
+    /// line — sent with the next batch.
+    review_note: Field,
+    review_note_focus: FocusHandle,
     /// Snippet for a comment whose source isn't a file (the agent's answer).
     rc_snippet: Option<String>,
     /// Spinner frame + when the running turn started, for the live "thinking" row.
     agent_spin: usize,
     agent_turn_start: Option<std::time::Instant>,
+    /// Whether this session has been told how to reach TIDE (a hidden preamble
+    /// on the first prompt, so the transcript stays yours).
+    agent_briefed: bool,
+    /// Ghost completion for the composer: the rest of the most recent message
+    /// that starts with what's typed. ⇥ accepts it.
+    agent_ghost: Option<String>,
+    /// The "my messages" jump list in the agent header is open, and its filter.
+    /// `@` completion in the composer: what's typed after the `@`, the matches,
+    /// and where the `@` sits in the text.
+    at_open: bool,
+    at_start: usize,
+    at_sel: usize,
+    at_items: Vec<Mention>,
+    /// `@token` → what the agent is sent in its place, for every mention picked
+    /// since the composer was last cleared.
+    agent_mentions: HashMap<String, String>,
+    agent_jump_open: bool,
+    agent_jump_query: Field,
+    agent_jump_focus: FocusHandle,
     /// Prompts typed while a turn was still running, sent in order as each turn
     /// ends — the same queueing Claude Code does in the terminal.
-    agent_queue: Vec<String>,
+    agent_queue: Vec<(String, Option<String>)>,
     /// Virtualized transcript state, and the item count it was last told about.
     agent_list: gpui::ListState,
     agent_list_len: usize,
@@ -3870,6 +4508,8 @@ struct Storm {
 /// Navigation requests a project view sends up to the workspace.
 enum ProjectNav {
     Switch(usize),
+    /// Open the ⌘E switcher (the dialog lives on the parent).
+    Switcher,
     Open,
     OpenPath(PathBuf), // open a project at a specific folder path (from the new-project dialog)
     Remove(usize),
@@ -3913,6 +4553,7 @@ impl Storm {
         let ws_idle = load_ws_idle(&root);
         let ws_paused = load_ws_paused(&root);
         let ws_client = load_ws_client(&root);
+        let agent_fresh = load_ws_fresh(&root);
         let review = load_review(&root);
         let mut s = Self {
             root,
@@ -3920,7 +4561,7 @@ impl Storm {
             entries: Vec::new(),
             tabs: Vec::new(),
             active: 0,
-            tree_width: 280.,
+            tree_width: 420.,
             resizing: false,
             tree_scroll: UniformListScrollHandle::new(),
             tree_focus: cx.focus_handle(),
@@ -3930,6 +4571,7 @@ impl Storm {
             pr_files: Vec::new(),
             pr_viewed: HashSet::new(),
             pr_viewed_pending: Arc::new(Mutex::new(HashMap::new())),
+            pr_viewed_queued: Vec::new(),
             pr_collapsed: HashSet::new(),
             pr_base: String::new(),
             pr_stale: None,
@@ -3955,9 +4597,11 @@ impl Storm {
             rc_query: Field::default(),
             rc_target: None,
             rc_reply_mode: false,
+            review_resolved_tab: false,
             review_expanded: HashSet::new(),
             rc_thread_h: None,
             rc_resize: None,
+            rc_width: None,
             ws_idle,
             ws_paused,
             active_term: 0,
@@ -3971,6 +4615,9 @@ impl Storm {
             run_active: false,
             run_failed: false,
             run_spin: 0,
+            run_progress: None,
+            build_preview: None,
+            build_checking: false,
             run_gen: 0,
             run_buf: Arc::new(Mutex::new(Vec::new())),
             run_dirty: Arc::new(AtomicBool::new(false)),
@@ -3996,6 +4643,8 @@ impl Storm {
             finder_gen: 0,
             finder_dirs_mode: false,
             all_files: Vec::new(),
+            ref_hits: HashMap::new(),
+            files_scanned: false,
             all_dirs: Vec::new(),
             goto_open: false,
             goto_focus: cx.focus_handle(),
@@ -4032,6 +4681,7 @@ impl Storm {
             newproj_path: Field::default(),
             newproj_recents: Vec::new(),
             newproj_titles: HashMap::new(),
+            newproj_last_titles: HashMap::new(),
             newproj_sel: 0,
             commit_msg: Field::default(),
             commit_focus: cx.focus_handle(),
@@ -4115,6 +4765,7 @@ impl Storm {
             ws_names: Vec::new(),
             ws_roots: Vec::new(),
             ws_branches: Vec::new(),
+            ws_states: Vec::new(),
             ws_active: 0,
             ws_open: false,
             // the agent pane is the default right-hand view; it starts zoomed,
@@ -4125,6 +4776,7 @@ impl Storm {
             agent_share: 0.78,
             resizing_agent: false,
             agent_zoomed: true,
+            term_zoomed: false,
             acp: None,
             acp_polling: false,
             agent_msgs: Vec::new(),
@@ -4137,16 +4789,34 @@ impl Storm {
             agent_sessions: Vec::new(),
             agent_autoresume: false,
             agent_resumed: false,
+            agent_fresh,
             agent_picker: false,
+            agent_brief_open: false,
             agent_title: None,
             agent_sel: None,
             agent_sel_drag: false,
+            agent_sel_armed: None,
             agent_sel_moved: false,
             agent_sel_pos: None,
             agent_imgs: Vec::new(),
+            agent_img_seq: 0,
+            agent_pastes: HashMap::new(),
+            agent_paste_seq: 0,
+            review_note: Field::multiline(),
+            review_note_focus: cx.focus_handle(),
             rc_snippet: None,
             agent_spin: 0,
             agent_turn_start: None,
+            agent_briefed: false,
+            agent_ghost: None,
+            at_open: false,
+            at_start: 0,
+            at_sel: 0,
+            at_items: Vec::new(),
+            agent_mentions: HashMap::new(),
+            agent_jump_open: false,
+            agent_jump_query: Field::default(),
+            agent_jump_focus: cx.focus_handle(),
             agent_queue: Vec::new(),
             agent_list: gpui::ListState::new(0, gpui::ListAlignment::Bottom, px(600.)),
             agent_list_len: 0,
@@ -4420,6 +5090,51 @@ impl Storm {
         self.start_usage_poll(cx);
     }
 
+    /// Ask "what would a build do?" once — `yarn build --preview --json`, which
+    /// builds nothing and takes ~2s. On demand only: polling meant every open
+    /// workspace (paused ones included) spawning a yarn every few seconds.
+    fn refresh_build_preview(&mut self, cx: &mut Context<Self>) {
+        let root = self.root.clone();
+        if !root.join("scripts/buildPackages").is_dir() {
+            self.show_flash("No package build in this project", cx);
+            return;
+        }
+        self.build_checking = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let preview = cx
+                .background_executor()
+                .spawn(async move {
+                    let out = Command::new("zsh")
+                        .arg("-lc")
+                        .arg("yarn build --preview --json 2>/dev/null")
+                        .current_dir(&root)
+                        .output()
+                        .ok()?;
+                    // parse stdout, not the exit code: a preview always exits 0
+                    build::parse_preview(&String::from_utf8_lossy(&out.stdout))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.build_checking = false;
+                match preview {
+                    Some(p) => {
+                        let msg = if p.to_build == 0 {
+                            format!("All {} packages are up to date", p.total)
+                        } else {
+                            format!("{} of {} packages need a rebuild", p.to_build, p.total)
+                        };
+                        this.build_preview = Some(p);
+                        this.show_flash(&msg, cx);
+                    }
+                    None => this.show_flash("Could not read the build preview", cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Re-read the statusline dump so the usage chip follows the session. Cheap:
     /// one small file, and only when it changed.
     fn start_usage_poll(&self, cx: &mut Context<Self>) {
@@ -4644,10 +5359,41 @@ impl Storm {
             cx.background_executor().timer(Duration::from_millis(250)).await;
             let alive = this
                 .update(cx, |this, cx| {
-                    let (reports, replies) = match this.agent_rpc.as_ref() {
-                        Some(s) => (s.drain(), s.drain_replies()),
-                        None => (Vec::new(), Vec::new()),
+                    let (reports, replies, refresh, titles, viewed) = match this.agent_rpc.as_ref()
+                    {
+                        Some(s) => (
+                            s.drain(),
+                            s.drain_replies(),
+                            s.take_refresh(),
+                            s.drain_titles(),
+                            s.drain_viewed(),
+                        ),
+                        None => (Vec::new(), Vec::new(), false, Vec::new(), Vec::new()),
                     };
+                    for batch in viewed {
+                        this.apply_agent_viewed(&batch, false, cx);
+                    }
+                    // a proposed name is only taken when this workspace has none:
+                    // an agent never renames work you named yourself
+                    if let Some(t) = titles.into_iter().next().map(|t| typed_title(&t)) {
+                        if this.ws_title.as_ref().map(|t| t.trim().is_empty()).unwrap_or(true) {
+                            this.ws_title = Some(t.clone());
+                            save_ws_title(&this.root, Some(&t));
+                            this.ws_idle = false;
+                            save_ws_idle(&this.root, false);
+                            this.show_flash(&format!("Workspace named “{t}”"), cx);
+                            cx.notify();
+                        }
+                    }
+                    if refresh {
+                        // an agent opened a PR or switched branch: re-read now
+                        // instead of waiting for ⌘R
+                        this.pr_link_branch.clear(); // forces the git poll to re-query
+                        this.refresh_pr_link(cx);
+                        this.load_pr(cx);
+                        this.check_admin_now(cx);
+                        cx.notify();
+                    }
                     if !replies.is_empty() {
                         let mut landed = 0usize;
                         for r in replies {
@@ -4817,7 +5563,11 @@ impl Storm {
         let ix = self.active_term;
         let Some(tab) = self.term_tabs.get_mut(ix) else { return };
         tab.active = cur.entity_id();
-        tab.zoomed = !tab.zoomed;
+        let zoom = !tab.zoomed;
+        tab.zoomed = zoom;
+        // "full screen" means the whole dock: hide the sibling panes *and* the
+        // agent above them, or a zoomed pane just fills the strip it had
+        self.term_zoomed = zoom;
         self.focus_pane(&cur, window, cx);
         cx.notify();
     }
@@ -4883,6 +5633,7 @@ impl Storm {
     fn focus_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_terminal = true;
         self.agent_open = true;
+        self.term_zoomed = false;
         self.ensure_acp(cx);
         self.autoresume_agent(cx);
         self.agent_list.scroll_to_end();
@@ -4914,8 +5665,37 @@ impl Storm {
         self.split_terminal(false, window, cx);
     }
 
+    /// ⌘T from anywhere. The first press brings the terminal up (the agent pane
+    /// holds the dock on its own until then); after that it adds tabs the way it
+    /// always has.
     fn act_new_terminal(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {
-        self.new_terminal(window, cx);
+        if self.terminal_visible() {
+            self.new_terminal(window, cx);
+        } else {
+            self.reveal_terminal(window, cx);
+        }
+    }
+
+    /// True when the terminal strip is actually on screen: it's toggled on, it
+    /// has a tab, and the agent hasn't folded it away.
+    fn terminal_visible(&self) -> bool {
+        self.show_terminal
+            && !self.term_tabs.is_empty()
+            && !(AGENT_PANEL && self.agent_open && self.agent_zoomed)
+    }
+
+    /// Put the terminal strip back under the agent and focus it, starting one
+    /// if this workspace has none yet.
+    fn reveal_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.agent_zoomed = false;
+        self.show_terminal = true;
+        self.hide_browser(); // terminal + browser share the right dock
+        self.ensure_terminal(cx);
+        if let Some(t) = self.active_terminal() {
+            let fh = t.read(cx).focus_handle.clone();
+            window.focus(&fh, cx);
+        }
+        cx.notify();
     }
 
     /// ⌘W in the terminal: close the focused pane; the last pane closes the tab.
@@ -5185,7 +5965,8 @@ impl Storm {
             || self.find_open
             || self.gitp_open
             || self.mc_open
-            || self.ws_open;
+            || self.ws_open
+            || self.limits_open;
         if any_open {
             self.palette_open = false;
             self.finder_open = false;
@@ -5199,6 +5980,7 @@ impl Storm {
             self.find_open = false;
             self.gitp_open = false;
             self.ws_open = false;
+            self.limits_open = false;
             self.gitp_action_branch = None;
             self.focus_active(window, cx);
             cx.notify();
@@ -5463,6 +6245,11 @@ impl Storm {
     /// Run `cmd` (through the login shell, so zsh aliases work) and stream its
     /// output into the read-only Run console — no terminal needed.
     fn run_command(&mut self, cmd: String, cx: &mut Context<Self>) {
+        // the package build can report structured progress (webiny-js #5629):
+        // ask for it, and drive a real bar off the event stream
+        let json_build = build::is_build_command(&cmd);
+        let cmd = if json_build { build::with_json(&cmd) } else { cmd };
+        self.run_progress = json_build.then(build::Progress::default);
         self.run_cmd = cmd.clone();
         self.run_running = true;
         self.run_active = true; // show the bottom-right toast (not the console)
@@ -5530,12 +6317,20 @@ impl Storm {
                     }
                     this.run_spin = this.run_spin.wrapping_add(1);
                     if this.run_dirty.swap(false, Ordering::Relaxed) {
-                        let mut new = this
+                        let new = this
                             .run_buf
                             .lock()
                             .map(|mut b| std::mem::take(&mut *b))
                             .unwrap_or_default();
-                        this.run_lines.append(&mut new);
+                        match this.run_progress.as_mut() {
+                            // JSON build: keep the readable line, drop the event
+                            Some(p) => {
+                                let shown: Vec<String> =
+                                    new.iter().filter_map(|l| p.apply(l)).collect();
+                                this.run_lines.extend(shown);
+                            }
+                            None => this.run_lines.extend(new),
+                        }
                         let n = this.run_lines.len();
                         if n > 5000 {
                             this.run_lines.drain(0..n - 5000);
@@ -5545,6 +6340,12 @@ impl Storm {
                     }
                     if this.run_done.load(Ordering::Relaxed) {
                         this.run_running = false;
+                        // a build changed what a preview would say: re-check, so
+                        // the chip is right without being asked
+                        if build::is_build_command(&this.run_cmd) {
+                            this.build_preview = None;
+                            this.refresh_build_preview(cx);
+                        }
                         let success = this.run_ok.load(Ordering::Relaxed);
                         this.run_failed = !success;
                         // after a merge/pull/rebase, auto-open the conflicts dialog
@@ -5638,6 +6439,9 @@ impl Storm {
     }
 
     fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if is_agent_src(&path) {
+            return; // the agent-answer sentinel isn't a file; nothing to open
+        }
         // leaving the current tab → auto-save it
         self.save_tab(self.active, cx);
         // already open? just switch (and pick up any external edits)
@@ -5850,21 +6654,23 @@ impl Storm {
 
     fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.save_tab(self.active, cx); // leaving the editor → auto-save
-        let agent_holds_dock = AGENT_PANEL && self.agent_open && self.show_terminal;
-        if agent_holds_dock {
-            // the dock is the agent's; this toggles the terminal strip under it
-            // rather than hiding the agent along with it
-            self.agent_zoomed = !self.agent_zoomed;
-            if self.agent_zoomed {
+        if AGENT_PANEL && self.agent_open {
+            // ⌥F12 while a pane is zoomed means "give me the agent back"
+            if self.term_zoomed {
+                self.term_zoomed = false;
                 self.focus_agent(window, cx);
-            } else {
-                self.ensure_terminal(cx);
-                if let Some(t) = self.active_terminal() {
-                    let fh = t.read(cx).focus_handle.clone();
-                    window.focus(&fh, cx);
-                }
+                cx.notify();
+                return;
             }
-            cx.notify();
+            // the dock belongs to the agent; this folds the terminal strip under
+            // it away and back, and never hides the agent along with it
+            if self.terminal_visible() {
+                self.agent_zoomed = true; // fold the strip away; the agent takes the dock
+                self.focus_agent(window, cx);
+                cx.notify();
+            } else {
+                self.reveal_terminal(window, cx);
+            }
             return;
         }
         self.show_terminal = !self.show_terminal;
@@ -5943,6 +6749,7 @@ impl Storm {
         cx.notify();
 
         // (re)scan the file list off the main thread so opening never blocks
+        self.files_scanned = true; // this scan is the index; no need for another
         let root = self.root.clone();
         cx.spawn(async move |this, cx| {
             let (files, dirs) = cx
@@ -5952,6 +6759,7 @@ impl Storm {
             this.update(cx, |this, cx| {
                 this.all_files = files;
                 this.all_dirs = dirs;
+                this.ref_hits.clear();
                 this.update_finder();
                 cx.notify();
             })
@@ -6139,6 +6947,18 @@ impl Storm {
                 let c = self.title_client.text.trim().to_string();
                 self.ws_client = (!c.is_empty()).then(|| c.clone());
                 save_ws_client(&self.root, if c.is_empty() { None } else { Some(&c) });
+                // naming a workspace means you're picking it up: it's neither
+                // parked nor free any more
+                if !t.is_empty() {
+                    if self.ws_paused {
+                        self.ws_paused = false;
+                        save_ws_paused(&self.root, false);
+                    }
+                    if self.ws_idle {
+                        self.ws_idle = false;
+                        save_ws_idle(&self.root, false);
+                    }
+                }
                 self.title_open = false;
                 self.focus_active(window, cx);
             }
@@ -6266,7 +7086,7 @@ impl Storm {
                             .cursor_pointer()
                             .text_color(rgb(TEXT))
                             .child(if self.title_client.is_empty() && self.title_field != 1 {
-                                div().text_color(rgb(MUTED)).child("optional — e.g. Acme")
+                                div().text_color(rgb(MUTED)).child("optional — e.g. Acme").into_any_element()
                             } else {
                                 self.title_client.render(self.caret_if(self.title_field == 1), SELECTION)
                             })
@@ -6555,6 +7375,7 @@ impl Storm {
             "enter" => {
                 let cmd = self.runc_query.text.trim().to_string();
                 self.runc_open = false;
+                self.focus_active(window, cx);
                 if !cmd.is_empty() {
                     self.run_command(cmd, cx);
                 }
@@ -6576,9 +7397,10 @@ impl Storm {
         self.run_command("wipp".into(), cx);
     }
 
-    /// cmd+shift+b: build (`yyb`).
+    /// cmd+shift+b: build (`yb`). "Install and Build" (`yyb`) is a palette
+    /// command — installing is the slow, occasional case.
     fn act_run_build(&mut self, _: &RunBuild, _window: &mut Window, cx: &mut Context<Self>) {
-        self.run_command("yyb".into(), cx);
+        self.run_command("yb".into(), cx);
     }
 
     /// opt+l: pull the current branch, merging when local+remote have diverged
@@ -6606,6 +7428,7 @@ impl Storm {
         self.newproj_recents = load_recent_projects();
         // titles come off disk once, on open — not per frame
         self.newproj_titles = load_ws_titles();
+        self.newproj_last_titles = load_ws_last_titles();
         self.newproj_sel = 0;
         window.focus(&self.newproj_focus, cx);
         cx.notify();
@@ -6669,8 +7492,51 @@ impl Storm {
         if path.is_dir() {
             self.newproj_open = false;
             cx.emit(ProjectNav::OpenPath(path));
+            return;
         }
-        // not a folder → leave the dialog open so the user can fix the path
+        // a GitHub URL (or owner/repo) is cloned into ~/dev and opened
+        if let Some((url, name)) = parse_repo_ref(raw) {
+            self.newproj_open = false;
+            self.clone_and_open(url, name, cx);
+            return;
+        }
+        // not a folder or a repo → leave the dialog open so the path can be fixed
+    }
+
+    /// Clone `url` into `~/dev/<name>` and open it. An existing folder of that
+    /// name is opened as-is rather than cloned over.
+    fn clone_and_open(&mut self, url: String, name: String, cx: &mut Context<Self>) {
+        let dest = clone_root().join(&name);
+        if dest.is_dir() {
+            self.show_flash(&format!("{name} is already in ~/dev — opening it"), cx);
+            cx.emit(ProjectNav::OpenPath(dest));
+            return;
+        }
+        self.show_flash(&format!("Cloning {name} into ~/dev…"), cx);
+        cx.spawn(async move |this, cx| {
+            let (u, d) = (url.clone(), dest.clone());
+            let ok = cx
+                .background_executor()
+                .spawn(async move {
+                    let _ = std::fs::create_dir_all(clone_root());
+                    Command::new("git")
+                        .args(["clone", &u, &d.to_string_lossy()])
+                        .output()
+                        .map(|o| o.status.success())
+                        .unwrap_or(false)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if ok {
+                    this.show_flash(&format!("Cloned {name}"), cx);
+                    cx.emit(ProjectNav::OpenPath(dest));
+                } else {
+                    this.show_flash(&format!("Could not clone {url}"), cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// "Choose…" button: open the native macOS folder picker and fill the field.
@@ -6962,12 +7828,76 @@ impl Storm {
                     }
                     this.pr_viewed = viewed;
                     this.pr_loading = false;
+                    // an agent's batch that beat the file list here
+                    for batch in std::mem::take(&mut this.pr_viewed_queued) {
+                        this.apply_agent_viewed(&batch, true, cx);
+                    }
                     cx.notify();
                 }
             })
             .ok();
         })
         .detach();
+    }
+
+    /// A `/viewed` batch from the agent: the same thing as ticking the boxes by
+    /// hand, GitHub mirroring included. Paths are matched against the files the
+    /// PR actually touches, however the agent wrote them (repo-relative,
+    /// absolute, `./`-prefixed), and anything that isn't in the PR is reported
+    /// back rather than silently dropped.
+    fn apply_agent_viewed(&mut self, batch: &rpc::Viewed, retry: bool, cx: &mut Context<Self>) {
+        if self.pr_files.is_empty() {
+            // the pane may never have been opened this session: load the PR and
+            // let the batch land when its file list arrives. A batch that has
+            // already waited for one load is dropped — there's no PR to mark.
+            if retry {
+                self.show_flash("Agent marked files viewed, but no PR is loaded", cx);
+                return;
+            }
+            self.pr_viewed_queued.push(rpc::Viewed {
+                paths: batch.paths.clone(),
+                viewed: batch.viewed,
+            });
+            if !self.pr_loading {
+                self.load_pr(cx);
+            }
+            return;
+        }
+        let mut hit: Vec<PathBuf> = Vec::new();
+        let mut missed = 0usize;
+        for want in &batch.paths {
+            let want = want.trim().trim_start_matches("./");
+            let abs = self
+                .pr_files
+                .iter()
+                .map(|(p, _)| p)
+                .find(|p| {
+                    let rel = self.rel(p);
+                    rel == want || p.to_string_lossy() == want || rel.ends_with(&format!("/{want}"))
+                })
+                .cloned();
+            match abs {
+                Some(p) if !hit.contains(&p) => hit.push(p),
+                Some(_) => {}
+                None => missed += 1,
+            }
+        }
+        for p in &hit {
+            if batch.viewed {
+                self.pr_viewed.insert(p.clone());
+            } else {
+                self.pr_viewed.remove(p);
+            }
+        }
+        self.push_pr_viewed(&hit);
+        let verb = if batch.viewed { "viewed" } else { "unviewed" };
+        let msg = match (hit.len(), missed) {
+            (0, m) => format!("Agent: none of those {m} files are in this PR"),
+            (n, 0) => format!("Agent marked {n} file(s) {verb}"),
+            (n, m) => format!("Agent marked {n} file(s) {verb} · {m} not in this PR"),
+        };
+        self.show_flash(&msg, cx);
+        cx.notify();
     }
 
     fn toggle_pr_viewed(&mut self, path: PathBuf) {
@@ -7313,6 +8243,12 @@ impl Storm {
                 items.push(GitItem::Action(a, label, icon));
             }
         }
+        // a bare number is a PR: offer it first, since that's clearly the intent
+        if let Ok(n) = q.trim().parse::<u64>() {
+            if n > 0 {
+                items.push(GitItem::Pr(n));
+            }
+        }
         // branches: fuzzy-filtered (so "orinext" finds "origin/next"), best
         // matches first; committerdate order when there's no query
         if q.is_empty() {
@@ -7333,6 +8269,12 @@ impl Storm {
         items
     }
 
+    /// `gh pr checkout <n>` — it resolves the head branch, fetches it, and
+    /// switches, including for forks. Runs in the console like any other job.
+    fn checkout_pr(&mut self, n: u64, cx: &mut Context<Self>) {
+        self.run_command(format!("gh pr checkout {n}"), cx);
+    }
+
     fn gitp_execute(&mut self, item: GitItem, window: &mut Window, cx: &mut Context<Self>) {
         // a branch doesn't act directly — it opens the per-branch action submenu
         if let GitItem::Branch(name) = item {
@@ -7342,6 +8284,8 @@ impl Storm {
             return;
         }
         self.gitp_open = false;
+        // don't leave focus on the dialog we just closed (see palette_execute)
+        self.focus_active(window, cx);
         match item {
             GitItem::Action(GitAction::Update, ..) => self.run_command("git pull".into(), cx),
             GitItem::Action(GitAction::Commit, ..) => {
@@ -7354,19 +8298,22 @@ impl Storm {
             GitItem::Action(GitAction::Pr, ..) => self.run_command("pro".into(), cx),
             GitItem::Action(GitAction::CreatePr, ..) => self.open_pr_create_prompt(window, cx),
             GitItem::Action(GitAction::NewBranch, ..) => self.open_branch_prompt(window, cx),
+            GitItem::Pr(n) => self.checkout_pr(n, cx),
             GitItem::Branch(_) => {}
         }
     }
 
     /// Submenu entries for the branch the popup is acting on (display order).
-    /// Delete is offered only for a local branch that isn't the current one.
+    /// Delete is listed for any local branch — including the current one, where
+    /// picking it says why it can't run rather than hiding the option and
+    /// leaving you wondering where it went.
     fn gitp_branch_actions(&self) -> Vec<(BranchAction, &'static str, &'static str)> {
         let mut v = vec![
             (BranchAction::Checkout, "Checkout", IC_HOME),
             (BranchAction::Merge, "Merge", IC_BRANCH),
         ];
         let b = self.gitp_action_branch.as_deref().unwrap_or("");
-        if self.gitp_local.contains(b) && b != self.branch {
+        if self.gitp_local.contains(b) {
             v.push((BranchAction::Delete, "Delete", IC_TRASH));
         }
         v
@@ -7381,7 +8328,7 @@ impl Storm {
     ) {
         let Some(branch) = self.gitp_action_branch.take() else { return };
         self.gitp_open = false;
-        let _ = window;
+        self.focus_active(window, cx);
         match action {
             BranchAction::Checkout => {
                 // if the entry is a remote-tracking ref (origin/x), check out the
@@ -7395,6 +8342,9 @@ impl Storm {
             }
             BranchAction::Merge => self.run_command(format!("git merge {}", branch), cx),
             // safe delete (-d refuses unmerged branches; git prints why in the console)
+            BranchAction::Delete if branch == self.branch => {
+                self.show_flash("That's the branch you're on — check out another one first", cx)
+            }
             BranchAction::Delete => self.run_command(format!("git branch -d {}", branch), cx),
         }
     }
@@ -7637,12 +8587,21 @@ impl Storm {
 
     fn palette_execute(&mut self, cmd: Cmd, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = false;
+        // The palette's focus handle belongs to an element that is now gone. A
+        // command that doesn't claim focus itself would leave focus dangling,
+        // and a dangling focus has no dispatch path — which is how ⌘K stopped
+        // working after commands like "Pause Workspace". Park focus somewhere
+        // alive first; commands that open their own dialog take it from here.
+        self.focus_active(window, cx);
         match cmd {
             Cmd::WipCommit => self.run_command("wip".into(), cx),
             Cmd::WipPush => self.run_command("wipp".into(), cx),
             Cmd::OpenPr => self.run_command("pro".into(), cx),
             Cmd::CreatePr => self.open_pr_create_prompt(window, cx),
-            Cmd::Build => self.run_command("yyb".into(), cx),
+            // `yb` builds; `yyb` installs first (`y && yb`)
+            Cmd::Build => self.run_command("yb".into(), cx),
+            Cmd::InstallBuild => self.run_command("yyb".into(), cx),
+            Cmd::BuildPreview => self.refresh_build_preview(cx),
             Cmd::GitAdd => self.run_command("gaa".into(), cx),
             Cmd::Pull => self.run_command("git pull --no-rebase".into(), cx),
             Cmd::Fetch => self.run_command("git fetch --all --prune".into(), cx),
@@ -7688,6 +8647,7 @@ impl Storm {
             Cmd::AddComment => self.open_comment_prompt(window, cx),
             Cmd::ShowComments => self.open_comment_list(window, cx),
             Cmd::SendComments => self.send_review(window, cx),
+            Cmd::OpenRepository => self.act_new_project(&NewProject, window, cx),
             Cmd::InstallUsageBars => self.install_usage_bars(cx),
             Cmd::TogglePause => self.toggle_pause(cx),
             Cmd::ResetWorkspace => self.reset_workspace(cx),
@@ -7696,6 +8656,14 @@ impl Storm {
             Cmd::ResetWorkspaceClose => {
                 self.reset_workspace(cx);
                 cx.emit(ProjectNav::Remove(self.ws_active));
+            }
+            // reset, then park it: the folder stays open but ⌥Tab skips it until
+            // you pick the work up again
+            Cmd::ResetWorkspacePause => {
+                self.reset_workspace(cx);
+                if !self.ws_paused {
+                    self.toggle_pause(cx);
+                }
             }
         }
     }
@@ -7721,6 +8689,15 @@ impl Storm {
         // reports describe work on the branch we're leaving — drop them and mark
         // the workspace idle (persisted, so other TIDE instances see it too)
         self.agent_states.clear();
+        // the conversation was about the work being reset: start the agent fresh
+        // rather than carrying it into the next piece of work
+        if self.acp.is_some() {
+            self.new_agent_session(cx);
+        }
+        self.agent_resumed = true; // don't auto-resume the old session either
+        // …and don't resume it after a restart, whether or not the adapter was
+        // up when the reset happened
+        self.mark_agent_fresh(true);
         self.review.clear();
         self.save_review();
         self.ws_idle = true;
@@ -7735,7 +8712,14 @@ impl Storm {
         // whatever this repo calls its default branch — `next` in webiny-js,
         // `main`/`master` elsewhere — rather than one hardcoded name
         let default_branch = git_default_branch(&self.root);
-        self.run_command(format!("git checkout {default_branch} && git pull --no-rebase"), cx);
+        // `git reset --hard` first: a reset is meant to hand back a clean slate,
+        // and without it a modified file either rides along into the default
+        // branch or makes the checkout fail outright. Untracked files are left
+        // alone — that's `git clean`, and it eats things git never knew about.
+        self.run_command(
+            format!("git reset --hard && git checkout {default_branch} && git pull --no-rebase"),
+            cx,
+        );
         cx.notify();
     }
 
@@ -7777,7 +8761,7 @@ impl Storm {
             self.rc_snippet = None;
         }
         self.rc_target = Some((path, a, b));
-        self.rc_query.multiline = true; // ↩ saves, ⇧↩ adds a line
+        self.rc_query.multiline = true; // ↩ adds a line, ⌘↩ saves
         self.rc_query.set(text);
         self.rc_open = true;
         self.sync_comment_gutters(cx); // reserve the space the box will sit in
@@ -7815,10 +8799,8 @@ impl Storm {
         let ks = &ev.keystroke;
         match ks.key.as_str() {
             "escape" => self.cancel_comment(window, cx),
-            // a bare ↩ commits; ⇧↩ / ⌘↩ add a line (handled by the field below)
-            "enter" if !ks.modifiers.shift && !ks.modifiers.platform => {
-                self.commit_comment(window, cx)
-            }
+            // ⌘↩ commits; a bare ↩ is a newline (handled by the field below)
+            "enter" if ks.modifiers.platform => self.commit_comment(window, cx),
             _ => {
                 if Self::text_comes_via_input_handler(ks) {
                     return; // the input handler inserts it
@@ -7868,7 +8850,7 @@ impl Storm {
         self.show_flash("Comment kept as draft", cx);
     }
 
-    /// Save the box and close it (↩ / the primary button). In reply mode the
+    /// Save the box and close it (⌘↩ / the primary button). In reply mode the
     /// text becomes your turn in the thread and the comment goes back into the
     /// send queue, so ⌥↩ carries the follow-up to the agent.
     fn commit_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -7884,6 +8866,7 @@ impl Storm {
                     c.replies.push(ReviewReply { who: "you".into(), text });
                     c.sent = false; // your turn goes out with the next send
                     c.draft = false;
+                    c.resolved = false; // replying reopens what you'd filed away
                 }
                 self.save_review();
                 self.show_flash("Reply queued — ⌥↩ sends it", cx);
@@ -7897,12 +8880,17 @@ impl Storm {
         cx.notify();
     }
 
-    /// Done discussing: drop the thread.
+    /// Done discussing: file the thread away. It leaves the open list and every
+    /// count, but stays in the Resolved tab, where it can be reopened.
     fn resolve_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((path, a, b)) = self.rc_target.clone() else { return };
         self.rc_open = false;
         self.rc_reply_mode = false;
-        self.review.retain(|c| !(c.path == path && c.line == a && c.end == b));
+        if let Some(c) =
+            self.review.iter_mut().find(|c| c.path == path && c.line == a && c.end == b)
+        {
+            c.resolved = true;
+        }
         self.sync_comment_gutters(cx);
         self.save_review();
         self.show_flash("Thread resolved", cx);
@@ -7913,6 +8901,7 @@ impl Storm {
     /// Close the box, leaving the note as it was (esc / the Cancel button).
     fn cancel_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.rc_snippet = None;
+        self.rc_width = None;
         self.rc_open = false;
         self.sync_comment_gutters(cx); // give the reserved space back
         self.focus_active(window, cx);
@@ -7945,7 +8934,7 @@ impl Storm {
             .review
             .iter()
             .find(|c| c.path == path && c.line == a && c.end == b)
-            .map(|c| (c.id.clone(), c.sent, c.replies.clone()));
+            .map(|c| (c.id.clone(), c.sent, c.replies.clone(), c.text.clone()));
         self.review.retain(|c| !(c.path == path && c.line == a && c.end == b));
         if text.is_empty() {
             self.sync_comment_gutters(cx);
@@ -7954,11 +8943,34 @@ impl Storm {
             cx.notify();
             return;
         }
-        let (id, sent, replies) = existing.unwrap_or_else(|| (random_id(), false, Vec::new()));
-        self.review.push(ReviewComment { id, path, line: a, end: b, snippet, text, draft, sent, replies });
+        let (id, was_sent, replies, old_text) =
+            existing.unwrap_or_else(|| (random_id(), false, Vec::new(), String::new()));
+        // an edit to a comment the agent already has is a correction, not a
+        // no-op: it goes back into the queue so the next send carries the new
+        // wording, instead of the thread quietly disagreeing with what was sent
+        let resend = was_sent && old_text != text;
+        // writing on a thread you'd filed away means you're not done with it
+        let sent = was_sent && !resend;
+        self.review.push(ReviewComment {
+            id,
+            path,
+            line: a,
+            end: b,
+            snippet,
+            text,
+            draft,
+            sent,
+            replies,
+            resolved: false,
+        });
         self.review.sort_by(|x, y| x.path.cmp(&y.path).then(x.line.cmp(&y.line)));
         self.sync_comment_gutters(cx);
         self.save_review();
+        if resend {
+            self.show_flash("Comment updated — ⌥↩ sends it again", cx);
+            cx.notify();
+            return;
+        }
         let n = self.review.len();
         self.show_flash(&format!("{n} comment{} pending", if n == 1 { "" } else { "s" }), cx);
         cx.notify();
@@ -7981,7 +8993,7 @@ impl Storm {
     /// Review comments pinned to `path` (for the per-file markers in the Changes
     /// and PR panes).
     fn comment_count(&self, path: &Path) -> usize {
-        self.review.iter().filter(|c| c.path == path).count()
+        self.review.iter().filter(|c| c.path == path && !c.resolved).count()
     }
 
     /// Tell each open editor which of its lines carry comments (gutter marker)
@@ -7995,7 +9007,8 @@ impl Storm {
             let mut spans: Vec<(usize, usize)> = self
                 .review
                 .iter()
-                .filter(|c| c.path == tab.path && c.line > 0) // 0 = whole file
+                // 0 = whole file; a resolved thread leaves the gutter too
+                .filter(|c| c.path == tab.path && c.line > 0 && !c.resolved)
                 .map(|c| (c.line, c.end))
                 .collect();
             spans.sort();
@@ -8078,13 +9091,14 @@ impl Storm {
                 }
             })
             .collect();
-        format_review(&items)
+        format_review(&items, &self.review_note.text)
     }
 
     /// Type the comments into the agent's pane and submit them.
     fn send_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let ready = self.review.iter().filter(|c| !c.draft && !c.sent).count();
-        if ready == 0 {
+        let ready = self.review.iter().filter(|c| !c.draft && !c.sent && !c.resolved).count();
+        let note = self.review_note.text.trim().to_string();
+        if ready == 0 && note.is_empty() {
             let msg = if self.review.is_empty() {
                 "No comments to send"
             } else {
@@ -8104,7 +9118,28 @@ impl Storm {
         let sent_to_panel = AGENT_PANEL && self.acp.is_some();
         let pane = if sent_to_panel { None } else { self.agent_pane(cx) };
         if sent_to_panel {
-            self.send_agent_prompt(msg, cx);
+            // the transcript gets a receipt; the agent gets the full batch
+            let mut label = if ready == 0 {
+                "Posted a review note".to_string()
+            } else {
+                format!("Posted {ready} review comment{}", if ready == 1 { "" } else { "s" })
+            };
+            if !note.is_empty() && ready > 0 {
+                label.push_str(" + a note");
+            }
+            for c in self.review.iter().filter(|c| !c.draft && !c.sent && !c.resolved) {
+                let where_ = if is_agent_src(&c.path) {
+                    "your earlier answer".to_string()
+                } else if c.line == 0 {
+                    format!("{} (whole file)", self.rel(&c.path))
+                } else if c.end > c.line {
+                    format!("{}:{}-{}", self.rel(&c.path), c.line, c.end)
+                } else {
+                    format!("{}:{}", self.rel(&c.path), c.line)
+                };
+                label.push_str(&format!("\n• {where_}"));
+            }
+            self.send_agent_prompt_as(msg, Some(label), cx);
         } else if let Some(pane) = pane.clone() {
             pane.read(cx).send_paste(&msg);
             pane.read(cx).send_text("\r");
@@ -8113,11 +9148,12 @@ impl Storm {
             return;
         }
         let n = ready;
-        let drafts = self.review.iter().filter(|c| c.draft).count();
+        let drafts = self.review.iter().filter(|c| c.draft && !c.resolved).count();
         // the comments stay: each one is a thread now, waiting for its answer
-        for c in self.review.iter_mut().filter(|c| !c.draft) {
+        for c in self.review.iter_mut().filter(|c| !c.draft && !c.resolved) {
             c.sent = true;
         }
+        self.review_note.clear();
         self.sync_comment_gutters(cx);
         self.save_review();
         match pane {
@@ -8358,6 +9394,13 @@ impl Storm {
 
     fn palette_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
+        // ⌘K again closes it, the way a toggle should
+        if ks.key == "k" && ks.modifiers.platform {
+            self.palette_open = false;
+            self.focus_active(window, cx);
+            cx.notify();
+            return;
+        }
         match ks.key.as_str() {
             "escape" => {
                 self.palette_open = false;
@@ -8631,11 +9674,15 @@ impl Storm {
                 (f32::from(ev.position.y) - top - FIND_HEAD_H).clamp(80.0, content_h - 80.0);
             self.find_split = results_h / content_h;
             cx.notify();
-        } else if let Some((origin, start)) = self.rc_resize {
-            // drag the comment box's bottom edge: taller thread area, more of the
-            // agent's answer on screen at once
-            let h = (start + (f32::from(ev.position.y) - origin)).clamp(40.0, 600.0);
+        } else if let Some((ox, oy, w0, h0, corner)) = self.rc_resize {
+            // bottom edge → taller thread area; corner → wider too
+            let h = (h0 + (f32::from(ev.position.y) - oy)).clamp(40.0, 900.0);
             self.rc_thread_h = Some(h);
+            if corner {
+                let w = (w0 + (f32::from(ev.position.x) - ox))
+                    .clamp(280.0, (self.win_width - 40.0).max(280.0));
+                self.rc_width = Some(w);
+            }
             self.sync_comment_gutters(cx); // the editor's reserved gap grows with it
             cx.notify();
         } else if let Some(d) = self.pane_drag.clone() {
@@ -8679,6 +9726,7 @@ impl Storm {
             self.rc_resize = None;
             self.agent_sel_drag = false;
             self.agent_sel_moved = false;
+            self.agent_sel_armed = None;
             for t in self.all_terminals() {
                 t.update(cx, |t, _| t.defer_resize = false);
             }
@@ -8718,6 +9766,12 @@ impl Storm {
         }
         if self.rc_focus.is_focused(window) {
             return Some(&mut self.rc_query);
+        }
+        if self.review_note_focus.is_focused(window) {
+            return Some(&mut self.review_note);
+        }
+        if self.agent_jump_focus.is_focused(window) {
+            return Some(&mut self.agent_jump_query);
         }
         None
     }
@@ -8761,9 +9815,20 @@ impl EntityInputHandler for Storm {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let new_text = new_text.to_string();
+        // control characters (⌃C sends U+0003) aren't text; inserting one would
+        // also delete the current selection on the way in
+        let new_text: String =
+            new_text.chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t').collect();
+        if new_text.is_empty() {
+            return;
+        }
+        let agent = self.agent_focus.is_focused(window);
         if let Some(f) = self.focused_field(window) {
             f.insert_text(&new_text);
+            self.recompute_agent_ghost();
+            if agent {
+                self.recompute_mentions(cx);
+            }
             self.sync_comment_gutters(cx); // the comment box may have grown
             cx.notify();
         }
@@ -8858,7 +9923,7 @@ impl Render for Storm {
                 LeftView::Files => self.render_tree(window, cx).into_any_element(),
                 LeftView::Changes => self.render_changes(window, cx).into_any_element(),
                 LeftView::PullRequest => self.render_pr(window, cx).into_any_element(),
-                LeftView::Review => self.render_review_pane(cx).into_any_element(),
+                LeftView::Review => self.render_review_pane(window, cx).into_any_element(),
             })
         } else {
             None
@@ -8879,9 +9944,16 @@ impl Render for Storm {
         }
         middle = middle.child(self.render_editor_wrap(center, cx));
 
-        if show_term {
-            let panes = self.render_term_panes(window, cx);
-            let tab_bar = self.render_term_tabs(cx);
+        // The right dock: the agent pane on top, the terminal under it. The
+        // agent is always in it — closing the terminal hands the whole dock to
+        // the agent rather than taking the dock away with it.
+        let show_agent = AGENT_PANEL && self.agent_open && !self.term_zoomed;
+        let show_panes = show_term && !(show_agent && self.agent_zoomed);
+        if show_agent || show_term {
+            // built first: each of these borrows self on its own
+            let term_parts =
+                show_panes.then(|| (self.render_term_panes(window, cx), self.render_term_tabs(cx)));
+            let agent = show_agent.then(|| self.render_agent(window, cx));
             middle = middle
                 .child(
                     div()
@@ -8902,10 +9974,6 @@ impl Render for Storm {
                         ),
                 )
                 .child({
-                    // the dock is one column: the agent UI on top (when open),
-                    // then the terminal tabs and their panes. ⌘↑/⌘↓ walk between
-                    // them as if the agent were another pane.
-                    let show_agent = AGENT_PANEL && self.agent_open;
                     let mut dock = div()
                         .w(px(self.term_width))
                         .h_full()
@@ -8913,9 +9981,10 @@ impl Render for Storm {
                         .flex()
                         .flex_col()
                         .bg(rgb(PANEL_BG));
-                    if show_agent {
-                        let agent = self.render_agent(window, cx);
-                        let share = if self.agent_zoomed { 1.0 } else { self.agent_share };
+                    let split = agent.is_some() && term_parts.is_some();
+                    if let Some(agent) = agent {
+                        // with no terminal under it, the agent is the dock
+                        let share = if split { self.agent_share } else { 1.0 };
                         dock = dock.child(
                             div()
                                 .flex_grow(share)
@@ -8924,29 +9993,31 @@ impl Render for Storm {
                                 .overflow_hidden()
                                 .child(agent),
                         );
-                        if !self.agent_zoomed {
-                            dock = dock.child(
-                                div()
-                                    .h(px(4.))
-                                    .w_full()
-                                    .flex_shrink_0()
-                                    .bg(rgb(if self.resizing_agent { ACCENT } else { BORDER }))
-                                    .cursor(CursorStyle::ResizeUpDown)
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _ev, _window, cx| {
-                                            this.resizing_agent = true;
-                                            for t in this.all_terminals() {
-                                                t.update(cx, |t, _| t.defer_resize = true);
-                                            }
-                                            cx.notify();
-                                        }),
-                                    ),
-                            );
-                        }
                     }
-                    if !(show_agent && self.agent_zoomed) {
-                        let rest = if show_agent { 1.0 - self.agent_share } else { 1.0 };
+                    // the height divider only exists while there are two things
+                    // to divide
+                    if split {
+                        dock = dock.child(
+                            div()
+                                .h(px(4.))
+                                .w_full()
+                                .flex_shrink_0()
+                                .bg(rgb(if self.resizing_agent { ACCENT } else { BORDER }))
+                                .cursor(CursorStyle::ResizeUpDown)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev, _window, cx| {
+                                        this.resizing_agent = true;
+                                        for t in this.all_terminals() {
+                                            t.update(cx, |t, _| t.defer_resize = true);
+                                        }
+                                        cx.notify();
+                                    }),
+                                ),
+                        );
+                    }
+                    if let Some((panes, tab_bar)) = term_parts {
+                        let rest = if split { 1.0 - self.agent_share } else { 1.0 };
                         dock = dock.child(
                             div()
                                 .flex_grow(rest)
@@ -9121,33 +10192,57 @@ impl Render for Storm {
         if self.limits_open {
             root = root.children(self.render_usage_overlay(cx));
         }
-        if self.run_active && !self.run_open {
-            root = root.child(self.render_run_toast(cx));
-        }
-        if let Some(msg) = self.flash.clone() {
+        // one bottom-right column, so a flash and the run toast stack instead of
+        // landing on top of each other
+        let toast = self.run_active && !self.run_open;
+        if toast || self.flash.is_some() {
             root = root.child(
                 div()
                     .absolute()
                     .bottom(px(56.))
                     .right(px(28.))
-                    .min_w(px(340.))
-                    .max_w(px(560.))
                     .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_3()
-                    .pl_3()
-                    .pr_4()
-                    .py_3()
-                    .bg(rgb(POPUP_BG))
-                    .border_1()
-                    .border_color(rgb(GIT_NEW))
-                    .border_l_4()
-                    .rounded_md()
-                    .shadow_lg()
-                    .overflow_hidden()
-                    .child(div().flex_shrink_0().text_size(px(20.)).text_color(rgb(GIT_NEW)).child("✓"))
-                    .child(div().flex_grow(1.0).min_w(px(0.)).text_size(px(14.)).text_color(rgb(TEXT)).truncate().child(msg)),
+                    .flex_col()
+                    .items_end()
+                    .gap_2()
+                    .when(toast, |d| d.child(self.render_run_toast(cx)))
+                    .when_some(self.flash.clone(), |d, msg| {
+                        d.child(
+                            div()
+                                .min_w(px(340.))
+                                .max_w(px(560.))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_3()
+                                .pl_3()
+                                .pr_4()
+                                .py_3()
+                                .bg(rgb(POPUP_BG))
+                                .border_1()
+                                .border_color(rgb(GIT_NEW))
+                                .border_l_4()
+                                .rounded_md()
+                                .shadow_lg()
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(20.))
+                                        .text_color(rgb(GIT_NEW))
+                                        .child("✓"),
+                                )
+                                .child(
+                                    div()
+                                        .flex_grow(1.0)
+                                        .min_w(px(0.))
+                                        .text_size(px(14.))
+                                        .text_color(rgb(TEXT))
+                                        .truncate()
+                                        .child(msg),
+                                ),
+                        )
+                    }),
             );
         }
 
@@ -9538,6 +10633,13 @@ impl Storm {
                 .flex_row()
                 .items_center()
                 .gap_3()
+                .children(self.render_build_chip(cx))
+                // build state and workspace states are different things: keep a
+                // rule between them
+                .when(self.render_build_chip(cx).is_some() && self.ws_states.len() > 1, |d| {
+                    d.child(div().w(px(1.)).h(px(14.)).bg(rgb(BORDER)))
+                })
+                .children(self.render_ws_tally(cx))
                 .children(self.render_usage_chip(cx))
                 .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(format!("{} MB", self.mem_mb)))
                 // last item in the bar, hard against the right edge
@@ -9748,9 +10850,6 @@ impl Storm {
             })))
             .when(BROWSER_PANEL, |d| d.child(activity_icon("act-browser", IC_BROWSER, "Browser", self.browser_open, 0, cx.listener(|this, _ev, window, cx| {
                 this.toggle_browser(window, cx);
-            }))))
-            .when(AGENT_PANEL, |d| d.child(activity_icon("act-agent", IC_TOOLS, "Agent  (⌘⇧A)", self.agent_open, 0, cx.listener(|this, _ev, window, cx| {
-                this.toggle_agent(window, cx);
             }))))
     }
 
@@ -10054,7 +11153,7 @@ impl Storm {
 
         // send pending review comments straight from here — the agent pane is
         // right below this bar, so this is where you are when you want to send
-        let ready = self.review.iter().filter(|c| !c.draft).count();
+        let ready = self.review.iter().filter(|c| !c.draft && !c.resolved).count();
         bar.when(ready > 0, |b| {
             b.child(div().flex_grow(1.0)).child(
                 div()
@@ -10083,6 +11182,44 @@ impl Storm {
 
     /// Bottom-right status toast for a running/finished command. Click to open
     /// the full Run console.
+    /// Progress bar for a `--json` build: filled track plus `14/58 · batch 3/7`.
+    fn render_build_bar(&self, color: u32) -> Option<impl IntoElement> {
+        let p = self.run_progress.clone()?;
+        // nothing to show until the plan arrives (or an empty build ends)
+        if p.total == 0 && !p.done {
+            return None;
+        }
+        let color = if p.failed.is_empty() { color } else { GIT_DELETED };
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div().h(px(4.)).w_full().rounded_md().bg(rgb(BORDER)).child(
+                        div().h_full().w(relative(p.fraction())).rounded_md().bg(rgb(color)),
+                    ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_2()
+                        .text_size(px(10.))
+                        .text_color(rgb(MUTED))
+                        .child(div().flex_grow(1.0).min_w(px(0.)).truncate().child(p.summary()))
+                        .when(p.from_cache > 0, |d| {
+                            d.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_color(rgb(LINE_NUMBER))
+                                    .child(format!("{} cached", p.from_cache)),
+                            )
+                        }),
+                ),
+        )
+    }
+
     fn render_run_toast(&self, cx: &mut Context<Self>) -> impl IntoElement {
         const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let (glyph, color, msg) = if self.run_running {
@@ -10095,9 +11232,6 @@ impl Storm {
         let label = if self.run_running { "RUNNING" } else if self.run_failed { "FAILED" } else { "DONE" };
         div()
             .id("run-toast")
-            .absolute()
-            .bottom(px(56.))
-            .right(px(28.))
             .min_w(px(340.))
             .max_w(px(560.))
             .flex()
@@ -10125,13 +11259,158 @@ impl Storm {
                     .min_w(px(0.))
                     .gap_1()
                     .child(div().text_size(px(11.)).text_color(rgb(color)).child(label))
-                    .child(div().text_size(px(14.)).text_color(rgb(TEXT)).truncate().child(msg)),
+                    .child(div().text_size(px(14.)).text_color(rgb(TEXT)).truncate().child(msg))
+                    .children(self.render_build_bar(color)),
             )
             .on_click(cx.listener(|this, _e, _w, cx| {
                 this.run_open = true;
                 this.run_active = false;
                 cx.notify();
             }))
+    }
+
+    /// "How stale is my build?" — the count `yarn build --preview` reports, or
+    /// a check when nothing needs building. Click it to run the build.
+    fn render_build_chip(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.root.join("scripts/buildPackages").is_dir() {
+            return None; // no package build here at all
+        }
+        let checking = self.build_checking;
+        // the chip is always on show, so its absence never has to be interpreted
+        // always a ratio, so the number means the same thing in both states
+        let (label, color) = match (&self.build_preview, checking) {
+            (_, true) => ("checking…".to_string(), MUTED),
+            (None, _) => ("build ?".to_string(), MUTED),
+            (Some(p), _) if p.to_build == 0 => {
+                (format!("{}/{} packages built", p.total, p.total), GIT_NEW)
+            }
+            (Some(p), _) => (
+                format!("{}/{} packages built", p.up_to_date, p.total),
+                GIT_MODIFIED,
+            ),
+        };
+        let mut tip_text = match &self.build_preview {
+            None => "Haven't checked what needs rebuilding".to_string(),
+            Some(p) if p.to_build == 0 => format!("All {} packages are up to date", p.total),
+            Some(p) => format!(
+                "{} of {} packages need a rebuild  ·  {} batch{}\n",
+                p.to_build,
+                p.total,
+                p.batches,
+                if p.batches == 1 { "" } else { "es" }
+            ),
+        };
+        // a handful of names is useful; the whole list isn't
+        if let Some(p) = &self.build_preview {
+            for name in p.packages.iter().take(12) {
+                tip_text.push_str(&format!("\n{name}"));
+            }
+            if p.packages.len() > 12 {
+                tip_text.push_str(&format!("\n… and {} more", p.packages.len() - 12));
+            }
+        }
+        tip_text.push_str("\n\nclick to re-check  ·  ⌥click to build (⌘⇧B)");
+        Some(
+            div()
+                .id("build-chip")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .px_1()
+                .rounded_md()
+                .cursor_pointer()
+                .text_size(px(11.))
+                .text_color(rgb(color))
+                .hover(|s| s.bg(rgb(HOVER)))
+                // a dot in the state's colour, like the workspace tally uses
+                .child(div().w(px(6.)).h(px(6.)).rounded_full().flex_shrink_0().bg(rgb(color)))
+                .child(if checking { "checking…".to_string() } else { label })
+                .tooltip(move |_w, cx| {
+                    let text = tip_text.clone();
+                    cx.new(|_| TooltipView { text: text.into() }).into()
+                })
+                .on_click(cx.listener(|this, ev: &gpui::ClickEvent, _w, cx| {
+                    if ev.modifiers().alt {
+                        this.run_command("yb".into(), cx);
+                    } else {
+                        this.refresh_build_preview(cx);
+                    }
+                })),
+        )
+    }
+
+    /// How the other workspaces are doing, as the ⌘E switcher counts them: a
+    /// coloured dot and a number per state, most urgent first. `None` with a
+    /// single workspace open — there's nothing to compare.
+    fn render_ws_tally(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if self.ws_states.len() < 2 {
+            return None;
+        }
+        let mut tally: Vec<(AgentState, usize)> = Vec::new();
+        for st in self.ws_states.iter().flatten() {
+            match tally.iter_mut().find(|(s, _)| s == st) {
+                Some((_, n)) => *n += 1,
+                None => tally.push((*st, 1)),
+            }
+        }
+        tally.sort_by_key(|(s, _)| std::cmp::Reverse(s.priority()));
+        // workspaces nobody has reported on: without them the numbers don't add
+        // up to the workspaces you have open, which is the first thing you check
+        let quiet = self.ws_states.iter().filter(|s| s.is_none()).count();
+        let mut tip_text = tally
+            .iter()
+            .map(|(s, n)| format!("{n} {}", agent_label(*s)))
+            .collect::<Vec<_>>()
+            .join("  ·  ");
+        if quiet > 0 {
+            if !tip_text.is_empty() {
+                tip_text.push_str("  ·  ");
+            }
+            tip_text.push_str(&format!("{quiet} with nothing reported"));
+        }
+        let chip = |color: u32, n: usize, hollow: bool| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .w(px(6.))
+                        .h(px(6.))
+                        .rounded_full()
+                        .flex_shrink_0()
+                        // hollow = nothing reported, so it reads as "unknown"
+                        // rather than as a state of its own
+                        .when(hollow, |d| d.border_1().border_color(rgb(color)))
+                        .when(!hollow, |d| d.bg(rgb(color))),
+                )
+                .child(div().text_color(rgb(color)).child(format!("{n}")))
+        };
+        let mut row = div()
+            .id("ws-tally")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_1()
+            .rounded_md()
+            .cursor_pointer()
+            .text_size(px(11.))
+            .hover(|s| s.bg(rgb(HOVER)))
+            .tooltip(move |_w, cx| {
+                let text = format!("{tip_text}  ·  ⌘E to switch");
+                cx.new(|_| TooltipView { text: text.into() }).into()
+            })
+            .on_click(cx.listener(|_this, _e, _w, cx| cx.emit(ProjectNav::Switcher)));
+        for (st, n) in tally {
+            row = row.child(chip(agent_color(st), n, false));
+        }
+        if quiet > 0 {
+            row = row.child(chip(MUTED, quiet, true));
+        }
+        Some(row)
     }
 
     /// Plan usage: a small percentage chip in the topbar. Clicking it opens
@@ -10326,6 +11605,10 @@ impl Storm {
                     .text_color(rgb(if running { ACCENT } else if failed { GIT_DELETED } else { MUTED }))
                     .child(if running { "running…" } else if failed { "failed" } else { "done" }),
             )
+            // the build's own progress, inline in the header
+            .children(self.render_build_bar(if running { ACCENT } else { GIT_NEW }).map(|bar| {
+                div().flex_grow(1.0).min_w(px(120.)).max_w(px(420.)).child(bar)
+            }))
             .child(div().flex_1())
             .child(btn("run-rerun", "↻").tooltip(tip("Re-run")).on_click(cx.listener(|this, _e, _w, cx| {
                 let c = this.run_cmd.clone();
@@ -11348,7 +12631,7 @@ impl Storm {
         let (left, top, w) = match (anchor, agent_anchor) {
             (Some((x, y, avail, h)), _) => (
                 x + RC_BOX_PAD,
-                y + h + notes_above + RC_BOX_PAD,
+                y + h + notes_above + RC_BOX_VPAD,
                 (avail - RC_BOX_PAD * 2.0).clamp(220.0, 760.0),
             ),
             (None, Some((mx, my))) => {
@@ -11385,12 +12668,16 @@ impl Storm {
             .is_some_and(|(p, a, b)| {
                 self.review.iter().any(|c| &c.path == p && c.line == *a && c.end == *b)
             });
+        // a corner drag pins the width; otherwise it follows the pane
+        let box_w = self.rc_width.unwrap_or(w).clamp(280.0, (self.win_width - 40.0).max(280.0));
         div()
-            .when(!inline, |d| d.absolute().top(px(top)).left(px(left)).w(px(w)))
+            .when(!inline, |d| d.absolute().top(px(top)).left(px(left)).w(px(box_w)))
+            .when(inline && self.rc_width.is_some(), |d| d.w(px(box_w)))
             // `relative` only when it isn't already absolutely positioned —
             // setting it on an absolute box overrides that, dropping the box into
             // the layout flow and squeezing the whole window
-            .when(inline, |d| d.relative().w_full().my_1())
+            .when(inline && self.rc_width.is_none(), |d| d.w_full())
+            .when(inline, |d| d.relative().my_1())
             .child(input_sink(self.rc_focus.clone(), cx.entity()))
             // the estimate is a floor: let the box grow if the text wraps further
             .min_h(px(box_h))
@@ -11404,9 +12691,18 @@ impl Storm {
             .overflow_hidden() // a long note must not spill over the code
             .track_focus(&self.rc_focus)
             .on_key_down(cx.listener(Self::rc_key))
-            // the box sits over the editor: swallow the wheel so scrolling inside
-            // it never moves the code behind it
+            // the box sits over the editor (or inside the transcript): swallow the
+            // wheel so scrolling in it never moves what's behind it. `occlude` is
+            // what stops a gpui `list`: it registers its scroll handler *after*
+            // painting its children, so a mere stop_propagation comes too late —
+            // the hitbox has to take the list out of the hit test instead.
+            .occlude()
             .on_scroll_wheel(|_e, _w, cx| cx.stop_propagation())
+            // `occlude` also hides the root's drag handlers from anything over
+            // the box, which left a resize drag stuck on mouse-up. Re-dispatch
+            // both here so a drag that lives inside the box still tracks and ends.
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .child(
                 div()
                     .px_2()
@@ -11421,7 +12717,7 @@ impl Storm {
                         div()
                             .text_size(px(10.))
                             .text_color(rgb(LINE_NUMBER))
-                            .child("↩ save · ⇧↩ newline · esc cancel"),
+                            .child("⌘↩ save · ↩ newline · esc cancel"),
                     ),
             )
             // the answers, read here rather than in the terminal transcript
@@ -11558,21 +12854,58 @@ impl Storm {
                         )
                     }),
             )
-            // drag the bottom edge to make the box (and its thread) taller
+            // bottom edge grows the box vertically; the corner grows both axes
             .child(
                 div()
-                    .id("rc-resize")
-                    .h(px(5.))
                     .flex_shrink_0()
-                    .cursor(CursorStyle::ResizeUpDown)
-                    .bg(rgb(if self.rc_resize.is_some() { ACCENT } else { PANEL_BG }))
-                    .hover(|s| s.bg(rgb(ACCENT)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
-                            this.rc_resize = Some((f32::from(ev.position.y), thread_h));
-                            cx.notify();
-                        }),
+                    .h(px(6.))
+                    .flex()
+                    .flex_row()
+                    .child(
+                        div()
+                            .id("rc-resize")
+                            .flex_grow(1.0)
+                            .h_full()
+                            .cursor(CursorStyle::ResizeUpDown)
+                            .bg(rgb(if self.rc_resize.is_some() { ACCENT } else { PANEL_BG }))
+                            .hover(|s| s.bg(rgb(ACCENT)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
+                                    this.rc_resize = Some((
+                                        f32::from(ev.position.x),
+                                        f32::from(ev.position.y),
+                                        box_w,
+                                        thread_h,
+                                        false,
+                                    ));
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("rc-resize-corner")
+                            .w(px(14.))
+                            .h_full()
+                            .flex_shrink_0()
+                            .cursor(CursorStyle::ResizeUpLeftDownRight)
+                            .bg(rgb(if self.rc_resize.is_some_and(|r| r.4) { ACCENT } else { BORDER }))
+                            .hover(|s| s.bg(rgb(ACCENT)))
+                            .tooltip(tip("Drag to resize"))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
+                                    this.rc_resize = Some((
+                                        f32::from(ev.position.x),
+                                        f32::from(ev.position.y),
+                                        box_w,
+                                        thread_h,
+                                        true,
+                                    ));
+                                    cx.notify();
+                                }),
+                            ),
                     ),
             )
     }
@@ -11587,7 +12920,7 @@ impl Storm {
         let path = tab.path.clone();
         // several notes can share a first line; that one shows with a count
         let mut by_line: Vec<(usize, usize, String, usize, usize)> = Vec::new();
-        for c in self.review.iter().filter(|c| c.path == path) {
+        for c in self.review.iter().filter(|c| c.path == path && !c.resolved) {
             match by_line.iter_mut().find(|(l, _, _, _, _)| *l == c.line) {
                 Some((_, _, _, extra, answers)) => {
                     *extra += 1;
@@ -11679,14 +13012,25 @@ impl Storm {
 
     /// The review-comments pane: every pending note, and one button that hands
     /// the whole batch to the agent.
-    fn render_review_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_review_pane(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let width = px(self.tree_width);
-        let n = self.review.iter().filter(|c| !c.draft && !c.sent).count();
-        let drafts = self.review.iter().filter(|c| c.draft).count();
-        let answered = self.review.iter().filter(|c| !c.replies.is_empty()).count();
-        let waiting = self.review.iter().filter(|c| c.sent && c.replies.is_empty()).count();
+        let open = |c: &&ReviewComment| !c.resolved;
+        let n = self.review.iter().filter(open).filter(|c| !c.draft && !c.sent).count();
+        let drafts = self.review.iter().filter(open).filter(|c| c.draft).count();
+        let answered = self.review.iter().filter(open).filter(|c| !c.replies.is_empty()).count();
+        let waiting =
+            self.review.iter().filter(open).filter(|c| c.sent && c.replies.is_empty()).count();
+        let resolved_n = self.review.iter().filter(|c| c.resolved).count();
+        // reopening the last one takes the tab away with it: don't strand the
+        // pane on a tab that no longer exists
+        if resolved_n == 0 {
+            self.review_resolved_tab = false;
+        }
+        let resolved_tab = self.review_resolved_tab;
         let mut list = div().flex().flex_col().min_h(px(0.)).id("review-list").overflow_y_scroll();
-        for (i, c) in self.review.iter().enumerate() {
+        // `i` stays the index into `self.review`: the row's handlers look the
+        // comment back up by it
+        for (i, c) in self.review.iter().enumerate().filter(|(_, c)| c.resolved == resolved_tab) {
             let head = if is_agent_src(&c.path) {
                 if c.end > c.line {
                     format!("the agent's answer  ·  lines {}-{}", c.line, c.end)
@@ -11759,7 +13103,7 @@ impl Storm {
                                 },
                             )
                             // a discussed thread is resolved; ✕ still deletes
-                            .when(!replies.is_empty(), |d| {
+                            .when(!replies.is_empty() || resolved_tab, |d| {
                                 let (p2, l2, e2) = (path.clone(), line, end);
                                 d.child(
                                     div()
@@ -11771,15 +13115,22 @@ impl Storm {
                                         .text_size(px(9.))
                                         .text_color(rgb(GIT_NEW))
                                         .hover(|s| s.bg(rgb(HOVER)))
-                                        .child("resolve")
+                                        .child(if resolved_tab { "reopen" } else { "resolve" })
                                         .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
                                         .on_click(cx.listener(move |this, _e, _w, cx| {
-                                            this.review.retain(|c| {
-                                                !(c.path == p2 && c.line == l2 && c.end == e2)
-                                            });
+                                            if let Some(c) = this.review.iter_mut().find(|c| {
+                                                c.path == p2 && c.line == l2 && c.end == e2
+                                            }) {
+                                                c.resolved = !c.resolved;
+                                            }
                                             this.sync_comment_gutters(cx);
                                             this.save_review();
-                                            this.show_flash("Thread resolved", cx);
+                                            let msg = if resolved_tab {
+                                                "Thread reopened"
+                                            } else {
+                                                "Thread resolved — in the Resolved tab"
+                                            };
+                                            this.show_flash(msg, cx);
                                             cx.notify();
                                         })),
                                 )
@@ -11869,9 +13220,18 @@ impl Storm {
                         else {
                             return;
                         };
+                        // a comment on the answer has no file: show the pane and
+                        // scroll to the message it was made on
+                        if let Some(msg) = agent_msg_index(&p) {
+                            this.show_terminal = true;
+                            this.agent_open = true;
+                            this.agent_list.scroll_to_reveal_item(msg);
+                            this.begin_comment(p, l, e, window, cx);
+                            return;
+                        }
                         this.open_file(p.clone(), window, cx);
                         if let Some(tab) = this.tabs.get(this.active) {
-                            tab.editor.update(cx, |ed, cx| ed.goto(l.saturating_sub(1), 0, cx));
+                            tab.editor.update(cx, |ed, cx| ed.goto(l, 1, cx));
                         }
                         this.begin_comment(p, l, e, window, cx);
                     })),
@@ -11915,6 +13275,40 @@ impl Storm {
                     .child(div().flex_grow(1.0))
                     .child(self.collapse_left_btn(cx)),
             )
+            // Open / Resolved: a resolved thread leaves the list but not the
+            // pane, so one filed away too early can be picked back up
+            .when(resolved_n > 0, |d| {
+                let tab = |label: String, on: bool, to: bool| {
+                    div()
+                        .id(if to { "review-tab-done" } else { "review-tab-open" })
+                        .flex_grow(1.0)
+                        .py(px(3.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .text_size(px(11.))
+                        .border_b_2()
+                        .border_color(rgb(if on { COMMENT_MARK } else { BORDER }))
+                        .text_color(rgb(if on { TEXT } else { MUTED }))
+                        .hover(|s| s.text_color(rgb(TEXT)))
+                        .child(label)
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            this.review_resolved_tab = to;
+                            cx.notify();
+                        }))
+                };
+                let open_n = self.review.len() - resolved_n;
+                d.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .mx_3()
+                        .mb_2()
+                        .child(tab(format!("Open  {open_n}"), !resolved_tab, false))
+                        .child(tab(format!("Resolved  {resolved_n}"), resolved_tab, true)),
+                )
+            })
             // send-to-agent button, disabled-looking when there's nothing to send
             .child(
                 div()
@@ -11932,20 +13326,108 @@ impl Storm {
                     .text_size(px(11.))
                     .text_color(rgb(if n > 0 { COMMENT_MARK } else { MUTED }))
                     .when(n > 0, |d| d.cursor_pointer().hover(|s| s.bg(rgba(COMMENT_TINT))))
-                    .child(format!("Send {n} to agent  ·  ⌥↩"))
+                    .child(if n == 0 && !self.review_note.is_empty() {
+                        "Send note to agent  ·  ⌥↩".to_string()
+                    } else {
+                        format!("Send {n} to agent  ·  ⌥↩")
+                    })
                     .on_click(cx.listener(|this, _e, window, cx| this.send_review(window, cx))),
             )
-            .child(if self.review.is_empty() {
+            .child(if self.review.iter().all(|c| c.resolved != resolved_tab) {
                 div()
                     .flex_grow(1.0)
                     .px_3()
                     .text_size(px(12.))
                     .text_color(rgb(MUTED))
-                    .child("No comments yet. ⌥C on a line in the editor or the diff.")
+                    .child(if resolved_tab {
+                        "No resolved threads."
+                    } else {
+                        "No comments yet. ⌥C on a line in the editor or the diff."
+                    })
                     .into_any_element()
             } else {
                 list.flex_grow(1.0).into_any_element()
             })
+            // a general note for the review as a whole, like a PR review body:
+            // it leads the batch and isn't tied to any line
+            .child({
+                let focused = self.review_note_focus.is_focused(window);
+                let rows = self.review_note.text.split('\n').count().clamp(3, 10) as f32;
+                div()
+                    .flex_shrink_0()
+                    .relative()
+                    .m_2()
+                    .child(input_sink(self.review_note_focus.clone(), cx.entity()))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .min_h(px(rows * 18.0))
+                            .max_h(px(10.0 * 18.0))
+                            .overflow_hidden()
+                            .line_height(px(18.))
+                            .bg(rgb(BG))
+                            .border_1()
+                            .border_color(rgb(if focused { ACCENT } else { BORDER }))
+                            .rounded_md()
+                            .text_size(px(12.))
+                            .text_color(rgb(TEXT))
+                            .track_focus(&self.review_note_focus)
+                            .on_key_down(cx.listener(Self::review_note_key))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _e, window, cx| {
+                                    window.focus(&this.review_note_focus, cx);
+                                    cx.notify();
+                                }),
+                            )
+                            .child(if self.review_note.is_empty() {
+                                div()
+                                    .text_color(rgb(MUTED))
+                                    .child(format!("General comment…{}", self.caret_if(focused)))
+                                    .into_any_element()
+                            } else {
+                                self.review_note.render(self.caret_if(focused), SELECTION)
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_grow(1.0)
+                                    .text_size(px(10.))
+                                    .text_color(rgb(LINE_NUMBER))
+                                    .child("⌘↩ send  ·  ↩ newline"),
+                            )
+                            .child(
+                                rc_button("review-note-send", "Send to agent", true, false).on_click(
+                                    cx.listener(|this, _e, window, cx| this.send_review(window, cx)),
+                                ),
+                            ),
+                    )
+            })
+    }
+
+    /// Keys in the general-comment box: ⌘↩ sends the review, esc gives focus back.
+    fn review_note_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        match ks.key.as_str() {
+            "enter" if ks.modifiers.platform => self.send_review(window, cx),
+            "escape" => self.focus_active(window, cx),
+            _ => {
+                if !Self::text_comes_via_input_handler(ks) {
+                    Self::field_input(&mut self.review_note, ks, cx, |_| true);
+                }
+            }
+        }
+        cx.notify();
     }
 
     /// A transparent resize handle for the find dialog; caller positions/sizes it.
@@ -12045,7 +13527,16 @@ impl Storm {
             // positives and negatives read very differently — showing them in one
             // joined list hid whether an exclusion was actually picked up
             .when(globs.iter().any(|g| !g.starts_with('!')), |d| {
-                let pos: Vec<&str> = globs.iter().filter(|g| !g.starts_with('!')).map(|g| g.as_str()).collect();
+                // a folder pattern is passed twice (`api-core*` and its subtree
+                // form); the row shows what was typed, once
+                let pos: Vec<&str> = globs
+                    .iter()
+                    .filter(|g| !g.starts_with('!'))
+                    .map(|g| g.as_str())
+                    .filter(|g| {
+                        !g.strip_suffix("/**").is_some_and(|base| globs.iter().any(|o| o == base))
+                    })
+                    .collect();
                 d.child(
                     div()
                         .text_color(rgb(ACCENT))
@@ -12055,12 +13546,15 @@ impl Storm {
             })
             // path exclusions (whole subtrees skipped)
             .when(globs.iter().any(|g| g.starts_with('!')), |d| {
-                let neg: Vec<String> = globs
-                    .iter()
-                    .filter_map(|g| g.strip_prefix('!'))
-                    // show `**/dist/**` as `dist` — the form you typed
-                    .map(|g| g.trim_start_matches("**/").trim_end_matches("/**").to_string())
-                    .collect();
+                let mut neg: Vec<String> = Vec::new();
+                for g in globs.iter().filter_map(|g| g.strip_prefix('!')) {
+                    // show `**/dist/**` as `dist` — the form you typed — and only
+                    // once, since a folder pattern is passed in both forms
+                    let shown = g.trim_start_matches("**/").trim_end_matches("/**").to_string();
+                    if !neg.contains(&shown) {
+                        neg.push(shown);
+                    }
+                }
                 d.child(
                     div()
                         .text_color(rgb(GIT_DELETED))
@@ -12086,6 +13580,35 @@ impl Storm {
                     )
                 },
             );
+
+        // ── syntax legend: the four things the box understands, on screen so
+        //    the syntax doesn't have to be remembered ──
+        let legend = |example: &str, what: &str, color: u32| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .flex_shrink_0()
+                .child(div().font_family("Menlo").text_color(rgb(color)).child(example.to_string()))
+                .child(div().text_color(rgb(LINE_NUMBER)).child(what.to_string()))
+        };
+        let hints = div()
+            .h(px(20.))
+            .px_3()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .overflow_hidden()
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .text_size(px(10.))
+            .child(legend("*.ts", "file type", ACCENT))
+            .child(legend("api-core*", "folder", ACCENT))
+            .child(legend("src/**/*.tsx", "path", ACCENT))
+            .child(legend("-dist", "skip folder", GIT_DELETED))
+            .child(legend("-TODO", "drop lines", GIT_DELETED));
 
         // ── results list (height = draggable split fraction of the area below
         //    the header; the rest goes to the preview) ──
@@ -12340,6 +13863,7 @@ impl Storm {
             )
             .child(header)
             .child(scope_row)
+            .child(hints)
             .child(results)
             // draggable divider: drag down → bigger results, up → bigger preview
             .child(
@@ -12538,6 +14062,7 @@ impl Storm {
             let (icon, label, sub) = match item {
                 GitItem::Action(_, label, icon) => (*icon, label.to_string(), String::new()),
                 GitItem::Branch(name) => (IC_BRANCH, name.clone(), String::new()),
+                GitItem::Pr(n) => (IC_PR, format!("Checkout PR #{n}"), String::new()),
             };
             let _ = sub;
             list = list.child(
@@ -13961,7 +15486,9 @@ impl Storm {
                     .text_size(px(12.))
                     .text_color(rgb(TEXT))
                     .child(if self.newproj_path.is_empty() {
-                        div().text_color(rgb(MUTED)).child(format!("{}/path/to/folder", self.caret()))
+                        div()
+                            .text_color(rgb(MUTED))
+                            .child(format!("{}/path/to/folder  or  a GitHub URL", self.caret()))
                     } else {
                         div().child(self.newproj_path.render(self.caret(), SELECTION))
                     }),
@@ -14028,11 +15555,23 @@ impl Storm {
                 // compare canonicalised, so ~/dev/x and a symlinked path match
                 let canon = |q: &Path| std::fs::canonicalize(q).unwrap_or_else(|_| q.to_path_buf());
                 let already_open = self.ws_roots.iter().any(|r| canon(r) == canon(p));
-                let title = self
+                let key = p.to_string_lossy().to_string();
+                let live = self
                     .newproj_titles
-                    .get(&p.to_string_lossy().to_string())
+                    .get(&key)
                     .filter(|t| !t.trim().is_empty())
                     .cloned();
+                // a reset workspace keeps no title; show the last one it had in
+                // grey so the folder is still recognisable
+                let title = match live {
+                    Some(t) => Some((t, true)),
+                    None => self
+                        .newproj_last_titles
+                        .get(&key)
+                        .filter(|t| !t.trim().is_empty())
+                        .cloned()
+                        .map(|t| (t, false)),
+                };
                 recents = recents.child(
                     div()
                         .id(("newproj-recent", i))
@@ -14049,14 +15588,19 @@ impl Storm {
                         .child(div().flex_shrink_0().text_size(px(12.)).text_color(rgb(if sel { SEL_TEXT } else { TEXT })).child(name))
                         // the workspace title tells you which piece of work lives
                         // in this folder — the whole point of picking one
-                        .when_some(title, |d, t| {
+                        .when_some(title, |d, (t, live)| {
+                            let color = match (sel, live) {
+                                (true, _) => SEL_TEXT,
+                                (false, true) => ACCENT,
+                                (false, false) => MUTED,
+                            };
                             d.child(
                                 div()
                                     .flex_shrink_0()
                                     .max_w(px(240.))
                                     .text_size(px(11.))
                                     .truncate()
-                                    .text_color(rgb(if sel { SEL_TEXT } else { ACCENT }))
+                                    .text_color(rgb(color))
                                     .child(t),
                             )
                         })
@@ -14105,7 +15649,7 @@ impl Storm {
                     .py_2()
                     .text_size(px(11.))
                     .text_color(rgb(MUTED))
-                    .child("Open Project — folder path"),
+                    .child("Open Project — folder path, or a repo to clone into ~/dev"),
             )
             .child(input_row)
             .child(
@@ -14152,20 +15696,13 @@ impl Storm {
         self.toggle_agent(window, cx);
     }
 
+    /// ⌘⇧A. The pane is always up, so this is "put me in it" — the toggle it
+    /// used to be only ever got in the way of the surface you work in.
     fn toggle_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !AGENT_PANEL {
             return; // feature parked; flip AGENT_PANEL to re-enable
         }
-        self.agent_open = !self.agent_open;
-        if self.agent_open {
-            self.ensure_acp(cx);
-            self.autoresume_agent(cx);
-            self.agent_list.scroll_to_end(); // reopen at the end
-            window.focus(&self.agent_focus, cx);
-        } else {
-            self.focus_active(window, cx);
-        }
-        cx.notify();
+        self.focus_agent(window, cx);
     }
 
     /// On the panel's first open, pick up where the last session left off: ask
@@ -14174,6 +15711,12 @@ impl Storm {
     /// there's nothing to resume.
     fn autoresume_agent(&mut self, cx: &mut Context<Self>) {
         if self.agent_resumed || self.agent_autoresume {
+            return;
+        }
+        // started over and never prompted since: the handshake's own new session
+        // is the one that belongs here, not whatever came before the reset
+        if self.agent_fresh {
+            self.agent_resumed = true;
             return;
         }
         if let Some(acp) = self.acp.clone() {
@@ -14198,6 +15741,7 @@ impl Storm {
         self.ensure_acp(cx);
         self.agent_resumed = true; // an explicit new session outranks auto-resume
         self.agent_autoresume = false;
+        self.mark_agent_fresh(true);
         self.reset_agent_transcript();
         if let Some(acp) = self.acp.clone() {
             acp.new_session(&self.root);
@@ -14205,10 +15749,25 @@ impl Storm {
         cx.notify();
     }
 
+    /// Remember (on disk, per workspace) whether the agent here was started over
+    /// and not yet prompted.
+    fn mark_agent_fresh(&mut self, fresh: bool) {
+        if self.agent_fresh == fresh {
+            return;
+        }
+        self.agent_fresh = fresh;
+        save_ws_fresh(&self.root, fresh);
+    }
+
     fn reset_agent_transcript(&mut self) {
+        self.agent_briefed = false; // a new session hasn't been told anything yet
         self.acp_state = None;
+        self.agent_ghost = None;
+        self.agent_jump_open = false;
         self.agent_queue.clear();
         self.agent_imgs.clear();
+        self.agent_img_seq = 0;
+        self.agent_pastes.clear();
         self.agent_list.scroll_to_end(); // a replayed session opens at its end
         self.agent_picker = false;
         self.agent_msgs.clear();
@@ -14221,6 +15780,7 @@ impl Storm {
 
     /// Resume a session: the transcript is rebuilt from the adapter's replay.
     fn resume_agent_session(&mut self, id: String, cx: &mut Context<Self>) {
+        self.mark_agent_fresh(false); // resuming by hand is a choice to keep it
         self.reset_agent_transcript();
         if let Some(acp) = self.acp.clone() {
             acp.load_session(&self.root, &id);
@@ -14237,6 +15797,8 @@ impl Storm {
                     id: String::new(),
                     title: "could not start agent — is `npx` (Node 22+) on PATH?".into(),
                     status: "failed".into(),
+                    detail: String::new(),
+                    started: std::time::Instant::now(),
                 });
             }
         }
@@ -14276,7 +15838,7 @@ impl Storm {
             User(t) => {
                 self.agent_cur = None;
                 self.agent_cur_thought = None;
-                self.agent_msgs.push(AgentMsg::User(t));
+                self.agent_msgs.push(AgentMsg::User { text: t, imgs: Vec::new() });
             }
             Sessions(list) => {
                 self.agent_sessions = list;
@@ -14291,7 +15853,7 @@ impl Storm {
                     }
                 }
             }
-            Title(t) => self.agent_title = Some(t),
+            Title(t) => self.agent_title = session_title(&t),
             Text(t) => {
                 self.agent_cur_thought = None; // real answer began → close the reasoning bubble
                 match self.agent_cur {
@@ -14317,16 +15879,35 @@ impl Storm {
                     self.agent_cur_thought = Some(self.agent_msgs.len() - 1);
                 }
             },
-            Tool { id, title, status } => {
+            Tool { id, title, status, detail } => {
+                let detail = tool_note(&detail);
                 self.agent_cur = None; // text after a tool call starts a fresh bubble
                 self.agent_cur_thought = None;
-                self.agent_msgs.push(AgentMsg::Tool { id, title, status });
+                self.agent_msgs.push(AgentMsg::Tool {
+                    id,
+                    title,
+                    status,
+                    detail,
+                    started: std::time::Instant::now(),
+                });
             }
-            ToolStatus { id, status } => {
+            ToolUpdate { id, title, status, detail } => {
                 for m in self.agent_msgs.iter_mut() {
-                    if let AgentMsg::Tool { id: mid, status: st, .. } = m {
-                        if *mid == id {
+                    if let AgentMsg::Tool { id: mid, title: t, status: st, detail: d, .. } = m {
+                        if *mid != id {
+                            continue;
+                        }
+                        if let Some(status) = &status {
                             *st = status.clone();
+                        }
+                        // the announcement is made before the tool's input has
+                        // finished streaming, so this is usually the first time
+                        // we learn what the call actually is
+                        if let Some(title) = &title {
+                            *t = title.clone();
+                        }
+                        if let Some(detail) = &detail {
+                            *d = tool_note(detail);
                         }
                     }
                 }
@@ -14347,7 +15928,13 @@ impl Storm {
                 self.acp_state = Some(AgentState::Failed);
                 self.agent_cur = None;
                 self.agent_cur_thought = None;
-                self.agent_msgs.push(AgentMsg::Tool { id: String::new(), title: e, status: "failed".into() });
+                self.agent_msgs.push(AgentMsg::Tool {
+                    id: String::new(),
+                    title: e,
+                    status: "failed".into(),
+                    detail: String::new(),
+                    started: std::time::Instant::now(),
+                });
             }
         }
     }
@@ -14378,7 +15965,8 @@ impl Storm {
             }
         }
         let ks = &ev.keystroke;
-        // ctrl+j adds a line, ctrl+c interrupts the turn — terminal muscle memory
+        // terminal muscle memory: ⌃J adds a line, ⌃C abandons what you're typing
+        // (and the turn in flight), ⌃N starts a fresh session
         if ks.modifiers.control {
             match ks.key.as_str() {
                 "j" => {
@@ -14388,14 +15976,26 @@ impl Storm {
                 }
                 "c" => {
                     self.interrupt_agent(cx);
+                    self.agent_input.clear();
+                    self.agent_ghost = None;
+                    cx.notify();
                     return;
                 }
-                _ => {}
+                "n" => {
+                    self.new_agent_session(cx);
+                    return;
+                }
+                // every other control combo is inert here rather than falling
+                // through to the field, where it could edit the text
+                _ => return,
             }
         }
         // ⌘V with an image on the clipboard attaches it to the next prompt
         if ks.key == "v" && ks.modifiers.platform && !ks.modifiers.alt {
             if self.attach_clipboard_image(cx) {
+                return;
+            }
+            if self.paste_collapsed(cx) {
                 return;
             }
         }
@@ -14411,24 +16011,111 @@ impl Storm {
                 return;
             }
         }
+        // `[Image #1]` is one thing: arrows step over it and backspace takes the
+        // whole token (and its attachment) rather than a character of it
+        if !ks.modifiers.platform && !ks.modifiers.alt && !ks.modifiers.control {
+            let (text, caret) = (self.agent_input.text.clone(), self.agent_input.caret);
+            match ks.key.as_str() {
+                "left" if !ks.modifiers.shift => {
+                    if let Some((start, _, _)) = image_token_before(&text, caret) {
+                        self.agent_input.move_to(start);
+                        cx.notify();
+                        return;
+                    }
+                }
+                "right" if !ks.modifiers.shift => {
+                    if let Some((_, end)) = image_token_after(&text, caret) {
+                        self.agent_input.move_to(end);
+                        cx.notify();
+                        return;
+                    }
+                }
+                "backspace" => {
+                    if let Some((start, end, label)) = image_token_before(&text, caret) {
+                        self.agent_input.splice(start..end, "");
+                        self.agent_imgs.retain(|i| i.label != label);
+                        if let Some(id) = label
+                            .strip_prefix("Pasted text #")
+                            .and_then(|r| r.split_whitespace().next())
+                            .and_then(|n| n.parse::<usize>().ok())
+                        {
+                            self.agent_pastes.remove(&id);
+                        }
+                        cx.notify();
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // word motions would otherwise land inside a token
+        if ks.modifiers.alt && !ks.modifiers.platform && matches!(ks.key.as_str(), "left" | "right") {
+            let forward = ks.key == "right";
+            Self::field_input(&mut self.agent_input, ks, cx, |_| true);
+            let (text, caret) = (self.agent_input.text.clone(), self.agent_input.caret);
+            if let Some((start, end)) = image_token_around(&text, caret) {
+                self.agent_input.move_to(if forward { end } else { start });
+            }
+            cx.notify();
+            return;
+        }
         match ks.key.as_str() {
+            // the `@` list owns these keys while it's up
+            "escape" if self.at_open => {
+                self.at_open = false;
+                self.at_items.clear();
+            }
+            "up" | "down" if self.at_open => {
+                let last = self.at_items.len().saturating_sub(1);
+                self.at_sel = if ks.key == "down" {
+                    if self.at_sel >= last { 0 } else { self.at_sel + 1 }
+                } else if self.at_sel == 0 {
+                    last
+                } else {
+                    self.at_sel - 1
+                };
+                cx.notify();
+                return;
+            }
+            "tab" | "enter" if self.at_open && !ks.modifiers.shift && !ks.modifiers.platform => {
+                self.accept_mention();
+                cx.notify();
+                return;
+            }
+            "escape" if self.agent_jump_open => {
+                self.agent_jump_open = false;
+                cx.notify();
+            }
             // a selection is what escape drops first
             "escape" if self.agent_sel.is_some() => {
                 self.agent_sel = None;
                 cx.notify();
             }
-            "escape" => {
-                self.agent_open = false;
-                self.focus_active(window, cx);
+            // escape drops the jump list or a selection (above) and nothing
+            // else: the pane isn't closable, so there's nothing left to close
+            // ⇥ takes the suggestion
+            "tab" if self.agent_ghost.is_some() => {
+                if let Some(rest) = self.agent_ghost.take() {
+                    self.agent_input.insert_text(&rest);
+                }
             }
             // ↩ sends; the field's own newline handling is bypassed here
             "enter" if !ks.modifiers.shift => {
-                let text = self.agent_input.text.trim().to_string();
-                if text.is_empty() && self.agent_imgs.is_empty() {
+                let shown = self.agent_input.text.trim().to_string();
+                if shown.is_empty() && self.agent_imgs.is_empty() {
                     return;
                 }
+                let full = self.expand_mentions(&self.expand_pastes(&shown));
                 self.agent_input.clear();
-                self.send_agent_prompt(text, cx);
+                self.agent_ghost = None;
+                self.agent_pastes.clear();
+                self.agent_mentions.clear();
+                self.at_open = false;
+                self.at_items.clear();
+                // the transcript shows what you typed (tokens and all); the
+                // agent gets the pasted content spliced back in
+                let label = (full != shown).then_some(shown);
+                self.send_agent_prompt_as(full, label, cx);
             }
             "enter" => {
                 self.agent_input.newline(); // ⇧↩ too, since it costs nothing
@@ -14440,6 +16127,8 @@ impl Storm {
                 }
             }
         }
+        self.recompute_agent_ghost();
+        self.recompute_mentions(cx);
         cx.notify();
     }
 
@@ -14468,26 +16157,111 @@ impl Storm {
         cx.notify();
     }
 
-    fn send_agent_prompt(&mut self, text: String, cx: &mut Context<Self>) {
+    /// What the agent is told about TIDE, once per session, ahead of the first
+    /// prompt. It never appears in the transcript — the label carries what you
+    /// actually typed.
+    fn tide_briefing(&self) -> String {
+        // The repo's own instructions come first, and they're named explicitly:
+        // the adapter picks up CLAUDE.md on its own, but AGENTS.md is the file
+        // this repo actually keeps its house rules in, and nothing loads it.
+        let mut house = String::new();
+        for name in ["AGENTS.md", "CLAUDE.md"] {
+            if self.root.join(name).is_file() {
+                if !house.is_empty() {
+                    house.push_str(" and ");
+                }
+                house.push_str(name);
+            }
+        }
+        let house = if house.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "Read {house} at the root of this repo before you start, and work \
+                 the way it says. Those are the house rules for this codebase and \
+                 they outrank anything below.\n\n"
+            )
+        };
+        format!("{house}{}", Self::tide_briefing_body())
+    }
+
+    /// The part of the briefing that never changes.
+    fn tide_briefing_body() -> String {
+        "You are running inside TIDE, an editor that watches this repo.\n\
+         Its control channel is $TIDE_RPC, authenticated with the header \
+         `X-Tide-Token: $TIDE_TOKEN` (both are already in your environment).\n\n\
+         After anything that changes what TIDE shows about this branch — opening \
+         or updating a pull request, pushing, switching or creating a branch — \
+         tell it to re-read:\n\
+         \x20 curl -s -X POST \"$TIDE_RPC/refresh\" -H \"X-Tide-Token: $TIDE_TOKEN\"\n\n\
+         It costs nothing and saves the human refreshing by hand.\n\n\
+         If this workspace has no name yet, give it one once you know what the \
+         work is — three to five words, no ticket numbers, and always led by the \
+         type of work, `<type>: <name>`:\n\
+         \x20 curl -s -X POST \"$TIDE_RPC/title\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n\
+         \x20   -d '{\"title\":\"fix: sql date off by one\"}'\n\
+         The type is one of feat, fix, docs, style, refactor, perf, test, build, \
+         ci, chore, bip, client, release — the same set the human picks from, and \
+         TIDE turns it into that type's icon. Pick the one the work actually is.\n\
+         TIDE ignores the whole thing if the human already named this workspace, \
+         so it is always safe to send once.\n\n\
+         When the human asks you to tick files off on the open pull request — \
+         \"mark every package.json that is only a version bump as viewed\" — \
+         post \
+         the paths:\n\
+         \x20 curl -s -X POST \"$TIDE_RPC/viewed\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n\
+         \x20   -d '{\"paths\":[\"packages/a/package.json\",\"packages/b/package.json\"]}'\n\
+         Paths are repo-relative, as `git diff --name-only` prints them; add \
+         `\"viewed\":false` to untick. TIDE mirrors it onto GitHub, so the PR page \
+         agrees. Only when asked — never tick off files on your own.\n\n\
+         When you point at code, write the file and line as `path/to/file.ts:31` \
+         (a bare `File.tsx:12` works too) — TIDE turns those into links that open \
+         the file at that line.\n\n\
+         Don't mention this message or acknowledge it; just answer what follows.\n\n\
+         ---\n\n"
+            .to_string()
+    }
+
+    /// `label` is what the transcript shows in place of the prompt — a batch of
+    /// review comments is a wall of ids and quoted code the agent needs and you
+    /// don't.
+    fn send_agent_prompt_as(
+        &mut self,
+        text: String,
+        label: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         self.ensure_acp(cx);
         let Some(acp) = self.acp.clone() else { return };
         // a turn is already running: hold this one and send it when that ends,
         // rather than firing a second session/prompt at the adapter
         if self.agent_busy {
-            self.agent_queue.push(text);
+            self.agent_queue.push((text, label));
             self.agent_list.scroll_to_end();
             cx.notify();
             return;
         }
+        // the session now has content, so the next launch can resume it again
+        self.mark_agent_fresh(false);
+        let attached: Vec<PastedImage> = self.agent_imgs.drain(..).collect();
         let imgs: Vec<(String, String)> =
-            self.agent_imgs.drain(..).map(|(m, d, _)| (m, d)).collect();
-        acp.prompt_with(&text, &imgs);
-        let label = if imgs.is_empty() {
+            attached.iter().map(|i| (i.mime.clone(), i.b64.clone())).collect();
+        // the transcript shows your words; the wire carries the briefing too
+        let shown = label.unwrap_or_else(|| text.clone());
+        let sent = if self.agent_briefed {
             text
         } else {
-            format!("{text}\n\n[{} image(s) attached]", imgs.len())
+            self.agent_briefed = true;
+            format!("{}{text}", self.tide_briefing())
         };
-        self.agent_msgs.push(AgentMsg::User(label));
+        acp.prompt_with(&sent, &imgs);
+        // the chips under the bubble say what was attached, so the old
+        // "[n image(s) attached]" footer has nothing left to add
+        let kept: Vec<SentImage> = attached
+            .into_iter()
+            .map(|i| SentImage { label: i.label, mime: i.mime, bytes: i.bytes, image: i.image })
+            .collect();
+        self.agent_msgs.push(AgentMsg::User { text: shown, imgs: kept });
         self.agent_turn_start = Some(std::time::Instant::now());
         self.start_agent_spinner(cx);
         // same signal a terminal agent's UserPromptSubmit hook sends
@@ -14536,15 +16310,19 @@ impl Storm {
         let wrap = |i: usize, inner: AnyElement, cx: &mut Context<Self>| {
             div()
                 .child(inner)
+                // A press only *arms* the selection; the range appears once the
+                // pointer actually moves. Selecting on mouse-down swallowed
+                // clicks on file links, since the row re-rendered underneath the
+                // click.
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
-                        this.agent_sel = Some((msg, i, i));
+                        this.agent_sel_armed = Some((msg, i));
                         this.agent_sel_drag = true;
                         this.agent_sel_moved = false;
                         this.agent_sel_pos =
                             Some((f32::from(ev.position.x), f32::from(ev.position.y)));
-                        cx.notify();
+                        let _ = cx;
                     }),
                 )
                 .on_mouse_down(
@@ -14557,6 +16335,7 @@ impl Storm {
                             .is_some_and(|(m, a, b)| m == msg && i >= a.min(b) && i <= a.max(b));
                         if !inside {
                             this.agent_sel = Some((msg, i, i));
+                            this.agent_sel_armed = None;
                         }
                         this.tree_ctx = Some((f32::from(ev.position.x), f32::from(ev.position.y)));
                         this.tree_ctx_path = None;
@@ -14567,6 +16346,15 @@ impl Storm {
                 )
                 .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _w, cx| {
                     if !this.agent_sel_drag {
+                        return;
+                    }
+                    // first movement after the press starts the selection
+                    if let Some((m, anchor)) = this.agent_sel_armed.take() {
+                        this.agent_sel = Some((m, anchor, i));
+                        this.agent_sel_moved = true;
+                        this.agent_sel_pos =
+                            Some((f32::from(ev.position.x), f32::from(ev.position.y)));
+                        cx.notify();
                         return;
                     }
                     if let Some((m, a, b)) = this.agent_sel {
@@ -14604,6 +16392,23 @@ impl Storm {
                 continue;
             }
             let row = &rows[i];
+            // file references in the answer are links: `Icon.tsx:14` opens the
+            // file at that line
+            // two kinds of link in one line: a file reference opens the file,
+            // a URL opens the browser. Sorted and non-overlapping, since that's
+            // what the highlighter and the click ranges both need.
+            let mut links: Vec<(std::ops::Range<usize>, LinkTarget)> = file_refs(&row.text)
+                .into_iter()
+                .filter(|r| self.file_ref_target(&r.path, cx).is_some())
+                .map(|r| (r.range, LinkTarget::File(r.path, r.line)))
+                .chain(
+                    url_spans(&row.text)
+                        .into_iter()
+                        .map(|r| (r.clone(), LinkTarget::Url(row.text[r].to_string()))),
+                )
+                .collect();
+            links.sort_by_key(|(r, _)| r.start);
+            links.dedup_by(|b, a| b.0.start < a.0.end);
             // the marker sits in the reserved left gutter, once per span, exactly
             // like the editor's gutter icon — click it to open that thread
             let span = commented.iter().find(|(a, b, _)| i + 1 >= *a && i + 1 <= *b).copied();
@@ -14640,7 +16445,32 @@ impl Storm {
                         .flex_grow(1.0)
                         .min_w(px(0.))
                         .text_size(px(row.size.max(1.0)))
-                        .child(md_row_el(row, selected(i))),
+                        .child(if links.is_empty() {
+                            md_row_el(row, selected(i))
+                        } else {
+                            let ranges: Vec<std::ops::Range<usize>> =
+                                links.iter().map(|(r, _)| r.clone()).collect();
+                            let targets: Vec<LinkTarget> =
+                                links.iter().map(|(_, t)| t.clone()).collect();
+                            let styled = md_styled_links(row, row.heading, selected(i), &ranges);
+                            let me = cx.entity().downgrade();
+                            gpui::InteractiveText::new(("md-link", msg * 10_000 + i), styled)
+                                .on_click(ranges, move |ix, window, cx| {
+                                    match targets.get(ix) {
+                                        Some(LinkTarget::Url(u)) => open_browser(u),
+                                        Some(LinkTarget::File(path, line)) => {
+                                            let (path, line) = (path.clone(), *line);
+                                            if let Some(me) = me.upgrade() {
+                                                me.update(cx, |this, cx| {
+                                                    this.open_file_ref(&path, line, window, cx)
+                                                });
+                                            }
+                                        }
+                                        None => {}
+                                    }
+                                })
+                                .into_any_element()
+                        }),
                 )
                 .into_any_element();
             built.push((i, wrap(i, inner, cx)));
@@ -14737,11 +16567,66 @@ impl Storm {
             self.show_flash("That image is too large to attach (over 6 MB)", cx);
             return true;
         }
-        let mime = img.format.mime_type().to_string();
-        self.agent_imgs.push((mime, acp::base64(&img.bytes), img.bytes.len()));
-        self.show_flash("Image attached — send when ready", cx);
+        self.agent_img_seq += 1;
+        let label = format!("Image #{}", self.agent_img_seq);
+        // the token goes into the text at the caret, so the question can point
+        // at a specific picture ("what's wrong in [Image #2]?")
+        self.agent_input.insert_text(&format!("[{label}] "));
+        self.agent_imgs.push(PastedImage {
+            mime: img.format.mime_type().to_string(),
+            b64: acp::base64(&img.bytes),
+            bytes: img.bytes.len(),
+            image: Arc::new(img),
+            label,
+        });
         cx.notify();
         true
+    }
+
+    /// A long clipboard paste lands as `[Pasted text #3 +216 lines]` rather than
+    /// burying the composer. Pasting the same text again expands that token in
+    /// place, which is the escape hatch when you do want to see it.
+    /// Returns false when the clipboard isn't worth collapsing.
+    fn paste_collapsed(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) else { return false };
+        // already collapsed once: the second paste reveals it
+        if let Some((id, _)) = self.agent_pastes.iter().find(|(_, t)| **t == text) {
+            let id = *id;
+            let token = self.paste_token(id, &text);
+            if let Some(at) = self.agent_input.text.find(&token) {
+                self.agent_input.splice(at..at + token.len(), &text);
+                self.agent_pastes.remove(&id);
+                cx.notify();
+                return true;
+            }
+        }
+        let lines = text.lines().count();
+        if lines < 6 && text.len() < 400 {
+            return false; // short enough to read in the box
+        }
+        self.agent_paste_seq += 1;
+        let id = self.agent_paste_seq;
+        self.agent_pastes.insert(id, text.clone());
+        let token = self.paste_token(id, &text);
+        self.agent_input.insert_text(&format!("{token} "));
+        self.show_flash("Pasted text collapsed — paste again to expand it", cx);
+        cx.notify();
+        true
+    }
+
+    fn paste_token(&self, id: usize, text: &str) -> String {
+        format!("[Pasted text #{id} +{} lines]", text.lines().count())
+    }
+
+    /// Swap every `[Pasted text #N …]` token back for what was pasted. The agent
+    /// needs the content; only the composer and the transcript show the token.
+    fn expand_pastes(&self, text: &str) -> String {
+        let mut out = text.to_string();
+        for (id, full) in &self.agent_pastes {
+            let token = self.paste_token(*id, full);
+            out = out.replace(&format!("{token} "), full).replace(&token, full);
+        }
+        out
     }
 
     /// ⌥C in the agent pane: comment on the selected answer text. Opens the same
@@ -14783,15 +16668,313 @@ impl Storm {
         .detach();
     }
 
+    /// Turn a written reference into a real file. An absolute-ish path is taken
+    /// as repo-relative; a bare `Icon.tsx` is looked up in the finder's index,
+    /// preferring a unique match and otherwise the shortest path (the least
+    /// nested one is nearly always what the agent meant).
+    fn resolve_file_ref(&self, path: &str) -> Option<PathBuf> {
+        let direct = self.root.join(path);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        if path.contains('/') {
+            // a partial path: match on the suffix
+            let mut hits: Vec<&PathBuf> =
+                self.all_files.iter().filter(|p| p.to_string_lossy().ends_with(path)).collect();
+            hits.sort_by_key(|p| p.to_string_lossy().len());
+            return hits.first().map(|p| (*p).clone());
+        }
+        let mut hits: Vec<&PathBuf> = self
+            .all_files
+            .iter()
+            .filter(|p| p.file_name().is_some_and(|n| n == path))
+            .collect();
+        hits.sort_by_key(|p| p.to_string_lossy().len());
+        hits.first().map(|p| (*p).clone())
+    }
+
+    /// [`resolve_file_ref`] memoized, and the reason the file index gets built
+    /// even when the finder was never opened: a reference is only drawn as a
+    /// link if it resolves, so this runs while rendering the transcript.
+    fn file_ref_target(&mut self, path: &str, cx: &mut Context<Self>) -> Option<PathBuf> {
+        if let Some(hit) = self.ref_hits.get(path) {
+            return hit.clone();
+        }
+        self.index_files(cx);
+        let hit = self.resolve_file_ref(path);
+        self.ref_hits.insert(path.to_string(), hit.clone());
+        hit
+    }
+
+    /// Scan the project's paths once, in the background. The finder does its own
+    /// (debounced, repeatable) scan; this is the first-use one for everything
+    /// else, and it never runs twice.
+    fn index_files(&mut self, cx: &mut Context<Self>) {
+        if self.files_scanned {
+            return;
+        }
+        self.files_scanned = true;
+        let root = self.root.clone();
+        cx.spawn(async move |this, cx| {
+            let (files, dirs) = cx
+                .background_executor()
+                .spawn(async move { collect_paths(&root) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.all_files = files;
+                this.all_dirs = dirs;
+                this.ref_hits.clear();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Open a file reference from the transcript at its line.
+    fn open_file_ref(&mut self, path: &str, line: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(p) = self.file_ref_target(path, cx) else {
+            self.show_flash(&format!("Can't find {path} in this project"), cx);
+            return;
+        };
+        self.open_file(p, window, cx);
+        if line > 0 {
+            if let Some(tab) = self.tabs.get(self.active) {
+                tab.editor.update(cx, |e, cx| e.goto(line, 1, cx));
+            }
+        }
+    }
+
+    /// The `@` list, sitting on top of the composer. Rows are clickable, ↑/↓
+    /// move, ⇥ or ↩ takes the highlighted one.
+    fn render_mentions(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.at_open || self.at_items.is_empty() {
+            return None;
+        }
+        let mut panel = div()
+            .absolute()
+            .left_0()
+            .right_0()
+            // bottom: 100% — the list grows upwards from the composer's top edge
+            .bottom(relative(1.))
+            .mb_1()
+            .max_h(px(240.))
+            .overflow_hidden()
+            .bg(rgb(POPUP_BG))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .rounded_md()
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .py_1();
+        for (i, m) in self.at_items.iter().enumerate() {
+            let sel = i == self.at_sel;
+            panel = panel.child(
+                div()
+                    .id(("agent-mention", i))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_0p5()
+                    .cursor_pointer()
+                    .when(sel, |d| d.bg(rgb(SELECTED_BG)))
+                    .hover(|s| s.bg(rgb(if sel { SELECTED_BG } else { HOVER })))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(12.))
+                            .text_color(rgb(if sel { SEL_TEXT } else { TEXT }))
+                            .child(m.token.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_grow(1.0)
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(11.))
+                            .text_color(rgb(MUTED))
+                            .child(m.detail.clone()),
+                    )
+                    .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _e, window, cx| {
+                        this.at_sel = i;
+                        this.accept_mention();
+                        window.focus(&this.agent_focus, cx);
+                        cx.notify();
+                    })),
+            );
+        }
+        Some(panel)
+    }
+
+    /// Recompute the `@` completion from the composer's text and caret. Driven
+    /// off the text rather than off keystrokes, so typing, backspacing, pasting
+    /// and moving the caret all end up in the same place.
+    fn recompute_mentions(&mut self, cx: &mut Context<Self>) {
+        let text = self.agent_input.text.clone();
+        let caret = self.agent_input.caret_safe();
+        let Some((i, query)) = mention_span(&text, caret) else {
+            self.at_open = false;
+            self.at_items.clear();
+            return;
+        };
+        self.at_start = i;
+        self.at_items = self.mention_matches(&query, cx);
+        self.at_open = !self.at_items.is_empty();
+        self.at_sel = self.at_sel.min(self.at_items.len().saturating_sub(1));
+    }
+
+    /// What `@query` can mean: any open workspace, then any file in this one.
+    /// Workspaces come first because that's the thing you can't otherwise say —
+    /// the agent already knows its own repo.
+    fn mention_matches(&mut self, query: &str, cx: &mut Context<Self>) -> Vec<Mention> {
+        let q = query.to_lowercase();
+        let mut out: Vec<Mention> = Vec::new();
+        for (i, root) in self.ws_roots.iter().enumerate() {
+            let name = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let title = self.ws_names.get(i).cloned().unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+            if !q.is_empty()
+                && !name.to_lowercase().contains(&q)
+                && !title.to_lowercase().contains(&q)
+            {
+                continue;
+            }
+            let detail = if title.is_empty() || title == name {
+                root.to_string_lossy().to_string()
+            } else {
+                format!("{title}  ·  {}", root.to_string_lossy())
+            };
+            out.push(Mention {
+                token: format!("@{name}"),
+                detail,
+                // the agent needs the path, not the nickname
+                expand: Some(format!("{name} ({})", root.to_string_lossy())),
+            });
+        }
+        // files need something to go on: every path matches an empty query
+        if q.len() >= 2 {
+            self.index_files(cx);
+            let mut hits: Vec<String> = self
+                .all_files
+                .iter()
+                .map(|p| self.rel(p))
+                .filter(|rel| rel.to_lowercase().contains(&q))
+                .collect();
+            hits.sort_by_key(|r| r.len());
+            for rel in hits.into_iter().take(8) {
+                let folder = rel.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default();
+                // a path says everything already: it goes in as itself, no `@`
+                out.push(Mention { token: rel, detail: folder, expand: None });
+            }
+        }
+        out.truncate(12);
+        out
+    }
+
+    /// Put the highlighted candidate into the composer.
+    fn accept_mention(&mut self) {
+        let Some(m) = self.at_items.get(self.at_sel).cloned() else { return };
+        let caret = self.agent_input.caret_safe();
+        self.agent_input.splice(self.at_start..caret, &format!("{} ", m.token));
+        if let Some(expand) = m.expand {
+            self.agent_mentions.insert(m.token, expand);
+        }
+        self.at_open = false;
+        self.at_items.clear();
+        self.at_sel = 0;
+    }
+
+    /// `@wby-next6` → `wby-next6 (/Users/adrian/dev/wby-next6)`. The composer
+    /// keeps the short form; the agent gets the path it can actually open.
+    fn expand_mentions(&self, text: &str) -> String {
+        let mut toks: Vec<(&String, &String)> = self.agent_mentions.iter().collect();
+        // longest first: `@wby` must not eat its way into `@wby-next6`
+        toks.sort_by_key(|(t, _)| std::cmp::Reverse(t.len()));
+        let mut out = text.to_string();
+        for (token, expansion) in toks {
+            out = out.replace(token.as_str(), expansion);
+        }
+        out
+    }
+
+    /// The rest of the newest message that starts with what's typed, fish-style.
+    /// History only — no model call, so it costs nothing and never surprises.
+    fn recompute_agent_ghost(&mut self) {
+        let typed = self.agent_input.text.clone();
+        self.agent_ghost = None;
+        // only for a single line, and only once there's enough to match on
+        if typed.trim().len() < 3 || typed.contains('\n') {
+            return;
+        }
+        let lower = typed.to_lowercase();
+        self.agent_ghost = self
+            .agent_msgs
+            .iter()
+            .rev()
+            .filter_map(|m| match m {
+                AgentMsg::User { text, .. } => Some(text),
+                _ => None,
+            })
+            .filter(|t| !t.contains('\n'))
+            .find(|t| t.len() > typed.len() && t.to_lowercase().starts_with(&lower))
+            .map(|t| t[typed.len()..].to_string());
+    }
+
+    /// Keys while the jump list is open: esc closes it, ↩ jumps to the newest
+    /// match, everything else filters.
+    fn agent_jump_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        match ks.key.as_str() {
+            "escape" => {
+                self.agent_jump_open = false;
+                self.agent_jump_query.clear();
+                window.focus(&self.agent_focus, cx);
+            }
+            "enter" => {
+                let q = self.agent_jump_query.text.to_lowercase();
+                let hit = self.agent_msgs.iter().enumerate().rev().find(|(_, m)| match m {
+                    AgentMsg::User { text, .. } => q.is_empty() || text.to_lowercase().contains(&q),
+                    _ => false,
+                });
+                if let Some((ix, _)) = hit {
+                    self.agent_list.scroll_to_reveal_item(ix);
+                    self.agent_jump_open = false;
+                    self.agent_jump_query.clear();
+                    window.focus(&self.agent_focus, cx);
+                }
+            }
+            _ => {
+                // printable text arrives through the input handler instead
+                if !Self::text_comes_via_input_handler(ks) {
+                    Self::field_input(&mut self.agent_jump_query, ks, cx, |_| true);
+                }
+            }
+        }
+        cx.notify();
+    }
+
     /// Send the next queued prompt, if any. Called when a turn ends.
     fn agent_next_queued(&mut self) {
         if self.agent_queue.is_empty() {
             return;
         }
-        let text = self.agent_queue.remove(0);
+        let (text, label) = self.agent_queue.remove(0);
         if let Some(acp) = self.acp.clone() {
-            acp.prompt(&text);
-            self.agent_msgs.push(AgentMsg::User(text));
+            let sent = if self.agent_briefed {
+                text.clone()
+            } else {
+                self.agent_briefed = true;
+                format!("{}{text}", self.tide_briefing())
+            };
+            acp.prompt(&sent);
+            self.agent_msgs
+                .push(AgentMsg::User { text: label.unwrap_or(text), imgs: Vec::new() });
             self.agent_turn_start = Some(std::time::Instant::now());
             self.acp_state = Some(AgentState::Working);
             self.agent_cur = None;
@@ -14799,6 +16982,107 @@ impl Storm {
             self.agent_busy = true;
             self.agent_list.scroll_to_end();
         }
+    }
+
+    /// The briefing, on screen: the same text every new session is handed
+    /// before your first prompt. Read-only, copyable, closed by clicking away.
+    fn render_agent_brief(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.agent_brief_open {
+            return None;
+        }
+        let text = self.tide_briefing();
+        let copy = text.clone();
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .id("agent-brief-backdrop")
+                .on_click(cx.listener(|this, _e, _w, cx| {
+                    this.agent_brief_open = false;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(38.))
+                        .left(px(8.))
+                        .right(px(8.))
+                        .max_h(px(420.))
+                        .bg(rgb(POPUP_BG))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .rounded_md()
+                        .shadow_lg()
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        // clicks inside are for the panel, not the backdrop
+                        .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .px_3()
+                                .py_1p5()
+                                .border_b_1()
+                                .border_color(rgb(BORDER))
+                                .text_size(px(11.))
+                                .text_color(rgb(MUTED))
+                                .child(
+                                    div()
+                                        .flex_grow(1.0)
+                                        .text_color(rgb(TEXT))
+                                        .child("Sent to every new session, before your first message"),
+                                )
+                                .child(
+                                    div()
+                                        .id("agent-brief-copy")
+                                        .px_1p5()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                        .child("copy")
+                                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                copy.clone(),
+                                            ));
+                                            this.show_flash("Briefing copied", cx);
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("agent-brief-close")
+                                        .px_1p5()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                        .child("✕")
+                                        .on_click(cx.listener(|this, _e, _w, cx| {
+                                            this.agent_brief_open = false;
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("agent-brief-body")
+                                .min_h(px(0.))
+                                .overflow_y_scroll()
+                                .px_3()
+                                .py_2()
+                                .font_family("Menlo")
+                                .text_size(px(11.))
+                                .line_height(px(16.))
+                                .text_color(rgb(TEXT))
+                                // the trailing `---` separator is machinery, not
+                                // instruction: the panel shows what it says
+                                .child(text.trim_end_matches(['-', '\n', ' ']).to_string()),
+                        ),
+                ),
+        )
     }
 
     fn render_agent(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -14827,11 +17111,23 @@ impl Storm {
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .child(div().font_family(ICON_FONT).text_size(px(14.)).text_color(rgb(ICON)).child(IC_TOOLS))
-                    .child(div().text_size(px(12.)).text_color(rgb(TEXT)).child("Agent"))
+                    // the title is the adapter's, and can be a paragraph: clip the
+                    // whole group so it can't shove the buttons out of the header
+                    .flex_grow(1.0)
+                    .min_w(px(0.))
+                    .overflow_hidden()
+                    .child(div().flex_shrink_0().font_family(ICON_FONT).text_size(px(14.)).text_color(rgb(ICON)).child(IC_AGENT))
+                    .child(div().flex_shrink_0().text_size(px(12.)).text_color(rgb(TEXT)).child("Agent"))
                     // the adapter's own title for the session, once it has one
                     .when_some(self.agent_title.clone(), |d, t| {
-                        d.child(div().text_size(px(11.)).text_color(rgb(MUTED)).truncate().child(t))
+                        d.child(
+                            div()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_size(px(11.))
+                                .text_color(rgb(MUTED))
+                                .child(t),
+                        )
                     })
                     // context bar straight from ACP's usage_update
                     .when_some(self.agent_ctx, |d, (used, size)| {
@@ -14850,9 +17146,61 @@ impl Storm {
                     .flex_row()
                     .items_center()
                     .gap_2()
+                    .flex_shrink_0() // the actions keep their room, always
                     // resume an earlier session for this project (ACP session/list
                     // + session/load; Claude Code's own /resume isn't available
                     // over the protocol)
+                    // jump list of your own turns, for walking back through a
+                    // long conversation
+                    .when(!self.agent_msgs.is_empty(), |d| {
+                        let mine = self
+                            .agent_msgs
+                            .iter()
+                            .filter(|m| matches!(m, AgentMsg::User { .. }))
+                            .count();
+                        let open = self.agent_jump_open;
+                        d.child(
+                            div()
+                                .id("agent-jump")
+                                .px_1p5()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .text_size(px(11.))
+                                .when(open, |d| d.bg(rgb(HOVER)))
+                                .text_color(rgb(MUTED))
+                                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                .child(format!("☰ {mine}"))
+                                .tooltip(tip("Your messages — click to jump"))
+                                .on_click(cx.listener(|this, _e, window, cx| {
+                                    this.agent_jump_open = !this.agent_jump_open;
+                                    this.agent_jump_query.clear();
+                                    if this.agent_jump_open {
+                                        window.focus(&this.agent_jump_focus, cx);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    // what TIDE says to the agent before your first word: not a
+                    // secret, just hidden, so there's a way to read it
+                    .child(
+                        div()
+                            .id("agent-brief")
+                            .px_1p5()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .font_family(ICON_FONT)
+                            .text_size(px(12.))
+                            .when(self.agent_brief_open, |d| d.bg(rgb(HOVER)))
+                            .text_color(rgb(MUTED))
+                            .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                            .child(IC_GEAR)
+                            .tooltip(tip("The instructions TIDE gives this agent"))
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                this.agent_brief_open = !this.agent_brief_open;
+                                cx.notify();
+                            })),
+                    )
                     .child(
                         div()
                             .id("agent-resume")
@@ -14876,7 +17224,7 @@ impl Storm {
                             .text_color(rgb(MUTED))
                             .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
                             .child("+ New")
-                            .tooltip(tip("Start a fresh session"))
+                            .tooltip(tip("Start a fresh session  (⌃N)"))
                             .on_click(cx.listener(|this, _e, _w, cx| this.new_agent_session(cx))),
                     )
                     .child(
@@ -14919,7 +17267,7 @@ impl Storm {
                     .enumerate()
                     .rev()
                     .find_map(|(i, m)| match m {
-                        AgentMsg::User(t) => Some((i, t.clone())),
+                        AgentMsg::User { text, .. } => Some((i, text.clone())),
                         _ => None,
                     })
             })
@@ -14953,7 +17301,7 @@ impl Storm {
                                 .child(this.render_agent_md(ix, &t, window, cx))
                                 .into_any_element();
                         }
-                        return div().px_3().py_1().child(render_agent_msg(m)).into_any_element();
+                        return div().px_3().py_1().child(render_agent_msg(m, ix)).into_any_element();
                     }
                     let after = ix - this.agent_msgs.len();
                     // the "thinking" row sits between the transcript and the queue
@@ -14987,7 +17335,7 @@ impl Storm {
                             .into_any_element();
                     }
                     let qi = after - usize::from(this.agent_busy);
-                    match this.agent_queue.get(qi).cloned() {
+                    match this.agent_queue.get(qi).map(|(t, l)| l.clone().unwrap_or_else(|| t.clone())) {
                         Some(text) => div()
                             .px_3()
                             .py_1()
@@ -14996,9 +17344,51 @@ impl Storm {
                             .gap_1()
                             .child(
                                 div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
                                     .text_size(px(10.))
                                     .text_color(rgb(MUTED))
-                                    .child("You  ·  queued"),
+                                    .child("You  ·  queued")
+                                    // a queued message hasn't been sent yet, so
+                                    // changing your mind has to be possible
+                                    .child(
+                                        div()
+                                            .id(("agent-queue-drop", qi))
+                                            .px_1()
+                                            .rounded_md()
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(GIT_DELETED)))
+                                            .child("✕ remove")
+                                            .tooltip(tip("Don't send this one"))
+                                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                                if qi < this.agent_queue.len() {
+                                                    this.agent_queue.remove(qi);
+                                                    cx.notify();
+                                                }
+                                            })),
+                                    )
+                                    // and putting it back in the box to edit is
+                                    // the other half of that
+                                    .child(
+                                        div()
+                                            .id(("agent-queue-edit", qi))
+                                            .px_1()
+                                            .rounded_md()
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                            .child("edit")
+                                            .tooltip(tip("Move it back into the composer"))
+                                            .on_click(cx.listener(move |this, _e, window, cx| {
+                                                if qi < this.agent_queue.len() {
+                                                    let (t, _) = this.agent_queue.remove(qi);
+                                                    this.agent_input.set(t);
+                                                    window.focus(&this.agent_focus, cx);
+                                                    cx.notify();
+                                                }
+                                            })),
+                                    ),
                             )
                             .child(
                                 div()
@@ -15058,12 +17448,15 @@ impl Storm {
         // the very bottom of the pane
         let rows = self.agent_input.text.split('\n').count().clamp(4, 14) as f32;
         let busy = self.agent_busy;
+        let pending_comments =
+            self.review.iter().filter(|c| !c.draft && !c.sent && !c.resolved).count();
         // one box, full width: the text on top, controls along its bottom edge
         // (the way Claude's own composer does it)
         let input = div()
             .flex_shrink_0()
             .relative()
             .child(input_sink(self.agent_focus.clone(), cx.entity()))
+            .children(self.render_mentions(cx))
             .mx_2()
             .mt_2()
             .mb_3()
@@ -15075,26 +17468,45 @@ impl Storm {
             .rounded_md()
             .flex()
             .flex_col()
-            // pasted images waiting to go with the next message
+            // pasted images waiting to go with the next message: a thumbnail
+            // chip each, hover for a bigger look
             .when(!self.agent_imgs.is_empty(), |d| {
-                let mut row = div().mb_1().flex().flex_row().flex_wrap().gap_1();
-                for (i, (mime, _, size)) in self.agent_imgs.iter().enumerate() {
-                    let kind = mime.rsplit('/').next().unwrap_or("image").to_uppercase();
-                    let kb = (*size as f32 / 1024.0).round() as usize;
+                let mut row = div().mb_1p5().flex().flex_row().flex_wrap().gap_2();
+                for (i, pi) in self.agent_imgs.iter().enumerate() {
+                    let kind = pi.mime.rsplit('/').next().unwrap_or("image").to_uppercase();
+                    let kb = (pi.bytes as f32 / 1024.0).round() as usize;
+                    let preview = pi.image.clone();
                     row = row.child(
                         div()
+                            .id(("agent-img", i))
                             .flex()
                             .flex_row()
                             .items_center()
                             .gap_1()
-                            .px_1p5()
+                            .pl_0p5()
+                            .pr_1()
                             .rounded_md()
                             .bg(rgb(CURRENT_LINE))
                             .border_1()
                             .border_color(rgb(BORDER))
                             .text_size(px(10.))
                             .text_color(rgb(MUTED))
-                            .child(format!("🖼 {kind}  ·  {kb} KB"))
+                            .child(
+                                gpui::img(pi.image.clone())
+                                    .h(px(104.))
+                                    .max_w(px(192.))
+                                    .rounded_sm(),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .child(div().text_color(rgb(COMMENT_MARK)).child(pi.label.clone()))
+                                    .child(format!("{kind}  ·  {kb} KB")),
+                            )
+                            .tooltip(move |_w, cx| {
+                                cx.new(|_| ImagePreview { image: preview.clone() }).into()
+                            })
                             .child(
                                 div()
                                     .id(("agent-img-drop", i))
@@ -15104,7 +17516,14 @@ impl Storm {
                                     .child("✕")
                                     .on_click(cx.listener(move |this, _e, _w, cx| {
                                         if i < this.agent_imgs.len() {
-                                            this.agent_imgs.remove(i);
+                                            let gone = this.agent_imgs.remove(i);
+                                            let token = format!("[{}] ", gone.label);
+                                            let text = this
+                                                .agent_input
+                                                .text
+                                                .replace(&token, "")
+                                                .replace(&format!("[{}]", gone.label), "");
+                                            this.agent_input.set(text);
                                         }
                                         cx.notify();
                                     })),
@@ -15134,7 +17553,38 @@ impl Storm {
                             .text_color(rgb(MUTED))
                             .child(format!("Message the agent…{}", self.caret_if(focused)))
                     } else {
-                        self.agent_input.render(self.caret_if(focused), SELECTION)
+                        // the ghost sits after the text, dimmed, like a shell's
+                        // history suggestion — ⇥ takes it
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .items_start()
+                            // min_w(0) lets the text shrink below its content
+                            // width, which is what makes a long line wrap instead
+                            // of running off the edge of the box
+                            .child(
+                                div()
+                                    .min_w(px(0.))
+                                    .child(self.agent_input.render(self.caret_if(focused), SELECTION)),
+                            )
+                            .when_some(self.agent_ghost.clone(), |d, rest| {
+                                d.child(
+                                    div()
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .text_color(rgb(LINE_NUMBER))
+                                        .child(rest),
+                                )
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .ml_2()
+                                        .text_size(px(9.))
+                                        .text_color(rgb(LINE_NUMBER))
+                                        .child("⇥"),
+                                )
+                            })
                     }),
             )
             // bottom row inside the box: the key legend, and Stop while a turn runs
@@ -15149,9 +17599,42 @@ impl Storm {
                         div()
                             .text_size(px(10.))
                             .text_color(rgb(LINE_NUMBER))
-                            .child("↩ send  ·  ⌃J newline  ·  ⌘V paste image  ·  ⌥C comment on selection  ·  ⌃C stop"),
+                            .child("↩ send  ·  @ reference  ·  ⌃J newline  ·  ⌃N new  ·  ⌘V paste image  ·  ⌥C comment  ·  ⌃C clear"),
                     )
                     .child(div().flex_grow(1.0))
+                    // pending review comments are usually written while reading an
+                    // answer right here — the send button belongs next to the box
+                    // you're already looking at, not only in the review pane
+                    .when(pending_comments > 0, |d| {
+                        d.child(
+                            div()
+                                .id("agent-send-comments")
+                                .flex_shrink_0()
+                                .mr_2()
+                                .px_1p5()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .text_size(px(11.))
+                                .border_1()
+                                .border_color(rgb(COMMENT_MARK))
+                                .text_color(rgb(COMMENT_MARK))
+                                .hover(|s| s.bg(rgb(HOVER)))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
+                                // the codicon needs its own font family
+                                .child(div().font_family(ICON_FONT).text_size(px(10.)).child(IC_COMMENT))
+                                .child(format!(
+                                    "Send {pending_comments} comment{}",
+                                    if pending_comments == 1 { "" } else { "s" }
+                                ))
+                                .tooltip(tip("Send the pending review comments  (⌥↩)"))
+                                .on_click(cx.listener(|this, _e, window, cx| {
+                                    this.send_review(window, cx)
+                                })),
+                        )
+                    })
                     .when(busy, |d| {
                         d.child(
                             div()
@@ -15166,7 +17649,7 @@ impl Storm {
                                 .text_color(rgb(GIT_DELETED))
                                 .hover(|s| s.bg(rgb(HOVER)))
                                 .child("■ Stop")
-                                .tooltip(tip("Interrupt the agent  (⌃C)"))
+                                .tooltip(tip("Interrupt the agent  (⌃C, which also clears the box)"))
                                 .on_click(cx.listener(|this, _e, _w, cx| this.interrupt_agent(cx))),
                         )
                     }),
@@ -15235,6 +17718,7 @@ impl Storm {
             .track_focus(&self.agent_focus)
             .key_context("Agent")
             .on_key_down(cx.listener(Self::agent_key))
+            .relative()
             .child(header)
             // the pinned row only shows with the transcript, never over the picker
             .children(if picker.is_some() { None } else { pinned_row })
@@ -15243,13 +17727,134 @@ impl Storm {
                 None => list.into_any_element(),
             })
             .child(input)
+            .children(self.render_agent_brief(cx))
+            // last child, so it paints over the transcript instead of under it
+            .when(self.agent_jump_open, |d| {
+                let jump_focused = self.agent_jump_focus.is_focused(window);
+                let q = self.agent_jump_query.text.to_lowercase();
+                let mut panel = div()
+                    .id("agent-jump-list")
+                    .absolute()
+                    .top(px(34.))
+                    .left(px(8.))
+                    .right(px(8.))
+                    .max_h(px(420.))
+                    .overflow_y_scroll()
+                    .pb_1()
+                    .bg(rgb(POPUP_BG))
+                    .border_1()
+                    .border_color(rgb(ACCENT))
+                    .rounded_md()
+                    .shadow_lg()
+                    .occlude()
+                    .track_focus(&self.agent_jump_focus)
+                    .on_key_down(cx.listener(Self::agent_jump_key))
+                    .child(input_sink(self.agent_jump_focus.clone(), cx.entity()))
+                    .flex()
+                    .flex_col()
+                    // filter: a long conversation is easier to search than to scroll
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .px_2()
+                            .py_1p5()
+                            .border_b_1()
+                            .border_color(rgb(BORDER))
+                            .text_size(px(11.))
+                            .child(div().font_family(ICON_FONT).text_color(rgb(MUTED)).child(IC_SEARCH))
+                            .child(if self.agent_jump_query.is_empty() {
+                                div()
+                                    .flex_grow(1.0)
+                                    .text_color(rgb(MUTED))
+                                    .child(format!("Filter your messages…{}", self.caret_if(jump_focused)))
+                            } else {
+                                div().flex_grow(1.0).text_color(rgb(TEXT)).child(
+                                    self.agent_jump_query.render(self.caret_if(jump_focused), SELECTION),
+                                )
+                            }),
+                    );
+                // newest first: the turn you want is nearly always a recent one
+                let mine: Vec<(usize, &String)> = self
+                    .agent_msgs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(ix, m)| match m {
+                        AgentMsg::User { text, .. } => Some((ix, text)),
+                        _ => None,
+                    })
+                    .collect();
+                let total = mine.len();
+                for (pos, (ix, text)) in mine.into_iter().rev().enumerate() {
+                    // keep the conversation's own numbering, counted from the top
+                    let n = total - pos;
+                    if !q.is_empty() && !text.to_lowercase().contains(&q) {
+                        continue;
+                    }
+                    let one_line = text.replace('\n', " ");
+                    let label = if one_line.chars().count() > 110 {
+                        format!("{}…", one_line.chars().take(110).collect::<String>())
+                    } else {
+                        one_line
+                    };
+                    panel = panel.child(
+                        div()
+                            .id(("agent-jump-row", ix))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .px_2()
+                            .py_1()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(HOVER)))
+                            .text_size(px(11.))
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .w(px(20.))
+                                    .text_color(rgb(LINE_NUMBER))
+                                    .child(format!("{n}")),
+                            )
+                            .child(
+                                div()
+                                    .flex_grow(1.0)
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_color(rgb(TEXT))
+                                    .child(label),
+                            )
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                this.agent_list.scroll_to_reveal_item(ix);
+                                this.agent_jump_open = false;
+                                this.agent_jump_query.clear();
+                                cx.notify();
+                            })),
+                    );
+                }
+                d.child(panel)
+            })
     }
 }
 
 /// Render one transcript entry (user bubble, assistant text, or a tool card).
-fn render_agent_msg(m: &AgentMsg) -> impl IntoElement {
+/// A tool call's text kept for display only: the first few lines, clipped. The
+/// full thing can be a whole file (a Read's result) and the row shows two lines,
+/// so there's no reason to hold on to the rest for the life of the session.
+fn tool_note(s: &str) -> String {
+    s.lines()
+        .filter(|l| !l.trim().is_empty())
+        .take(4)
+        .map(|l| l.chars().take(200).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_agent_msg(m: &AgentMsg, ix: usize) -> impl IntoElement {
     match m {
-        AgentMsg::User(t) => div()
+        AgentMsg::User { text: t, imgs } => div()
             .flex()
             .flex_col()
             .gap_1()
@@ -15263,7 +17868,89 @@ fn render_agent_msg(m: &AgentMsg) -> impl IntoElement {
                     // same size as the agent's prose (md_doc's body size)
                     .text_size(px(14.5))
                     .text_color(rgb(SEL_TEXT))
-                    .child(t.clone()),
+                    // a URL you pasted is a link here too: underlined rather
+                    // than recoloured, since accent-on-selection is unreadable
+                    .child({
+                        let spans = url_spans(t);
+                        if spans.is_empty() {
+                            div().child(t.clone()).into_any_element()
+                        } else {
+                            let urls: Vec<String> =
+                                spans.iter().map(|r| t[r.clone()].to_string()).collect();
+                            let hl: Vec<(std::ops::Range<usize>, gpui::HighlightStyle)> = spans
+                                .iter()
+                                .map(|r| {
+                                    (
+                                        r.clone(),
+                                        gpui::HighlightStyle {
+                                            underline: Some(gpui::UnderlineStyle {
+                                                thickness: px(1.),
+                                                color: Some(rgb(SEL_TEXT).into()),
+                                                wavy: false,
+                                            }),
+                                            ..Default::default()
+                                        },
+                                    )
+                                })
+                                .collect();
+                            let styled = StyledText::new(t.clone()).with_highlights(hl);
+                            gpui::InteractiveText::new(("you-link", ix), styled)
+                                .on_click(spans, move |i, _w, _cx| {
+                                    if let Some(u) = urls.get(i) {
+                                        open_browser(u);
+                                    }
+                                })
+                                .into_any_element()
+                        }
+                    })
+                    // what went out with it: the same chips the composer showed
+                    // while you were writing, so `[Image #1]` still has a picture
+                    // attached to it after the fact
+                    .when(!imgs.is_empty(), |d| {
+                        let mut row = div().mt_1p5().flex().flex_row().flex_wrap().gap_2();
+                        for (n, pi) in imgs.iter().enumerate() {
+                            let kind = pi.mime.rsplit('/').next().unwrap_or("image").to_uppercase();
+                            let kb = (pi.bytes as f32 / 1024.0).round() as usize;
+                            let preview = pi.image.clone();
+                            row = row.child(
+                                div()
+                                    .id(("you-img", ix * 100 + n))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    .pl_0p5()
+                                    .pr_1()
+                                    .rounded_md()
+                                    .bg(rgb(CURRENT_LINE))
+                                    .border_1()
+                                    .border_color(rgb(BORDER))
+                                    .text_size(px(10.))
+                                    .text_color(rgb(MUTED))
+                                    .child(
+                                        gpui::img(pi.image.clone())
+                                            .h(px(88.))
+                                            .max_w(px(160.))
+                                            .rounded_sm(),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .child(
+                                                div()
+                                                    .text_color(rgb(COMMENT_MARK))
+                                                    .child(pi.label.clone()),
+                                            )
+                                            .child(format!("{kind}  ·  {kb} KB")),
+                                    )
+                                    .tooltip(move |_w, cx| {
+                                        cx.new(|_| ImagePreview { image: preview.clone() }).into()
+                                    }),
+                            );
+                        }
+                        d.child(row)
+                    }),
             )
             .into_any_element(),
         // the model answers in markdown — headings, `code`, and bullets included
@@ -15274,25 +17961,99 @@ fn render_agent_msg(m: &AgentMsg) -> impl IntoElement {
             .border_color(rgb(BORDER))
             .child(md_text(t, 12.0, MUTED))
             .into_any_element(),
-        AgentMsg::Tool { title, status, .. } => {
+        AgentMsg::Tool { title, status, detail, started, .. } => {
+            let running = matches!(status.as_str(), "pending" | "in_progress");
             let (glyph, color) = match status.as_str() {
                 "completed" => (IC_CHECK, GIT_NEW),
                 "failed" | "cancelled" => ("✕", GIT_DELETED),
-                _ => ("●", MUTED),
+                // a running call is the one thing here worth looking at
+                _ => ("●", ACCENT),
             };
+            // for a Bash call the title *is* the command, so it can be long and
+            // can carry newlines: the row shows the first line, the tooltip the
+            // whole of it
+            let mut head = title.lines().next().unwrap_or_default().to_string();
+            if title.lines().count() > 1 {
+                head.push_str(" …");
+            }
+            let secs = started.elapsed().as_secs();
+            let elapsed = if secs >= 60 {
+                format!("{}m {}s", secs / 60, secs % 60)
+            } else {
+                format!("{secs}s")
+            };
+            // while it runs, `detail` says what the call is for; when it failed,
+            // it's the error the model saw. On a call that worked it's noise.
+            let note = detail
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .take(2)
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim()
+                .to_string();
             div()
                 .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
+                .flex_col()
+                .gap(px(2.))
                 .px_2()
                 .py_1()
                 .rounded_md()
                 .bg(rgb(BG))
                 .border_1()
-                .border_color(rgb(BORDER))
-                .child(div().font_family(ICON_FONT).text_size(px(11.)).text_color(rgb(color)).child(glyph))
-                .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(title.clone()))
+                .border_color(rgb(if running { ACCENT } else { BORDER }))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .font_family(ICON_FONT)
+                                .text_size(px(11.))
+                                .text_color(rgb(color))
+                                .flex_shrink_0()
+                                .child(glyph),
+                        )
+                        .child(
+                            div()
+                                .id(("agent-tool", ix))
+                                .flex_grow(1.0)
+                                .min_w(px(0.))
+                                .truncate()
+                                .font_family("Menlo")
+                                .text_size(px(11.5))
+                                .text_color(rgb(if running { TEXT } else { MUTED }))
+                                .child(head)
+                                .tooltip({
+                                    let full = title.clone();
+                                    move |_w, cx| {
+                                        cx.new(|_| TooltipView { text: full.clone().into() }).into()
+                                    }
+                                }),
+                        )
+                        // how long it has been going: the whole point of the row
+                        // when a command takes minutes
+                        .when(running, |d| {
+                            d.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(LINE_NUMBER))
+                                    .child(elapsed),
+                            )
+                        }),
+                )
+                .when(!note.is_empty() && (running || status == "failed"), |d| {
+                    d.child(
+                        div()
+                            .pl(px(19.))
+                            .text_size(px(11.))
+                            .text_color(rgb(if status == "failed" { GIT_DELETED } else { MUTED }))
+                            .child(note),
+                    )
+                })
                 .into_any_element()
         }
     }
@@ -15640,7 +18401,7 @@ impl Storm {
                     .track_focus(&self.git_filter_focus)
                     .on_key_down(cx.listener(Self::git_filter_key))
                     .child(if self.git_query.text.is_empty() {
-                        div().text_color(rgb(MUTED)).child("Text or hash")
+                        div().text_color(rgb(MUTED)).child("Text or hash").into_any_element()
                     } else {
                         self.git_query.render(self.caret(), SELECTION)
                     }),
@@ -16678,7 +19439,7 @@ impl Storm {
 
         // pending review comments (nothing pending → no row)
         if !self.review.is_empty() {
-            let ready = self.review.iter().filter(|c| !c.draft).count();
+            let ready = self.review.iter().filter(|c| !c.draft && !c.resolved).count();
             let drafts = self.review.len() - ready;
             let label = match (ready, drafts) {
                 (r, 0) => format!("{r} pending comment{}", if r == 1 { "" } else { "s" }),
@@ -16858,6 +19619,12 @@ struct Workspace {
     switcher_query: Field, // type-to-filter text (full input: caret, selection, word motion)
     // opened via alt-tab (cmd+tab style): keep advancing on tab; commit on opt release
     switcher_quick: bool,
+    /// The switcher was opened from a child view, which has no window handle —
+    /// the next render claims focus for it.
+    switcher_focus_pending: bool,
+    /// Project the mouse is over while the ⌥Tab switcher is up: releasing ⌥
+    /// commits this rather than the keyboard selection.
+    switcher_hover: Option<usize>,
     // blinking caret for the switcher's filter input
     caret_on: bool,
     switcher_scroll: ScrollHandle, // the row list scrolls when it outgrows the panel
@@ -16879,6 +19646,8 @@ impl Workspace {
             switcher_focus: cx.focus_handle(),
             switcher_query: Field::default(),
             switcher_quick: false,
+            switcher_focus_pending: false,
+            switcher_hover: None,
             caret_on: true,
             switcher_scroll: ScrollHandle::new(),
             quit_busy: None,
@@ -16944,6 +19713,7 @@ impl Workspace {
                     cx.notify();
                 }
             }
+            ProjectNav::Switcher => this.open_switcher(cx),
             ProjectNav::Open => this.open_project(cx),
             ProjectNav::OpenPath(p) => this.add_project(p.clone(), cx),
             ProjectNav::Remove(i) => this.remove_project(*i, cx),
@@ -17016,9 +19786,11 @@ impl Workspace {
         if self.projects.len() <= 1 {
             return;
         }
+        self.switcher_hover = None;
         if !self.switcher_open {
             self.switcher_open = true;
             self.switcher_query.clear();
+            self.switcher_hover = None; // stale hover from a previous open
             self.switcher_quick = true;
             window.focus(&self.switcher_focus, cx);
             // quick-switch only walks unpaused workspaces; start from the one
@@ -17043,9 +19815,15 @@ impl Workspace {
     fn switcher_modifiers(&mut self, ev: &ModifiersChangedEvent, _w: &mut Window, cx: &mut Context<Self>) {
         if self.switcher_open && self.switcher_quick && !ev.modifiers.alt {
             let filtered = self.switcher_matches(cx);
-            let target = filtered.get(self.switcher_sel).copied();
+            // the row under the cursor wins: if you went looking with the mouse,
+            // that's the one you meant, not wherever ⌥Tab left the selection
+            let target = self
+                .switcher_hover
+                .filter(|i| filtered.contains(i))
+                .or_else(|| filtered.get(self.switcher_sel).copied());
             self.switcher_open = false;
             self.switcher_quick = false;
+            self.switcher_hover = None;
             if let Some(pi) = target {
                 self.switch_to(pi, cx);
             }
@@ -17071,8 +19849,27 @@ impl Workspace {
         self.switcher_quick = false;
         self.switcher_query.clear();
         self.switcher_sel = self.active;
+        self.switcher_hover = None;
         self.switcher_scroll.scroll_to_item(self.switcher_sel);
         window.focus(&self.switcher_focus, cx);
+        cx.notify();
+    }
+
+    /// ⌘K from anywhere in the window: open the active project's palette.
+    fn act_palette(&mut self, _: &CommandPalette, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(p) = self.projects.get(self.active).cloned() else { return };
+        p.update(cx, |s, cx| s.act_command_palette(&CommandPalette, window, cx));
+    }
+
+    /// Same dialog, opened from a child view (the topbar's workspace tally).
+    /// Focus is claimed on the next render, since there's no window here.
+    fn open_switcher(&mut self, cx: &mut Context<Self>) {
+        self.switcher_open = true;
+        self.switcher_quick = false;
+        self.switcher_query.clear();
+        self.switcher_sel = self.active;
+        self.switcher_scroll.scroll_to_item(self.switcher_sel);
+        self.switcher_focus_pending = true;
         cx.notify();
     }
 
@@ -17100,6 +19897,8 @@ impl Workspace {
 
     fn switcher_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let key = ev.keystroke.key.as_str();
+        // typing or arrowing means the keyboard is choosing again
+        self.switcher_hover = None;
         let filtered = self.switcher_matches(cx);
         match key {
             "escape" => {
@@ -17433,10 +20232,16 @@ impl Render for Workspace {
             .collect();
         let branches: Vec<String> = self.projects.iter().map(|p| p.read(cx).branch.clone()).collect();
         let roots: Vec<PathBuf> = self.projects.iter().map(|p| p.read(cx).root.clone()).collect();
+        let states: Vec<Option<AgentState>> = self
+            .projects
+            .iter()
+            .map(|p| p.read(cx).agent_rollup().map(|(s, _)| s))
+            .collect();
         self.projects[active].update(cx, |s, _| {
             s.ws_names = names;
             s.ws_roots = roots;
             s.ws_branches = branches;
+            s.ws_states = states;
             s.ws_active = active;
         });
         // hide every background project's native WebView so it doesn't float
@@ -17471,6 +20276,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_project_action))
             .on_action(cx.listener(Self::show_projects))
             .on_action(cx.listener(Self::act_quit))
+            // Actions only travel *up* from the focused element, so a handler on
+            // the project view is unreachable whenever focus sits on this root
+            // (right after the switcher closes, say) — which is why ⌘K sometimes
+            // did nothing. Handle it here too and forward it down.
+            .on_action(cx.listener(Self::act_palette))
             .child(self.projects[active].clone());
 
         if let Some(busy) = self.quit_busy.clone() {
@@ -17478,6 +20288,9 @@ impl Render for Workspace {
         }
 
         if self.switcher_open {
+            if std::mem::take(&mut self.switcher_focus_pending) {
+                window.focus(&self.switcher_focus, cx);
+            }
             let win = window.viewport_size();
             let w = 520.0_f32;
             let filtered = self.switcher_matches(cx);
@@ -17523,6 +20336,12 @@ impl Render for Workspace {
                         .id(("ws-switch", i))
                         .relative()
                         .w_full()
+                        .on_mouse_move(cx.listener(move |this, _e: &MouseMoveEvent, _w, cx| {
+                            if this.switcher_hover != Some(i) {
+                                this.switcher_hover = Some(i);
+                                cx.notify();
+                            }
+                        }))
                         // min, not fixed: a row with an agent-state line is taller,
                         // and a fixed height clipped it into the row below
                         .min_h(px(64.))
@@ -17535,6 +20354,11 @@ impl Render for Workspace {
                         .rounded_md()
                         .border_1()
                         .border_color(rgb(if sel { ACCENT } else { BORDER }))
+                        // a free workspace is the thing you open this list to
+                        // find: give the whole row the badge's colour, faintly
+                        // the wash alone: a cyan border as well read as loud as
+                        // the selected row
+                        .when(free && !sel, |d| d.bg(rgba(FREE_TINT)))
                         .when(sel, |d| d.bg(rgb(SELECTED_BG)))
                         // HOVER is nearly identical to POPUP_BG here → use a clearly
                         // lighter tint + accent border so hover is actually visible
@@ -18071,7 +20895,7 @@ impl DiffWindow {
                     .unwrap_or_default()
             })
             .unwrap_or_default();
-        self.rc_query.multiline = true; // ↩ save, ⇧↩ newline
+        self.rc_query.multiline = true; // ↩ newline, ⌘↩ save
         self.rc_query.set(existing);
         self.rc_open = true;
         // same rule as the editor's box: an existing thread opens for reading,
@@ -18133,7 +20957,7 @@ impl DiffWindow {
                     .text_size(px(10.))
                     .child(div().text_color(rgb(COMMENT_MARK)).child(format!("comment on line {}", self.rc_line)))
                     .child(div().flex_grow(1.0))
-                    .child(div().text_color(rgb(LINE_NUMBER)).child("↩ save · ⇧↩ newline · esc cancel")),
+                    .child(div().text_color(rgb(LINE_NUMBER)).child("⌘↩ save · ↩ newline · esc cancel")),
             )
             .when(!replies.is_empty(), |d| {
                 d.child(
@@ -18238,7 +21062,7 @@ impl DiffWindow {
                 self.rc_open = false;
                 window.focus(&self.focus, cx);
             }
-            "enter" if !ev.keystroke.modifiers.shift && !ev.keystroke.modifiers.platform => {
+            "enter" if ev.keystroke.modifiers.platform => {
                 self.save_comment(cx);
                 self.rc_open = false;
                 window.focus(&self.focus, cx);
@@ -18676,7 +21500,7 @@ impl DiffWindow {
                     .text_size(px(12.))
                     .text_color(rgb(TEXT))
                     .child(if self.search.is_empty() {
-                        div().text_color(rgb(MUTED)).child("Find in diff…▏")
+                        div().text_color(rgb(MUTED)).child("Find in diff…▏").into_any_element()
                     } else {
                         self.search.render("▏", SELECTION)
                     }),
@@ -19618,15 +22442,15 @@ fn main() {
             // terminal toggle (global)
             KeyBinding::new("alt-f12", ToggleTerminal, None),
             // terminal tab management (when terminal focused)
-            KeyBinding::new("cmd-t", NewTerminal, Some("Terminal")),
+            // global, not Terminal-scoped: the first ⌘T is what opens the thing
+            KeyBinding::new("cmd-t", NewTerminal, None),
             KeyBinding::new("cmd-w", CloseTerminalTab, Some("Terminal")),
             KeyBinding::new("cmd-shift-w", CloseOtherTerminals, Some("Terminal")),
             // fuzzy file finder (global)
             KeyBinding::new("cmd-shift-o", OpenFinder, None),
             // go to line (global)
             KeyBinding::new("cmd-l", GotoLine, None),
-            // jump to commit pane with the active file checked (global)
-            KeyBinding::new("cmd-k", GotoCommit, None),
+            // the commit pane is a palette command now — ⌘K opens the palette
             KeyBinding::new("cmd-shift-k", PushDialog, None),
             KeyBinding::new("cmd-shift-t", SetWsTitle, None),
             // find in files (global)
@@ -19641,7 +22465,7 @@ fn main() {
             KeyBinding::new("alt-h", GitLog, None),
             KeyBinding::new("alt-l", PullRemote, None),
             // command palette (global)
-            KeyBinding::new("cmd-shift-p", CommandPalette, None),
+            KeyBinding::new("cmd-k", CommandPalette, None),
             KeyBinding::new("cmd-shift-h", OpenOnGithub, None),
             // multi-project workspace (global)
             KeyBinding::new("alt-tab", NextProject, None),
@@ -19656,7 +22480,7 @@ fn main() {
             KeyBinding::new("alt-c", QuoteAgentSel, Some("Agent")),
             KeyBinding::new("alt-shift-c", ShowComments, None),
             KeyBinding::new("alt-enter", SendComments, None),
-            KeyBinding::new("cmd-shift-s", SendComments, None),
+            KeyBinding::new("cmd-f12", SendComments, None),
             KeyBinding::new("cmd-q", QuitApp, None),
             KeyBinding::new("cmd-shift-v", ToggleMdPreview, None),
             // refresh PR status + admin health (topbar chip and status screen)
@@ -19715,8 +22539,299 @@ mod short_cmd_tests {
 }
 
 #[cfg(test)]
+mod highlight_merge_tests {
+    use super::*;
+
+    fn style(color: u32) -> gpui::HighlightStyle {
+        gpui::HighlightStyle { color: Some(rgb(color).into()), ..Default::default() }
+    }
+
+    /// gpui walks runs in order, so the output has to be sorted and disjoint
+    /// whatever order the callers pushed their spans in.
+    #[test]
+    fn overlapping_spans_come_out_sorted_and_disjoint() {
+        let out = merged_highlights(vec![(10..20, style(0x111111)), (0..5, style(0x222222))]);
+        let starts: Vec<usize> = out.iter().map(|(r, _)| r.start).collect();
+        assert_eq!(starts, vec![0, 10]);
+        // an overlap is split, and the later span wins on the shared stretch
+        let out = merged_highlights(vec![(0..10, style(0x111111)), (4..6, style(0x222222))]);
+        assert_eq!(
+            out.iter().map(|(r, _)| (r.start, r.end)).collect::<Vec<_>>(),
+            vec![(0, 4), (4, 6), (6, 10)]
+        );
+        assert_eq!(out[1].1.color, style(0x222222).color);
+        assert_eq!(out[0].1.color, style(0x111111).color);
+    }
+
+    /// A run split only by boundaries, with the same style either side, is one
+    /// run again — fewer runs to shape.
+    #[test]
+    fn identical_neighbours_are_joined() {
+        let out = merged_highlights(vec![(0..4, style(0x111111)), (4..8, style(0x111111))]);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].0.start, out[0].0.end), (0, 8));
+    }
+}
+
+#[cfg(test)]
+mod file_ref_tests {
+    use super::*;
+
+    #[test]
+    fn a_basename_with_a_line_is_a_reference() {
+        let t = "fill-inherit (Icon.tsx:14,25) and InputPrimitive.tsx:12 too";
+        let refs = file_refs(t);
+        assert_eq!(refs.len(), 2);
+        assert_eq!(&t[refs[0].range.clone()], "Icon.tsx:14,25");
+        assert_eq!((refs[0].path.as_str(), refs[0].line), ("Icon.tsx", 14));
+        assert_eq!(&t[refs[1].range.clone()], "InputPrimitive.tsx:12");
+        assert_eq!(refs[1].line, 12);
+    }
+
+    #[test]
+    fn full_paths_and_extensionless_lines_work() {
+        let refs = file_refs("see packages/api-aco/src/x.ts:31 for the fix");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].path, "packages/api-aco/src/x.ts");
+        assert_eq!(refs[0].line, 31);
+        // no line number is still a file
+        let refs = file_refs("touch Cargo.toml and move on");
+        assert_eq!((refs[0].path.as_str(), refs[0].line), ("Cargo.toml", 0));
+    }
+
+    /// Prose is full of numbers and dots; only real-looking files may match.
+    #[test]
+    fn prose_is_not_mistaken_for_a_path() {
+        assert!(file_refs("11 call sites, 3 files, at 10:30").is_empty());
+        assert!(file_refs("version 6.4.9 shipped").is_empty());
+        assert!(file_refs("fill-neutral-xstrong on ghost").is_empty());
+        // a trailing sentence dot isn't part of the name
+        let refs = file_refs("in Icon.tsx.");
+        assert_eq!(refs[0].path, "Icon.tsx");
+    }
+}
+
+#[cfg(test)]
+mod session_title_tests {
+    use super::*;
+
+    /// The adapter names a session after its first prompt, and the first prompt
+    /// of a session carries the hidden briefing — that isn't a title.
+    #[test]
+    fn the_briefing_is_not_a_title() {
+        assert_eq!(
+            session_title("You are running inside TIDE, an editor that watches this repo."),
+            None
+        );
+        // with house rules, the briefing opens with those instead
+        assert_eq!(session_title("Read AGENTS.md at the root of this repo before you start"), None);
+        assert_eq!(session_title("   "), None);
+    }
+
+    #[test]
+    fn a_real_title_keeps_its_first_line_clipped() {
+        assert_eq!(session_title("Fix the SQL date bug\nand more"), Some("Fix the SQL date bug".into()));
+        let long = "x".repeat(200);
+        let out = session_title(&long).unwrap();
+        assert_eq!(out.chars().count(), 71, "70 chars plus the ellipsis");
+        assert!(out.ends_with('…'));
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::*;
+
+    fn urls(t: &str) -> Vec<String> {
+        url_spans(t).into_iter().map(|r| t[r].to_string()).collect()
+    }
+
+    #[test]
+    fn a_pasted_link_is_found_whole() {
+        assert_eq!(
+            urls("does it have anything to do with https://github.com/webiny/webiny-js/pull/5647"),
+            ["https://github.com/webiny/webiny-js/pull/5647"]
+        );
+        // two on one line, and http as well as https
+        assert_eq!(
+            urls("see https://a.com/x and http://b.dev/y?q=1#z now"),
+            ["https://a.com/x", "http://b.dev/y?q=1#z"]
+        );
+    }
+
+    /// The punctuation that ends the sentence isn't part of the address, but a
+    /// bracket the URL opened itself is.
+    #[test]
+    fn sentence_punctuation_is_left_out() {
+        assert_eq!(urls("read https://x.com/a."), ["https://x.com/a"]);
+        assert_eq!(urls("(https://x.com/a)"), ["https://x.com/a"]);
+        assert_eq!(urls("<https://x.com/a>,"), ["https://x.com/a"]);
+        assert_eq!(urls("wiki https://x.com/a_(b)"), ["https://x.com/a_(b)"]);
+    }
+
+    #[test]
+    fn prose_without_a_scheme_is_not_a_link() {
+        assert!(urls("github.com/webiny/webiny-js").is_empty());
+        assert!(urls("the https:// prefix").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod mention_tests {
+    use super::*;
+
+    #[test]
+    fn an_at_in_front_of_the_caret_opens_a_mention() {
+        assert_eq!(mention_span("@", 1), Some((0, String::new())));
+        assert_eq!(mention_span("write in @wby", 13), Some((9, "wby".into())));
+        // the caret, not the end of the text, decides what's being typed
+        assert_eq!(mention_span("write in @wby next6", 13), Some((9, "wby".into())));
+    }
+
+    #[test]
+    fn everything_else_is_plain_text() {
+        // an e-mail isn't a mention
+        assert_eq!(mention_span("mail a@b.com", 12), None);
+        // a space closes it: the name has been typed and the sentence goes on
+        assert_eq!(mention_span("@wby-next6 and", 14), None);
+        assert_eq!(mention_span("no at sign here", 15), None);
+        // a caret before the `@` sees nothing
+        assert_eq!(mention_span("in @wby", 2), None);
+    }
+}
+
+#[cfg(test)]
+mod typed_title_tests {
+    use super::*;
+
+    /// An agent posts `fix: …`; the workspace ends up looking exactly as if the
+    /// type had been picked in the dialog.
+    #[test]
+    fn a_type_prefix_becomes_that_types_emoji() {
+        assert_eq!(typed_title("fix: sql date off by one"), "🐛 sql date off by one");
+        assert_eq!(typed_title("  FEAT:  brand colors "), "✨ brand colors");
+        // conventional-commit scopes are fine and don't survive
+        assert_eq!(typed_title("refactor(api): drop the shim"), "♻️ drop the shim");
+    }
+
+    /// Anything that isn't one of our types is left alone: a colon in a title is
+    /// far more likely to be prose than a mistyped type.
+    #[test]
+    fn other_titles_pass_through() {
+        assert_eq!(typed_title("wire up: the new dock"), "wire up: the new dock");
+        assert_eq!(typed_title("sql date bug"), "sql date bug");
+        assert_eq!(typed_title("fix:"), "fix:");
+        // already carrying a type (a resent title) stays as it is
+        assert_eq!(typed_title("🐛 sql date bug"), "🐛 sql date bug");
+    }
+}
+
+#[cfg(test)]
+mod repo_ref_tests {
+    use super::*;
+
+    #[test]
+    fn github_urls_become_a_clone_url_and_a_folder_name() {
+        assert_eq!(
+            parse_repo_ref("https://github.com/webiny/webiny-js"),
+            Some(("https://github.com/webiny/webiny-js.git".into(), "webiny-js".into()))
+        );
+        // a link copied from a file view still names the repo
+        assert_eq!(
+            parse_repo_ref("https://github.com/webiny/webiny-js/tree/next/packages"),
+            Some(("https://github.com/webiny/webiny-js.git".into(), "webiny-js".into()))
+        );
+        assert_eq!(
+            parse_repo_ref("git@github.com:webiny/webiny-js.git"),
+            Some(("git@github.com:webiny/webiny-js.git".into(), "webiny-js".into()))
+        );
+        assert_eq!(
+            parse_repo_ref("webiny/webiny-js"),
+            Some(("https://github.com/webiny/webiny-js.git".into(), "webiny-js".into()))
+        );
+    }
+
+    /// Paths must keep working — the same field opens folders.
+    #[test]
+    fn paths_are_not_mistaken_for_repos() {
+        assert!(parse_repo_ref("~/dev/tide").is_none());
+        assert!(parse_repo_ref("./src").is_none());
+        assert!(parse_repo_ref("/Users/adrian/dev").is_none());
+        assert!(parse_repo_ref("packages/api-aco/src").is_none());
+        assert!(parse_repo_ref("").is_none());
+        assert!(parse_repo_ref("two words/repo").is_none());
+    }
+}
+
+#[cfg(test)]
+mod image_token_tests {
+    use super::*;
+
+    #[test]
+    fn backspace_after_a_token_takes_the_whole_token() {
+        let t = "look at [Image #1] here";
+        let (s, e, label) = image_token_before(t, 19).expect("token");
+        assert_eq!(&t[s..e], "[Image #1] ");
+        assert_eq!(label, "Image #1");
+        // and right after the bracket, once the space is gone
+        let t2 = "look at [Image #12]";
+        let (s2, e2, l2) = image_token_before(t2, t2.len()).expect("token");
+        assert_eq!(&t2[s2..e2], "[Image #12]");
+        assert_eq!(l2, "Image #12");
+    }
+
+    /// Only image tokens are atomic; other bracketed text stays ordinary.
+    #[test]
+    fn other_brackets_are_left_alone() {
+        assert!(image_token_before("see [note] ", 11).is_none());
+        assert!(image_token_before("plain text", 10).is_none());
+        assert!(image_token_after("[note] x", 0).is_none());
+    }
+
+    /// ⌥← / ⌥→ walk by word, which lands inside `[Image #2]`; the caret is
+    /// snapped back out to the nearest edge.
+    #[test]
+    fn a_word_motion_inside_a_token_is_detected() {
+        let t = "a [Image #2] b";
+        assert_eq!(image_token_around(t, 4), Some((2, 13)));
+        assert_eq!(image_token_around(t, 9), Some((2, 13)));
+        // the edges themselves are outside
+        assert!(image_token_around(t, 2).is_none());
+        assert!(image_token_around(t, 13).is_none());
+        // and a second token is found too
+        let t2 = "[Image #1] [Image #2] x";
+        assert_eq!(image_token_around(t2, 15), Some((11, 22)));
+    }
+
+    /// A collapsed paste is atomic in the same way an image token is.
+    #[test]
+    fn a_pasted_text_token_is_atomic_too() {
+        let t = "see [Pasted text #3 +216 lines] ok";
+        let (s, e, label) = image_token_before(t, 32).expect("token");
+        assert_eq!(&t[s..e], "[Pasted text #3 +216 lines] ");
+        assert_eq!(label, "Pasted text #3 +216 lines");
+        assert_eq!(image_token_after(t, 4), Some((4, 32)));
+        assert_eq!(image_token_around(t, 10), Some((4, 32)));
+    }
+
+    #[test]
+    fn the_right_arrow_steps_over_a_token() {
+        let t = "a [Image #2] b";
+        let (s, e) = image_token_after(t, 2).expect("token");
+        assert_eq!(&t[s..e], "[Image #2] ");
+        // mid-token there's nothing to step over
+        assert!(image_token_after(t, 3).is_none());
+    }
+}
+
+#[cfg(test)]
 mod review_tests {
     use super::*;
+
+    /// One comment, no general note — the common shape in these tests.
+    fn format_review_one(item: ReviewItem) -> String {
+        format_review(&[item], "")
+    }
 
     #[test]
     fn message_numbers_items_and_quotes_the_code() {
@@ -19736,7 +22851,7 @@ mod review_tests {
                 thread: Vec::new(),
             },
         ];
-        let msg = format_review(&items);
+        let msg = format_review(&items, "");
         assert!(msg.starts_with("Review comments from TIDE"), "{msg}");
         assert!(msg.contains("1. [ab12c] src/foo.ts:42\n   | const x = doThing()\n   -> memoize this"), "{msg}");
         // the id is what lets an answer find its way back to this thread
@@ -19749,7 +22864,7 @@ mod review_tests {
     /// original note again instead of the new question.
     #[test]
     fn a_thread_is_included_so_a_follow_up_reads_as_a_conversation() {
-        let msg = format_review(&[ReviewItem {
+        let msg = format_review_one(ReviewItem {
             id: "t1".into(),
             reference: "a.tsx:45".into(),
             snippet: "value: String(option.value),".into(),
@@ -19758,7 +22873,7 @@ mod review_tests {
                 ("agent".into(), "!= null covers both".into()),
                 ("you".into(), "then why the extra guard?".into()),
             ],
-        }]);
+        });
         assert!(msg.contains("   you (agent): != null covers both"), "{msg}");
         assert!(msg.contains("   me: then why the extra guard?"), "{msg}");
     }
@@ -19766,13 +22881,13 @@ mod review_tests {
     #[test]
     fn a_long_snippet_is_capped() {
         let snippet = (0..40).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
-        let msg = format_review(&[ReviewItem {
+        let msg = format_review_one(ReviewItem {
             id: "x9".into(),
             reference: "f.rs:1-40".into(),
             snippet,
             note: "too big".into(),
             thread: Vec::new(),
-        }]);
+        });
         assert_eq!(msg.lines().filter(|l| l.starts_with("   | ")).count(), 12);
     }
 }
@@ -19793,6 +22908,7 @@ mod review_persist_tests {
                 draft: false,
                 sent: true,
                 replies: vec![ReviewReply { who: "agent".into(), text: "done, memoized".into() }],
+                resolved: true,
             },
             ReviewComment {
                 id: "bbb22".into(),
@@ -19804,6 +22920,7 @@ mod review_persist_tests {
                 draft: true,
                 sent: false,
                 replies: Vec::new(),
+                resolved: false,
             },
         ]
     }

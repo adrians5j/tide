@@ -1,6 +1,9 @@
 //! Shared single-line text-input buffer with caret, selection, undo/redo and
 //! the standard editing keys. Used by every chrome input and the editor search.
-use gpui::{div, prelude::*, rgb, Div, Keystroke};
+use gpui::{
+    fill, prelude::*, px, rgb, AnyElement, App, Bounds, ElementId, GlobalElementId, HighlightStyle,
+    InspectorElementId, Keystroke, LayoutId, Pixels, StyledText, Window,
+};
 
 fn is_word_sep(c: char) -> bool {
     c.is_whitespace() || matches!(c, '/' | '.' | '_' | '-')
@@ -90,6 +93,29 @@ impl Field {
         self.caret = s.len();
         self.text = s;
         self.anchor = None;
+    }
+
+    /// Move the caret (clearing any selection) — for a host that treats some run
+    /// of text as one unit, like the composer's `[Image #1]` tokens.
+    pub fn move_to(&mut self, pos: usize) {
+        let mut p = pos.min(self.text.len());
+        while p > 0 && !self.text.is_char_boundary(p) {
+            p -= 1;
+        }
+        self.move_caret(p, false);
+    }
+
+    /// Replace `range` with `with`, caret after it. One undo step.
+    pub fn splice(&mut self, range: std::ops::Range<usize>, with: &str) {
+        let (s, e) = (range.start.min(self.text.len()), range.end.min(self.text.len()));
+        if s > e || !self.text.is_char_boundary(s) || !self.text.is_char_boundary(e) {
+            return;
+        }
+        self.push_undo();
+        self.text.replace_range(s..e, with);
+        self.caret = s + with.len();
+        self.anchor = None;
+        self.typing = false;
     }
 
     /// Insert text at the caret, replacing any selection. This is the path
@@ -193,7 +219,7 @@ impl Field {
     /// Caret snapped into the text and onto a char boundary. Every index that
     /// reaches a slice goes through here: a stray mid-character caret (an IME
     /// commit, a host that hands us byte offsets) must degrade, never panic.
-    fn caret_safe(&self) -> usize {
+    pub fn caret_safe(&self) -> usize {
         let mut i = self.caret.min(self.text.len());
         while i > 0 && !self.text.is_char_boundary(i) {
             i -= 1;
@@ -201,64 +227,29 @@ impl Field {
         i
     }
 
-    /// The text with `glyph` inserted at the caret (caret-only rendering).
-    pub fn display(&self, glyph: &str) -> String {
-        let (a, b) = self.text.split_at(self.caret_safe());
-        format!("{a}{glyph}{b}")
-    }
-
-    /// Render the text with the selection highlighted (and caret when there's
-    /// no selection). `glyph` is the blinking caret string.
-    pub fn render(&self, glyph: &str, sel_bg: u32) -> Div {
-        if self.multiline {
-            let Some((s, e)) = self.selection() else {
-                // stack the lines; the caret glyph is already inside `display`
-                let shown = self.display(glyph);
-                let mut col = div().flex().flex_col();
-                for line in shown.split('\n') {
-                    col = col.child(div().child(line.to_string()));
-                }
-                return col;
-            };
-            // a selection spans lines: highlight each line's slice of it, and
-            // mark a swallowed newline with a highlighted trailing space so
-            // whole-line and empty-line selections are still visible
-            let mut col = div().flex().flex_col();
-            let mut off = 0usize;
-            for line in self.text.split('\n') {
-                let (ls, le) = (off, off + line.len());
-                off = le + 1; // past the '\n'
-                let (a, b) = (s.clamp(ls, le), e.clamp(ls, le));
-                let mut row = div().flex().flex_row();
-                // `get` rather than slicing: an index inside a multi-byte char
-                // yields None and the line renders unhighlighted instead of
-                // taking the process down
-                match (line.get(..a - ls), line.get(a - ls..b - ls), line.get(b - ls..)) {
-                    (Some(pre), Some(sel), Some(post)) if a != b => {
-                        row = row
-                            .child(div().child(pre.to_string()))
-                            .child(div().bg(rgb(sel_bg)).child(sel.to_string()))
-                            .child(div().child(post.to_string()));
-                    }
-                    _ => row = row.child(div().child(line.to_string())),
-                }
-                if s <= le && e > le {
-                    row = row.child(div().bg(rgb(sel_bg)).child(" "));
-                }
-                col = col.child(row);
-            }
-            return col;
+    /// One line drawn twice: the real string in flow, which is what decides the
+    /// layout, and on top of it the same string with the caret glyph spliced in
+    /// and every other character painted transparent. The caret lands exactly
+    /// where the text puts it while taking no width of its own, so moving it
+    /// can't push the rest of the line sideways.
+    /// Render the text, with the selection highlighted and a caret at the
+    /// insertion point. `glyph` is the blinking caret string; blank means hidden
+    /// (an unfocused field, or the off half of the blink).
+    pub fn render(&self, glyph: &str, sel_bg: u32) -> AnyElement {
+        // an empty buffer still needs a line box, or the row collapses to nothing
+        let base = if self.text.is_empty() { " ".to_string() } else { self.text.clone() };
+        let hl: Vec<(std::ops::Range<usize>, HighlightStyle)> = self
+            .selection()
+            .map(|(s, e)| {
+                (s..e, HighlightStyle { background_color: Some(rgb(sel_bg).into()), ..Default::default() })
+            })
+            .into_iter()
+            .collect();
+        CaretText {
+            text: StyledText::new(base).with_highlights(hl),
+            caret: (!glyph.trim().is_empty()).then(|| self.caret_safe()),
         }
-        if let Some((s, e)) = self.selection() {
-            div()
-                .flex()
-                .flex_row()
-                .child(div().child(self.text[..s].to_string()))
-                .child(div().bg(rgb(sel_bg)).child(self.text[s..e].to_string()))
-                .child(div().child(self.text[e..].to_string()))
-        } else {
-            div().child(self.display(glyph))
-        }
+        .into_any_element()
     }
 
     /// Apply a navigation/editing keystroke. `clip` supplies cmd+v text; `accept`
@@ -369,8 +360,8 @@ impl Field {
                 }
                 Edit::Changed
             }
-            // ↩ belongs to the form (it submits); ⇧↩ / ⌘↩ add the line break
-            "enter" if self.multiline && (m.shift || m.platform) && !m.control => {
+            // ↩ adds the line break; ⌘↩ is the form's submit key
+            "enter" if self.multiline && !m.platform && !m.control => {
                 self.push_undo();
                 self.delete_selection();
                 self.insert("\n");
@@ -420,6 +411,81 @@ impl Field {
                 Edit::None
             }
         }
+    }
+}
+
+/// Text with a caret drawn at a byte offset. gpui lays the text out (wrapping,
+/// line breaks, selection backgrounds and all); the caret is then painted as a
+/// thin quad at the position that layout reports for the offset. It therefore
+/// takes no width of its own, which is the whole point: a caret spliced into the
+/// string as a glyph shoves every character after it sideways on every keypress.
+struct CaretText {
+    text: StyledText,
+    caret: Option<usize>,
+}
+
+impl Element for CaretText {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        self.text.request_layout(id, inspector, window, cx)
+    }
+
+    fn prepaint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.text.prepaint(id, inspector, bounds, &mut (), window, cx)
+    }
+
+    fn paint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let color = window.text_style().color;
+        self.text.paint(id, inspector, bounds, &mut (), &mut (), window, cx);
+        let Some(ix) = self.caret else { return };
+        let layout = self.text.layout();
+        if let Some(origin) = layout.position_for_index(ix) {
+            window.paint_quad(fill(
+                Bounds::new(origin, gpui::size(px(1.5), layout.line_height())),
+                color,
+            ));
+        }
+    }
+}
+
+impl IntoElement for CaretText {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
     }
 }
 

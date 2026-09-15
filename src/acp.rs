@@ -49,10 +49,20 @@ pub enum AcpEvent {
     Text(String),
     /// A streamed chunk of assistant reasoning ("thinking").
     Thought(String),
-    /// A tool call was announced (`tool_call`): id + human title + status.
-    Tool { id: String, title: String, status: String },
-    /// A tool call changed state (`tool_call_update`).
-    ToolStatus { id: String, status: String },
+    /// A tool call was announced (`tool_call`): id + human title + status, plus
+    /// whatever the adapter could say about it yet (a Bash command's purpose, a
+    /// task's prompt).
+    Tool { id: String, title: String, status: String, detail: String },
+    /// A tool call changed. Every field is optional: the adapter announces a
+    /// call the moment it sees one, while the tool's input is still streaming,
+    /// then refines it — which is where a Bash call's actual command arrives,
+    /// and later its output.
+    ToolUpdate {
+        id: String,
+        title: Option<String>,
+        status: Option<String>,
+        detail: Option<String>,
+    },
     /// The current prompt turn finished.
     TurnEnd,
     /// A user turn replayed by `session/load` (resuming an earlier session).
@@ -420,7 +430,8 @@ impl Acp {
                     .and_then(|s| s.as_str())
                     .unwrap_or("pending")
                     .to_string();
-                self.push(AcpEvent::Tool { id, title, status });
+                let detail = tool_text(update).unwrap_or_default();
+                self.push(AcpEvent::Tool { id, title, status, detail });
             }
             "user_message_chunk" => {
                 if let Some(t) = update
@@ -446,9 +457,20 @@ impl Acp {
                     .and_then(|s| s.as_str())
                     .unwrap_or("")
                     .to_string();
-                if let Some(status) = update.get("status").and_then(|s| s.as_str()) {
-                    self.push(AcpEvent::ToolStatus { id, status: status.to_string() });
-                }
+                // a refining update carries the real title (Bash's `title` is
+                // its command, but the first notification goes out before the
+                // input has finished streaming), and the closing one carries the
+                // result the model saw
+                self.push(AcpEvent::ToolUpdate {
+                    id,
+                    title: update
+                        .get("title")
+                        .and_then(|s| s.as_str())
+                        .filter(|t| !t.is_empty())
+                        .map(|t| t.to_string()),
+                    status: update.get("status").and_then(|s| s.as_str()).map(|s| s.to_string()),
+                    detail: tool_text(update),
+                });
             }
             // available_commands_update / plan / others: ignored for now.
             _ => {}
@@ -520,6 +542,23 @@ impl Acp {
 }
 
 /// Pull plain text out of a content block (`{type:"text", text:"…"}`).
+/// The text of a tool call's `content` blocks: before it runs that's what the
+/// adapter can say about it (a Bash command's description, a task's prompt);
+/// after it ran it's the output the model saw. `diff` and `terminal` blocks
+/// carry no text and drop out.
+fn tool_text(update: &Value) -> Option<String> {
+    let mut out = String::new();
+    for b in update.get("content")?.as_array()? {
+        if let Some(t) = b.get("content").and_then(text_of) {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&t);
+        }
+    }
+    (!out.trim().is_empty()).then_some(out)
+}
+
 fn text_of(content: &Value) -> Option<String> {
     content.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
 }

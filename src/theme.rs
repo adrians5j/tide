@@ -41,6 +41,11 @@ pub const SEARCH_CURRENT_BG: u32 = 0x3a4768;
 // ── review comments (gutter marker, inline notes, boxes, counts) ───────────
 // Purple: amber means "agent needs you", green is added/passing, blue is the UI
 // accent, and the free-workspace badge moved to cyan so this hue is unshared.
+/// 7% cyan wash behind a free workspace's row in the switcher: enough to pick
+/// the row out while scanning a list of a dozen, not enough to compete with the
+/// selected row or with the FREE badge itself.
+pub const FREE_TINT: u32 = 0x56c8d812;
+
 pub const COMMENT_MARK: u32 = 0xbb9af7;
 pub const COMMENT_TINT: u32 = 0xbb9af722; // 13% wash behind inline notes
 pub const COMMENT_TINT_HOVER: u32 = 0xbb9af733;

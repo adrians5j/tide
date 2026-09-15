@@ -66,6 +66,14 @@ pub struct Reply {
     pub text: String,
 }
 
+/// A batch of PR files an agent wants marked (or unmarked) as viewed.
+pub struct Viewed {
+    /// Paths as the agent wrote them: repo-relative, absolute, `./`-prefixed.
+    /// TIDE matches them against the files actually in the PR.
+    pub paths: Vec<String>,
+    pub viewed: bool,
+}
+
 /// One report from a pane.
 pub struct Report {
     /// `TIDE_PANE` — the reporting pane's `EntityId` as a u64. `None` when the
@@ -83,6 +91,13 @@ pub struct Server {
     queue: Arc<Mutex<Vec<Report>>>,
     replies: Arc<Mutex<Vec<Reply>>>,
     dirty: Arc<AtomicBool>,
+    /// Set by `/refresh`: something changed that TIDE should re-read (a PR was
+    /// opened, a branch switched).
+    refresh: Arc<AtomicBool>,
+    /// Workspace titles posted to `/title`; TIDE decides whether to take one.
+    titles: Arc<Mutex<Vec<String>>>,
+    /// Viewed-state batches posted to `/viewed`, applied to the PR pane.
+    viewed: Arc<Mutex<Vec<Viewed>>>,
 }
 
 impl Server {
@@ -94,19 +109,23 @@ impl Server {
         let queue: Arc<Mutex<Vec<Report>>> = Arc::new(Mutex::new(Vec::new()));
         let replies: Arc<Mutex<Vec<Reply>>> = Arc::new(Mutex::new(Vec::new()));
         let dirty = Arc::new(AtomicBool::new(false));
+        let refresh = Arc::new(AtomicBool::new(false));
+        let titles = Arc::new(Mutex::new(Vec::new()));
+        let viewed = Arc::new(Mutex::new(Vec::new()));
         {
             let (queue, replies, dirty, token) =
                 (queue.clone(), replies.clone(), dirty.clone(), token.clone());
+            let (refresh, titles, viewed) = (refresh.clone(), titles.clone(), viewed.clone());
             std::thread::spawn(move || {
                 for stream in listener.incoming().flatten() {
                     // one short-lived connection per report; a wedged client
                     // can't block the next one for more than the read timeout
                     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-                    handle(stream, &token, &queue, &replies, &dirty);
+                    handle(stream, &token, &queue, &replies, &dirty, &refresh, &titles, &viewed);
                 }
             });
         }
-        Some(Server { port, token, queue, replies, dirty })
+        Some(Server { port, token, queue, replies, dirty, refresh, titles, viewed })
     }
 
     /// Take everything reported since the last call.
@@ -122,6 +141,22 @@ impl Server {
         self.replies.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default()
     }
 
+    /// Titles proposed for this workspace since the last call.
+    pub fn drain_titles(&self) -> Vec<String> {
+        self.titles.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default()
+    }
+
+    /// Viewed-state batches posted since the last call.
+    pub fn drain_viewed(&self) -> Vec<Viewed> {
+        self.viewed.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default()
+    }
+
+    /// True once since the last call if anything asked TIDE to re-read git state
+    /// (an agent that just opened a PR or switched branch).
+    pub fn take_refresh(&self) -> bool {
+        self.refresh.swap(false, Ordering::Relaxed)
+    }
+
     pub fn url(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
     }
@@ -133,6 +168,9 @@ fn handle(
     queue: &Mutex<Vec<Report>>,
     replies: &Mutex<Vec<Reply>>,
     dirty: &AtomicBool,
+    refresh: &AtomicBool,
+    titles: &Mutex<Vec<String>>,
+    viewed: &Mutex<Vec<Viewed>>,
 ) {
     let Some((path, headers, body)) = read_request(&mut stream) else {
         respond(&mut stream, 400, "{\"error\":\"bad request\"}");
@@ -172,6 +210,51 @@ fn handle(
                 "{\"error\":\"want {\\\"id\\\":\\\"<comment id>\\\",\\\"text\\\":\\\"<reply>\\\"}\"}",
             ),
         }
+        return;
+    }
+    // a name for the workspace, proposed once the agent knows what the work is.
+    // TIDE ignores it when the human already named this one.
+    if path == "/title" {
+        match parse_field(&body, "title") {
+            Some(t) if !t.trim().is_empty() => {
+                if let Ok(mut q) = titles.lock() {
+                    q.push(t.trim().to_string());
+                }
+                dirty.store(true, Ordering::Relaxed);
+                respond(&mut stream, 200, "{\"ok\":true}");
+            }
+            _ => respond(&mut stream, 400, "{\"error\":\"want {\\\"title\\\":\\\"<short name>\\\"}\"}"),
+        }
+        return;
+    }
+    // files the agent has finished reviewing on the PR: the same checkbox the
+    // human ticks in the PR pane, mirrored onto GitHub from there
+    if path == "/viewed" {
+        match parse_viewed(&body) {
+            Some(v) => {
+                if let Ok(mut q) = viewed.lock() {
+                    if q.len() > 64 {
+                        q.remove(0);
+                    }
+                    q.push(v);
+                }
+                dirty.store(true, Ordering::Relaxed);
+                respond(&mut stream, 200, "{\"ok\":true}");
+            }
+            None => respond(
+                &mut stream,
+                400,
+                "{\"error\":\"want {\\\"paths\\\":[\\\"<repo-relative path>\\\"],\\\"viewed\\\":true}\"}",
+            ),
+        }
+        return;
+    }
+    // "I just changed something git-visible" — a PR opened, a branch switched.
+    // TIDE re-reads its own state rather than waiting for the next poll or ⌘R.
+    if path == "/refresh" {
+        refresh.store(true, Ordering::Relaxed);
+        dirty.store(true, Ordering::Relaxed);
+        respond(&mut stream, 200, "{\"ok\":true}");
         return;
     }
     if path != "/agent" {
@@ -219,7 +302,7 @@ fn read_request(stream: &mut TcpStream) -> Option<(String, Vec<(String, String)>
             headers.push((k, v));
         }
     }
-    let len = len.min(8192);
+    let len = len.min(65536); // a /viewed batch can carry hundreds of paths
     let mut body = vec![0u8; len];
     if len > 0 {
         reader.read_exact(&mut body).ok()?;
@@ -262,6 +345,40 @@ fn parse_reply(body: &str) -> Option<Reply> {
         return None;
     }
     Some(Reply { id, text })
+}
+
+/// `{"paths": [...], "viewed": true}`. A single string is accepted for `paths`
+/// too, since marking one file is the obvious first thing anyone tries.
+/// `viewed` defaults to true: unmarking is the rare case and has to be asked for.
+fn parse_viewed(body: &str) -> Option<Viewed> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let one = |s: &str| -> Option<String> {
+        let s: String = s.chars().filter(|c| !c.is_control()).take(500).collect();
+        let s = s.trim().to_string();
+        (!s.is_empty()).then_some(s)
+    };
+    let paths: Vec<String> = match v.get("paths").or_else(|| v.get("path"))? {
+        serde_json::Value::String(s) => one(s).into_iter().collect(),
+        serde_json::Value::Array(a) => {
+            a.iter().filter_map(|p| p.as_str()).filter_map(one).take(2000).collect()
+        }
+        _ => return None,
+    };
+    if paths.is_empty() {
+        return None;
+    }
+    let viewed = v.get("viewed").and_then(|b| match b {
+        serde_json::Value::Bool(b) => Some(*b),
+        serde_json::Value::String(s) => Some(!matches!(s.trim(), "false" | "0" | "no")),
+        _ => None,
+    });
+    Some(Viewed { paths, viewed: viewed.unwrap_or(true) })
+}
+
+/// One string field of a JSON body, stripped of control characters and capped.
+fn parse_field(body: &str, key: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    Some(v.get(key)?.as_str()?.chars().filter(|c| !c.is_control()).take(120).collect())
 }
 
 fn respond(stream: &mut TcpStream, code: u16, body: &str) {
@@ -337,6 +454,29 @@ mod tests {
         assert!(s.drain().is_empty(), "drain should have emptied the queue");
     }
 
+    /// A batch of PR files to tick off, the way an agent that just reviewed a
+    /// hundred identical version bumps would send it.
+    #[test]
+    fn queues_a_viewed_batch() {
+        let s = Server::start("tok".into()).unwrap();
+        let body = "{\"paths\":[\"a/package.json\",\" ./b/package.json \"]}";
+        assert!(post(s.port, "/viewed", Some("tok"), body).starts_with("HTTP/1.1 200"));
+        let batches = s.drain_viewed();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].paths, vec!["a/package.json", "./b/package.json"]);
+        assert!(batches[0].viewed, "viewed defaults to true");
+        // one path as a bare string, and unticking
+        let body = "{\"path\":\"a/package.json\",\"viewed\":false}";
+        assert!(post(s.port, "/viewed", Some("tok"), body).starts_with("HTTP/1.1 200"));
+        let batches = s.drain_viewed();
+        assert_eq!(batches[0].paths, vec!["a/package.json"]);
+        assert!(!batches[0].viewed);
+        // nothing to mark is a bad request, not an empty batch
+        assert!(post(s.port, "/viewed", Some("tok"), "{\"paths\":[]}").starts_with("HTTP/1.1 400"));
+        assert!(post(s.port, "/viewed", Some("tok"), "{}").starts_with("HTTP/1.1 400"));
+        assert!(s.drain_viewed().is_empty());
+    }
+
     #[test]
     fn rejects_a_bad_token_and_queues_nothing() {
         let s = Server::start("right".into()).unwrap();
@@ -352,6 +492,16 @@ mod tests {
     fn health_needs_no_token_and_unknown_state_is_rejected() {
         let s = Server::start("tok".into()).unwrap();
         assert!(post(s.port, "/health", None, "").starts_with("HTTP/1.1 200"));
+        // /refresh is a bare signal: it carries no body and latches once
+        assert!(!s.take_refresh());
+        assert!(post(s.port, "/refresh", Some("tok"), "").starts_with("HTTP/1.1 200"));
+        // a title is queued for TIDE to accept or ignore
+        assert!(post(s.port, "/title", Some("tok"), "{\"title\":\"  SQL date bug \"}")
+            .starts_with("HTTP/1.1 200"));
+        assert_eq!(s.drain_titles(), vec!["SQL date bug".to_string()]);
+        assert!(post(s.port, "/title", Some("tok"), "{\"title\":\"\"}").starts_with("HTTP/1.1 400"));
+        assert!(s.take_refresh());
+        assert!(!s.take_refresh(), "the flag is consumed by the first read");
         let resp = post(s.port, "/agent", Some("tok"), "{\"state\":\"dancing\"}");
         assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
         // no pane → the UI decides where it belongs

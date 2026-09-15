@@ -81,6 +81,69 @@ Hook commands run through a shell, so `$HOME` expands. Claude Code re-reads
 settings when `/hooks` is opened — until then a running session keeps its old
 config.
 
+## Telling TIDE to re-read git state
+
+Opening a PR, pushing, or switching branches changes what TIDE's topbar should
+say, and it has no way to notice until its next poll (branch changes) or a ⌘R
+(PR link). One request fixes that:
+
+```
+POST $TIDE_RPC/refresh
+X-Tide-Token: $TIDE_TOKEN
+```
+
+No body. TIDE re-queries the PR for the current branch, reloads the PR file
+list, and re-checks admin health. Agents in the ACP pane are told about this
+automatically: TIDE prepends a short briefing to the first prompt of each
+session, which never shows in the transcript. The gear in the agent pane's
+header shows that briefing verbatim, and copies it. A terminal agent needs the
+same instructions in `CLAUDE.md`, next to the `/agent` ones.
+
+The briefing opens by pointing at the repo's own rules. When `AGENTS.md` or
+`CLAUDE.md` sits at the repo root, the agent is told to read it first and that
+it outranks everything TIDE says. Neither file is mentioned when neither
+exists.
+
+## Naming the workspace
+
+```
+POST $TIDE_RPC/title
+X-Tide-Token: $TIDE_TOKEN
+
+{"title": "fix: sql date off by one"}
+```
+
+Lead the name with the type of work, `<type>: <name>`. The types are the ones the
+title dialog offers (feat, fix, docs, style, refactor, perf, test, build, ci,
+chore, bip, client, release), and TIDE replaces the prefix with that type's icon,
+so an agent-named workspace reads the same as a hand-named one. A scope is
+accepted and dropped (`fix(api): …`). A title with no recognized prefix is stored
+as sent.
+
+TIDE takes the name only when the workspace has none — a name the human typed is
+never overwritten, so an agent can send one once without checking first. A named
+workspace also stops being marked free.
+
+## Marking PR files as viewed
+
+```
+POST $TIDE_RPC/viewed
+X-Tide-Token: $TIDE_TOKEN
+
+{"paths": ["packages/a/package.json", "packages/b/package.json"]}
+```
+
+The same checkbox the human ticks in the PR pane. Paths are repo-relative, the
+way `git diff --name-only` prints them; absolute and `./`-prefixed paths work
+too, and a single `"path": "..."` string is accepted. Add `"viewed": false` to
+untick. TIDE applies it to the loaded PR and mirrors it onto GitHub, so the PR
+page agrees, then says in a toast how many files matched. Paths the PR doesn't
+touch are counted and reported, never guessed at.
+
+This exists for requests like "mark every package.json that is only a version
+bump as viewed": the agent works out the list, TIDE does the ticking. An agent
+should not tick files off unasked.
+
 ## Answering review comments
 
 TIDE's review comments are threads. When a batch is sent to a pane, each comment
