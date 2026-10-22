@@ -15173,7 +15173,19 @@ impl Render for Storm {
         if self.prs_open {
             root = root.child(self.render_pr_screen(cx));
         }
-        if let Some(card) = self.render_tour_card(cx) {
+        // at either end there is no stop to stand on, so the bookend takes the
+        // card's place rather than sitting beside it
+        let bookend = self.walk.as_ref().and_then(|w| match (w.intro, w.done) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        });
+        if let Some(start) = bookend {
+            let (l, t, bw) = self.tour_bookend_at();
+            if let Some(card) = self.render_tour_bookend(start, l, t, bw, cx) {
+                root = root.child(card);
+            }
+        } else if let Some(card) = self.render_tour_card(cx) {
             root = root.child(card);
         }
         if self.hand_open {
@@ -21572,6 +21584,20 @@ impl Storm {
     /// them, joined by the arrows the tour takes. The file you are standing in
     /// is lit, and so is the stop inside it.
     fn render_tour_map(&self, w: &Walk, accent: u32, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        fn map_arrow(lit: bool, accent: u32) -> Div {
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .child(div().w(px(2.)).h(px(10.)).bg(rgb(if lit { accent } else { BORDER })))
+                .child(
+                    div()
+                        .text_size(px(9.))
+                        .line_height(px(9.))
+                        .text_color(rgb(if lit { accent } else { BORDER }))
+                        .child("▼"),
+                )
+        }
         let nodes = tour_nodes(&w.stops);
         let here = nodes.iter().position(|n| n.steps.contains(&w.at));
         let mut col = div()
@@ -21583,11 +21609,70 @@ impl Storm {
             .overflow_y_scroll()
             .px_2()
             .py_2();
+        // the route starts somewhere: a card that says so, and walks it
+        col = col.child(
+            div()
+                .id("tour-map-start")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1p5()
+                .rounded_md()
+                .cursor_pointer()
+                .border_1()
+                .border_color(rgb(if w.intro { accent } else { BORDER }))
+                .when(w.intro, |d| d.bg(rgba(TOUR_TINT)))
+                .hover(|s| s.bg(rgb(HOVER)))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(10.))
+                        .text_color(rgb(if w.intro { accent } else { MUTED }))
+                        .child("▶"),
+                )
+                .child(
+                    div()
+                        .flex_grow(1.0)
+                        .min_w(px(0.))
+                        .truncate()
+                        .text_size(px(12.))
+                        .text_color(rgb(if w.intro { TEXT } else { MUTED }))
+                        .child("The tour"),
+                )
+                .tooltip(tip("Open the first stop"))
+                .on_click(cx.listener(|this, _e, window, cx| {
+                    this.goto_walk_stop(0, window, cx);
+                    if let Some(w) = this.walk.as_mut() {
+                        w.intro = false;
+                        w.done = false;
+                    }
+                    cx.notify();
+                })),
+        );
+        col = col.child(map_arrow(here == Some(0) || w.intro, accent));
+        let mut group = String::new();
         for (ni, n) in nodes.iter().enumerate() {
             let on = here == Some(ni);
             // the tour leaves this file and comes back to it later
-            let returns = n.steps.len() > 1
-                && n.steps.windows(2).any(|p| p[1] != p[0] + 1);
+            let returns = n.repeat;
+            let notes: usize =
+                n.steps.iter().filter_map(|&si| w.stops.get(si)).map(|s| self.stop_notes(s)).sum();
+            // a named part of the tour starts here
+            if n.group.trim() != group {
+                group = n.group.trim().to_string();
+                if !group.is_empty() {
+                    col = col.child(
+                        div()
+                            .mt_1()
+                            .mb(px(3.))
+                            .text_size(px(10.))
+                            .text_color(rgb(MUTED))
+                            .child(group.clone()),
+                    );
+                }
+            }
             let mut box_ = div()
                 .flex()
                 .flex_col()
@@ -21636,6 +21721,23 @@ impl Storm {
                                     .child("↩")
                                     .tooltip(tip("The tour comes back to this file")),
                             )
+                        })
+                        .when(notes > 0, |d| {
+                            d.child(
+                                div()
+                                    .id(("tour-note", ni))
+                                    .flex_shrink_0()
+                                    .px_1()
+                                    .rounded_full()
+                                    .bg(rgb(COMMENT_MARK))
+                                    .text_size(px(9.))
+                                    .text_color(rgb(BG))
+                                    .child(format!("{notes}"))
+                                    .tooltip(tip_owned(format!(
+                                        "{notes} note{} waiting here",
+                                        if notes == 1 { "" } else { "s" }
+                                    ))),
+                            )
                         }),
                 )
                 .when(!n.dir.is_empty(), |d| {
@@ -21682,23 +21784,50 @@ impl Storm {
             col = col.child(box_);
             // the arrow to the next file, drawn rather than implied
             if ni + 1 < nodes.len() {
-                let lit = here.is_some_and(|h| h == ni || h == ni + 1);
-                col = col.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .child(div().w(px(2.)).h(px(10.)).bg(rgb(if lit { accent } else { BORDER })))
-                        .child(
-                            div()
-                                .text_size(px(9.))
-                                .line_height(px(9.))
-                                .text_color(rgb(if lit { accent } else { BORDER }))
-                                .child("▼"),
-                        ),
-                );
+                col = col.child(map_arrow(here.is_some_and(|h| h == ni || h == ni + 1), accent));
             }
         }
+        col = col.child(map_arrow(w.done || here == Some(nodes.len().saturating_sub(1)), accent));
+        col = col.child(
+            div()
+                .id("tour-map-end")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1p5()
+                .rounded_md()
+                .cursor_pointer()
+                .border_1()
+                .border_color(rgb(if w.done { accent } else { BORDER }))
+                .when(w.done, |d| d.bg(rgba(TOUR_TINT)))
+                .hover(|s| s.bg(rgb(HOVER)))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(10.))
+                        .text_color(rgb(if w.done { accent } else { MUTED }))
+                        .child("■"),
+                )
+                .child(
+                    div()
+                        .flex_grow(1.0)
+                        .min_w(px(0.))
+                        .truncate()
+                        .text_size(px(12.))
+                        .text_color(rgb(if w.done { TEXT } else { MUTED }))
+                        .child("End of the tour"),
+                )
+                .tooltip(tip("What the tour added up to"))
+                .on_click(cx.listener(|this, _e, _w, cx| {
+                    if let Some(w) = this.walk.as_mut() {
+                        w.intro = false;
+                        w.done = true;
+                    }
+                    cx.notify();
+                })),
+        );
         col
     }
 
@@ -21825,6 +21954,15 @@ impl Storm {
     /// on: what it covers, before you are dropped into the middle of it. The
     /// other is where it adds up — what you wrote down while walking, and the
     /// two things worth doing next.
+    /// Where the cards at either end of a tour sit. Neither end stands on a
+    /// line, so there is no span to hang them under: they go over the middle
+    /// of the window, high enough to read as a card rather than a dialog.
+    fn tour_bookend_at(&self) -> (f32, f32, f32) {
+        let width = TOUR_CARD_W.min((self.win_width - 160.0).max(320.0));
+        let left = ((self.win_width - width) / 2.0).max(0.0);
+        (left, (self.win_height * 0.2).max(72.0), width)
+    }
+
     fn render_tour_bookend(
         &mut self,
         start: bool,
@@ -21843,6 +21981,7 @@ impl Storm {
         let btn = |id: &'static str, label: String, lit: bool| {
             div()
                 .id(id)
+                .occlude()
                 .px_2()
                 .py(px(3.))
                 .rounded_md()
@@ -21856,6 +21995,7 @@ impl Storm {
         };
         Some(
             div()
+                .id("tour-bookend")
                 .absolute()
                 .left(px(left))
                 .top(px(top))
@@ -21863,6 +22003,13 @@ impl Storm {
                 .flex()
                 .flex_col()
                 .gap_2()
+                .when(start, |d| {
+                    // the whole card is the button: reading it is deciding to
+                    // walk it, and aiming for a 70px target to say so is friction
+                    d.cursor_pointer().on_click(cx.listener(|this, _e, window, cx| {
+                        this.step_walk(1, window, cx)
+                    }))
+                })
                 .px_3()
                 .py_2p5()
                 .rounded_md()
@@ -22095,6 +22242,17 @@ impl Storm {
         let accent = if tour.is_some() { TOUR_MARK } else { COMMENT_MARK };
         let title = stop.title.trim().to_string();
         let said = stop.said.trim().to_string();
+        let ask_empty = self.tour_ask.is_empty();
+        let caret = self.caret();
+        let thread: Vec<(bool, String)> = self
+            .stop_thread(stop)
+            .map(|c| {
+                let mut t = vec![(true, c.text.clone())];
+                t.extend(c.replies.iter().map(|r| (r.who == "you", r.text.clone())));
+                t
+            })
+            .unwrap_or_default();
+        let has_thread = !thread.is_empty();
         let arrow = |id: &'static str, glyph: &'static str, hint: &'static str, dir: i32, cx: &mut Context<Self>| {
             div()
                 .id(id)
@@ -22183,8 +22341,145 @@ impl Storm {
                             .text_color(rgb(TEXT))
                             .child(said),
                     )
-                }),
+                })
+                // what has already been said about this stop, so the card is
+                // the whole conversation rather than half of it
+                .when(has_thread, |d| {
+                    d.child(
+                        div()
+                            .id("card-thread")
+                            .w_full()
+                            .max_h(px(TOUR_CARD_ROWS as f32 * TOUR_LINE_H))
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .pt_1()
+                            .border_t_1()
+                            .border_color(rgb(BORDER))
+                            .children(thread.into_iter().map(|(mine, text)| {
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .text_size(px(10.))
+                                            .text_color(rgb(if mine { COMMENT_MARK } else { accent }))
+                                            .child(if mine { "You" } else { "Agent" }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .line_height(px(TOUR_LINE_H))
+                                            .text_color(rgb(TEXT))
+                                            .child(text),
+                                    )
+                            })),
+                    )
+                })
+                // asking here beats scrolling back to the agent pane to ask
+                // about the thing you are looking at
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1p5()
+                        .child(
+                            div()
+                                .id("card-ask")
+                                .flex_grow(1.0)
+                                .min_w(px(0.))
+                                .px_1p5()
+                                .py(px(2.))
+                                .rounded_md()
+                                .bg(rgb(BG))
+                                .border_1()
+                                .border_color(rgb(BORDER))
+                                .text_size(px(12.))
+                                .text_color(rgb(TEXT))
+                                .track_focus(&self.tour_ask_focus)
+                                .on_key_down(cx.listener(Self::tour_ask_key))
+                                .on_click(cx.listener(|this, _e, window, cx| {
+                                    window.focus(&this.tour_ask_focus, cx);
+                                    cx.notify();
+                                }))
+                                .child(if ask_empty {
+                                    div()
+                                        .text_color(rgb(MUTED))
+                                        .child("Ask about this stop…  ↩")
+                                        .into_any_element()
+                                } else {
+                                    self.tour_ask.render(caret, SELECTION).into_any_element()
+                                }),
+                        )
+                        .when(has_thread, |d| {
+                            d.child(
+                                div()
+                                    .id("card-resolve")
+                                    .flex_shrink_0()
+                                    .px_2()
+                                    .py(px(2.))
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_size(px(11.))
+                                    .border_1()
+                                    .border_color(rgb(BORDER))
+                                    .text_color(rgb(MUTED))
+                                    .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(GIT_NEW)))
+                                    .child("resolve")
+                                    .tooltip(tip("Done with this thread"))
+                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                        this.resolve_stop_thread(cx)
+                                    })),
+                            )
+                        })
+                        .child(
+                            div()
+                                .id("card-clarify")
+                                .flex_shrink_0()
+                                .px_2()
+                                .py(px(2.))
+                                .rounded_md()
+                                .cursor_pointer()
+                                .text_size(px(11.))
+                                .border_1()
+                                .border_color(rgb(BORDER))
+                                .text_color(rgb(MUTED))
+                                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                .child("clarify")
+                                .tooltip(tip("Ask the agent to explain this step more plainly"))
+                                .on_click(cx.listener(|this, _e, window, cx| {
+                                    this.tour_ask.set(CLARIFY_NOTE.to_string());
+                                    this.ask_about_stop(window, cx);
+                                })),
+                        ),
+                ),
         )
+    }
+
+    /// "Is the description still true?" — otherwise typed by hand after every
+    /// round of changes. Alt-click lets the agent rewrite it rather than only
+    /// report on it.
+    fn ask_pr_body_check(&mut self, number: u64, base: String, update: bool, cx: &mut Context<Self>) {
+        let label = if update {
+            format!("Asked whether #{number}'s description is current, and to bring it up to date")
+        } else {
+            format!("Asked whether #{number}'s description is still true")
+        };
+        self.agent_open = true;
+        self.send_agent_prompt_as(pr_body_check(number, &base, update), Some(label), cx);
+        self.agent_list.scroll_to_end();
+        cx.notify();
+    }
+
+    /// A tour of the pull request: its changes in the order they should be read.
+    fn ask_pr_tour(&mut self, number: u64, base: String, cx: &mut Context<Self>) {
+        let label = format!("Asked for a code tour of #{number}");
+        self.agent_open = true;
+        self.send_agent_prompt_as(pr_tour_request(number, &base), Some(label), cx);
+        self.agent_list.scroll_to_end();
+        cx.notify();
     }
 
     fn ask_for_tour(&mut self, about: Option<String>, cx: &mut Context<Self>) {
@@ -22225,6 +22520,61 @@ impl Storm {
             .ok();
         })
         .detach();
+    }
+
+    /// Where a stop's lines are on disk, which is what a review note is keyed
+    /// by. The stop holds the path the agent wrote; `ref_hits` holds what it
+    /// resolved to.
+    fn stop_abs(&self, stop: &Stop) -> PathBuf {
+        self.ref_hits
+            .get(&stop.path)
+            .cloned()
+            .flatten()
+            .unwrap_or_else(|| self.root.join(&stop.path))
+    }
+
+    /// The open review thread sitting on a stop, if one is.
+    fn stop_thread(&self, stop: &Stop) -> Option<&ReviewComment> {
+        let abs = self.stop_abs(stop);
+        self.review
+            .iter()
+            .find(|c| !c.draft && !c.resolved && c.path == abs && c.line == stop.line && c.end == stop.end.max(stop.line))
+    }
+
+    /// Done with the thread on the stop you are standing on. The same action
+    /// the gutter box has, where you are actually reading it.
+    fn resolve_stop_thread(&mut self, cx: &mut Context<Self>) {
+        let Some(stop) = self.walk.as_ref().and_then(|w| w.stops.get(w.at).cloned()) else {
+            return;
+        };
+        let abs = self.stop_abs(&stop);
+        let (line, end) = (stop.line, stop.end.max(stop.line));
+        let Some(c) =
+            self.review.iter_mut().find(|c| c.path == abs && c.line == line && c.end == end)
+        else {
+            return;
+        };
+        c.resolved = true;
+        self.sync_comment_gutters(cx);
+        self.save_review();
+        self.show_flash("Thread resolved", cx);
+        cx.notify();
+    }
+
+    /// Notes waiting on one stop. `tour_notes` counts them across the whole
+    /// walk; the map wants to know which stop they are on.
+    fn stop_notes(&self, stop: &Stop) -> usize {
+        let abs = self
+            .ref_hits
+            .get(&stop.path)
+            .cloned()
+            .flatten()
+            .unwrap_or_else(|| self.root.join(&stop.path));
+        self.review
+            .iter()
+            .filter(|c| !c.draft && !c.sent && !c.resolved)
+            .filter(|c| c.path == abs && c.line == stop.line && c.end == stop.end.max(stop.line))
+            .count()
     }
 
     fn tour_notes(&self, w: &Walk) -> usize {
@@ -29944,6 +30294,49 @@ impl Storm {
                 )
             })
             .child(div().flex_grow(1.0))
+            // the two questions worth asking about a PR you are looking at
+            .when(pr.state == PrState::Open || pr.state == PrState::Draft, |d| {
+                let (number, base) = (pr.number, pr.base.clone());
+                let tour_base = base.clone();
+                d.child(
+                    div()
+                        .id("pr-doc-body-check")
+                        .px_1p5()
+                        .py(px(1.))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_size(px(11.))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .text_color(rgb(MUTED))
+                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                        .child("Body current?")
+                        .tooltip(tip(
+                            "Ask whether the description still matches the code  ·  ⌥click to have it rewritten",
+                        ))
+                        .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _w, cx| {
+                            this.ask_pr_body_check(number, base.clone(), e.modifiers().alt, cx)
+                        })),
+                )
+                .child(
+                    div()
+                        .id("pr-doc-tour")
+                        .px_1p5()
+                        .py(px(1.))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_size(px(11.))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .text_color(rgb(MUTED))
+                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TOUR_MARK)))
+                        .child("Tour")
+                        .tooltip(tip("Ask for a code tour of this pull request"))
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            this.ask_pr_tour(number, tour_base.clone(), cx)
+                        })),
+                )
+            })
             // the repo's own CI commands: a comment is all they are
             .when(pr.state == PrState::Open || pr.state == PrState::Draft, |d| {
                 let number = pr.number;
