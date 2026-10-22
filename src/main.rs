@@ -5892,9 +5892,6 @@ struct TourRec {
 struct Walk {
     stops: Vec<Stop>,
     at: usize,
-    /// The message it came from, so the strip can go back to the prose. `None`
-    /// on a tour: a tour belongs to the work, not to one answer.
-    msg: Option<usize>,
     /// What the tour is called. `None` means this is a walk through an answer.
     tour: Option<String>,
     /// Standing at the start, before the first stop. A tour opens here: what
@@ -6211,7 +6208,6 @@ fn walk_from_rec(t: &TourRec, restart: bool) -> Walk {
     Walk {
         at: if restart { 0 } else { t.at.min(t.stops.len().saturating_sub(1)) },
         stops: t.stops.clone(),
-        msg: None,
         tour: Some(t.title.clone()),
         id: Some(t.id.clone()),
         intro: restart, // walking it again starts at the beginning, card and all
@@ -14992,7 +14988,6 @@ impl Render for Storm {
         // them. The terminal used to live in the right dock under the agent,
         // which meant the pane you work in shrank every time you opened a
         // shell; here it takes width it already has and leaves the agent alone.
-        let walk = self.render_walk(cx);
         let show_panes = show_term && !self.term_folded;
         let term_parts =
             show_panes.then(|| (self.render_term_panes(window, cx), self.render_term_tabs(cx)));
@@ -15016,9 +15011,6 @@ impl Render for Storm {
                     )
                     .children(steps),
             );
-        }
-        if let Some(strip) = walk {
-            centre = centre.child(strip);
         }
         if let Some((panes, tab_bar)) = term_parts {
             centre = centre
@@ -21609,56 +21601,17 @@ impl Storm {
             .overflow_y_scroll()
             .px_2()
             .py_2();
-        // the route starts somewhere: a card that says so, and walks it
-        col = col.child(
-            div()
-                .id("tour-map-start")
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .px_2()
-                .py_1p5()
-                .rounded_md()
-                .cursor_pointer()
-                .border_1()
-                .border_color(rgb(if w.intro { accent } else { BORDER }))
-                .when(w.intro, |d| d.bg(rgba(TOUR_TINT)))
-                .hover(|s| s.bg(rgb(HOVER)))
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_size(px(10.))
-                        .text_color(rgb(if w.intro { accent } else { MUTED }))
-                        .child("▶"),
-                )
-                .child(
-                    div()
-                        .flex_grow(1.0)
-                        .min_w(px(0.))
-                        .truncate()
-                        .text_size(px(12.))
-                        .text_color(rgb(if w.intro { TEXT } else { MUTED }))
-                        .child("The tour"),
-                )
-                .tooltip(tip("Open the first stop"))
-                .on_click(cx.listener(|this, _e, window, cx| {
-                    this.goto_walk_stop(0, window, cx);
-                    if let Some(w) = this.walk.as_mut() {
-                        w.intro = false;
-                        w.done = false;
-                    }
-                    cx.notify();
-                })),
-        );
-        col = col.child(map_arrow(here == Some(0) || w.intro, accent));
         let mut group = String::new();
         for (ni, n) in nodes.iter().enumerate() {
             let on = here == Some(ni);
             // the tour leaves this file and comes back to it later
             let returns = n.repeat;
-            let notes: usize =
-                n.steps.iter().filter_map(|&si| w.stops.get(si)).map(|s| self.stop_notes(s)).sum();
+            let (notes, answered) = n
+                .steps
+                .iter()
+                .filter_map(|&si| w.stops.get(si))
+                .map(|s| self.stop_threads(s))
+                .fold((0usize, false), |(n, a), (k, ans)| (n + k, a || ans));
             let first_step = n.steps.first().copied().unwrap_or(0);
             let tint = w
                 .stops
@@ -21736,20 +21689,38 @@ impl Storm {
                             )
                         })
                         .when(notes > 0, |d| {
+                            // an answered thread reads in the accent, an
+                            // unanswered one in the comment colour: the point is
+                            // finding the conversation again, not counting it
                             d.child(
                                 div()
                                     .id(("tour-note", ni))
                                     .flex_shrink_0()
-                                    .px_1()
-                                    .rounded_full()
-                                    .bg(rgb(COMMENT_MARK))
-                                    .text_size(px(9.))
-                                    .text_color(rgb(BG))
-                                    .child(format!("{notes}"))
-                                    .tooltip(tip_owned(format!(
-                                        "{notes} note{} waiting here",
-                                        if notes == 1 { "" } else { "s" }
-                                    ))),
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(2.))
+                                    .text_color(rgb(if answered { accent } else { COMMENT_MARK }))
+                                    .child(
+                                        div()
+                                            .font_family(ICON_FONT)
+                                            .text_size(px(9.))
+                                            .child(IC_COMMENT),
+                                    )
+                                    .when(notes > 1, |d| {
+                                        d.child(div().text_size(px(9.)).child(format!("{notes}")))
+                                    })
+                                    .tooltip(tip_owned(if answered {
+                                        format!(
+                                            "{notes} thread{}, answered",
+                                            if notes == 1 { "" } else { "s" }
+                                        )
+                                    } else {
+                                        format!(
+                                            "{notes} thread{} waiting to go to the agent",
+                                            if notes == 1 { "" } else { "s" }
+                                        )
+                                    })),
                             )
                         }),
                 )
@@ -21801,47 +21772,6 @@ impl Storm {
                 col = col.child(map_arrow(here.is_some_and(|h| h == ni || h == ni + 1), accent));
             }
         }
-        col = col.child(map_arrow(w.done || here == Some(nodes.len().saturating_sub(1)), accent));
-        col = col.child(
-            div()
-                .id("tour-map-end")
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .px_2()
-                .py_1p5()
-                .rounded_md()
-                .cursor_pointer()
-                .border_1()
-                .border_color(rgb(if w.done { accent } else { BORDER }))
-                .when(w.done, |d| d.bg(rgba(TOUR_TINT)))
-                .hover(|s| s.bg(rgb(HOVER)))
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_size(px(10.))
-                        .text_color(rgb(if w.done { accent } else { MUTED }))
-                        .child("■"),
-                )
-                .child(
-                    div()
-                        .flex_grow(1.0)
-                        .min_w(px(0.))
-                        .truncate()
-                        .text_size(px(12.))
-                        .text_color(rgb(if w.done { TEXT } else { MUTED }))
-                        .child("End of the tour"),
-                )
-                .tooltip(tip("What the tour added up to"))
-                .on_click(cx.listener(|this, _e, _w, cx| {
-                    if let Some(w) = this.walk.as_mut() {
-                        w.intro = false;
-                        w.done = true;
-                    }
-                    cx.notify();
-                })),
-        );
         col
     }
 
@@ -21964,13 +21894,8 @@ impl Storm {
                                 .text_color(rgb(LINE_NUMBER))
                                 .hover(|s| s.text_color(rgb(TEXT)))
                                 .child("✕")
-                                .tooltip(tip("Hide the step list"))
-                                .on_click(cx.listener(|this, _e, _w, cx| {
-                                    if let Some(w) = this.walk.as_mut() {
-                                        w.list = false;
-                                    }
-                                    cx.notify();
-                                })),
+                                .tooltip(tip("End the tour  (esc)"))
+                                .on_click(cx.listener(|this, _e, _w, cx| this.end_walk(cx))),
                         ),
                 )
                 .child(self.render_tour_map(w, accent, cx)),
@@ -22640,20 +22565,24 @@ impl Storm {
         cx.notify();
     }
 
-    /// Notes waiting on one stop. `tour_notes` counts them across the whole
-    /// walk; the map wants to know which stop they are on.
-    fn stop_notes(&self, stop: &Stop) -> usize {
-        let abs = self
-            .ref_hits
-            .get(&stop.path)
-            .cloned()
-            .flatten()
-            .unwrap_or_else(|| self.root.join(&stop.path));
-        self.review
+    /// Threads on one stop: how many, and whether the agent has answered in
+    /// any of them. Unlike `stop_notes` this counts a thread that has already
+    /// gone to the agent, because an answered thread is the one you most want
+    /// to find your way back to.
+    fn stop_threads(&self, stop: &Stop) -> (usize, bool) {
+        let abs = self.stop_abs(stop);
+        let (line, end) = (stop.line, stop.end.max(stop.line));
+        let open = self
+            .review
             .iter()
-            .filter(|c| !c.draft && !c.sent && !c.resolved)
-            .filter(|c| c.path == abs && c.line == stop.line && c.end == stop.end.max(stop.line))
-            .count()
+            .filter(|c| !c.draft && !c.resolved && c.path == abs && c.line == line && c.end == end);
+        let mut n = 0;
+        let mut answered = false;
+        for c in open {
+            n += 1;
+            answered |= c.replies.iter().any(|r| r.who != "you");
+        }
+        (n, answered)
     }
 
     fn tour_notes(&self, w: &Walk) -> usize {
@@ -24701,12 +24630,11 @@ impl Storm {
             Some(Walk {
                 stops,
                 at,
-                msg: Some(msg),
                 tour: None,
                 intro: false,
                 done: false,
                 id: None,
-                list: false,
+                list: true,
                 here: None,
             });
     }
@@ -24805,12 +24733,11 @@ impl Storm {
         self.walk = Some(Walk {
             stops,
             at: 0,
-            msg: None,
             tour: Some(title),
             intro: true,
             done: false,
             id: Some(rec.id.clone()),
-            list: false,
+            list: true,
             here: None,
         });
         // newest first, and the rest are put away: one tour is open at a time
@@ -25146,203 +25073,6 @@ impl Storm {
             }
         }
         cx.notify();
-    }
-
-    /// The strip along the bottom of the editor while a walk or a tour is on:
-    /// where you are, what the agent said about this stop, and the arrows.
-    ///
-    /// A tour gets two more things than a walk: its own name, and a list of
-    /// every stop — the route you're being taken on, so you can see what is
-    /// coming and jump around in it rather than only stepping.
-    fn render_walk(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        // the card over the code is where the description belongs when the stop
-        // is on screen; this only carries it when it can't be
-        let carded = self.tour_card_at(cx).is_some();
-        let w = self.walk.as_ref()?;
-        let stop = w.stops.get(w.at)?;
-        let tour = w.tour.clone();
-        let accent = if tour.is_some() { TOUR_MARK } else { COMMENT_MARK };
-        // at the ends of the walk the arrow that would leave it is spent: it
-        // dims and stops answering, rather than wrapping round
-        let (back_off, fwd_off) = (w.intro, w.done);
-        let arrow = |id: &'static str,
-                     glyph: &'static str,
-                     hint: &'static str,
-                     dir: i32,
-                     spent: bool,
-                     cx: &mut Context<Self>| {
-            div()
-                .id(id)
-                .px_1p5()
-                .rounded_md()
-                .text_color(rgb(if spent { BORDER } else { MUTED }))
-                .when(!spent, |d| {
-                    d.cursor_pointer().hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                })
-                .child(glyph)
-                .when(!spent, |d| d.tooltip(tip(hint)))
-                .on_click(cx.listener(move |this, _e, window, cx| this.step_walk(dir, window, cx)))
-        };
-        // top row: the controls, what this stop is called, and where it is
-        let mut top = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .flex_shrink_0()
-            .h(px(22.))
-            .child(arrow("walk-prev", "‹", "Previous stop  (⌥[)", -1, back_off, cx))
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_color(rgb(LINE_NUMBER))
-                    .child(format!("{}/{}", w.at + 1, w.stops.len())),
-            )
-            .child(arrow("walk-next", "›", "Next stop  (⌥])", 1, fwd_off, cx));
-        if let Some(name) = tour.clone().filter(|t| !t.trim().is_empty()) {
-            top = top.child(
-                div()
-                    .flex_shrink_0()
-                    .px_1p5()
-                    .rounded_md()
-                    .bg(rgba(TOUR_TINT))
-                    .text_color(rgb(TOUR_MARK))
-                    .child(name),
-            );
-        }
-        if !stop.title.trim().is_empty() {
-            top = top.child(
-                div()
-                    .id("walk-title")
-                    .flex_shrink_0()
-                    .max_w(px(420.))
-                    .truncate()
-                    .cursor_pointer()
-                    .text_color(rgb(TEXT))
-                    .hover(|s| s.text_color(rgb(accent)))
-                    .child(stop.title.clone())
-                    .tooltip(tip("Open this stop again"))
-                    .on_click(cx.listener(|this, _e, window, cx| {
-                        let at = this.walk.as_ref().map(|w| w.at).unwrap_or(0);
-                        this.goto_walk_stop(at, window, cx);
-                    })),
-            );
-        }
-        top = top
-            // the strip names where the stop is, so it may as well take you
-            // there: after scrolling away, this is the way back
-            .child(
-                div()
-                    .id("walk-where")
-                    .flex_shrink_0()
-                    .max_w(px(360.))
-                    .truncate()
-                    .cursor_pointer()
-                    .font_family("Menlo")
-                    .text_size(px(10.5))
-                    .text_color(rgb(accent))
-                    .hover(|s| s.text_color(rgb(TEXT)))
-                    .child(stop_label(stop))
-                    .tooltip(tip("Open this stop again"))
-                    .on_click(cx.listener(|this, _e, window, cx| {
-                        let at = this.walk.as_ref().map(|w| w.at).unwrap_or(0);
-                        this.goto_walk_stop(at, window, cx);
-                    })),
-            )
-            // the description, on the one line this strip is allowed to be. It
-            // is in full on the card when the stop is on screen; this is for
-            // when it isn't, and the strip must not change height either way.
-            .child({
-                let said = stop.said.trim().to_string();
-                let full = said.clone();
-                div()
-                    .id("walk-said")
-                    .flex_grow(1.0)
-                    .min_w(px(0.))
-                    .truncate()
-                    .text_color(rgb(MUTED))
-                    .when(!carded && !said.is_empty(), |d| d.child(said))
-                    .when(!full.is_empty(), |d| {
-                        d.tooltip(move |_w, cx| {
-                            cx.new(|_| TooltipView { text: full.clone().into() }).into()
-                        })
-                    })
-            })
-            // the route at a glance: a tour is an argument with an order, and
-            // reading it needs seeing where this stop sits in it
-            .when(tour.is_some(), |d| {
-                let open = w.list;
-                d.child(
-                    div()
-                        .id("walk-list-toggle")
-                        .px_1p5()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .flex_shrink_0()
-                        .when(open, |d| d.bg(rgb(HOVER)))
-                        .text_color(rgb(if open { TEXT } else { MUTED }))
-                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                        .child(format!("☰ {} steps", w.stops.len()))
-                        .tooltip(tip("Every stop on the tour"))
-                        .on_click(cx.listener(|this, _e, _w, cx| {
-                            if let Some(w) = this.walk.as_mut() {
-                                w.list = !w.list;
-                            }
-                            cx.notify();
-                        })),
-                )
-            })
-            .when(w.msg.is_some(), |d| {
-                d.child(
-                    div()
-                        .id("walk-back")
-                        .px_1p5()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .flex_shrink_0()
-                        .text_color(rgb(MUTED))
-                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                        .child("the answer")
-                        .tooltip(tip("Back to where this was written"))
-                        .on_click(cx.listener(|this, _e, _w, cx| {
-                            if let Some(m) = this.walk.as_ref().and_then(|w| w.msg) {
-                                this.agent_list.scroll_to_reveal_item(m);
-                            }
-                            cx.notify();
-                        })),
-                )
-            })
-            .child(
-                div()
-                    .id("walk-close")
-                    .px_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .flex_shrink_0()
-                    .text_color(rgb(LINE_NUMBER))
-                    .hover(|s| s.text_color(rgb(GIT_DELETED)))
-                    .child("✕")
-                    .tooltip(tip(if tour.is_some() {
-                        "End the tour  (esc)"
-                    } else {
-                        "End the walk  (esc)"
-                    }))
-                    .on_click(cx.listener(|this, _e, _w, cx| this.end_walk(cx))),
-            );
-
-        let mut strip = div()
-            .flex()
-            .flex_col()
-            .flex_shrink_0()
-            .gap_1()
-            .py_1()
-            .px_3()
-            .bg(rgb(PANEL_BG))
-            .border_t_1()
-            .border_color(rgb(accent))
-            .text_size(px(11.))
-            .child(top);
-        Some(strip)
     }
 
     /// Open a file reference from the transcript at its line.
@@ -35508,7 +35238,6 @@ mod tour_end_tests {
                 })
                 .collect(),
             at: 0,
-            msg: None,
             tour: Some("A tour".into()),
             id: Some("t1".into()),
             intro: false,
