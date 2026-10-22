@@ -21922,8 +21922,8 @@ impl Storm {
                 .border_color(rgb(BORDER))
                 .child(
                     div()
-                        .h(px(28.))
-                        .px_2()
+                        .h(px(36.))
+                        .px_3()
                         .flex()
                         .flex_row()
                         .items_center()
@@ -21941,6 +21941,19 @@ impl Storm {
                                 .child(w.tour.clone().unwrap_or_else(|| "This answer".to_string())),
                         )
                         .child(format!("{} steps", w.stops.len()))
+                        .child(
+                            div()
+                                .id("tour-steps-regen")
+                                .px_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .flex_shrink_0()
+                                .text_color(rgb(LINE_NUMBER))
+                                .hover(|s| s.text_color(rgb(TOUR_MARK)))
+                                .child("⟲")
+                                .tooltip(tip("Build this tour again from the code as it stands now"))
+                                .on_click(cx.listener(|this, _e, _w, cx| this.regen_tour(cx))),
+                        )
                         .child(
                             div()
                                 .id("tour-steps-close")
@@ -22504,6 +22517,28 @@ impl Storm {
         let label = format!("Asked for a code tour of #{number}");
         self.agent_open = true;
         self.send_agent_prompt_as(pr_tour_request(number, &base), Some(label), cx);
+        self.agent_list.scroll_to_end();
+        cx.notify();
+    }
+
+    /// Build this tour again. A tour is a snapshot: once the code under it has
+    /// moved, the stops drift off their lines and the prose stops matching.
+    fn regen_tour(&mut self, cx: &mut Context<Self>) {
+        let Some(name) = self.walk.as_ref().map(|w| w.tour.clone()) else { return };
+        let about = match name.as_deref().map(str::trim) {
+            Some(n) if !n.is_empty() => format!(
+                "\u{201c}{n}\u{201d}. There is already a tour by that name, but the code has \
+                 moved under it. Build it again from the code as it stands now, \
+                 and keep the name."
+            ),
+            _ => "this answer, again, from the code as it stands now".to_string(),
+        };
+        let label = match name.as_deref().map(str::trim) {
+            Some(n) if !n.is_empty() => format!("Asked for \u{201c}{n}\u{201d} to be built again"),
+            _ => "Asked for the tour to be built again".to_string(),
+        };
+        self.agent_open = true;
+        self.send_agent_prompt_as(tour_request(Some(&about), None), Some(label), cx);
         self.agent_list.scroll_to_end();
         cx.notify();
     }
@@ -25307,66 +25342,6 @@ impl Storm {
             .border_color(rgb(accent))
             .text_size(px(11.))
             .child(top);
-        if w.list {
-            let mut list = div()
-                .id("walk-list")
-                .flex()
-                .flex_col()
-                .w_full()
-                .max_h(px(168.))
-                .overflow_y_scroll()
-                .border_t_1()
-                .border_color(rgb(BORDER))
-                .pt_1();
-            for (i, s) in w.stops.iter().enumerate() {
-                let on = i == w.at;
-                let label = if s.title.trim().is_empty() {
-                    s.said.clone()
-                } else {
-                    s.title.clone()
-                };
-                list = list.child(
-                    div()
-                        .id(("walk-step", i))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .px_1()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .when(on, |d| d.bg(rgb(SELECTED_BG)))
-                        .hover(|st| st.bg(rgb(if on { SELECTED_BG } else { HOVER })))
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .w(px(18.))
-                                .text_color(rgb(if on { TOUR_MARK } else { LINE_NUMBER }))
-                                .child(format!("{}", i + 1)),
-                        )
-                        .child(
-                            div()
-                                .flex_grow(1.0)
-                                .min_w(px(0.))
-                                .truncate()
-                                .text_color(rgb(if on { SEL_TEXT } else { TEXT }))
-                                .child(label),
-                        )
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .font_family("Menlo")
-                                .text_size(px(10.))
-                                .text_color(rgb(MUTED))
-                                .child(stop_label(s)),
-                        )
-                        .on_click(cx.listener(move |this, _e, window, cx| {
-                            this.goto_walk_stop(i, window, cx)
-                        })),
-                );
-            }
-            strip = strip.child(list);
-        }
         Some(strip)
     }
 
