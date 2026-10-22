@@ -21,12 +21,17 @@ mod syntax;
 mod editor;
 mod term;
 mod acp;
+// The wry/WKWebView path, superseded by `mirror` (a native child view floats
+// above everything gpui paints, which is what parked it). Kept for reference.
+#[allow(dead_code)]
 mod browser;
+mod mirror;
 mod diff;
 mod build;
 mod lsp;
 mod md;
 mod rpc;
+mod todo;
 mod usage;
 use rpc::AgentState;
 use diff::{DiffKind, DiffRow};
@@ -66,6 +71,7 @@ const IC_COMMENT: &str = "\u{ea6b}"; // codicon "comment"
 const IC_AGENT: &str = "\u{ec4f}"; // codicon "chat-sparkle" — the agent pane
 const IC_GRAPH: &str = "\u{ebe2}"; // codicon "graph-line" — plan usage
 const IC_GEAR: &str = "\u{eb51}"; // codicon "gear" — the agent's own settings
+const IC_TOUR: &str = "\u{ebd5}"; // codicon "compass" — code tours
 // The codicon font is renamed to "Segoe Fluent Icons" because GPUI refuses to
 // load any font lacking an 'm' glyph — except that one specially-cased name.
 const ICON_FONT: &str = "Segoe Fluent Icons";
@@ -86,8 +92,9 @@ actions!(
         FocusPaneUp, FocusPaneDown, GotoCommit, ShowDiff, FindInFiles,
         GitPopup, CommandPalette, CopyReference, CopyReferenceLine, OpenOnGithub, NextProject, PrevProject, OpenProject,
         ShowProjects, PushDialog, RunCommand, NewProject, FetchRemotes, PullRemote, WipPush, RunBuild,
-        NewScratch, ToggleAgent, GitLog, SetWsTitle, RefreshPr, AddComment, ShowComments, SendComments,
-        QuitApp, ToggleMdPreview, QuoteAgentSel
+        NewScratch, ToggleAgent, GitLog, SetWsTitle, TodoList, WalkNext, WalkPrev, RefreshPr, AddComment, ShowComments, SendComments,
+        QuitApp, ToggleMdPreview, QuoteAgentSel, PrScreen,
+        MdFind, SendElsewhere
     ]
 );
 
@@ -96,11 +103,22 @@ enum AgentMsg {
     /// Something the user typed, and whatever was attached to it. The images
     /// outlive the composer: `[Image #1]` in the prose says where a picture
     /// went, and the chips under the bubble say what it was.
-    User { text: String, imgs: Vec<SentImage> },
+    User { text: String, imgs: Vec<SentImage>, by: Sender },
     /// Streamed assistant text (mutated in place as chunks arrive).
     Agent(String),
     /// Streamed assistant reasoning ("thinking"), shown dimmed.
     Thought(String),
+    /// The reviewers are reading. Carries nothing: it is drawn from the live
+    /// reviewer list, so the counts and the elapsed time stay true while it
+    /// sits in the transcript.
+    Reviewing,
+    /// The agent's closing word on a job TIDE handed it — the answer to "so what
+    /// happened?", drawn as a card instead of being the tail of a long turn.
+    Summary { title: String, text: String },
+    /// A picture the agent put on screen: a browser screenshot, with its note.
+    /// `dims` is the picture's own size in pixels, so its frame can be worked
+    /// out exactly rather than left to a layout rule to approximate.
+    Shot { note: String, image: Arc<gpui::Image>, path: PathBuf, dims: Option<(f32, f32)> },
     /// A tool call the agent ran: title (for Bash, the command itself), latest
     /// status, what the adapter said about it (a description before it runs, the
     /// output after), and when it started, so a long one can show its age.
@@ -146,6 +164,17 @@ fn session_title(raw: &str) -> Option<String> {
         out.push('…');
     }
     (!out.is_empty()).then_some(out)
+}
+
+/// A turn replayed by `session/load` is what was actually sent, and the first
+/// turn of a session opens with TIDE's briefing. The transcript shows what you
+/// typed, so the briefing is cut back off at the line that closes it.
+fn strip_briefing(raw: &str) -> &str {
+    const END: &str = "just answer what follows.\n\n---\n\n";
+    match raw.find(END) {
+        Some(i) => raw[i + END.len()..].trim_start(),
+        None => raw,
+    }
 }
 
 /// One `@` completion candidate in the agent composer.
@@ -655,6 +684,119 @@ fn load_ws_titles() -> HashMap<String, String> {
 fn load_ws_title(root: &Path) -> Option<String> {
     load_ws_titles().remove(&root.to_string_lossy().to_string())
 }
+/// A unix time as a clock reading — "14:32", or "Mon 14:32" once it isn't
+/// today. Local time, worked out from the offset the system reports.
+fn stamp_of(when: u64) -> String {
+    let out = Command::new("date")
+        .args(["-r", &when.to_string(), "+%H:%M|%j"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+    let (clock, day) = out.trim().split_once('|').unwrap_or(("", ""));
+    if clock.is_empty() {
+        return String::new();
+    }
+    let today = Command::new("date")
+        .args(["+%j"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+    if day == today.trim() {
+        format!("at {clock}")
+    } else {
+        format!("on {}", Command::new("date")
+            .args(["-r", &when.to_string(), "+%a %H:%M"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| clock.to_string()))
+    }
+}
+
+/// A duration as a human reads it: seconds under a minute, minutes and seconds
+/// under an hour, hours and minutes past that. `10078s` is a number; `2h 48m`
+/// is an answer.
+fn human_secs(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m {}s", s / 60, s % 60),
+        s => format!("{}h {}m", s / 3600, (s % 3600) / 60),
+    }
+}
+
+/// Unix seconds, for timestamps that outlive the process.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// When review comments were last handed to the agent, per workspace, and how
+/// many went. Persisted because the question it answers — "did I already send
+/// these?" — is one you ask after coming back, not during.
+fn review_sent_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".config/tide/review-sent.json"))
+}
+fn load_review_sent(root: &Path) -> Option<(u64, usize)> {
+    let map: HashMap<String, (u64, usize)> = review_sent_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())?;
+    map.get(&root.to_string_lossy().to_string()).copied()
+}
+fn save_review_sent(root: &Path, when: u64, count: usize) {
+    let Some(path) = review_sent_path() else { return };
+    let mut map: HashMap<String, (u64, usize)> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    map.insert(root.to_string_lossy().to_string(), (when, count));
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(s) = serde_json::to_string_pretty(&map) {
+        let _ = std::fs::write(path, s);
+    }
+}
+
+/// Where the work stands *within* a named workspace: "AI Chat" is the feature,
+/// "UI auto syncing" is the checkpoint you're on inside it. The title is yours
+/// and lasts the whole branch; this moves as the work moves, and the agent
+/// keeps it current.
+fn ws_subtitles_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".config/tide/workspace-subtitles.json"))
+}
+fn load_ws_subtitles() -> HashMap<String, String> {
+    ws_subtitles_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+fn load_ws_subtitle(root: &Path) -> Option<String> {
+    load_ws_subtitles().remove(&root.to_string_lossy().to_string())
+}
+fn save_ws_subtitle(root: &Path, subtitle: Option<&str>) {
+    let Some(path) = ws_subtitles_path() else { return };
+    let mut m = load_ws_subtitles();
+    let key = root.to_string_lossy().to_string();
+    match subtitle.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => m.insert(key, t.chars().take(60).collect()),
+        None => m.remove(&key),
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(s) = serde_json::to_string_pretty(&m) {
+        let _ = std::fs::write(path, s);
+    }
+}
+
 /// The title each folder *last* carried, kept when a workspace is reset so the
 /// Open Project list can still say what that folder was used for.
 fn ws_last_titles_path() -> Option<PathBuf> {
@@ -705,6 +847,43 @@ fn save_ws_title(root: &Path, title: Option<&str>) {
     }
     if let Ok(s) = serde_json::to_string_pretty(&m) {
         let _ = std::fs::write(path, s);
+    }
+}
+
+/// Workspaces whose title an agent wrote. A name the human typed is theirs and
+/// an agent may not touch it; a name an agent proposed is the agent's to
+/// improve, which is what lets the briefing say "name it now, refine it later"
+/// instead of "wait until you're sure".
+fn ws_agent_titled_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".config/tide/agent-titled.json"))
+}
+fn load_agent_titled_set() -> HashSet<String> {
+    ws_agent_titled_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .map(|v| v.into_iter().collect())
+        .unwrap_or_default()
+}
+fn load_agent_titled(root: &Path) -> bool {
+    load_agent_titled_set().contains(&root.to_string_lossy().to_string())
+}
+fn save_agent_titled(root: &Path, theirs: bool) {
+    let Some(path) = ws_agent_titled_path() else { return };
+    let mut set = load_agent_titled_set();
+    let key = root.to_string_lossy().to_string();
+    if theirs {
+        set.insert(key);
+    } else if !set.remove(&key) {
+        return; // nothing to write
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut list: Vec<String> = set.into_iter().collect();
+    list.sort();
+    if let Ok(body) = serde_json::to_string_pretty(&list) {
+        let _ = std::fs::write(path, body);
     }
 }
 
@@ -907,6 +1086,65 @@ fn push_recent_project(root: &Path) {
 /// Process-global tree clipboard shared across all workspaces (each project is
 /// a separate `Storm`, so a per-view clipboard can't paste across windows/tabs).
 /// Holds `(source path, is_cut)`.
+/// Files on the macOS pasteboard, if it holds any — what Finder puts there when
+/// you copy. Read through `osascript`: the legacy `NSFilenamesPboardType` list
+/// first, since macOS synthesizes it alongside whatever the copier wrote, then
+/// per-item `public.file-url` for anything that only wrote the modern type.
+fn system_clip_files() -> Vec<PathBuf> {
+    const JS: &str = r#"ObjC.import("AppKit");
+const pb = $.NSPasteboard.generalPasteboard;
+const plist = pb.propertyListForType("NSFilenamesPboardType");
+let out = [];
+if (!plist.isNil()) { out = ObjC.deepUnwrap(plist); }
+if (!out.length) {
+  const items = pb.pasteboardItems;
+  for (let i = 0; i < items.count; i++) {
+    const s = items.objectAtIndex(i).stringForType("public.file-url");
+    if (s.js === undefined || s.js === null) continue;
+    const u = $.NSURL.URLWithString(s);
+    if (!u.isNil()) out.push(ObjC.unwrap(u.path));
+  }
+}
+out.join("\n")"#;
+    Command::new("osascript")
+        .args(["-l", "JavaScript", "-e", JS])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| {
+            s.lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .map(PathBuf::from)
+                .filter(|p| p.exists())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Put files on the macOS pasteboard, so a copy here pastes in Finder. Writing
+/// the legacy type is enough: macOS derives `public.file-url` from it.
+fn set_system_clip_files(paths: &[PathBuf]) {
+    if paths.is_empty() {
+        return;
+    }
+    let list = paths
+        .iter()
+        .map(|p| format!("{:?}", p.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let js = format!(
+        r#"ObjC.import("AppKit");
+const pb = $.NSPasteboard.generalPasteboard;
+pb.clearContents;
+pb.declareTypesOwner(["NSFilenamesPboardType"], $());
+pb.setPropertyListForType($.NSArray.arrayWithArray([{list}]), "NSFilenamesPboardType");
+"ok""#
+    );
+    let _ = Command::new("osascript").args(["-l", "JavaScript", "-e", &js]).output();
+}
+
 fn tree_clip() -> &'static Mutex<Option<(PathBuf, bool)>> {
     use std::sync::OnceLock;
     static C: OnceLock<Mutex<Option<(PathBuf, bool)>>> = OnceLock::new();
@@ -925,7 +1163,9 @@ fn branch_style(name: &str) -> u32 {
     }
 }
 
-/// Render a branch name as a colored tag pill (see `branch_style`).
+/// Render a branch name as a colored tag pill (see `branch_style`). One shape
+/// everywhere a branch is named — the topbar, the status card, the dialogs, the
+/// head of a PR body — so a branch always looks like a branch.
 fn branch_name_el(name: &str) -> gpui::Div {
     let fg = branch_style(name);
     div()
@@ -1191,6 +1431,45 @@ impl DiffSel {
     }
 }
 
+/// The identifier a diff selection covers, when it covers exactly one. The
+/// same-word highlight the editor draws needs a word, not any old selection:
+/// half a line lit up everywhere it repeats is noise.
+fn diff_selected_word(rows: &[DiffRow], sel: Option<&DiffSel>) -> Option<String> {
+    let sel = sel?;
+    let ((r0, c0), (r1, c1)) = sel.range();
+    if r0 != r1 || c1 <= c0 {
+        return None;
+    }
+    let text = diff_side_text(rows.get(r0)?, sel.side);
+    let word: String = text.chars().skip(c0).take(c1 - c0).collect();
+    let is_word = !word.is_empty() && word.chars().all(|c| c.is_alphanumeric() || c == '_');
+    is_word.then_some(word)
+}
+
+/// Whole-word occurrences of `word` in `line`, as character columns — the
+/// coordinates the diff draws in. Whole-word, so `Tenant` doesn't light up
+/// inside `RuntimeTenant`.
+fn word_cols(line: &str, word: &str) -> Vec<(usize, usize)> {
+    let chars: Vec<char> = line.chars().collect();
+    let w: Vec<char> = word.chars().collect();
+    if w.is_empty() || chars.len() < w.len() {
+        return Vec::new();
+    }
+    let wordish = |c: char| c.is_alphanumeric() || c == '_';
+    let mut out = Vec::new();
+    for i in 0..=chars.len() - w.len() {
+        if chars[i..i + w.len()] != w[..] {
+            continue;
+        }
+        let before = i == 0 || !wordish(chars[i - 1]);
+        let after = i + w.len() == chars.len() || !wordish(chars[i + w.len()]);
+        if before && after {
+            out.push((i, i + w.len()));
+        }
+    }
+    out
+}
+
 /// Display text for one side of a row (tabs are already expanded in the rows).
 fn diff_side_text(row: &DiffRow, side: DiffSide) -> String {
     let s = match side {
@@ -1349,6 +1628,8 @@ fn diff_pane(
     // visible width of this pane — comment widgets use it so they don't run off
     // into the horizontally-scrollable area
     vis_w: f32,
+    // the identifier under a double-click, marked wherever else it appears
+    word: Option<&str>,
 ) -> impl IntoElement {
     let side_w = diff_side_w(rows, char_w, side);
     let id = match side {
@@ -1384,6 +1665,13 @@ fn diff_pane(
             if *ms == side && *mr == i {
                 let color = if mi == cur_match { SEARCH_CURRENT_BG } else { SEARCH_MATCH_BG };
                 spans.push((*cs, *ce, color));
+            }
+        }
+        // the same-word marks go under the selection, which is pushed last and
+        // therefore wins on the occurrence you actually clicked
+        if let Some(w) = word {
+            for (cs, ce) in word_cols(&text, w) {
+                spans.push((cs, ce, WORD_MATCH_BG));
             }
         }
         if let Some((cs, ce)) = diff_row_sel(sel, side, i, nchars) {
@@ -1482,6 +1770,93 @@ fn diff_pane(
         .child(area)
         .child(v_scrollbar(handle))
         .child(h_scrollbar(handle))
+}
+
+/// How many cells a review's progress bar is cut into. Ten is the number that
+/// reads at a glance without counting — one cell is a tenth, and "three lit" is
+/// the same thought as "30%".
+const BAR_CELLS: usize = 10;
+
+/// A progress bar in cells rather than one long fill, so a glance gives you the
+/// number without reading it. A partly-done cell fills from its own left edge,
+/// which is what keeps the motion smooth instead of jumping a tenth at a time.
+fn segmented_bar(pct: usize, color: u32, height: f32) -> Div {
+    segmented_bar_on(pct, color, height, HOVER)
+}
+
+/// The same, with the colour of the cells that aren't lit yet. The unlit cells
+/// are half the point — they are what says how much is left — so on a surface
+/// that `HOVER` disappears into, the caller picks something that shows.
+fn segmented_bar_on(pct: usize, color: u32, height: f32, track: u32) -> Div {
+    let mut row = div().flex().flex_row().items_center().gap(px(2.)).w_full().h(px(height));
+    for cell in 0..BAR_CELLS {
+        let fill = cell_fill(pct, cell);
+        row = row.child(
+            div()
+                .flex_grow(1.0)
+                .h_full()
+                .rounded_sm()
+                .bg(rgb(track))
+                .when(fill > 0.0, |d| {
+                    d.child(div().w(relative(fill)).h_full().rounded_sm().bg(rgb(color)))
+                }),
+        );
+    }
+    row
+}
+
+/// How full one cell of the bar is, 0 to 1. A cell is dark until progress
+/// reaches it and full once progress is past it; the one in between shows the
+/// remainder, which is what keeps the bar moving smoothly rather than jumping a
+/// tenth at a time.
+fn cell_fill(pct: usize, cell: usize) -> f32 {
+    // counted in whole percent: dividing the fraction instead leaves the last
+    // cell at 0.9999996 on a finished bar, which is a hairline of unlit pixels
+    // at exactly the moment the bar is supposed to look done
+    let span = 100.0 / BAR_CELLS as f32;
+    let into = pct.min(100).saturating_sub(cell * 100 / BAR_CELLS) as f32;
+    (into / span).clamp(0.0, 1.0)
+}
+
+/// GitHub's five-block diffstat: how much of the change is added against
+/// removed, at a glance, for files whose numbers are too big to compare by
+/// reading. Blocks are filled green for additions, red for deletions, and left
+/// empty for the rest.
+fn diffstat_squares(add: usize, del: usize) -> Div {
+    const N: usize = 5;
+    let total = add + del;
+    // at least one block each when a file has any of that kind, so a 400/1
+    // file still shows that something was removed
+    let greens = if total == 0 {
+        0
+    } else {
+        ((add * N + total - 1) / total).min(N).max(usize::from(add > 0))
+    };
+    let reds = if total == 0 { 0 } else { (N - greens).min(usize::from(del > 0) * N) };
+    let mut row = div().flex().flex_row().items_center().gap(px(1.)).flex_shrink_0().ml_1();
+    for i in 0..N {
+        let colour = if i < greens {
+            GIT_NEW
+        } else if i < greens + reds {
+            GIT_DELETED
+        } else {
+            BORDER
+        };
+        row = row.child(div().size(px(6.)).rounded_sm().bg(rgb(colour)));
+    }
+    row
+}
+
+/// A filled track: the shape the PR pane uses for "how far through this are
+/// you", so everything that answers that question looks the same. `frac` is
+/// 0..1 and `h` the track's height.
+fn progress_bar(frac: f32, h: f32, colour: u32) -> Div {
+    div()
+        .h(px(h))
+        .w_full()
+        .rounded_md()
+        .bg(rgb(BORDER))
+        .child(div().h_full().w(relative(frac.clamp(0.0, 1.0))).rounded_md().bg(rgb(colour)))
 }
 
 /// Progress-bar color interpolated red (0%) → yellow → green (100%).
@@ -1597,6 +1972,14 @@ enum CtxKind {
     ReviewFile,
     /// Selected text in the agent transcript.
     AgentSel,
+    /// A screenshot the agent posted into the transcript.
+    Shot,
+    /// A row in the PR pane's tree — about the change, not about the file.
+    PrTree,
+    /// The rendered-markdown view, which has no editor behind it to select in.
+    MdPreview,
+    /// One turn inside a review thread — the agent's answer to a note.
+    ThreadReply,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1606,6 +1989,10 @@ enum LeftView {
     PullRequest,
     /// Pending review comments, with a button that sends them to the agent.
     Review,
+    /// The scratch todo list, shared by every workspace.
+    Todos,
+    /// Code tours the agent has built for this workspace.
+    Tours,
 }
 
 /// PR review file filter by viewed-state.
@@ -1631,9 +2018,232 @@ fn md_text(text: &str, size: f32, color: u32) -> Div {
     let rows = md_prepare(text);
     let mut col = div().flex().flex_col().min_w(px(0.)).text_color(rgb(color));
     for row in rows.iter() {
-        col = col.child(div().text_size(px(size)).child(md_row_el(row, false)));
+        col = col.child(div().text_size(px(size)).child(md_row_el(row, Sel::None)));
     }
     col
+}
+
+/// Every `#5619` in a line, as a link to that pull request. `owner/repo#5619`
+/// points at the repo it names; a bare number at this checkout's own, so it is
+/// only a link when we know where "here" is.
+fn pr_links(
+    text: &str,
+    repo_web: Option<&str>,
+) -> Vec<(std::ops::Range<usize>, LinkTarget)> {
+    pr_refs(text)
+        .into_iter()
+        .filter_map(|(range, repo, num)| {
+            let base = if repo.is_empty() {
+                repo_web?.to_string()
+            } else {
+                format!("https://github.com/{repo}")
+            };
+            Some((range, LinkTarget::Url(format!("{base}/pull/{num}"))))
+        })
+        .collect()
+}
+
+/// [`md_text`], with file references and URLs turned into links: a thread reply
+/// quotes as much code as the answer it hangs off, and reading it without being
+/// able to open what it names is the same problem twice.
+fn md_links(
+    text: &str,
+    size: f32,
+    color: u32,
+    id: usize,
+    me: WeakEntity<Storm>,
+    resolves: &dyn Fn(&str) -> bool,
+    repo_web: Option<&str>,
+) -> Div {
+    let rows = md_prepare(text);
+    let mut col = div().flex().flex_col().min_w(px(0.)).text_color(rgb(color));
+    for (i, row) in rows.iter().enumerate() {
+        let mut links: Vec<(std::ops::Range<usize>, LinkTarget)> = file_refs(&row.text)
+            .into_iter()
+            .filter(|r| resolves(&r.path))
+            .map(|r| (r.range, LinkTarget::File(r.path, r.line)))
+            .chain(
+                url_spans(&row.text)
+                    .into_iter()
+                    .map(|r| (r.clone(), LinkTarget::Url(row.text[r].to_string()))),
+            )
+            .chain(pr_links(&row.text, repo_web))
+            .collect();
+        links.sort_by_key(|(r, _)| r.start);
+        links.dedup_by(|b, a| b.0.start < a.0.end);
+        col = col.child(div().text_size(px(size)).child(if links.is_empty() {
+            md_row_el(row, Sel::None).into_any_element()
+        } else {
+            let ranges: Vec<std::ops::Range<usize>> = links.iter().map(|(r, _)| r.clone()).collect();
+            let targets: Vec<LinkTarget> = links.iter().map(|(_, t)| t.clone()).collect();
+            let styled = md_styled_links(row, row.heading, Sel::None, &ranges);
+            let me = me.clone();
+            gpui::InteractiveText::new(("thread-link", id * 1_000 + i), styled)
+                .on_click(ranges, move |ix, window, cx| match targets.get(ix) {
+                    Some(LinkTarget::Url(u)) => open_browser(u),
+                    Some(LinkTarget::File(path, line)) => {
+                        let (path, line) = (path.clone(), *line);
+                        if let Some(me) = me.upgrade() {
+                            me.update(cx, |this, cx| this.open_file_ref(&path, line, window, cx));
+                        }
+                    }
+                    None => {}
+                })
+                .into_any_element()
+        }));
+    }
+    col
+}
+
+/// A picture a markdown document points at.
+enum MdImg {
+    /// Being fetched. The row draws a placeholder so the layout doesn't jump
+    /// when the bytes land.
+    Loading,
+    Ready(Arc<gpui::Image>, Option<(f32, f32)>),
+    /// Gone, unreachable, or not an image. The alt text stands in, which is
+    /// what alt text is for.
+    Failed,
+}
+
+/// Every picture any open document has asked for, keyed by its `src`. Global
+/// rather than per-tab: the same screenshot appears in a PR body, the agent's
+/// summary of it, and the file itself, and it should be fetched once.
+fn md_img_cache() -> &'static Mutex<HashMap<String, MdImg>> {
+    static C: std::sync::OnceLock<Mutex<HashMap<String, MdImg>>> = std::sync::OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Where a fetched picture is kept between runs, named by a hash of its URL so
+/// a second launch draws it without going back to the network.
+fn md_img_file(src: &str) -> Option<PathBuf> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    src.hash(&mut h);
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(format!(".config/tide/md-images/{:016x}", h.finish())))
+}
+
+/// Hand a picture to whatever opens pictures. A local one goes straight to
+/// Preview; one we fetched goes as the copy already on disk, named with the
+/// extension its bytes say it is, since the cache names files by hash and
+/// `open` picks the app by extension. With no copy to hand, the URL goes to
+/// the browser.
+fn open_img(src: &str, base: Option<&Path>) {
+    if src.starts_with("http://") || src.starts_with("https://") {
+        let cached = md_img_file(src).filter(|p| p.exists());
+        let Some(path) = cached else { return open_browser(src) };
+        let ext = std::fs::read(&path)
+            .ok()
+            .and_then(|b| img_format(&b))
+            .map(|f| match f {
+                gpui::ImageFormat::Jpeg => "jpg",
+                gpui::ImageFormat::Gif => "gif",
+                gpui::ImageFormat::Webp => "webp",
+                _ => "png",
+            })
+            .unwrap_or("png");
+        let named = path.with_extension(ext);
+        if named != path && std::fs::copy(&path, &named).is_err() {
+            return open_browser(src);
+        }
+        let _ = Command::new("open").arg(&named).spawn();
+        return;
+    }
+    let p = PathBuf::from(src);
+    let p = if p.is_absolute() { p } else { base.map(|b| b.join(&p)).unwrap_or(p) };
+    let _ = Command::new("open").arg(p).spawn();
+}
+
+/// What kind of picture these bytes are, read from the bytes themselves. An
+/// extension is a guess; `raw.githubusercontent.com/...png` serving a JPEG is
+/// not a hypothetical.
+fn img_format(b: &[u8]) -> Option<gpui::ImageFormat> {
+    Some(match b {
+        _ if b.starts_with(b"\x89PNG\r\n\x1a\n") => gpui::ImageFormat::Png,
+        _ if b.starts_with(&[0xff, 0xd8, 0xff]) => gpui::ImageFormat::Jpeg,
+        _ if b.starts_with(b"GIF8") => gpui::ImageFormat::Gif,
+        _ if b.starts_with(b"RIFF") && b.get(8..12) == Some(b"WEBP") => gpui::ImageFormat::Webp,
+        _ => return None,
+    })
+}
+
+/// Files TIDE opens as a picture rather than trying to read as text. The list
+/// is what `img_format` can actually decode: anything else still opens in the
+/// editor, which is right for an SVG and honest for the rest.
+fn is_image_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase().as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp"
+    )
+}
+
+/// Cache key for a picture open in a tab: the path plus its mtime, so a
+/// screenshot that gets retaken under an open tab shows the new one.
+fn image_key(path: &Path) -> String {
+    let stamp = std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{}#{stamp}", path.to_string_lossy())
+}
+
+/// Bytes as something to read at a glance: 940 B, 248 KB, 3.4 MB.
+fn size_label(bytes: usize) -> String {
+    match bytes {
+        b if b < 1024 => format!("{b} B"),
+        b if b < 1024 * 1024 => format!("{} KB", (b as f32 / 1024.0).round() as usize),
+        b => format!("{:.1} MB", b as f32 / (1024.0 * 1024.0)),
+    }
+}
+
+/// Fetch (or read) one picture. `base` is the folder the document lives in, so
+/// a relative `./shot.png` in a local file resolves the way it would anywhere
+/// else. Only http(s) goes to the network, and nothing is sent with the
+/// request — no headers, no cookies, no token.
+fn md_img_load(src: &str, base: Option<&Path>) -> MdImg {
+    const MAX: usize = 12 * 1024 * 1024;
+    let remote = src.starts_with("https://") || src.starts_with("http://");
+    let bytes = if remote {
+        let cached = md_img_file(src).filter(|p| p.exists()).and_then(|p| std::fs::read(p).ok());
+        match cached {
+            Some(b) => b,
+            None => {
+                let out = Command::new("curl")
+                    .args(["-sL", "--max-time", "20", "--max-filesize", "12000000", src])
+                    .output()
+                    .ok();
+                let b = match out.filter(|o| o.status.success()) {
+                    Some(o) => o.stdout,
+                    None => return MdImg::Failed,
+                };
+                if let Some(path) = md_img_file(src) {
+                    if let Some(dir) = path.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    let _ = std::fs::write(path, &b);
+                }
+                b
+            }
+        }
+    } else {
+        // a local path, absolute or relative to the document
+        let p = PathBuf::from(src);
+        let p = if p.is_absolute() { p } else { base.map(|b| b.join(&p)).unwrap_or(p) };
+        match std::fs::read(p) {
+            Ok(b) => b,
+            Err(_) => return MdImg::Failed,
+        }
+    };
+    if bytes.is_empty() || bytes.len() > MAX {
+        return MdImg::Failed;
+    }
+    let Some(format) = img_format(&bytes) else { return MdImg::Failed };
+    let dims = image_size(&bytes).map(|(w, h)| (w as f32, h as f32));
+    MdImg::Ready(Arc::new(gpui::Image::from_bytes(format, bytes)), dims)
 }
 
 /// A markdown line ready to draw: the flattened text plus the styling runs over
@@ -1655,9 +2265,21 @@ struct MdRow {
     table_header: bool,
     /// A blank line — pure paragraph spacing.
     gap: bool,
+    /// `(alt, src)` for every `![…](…)` on this line. They draw under the
+    /// line's text, which is where a markdown image sits in practice: on a
+    /// line of its own.
+    images: Vec<(String, String)>,
     /// Position among this document's rows, so a fence's scroll id is unique
     /// even when two blocks happen to be the same length.
     ix: usize,
+    /// The 0-based source line this row came from — the first one, for a fence
+    /// or a table that collapsed several.
+    src_line: usize,
+    /// How this row's text lines up with the markdown behind it:
+    /// `(offset in this row, length, offset in the document)`, in order. It is
+    /// what makes the rendered view editable — every character on screen knows
+    /// which character of the source it came from.
+    map: Vec<(usize, usize, usize)>,
 }
 
 fn md_row_blank() -> MdRow {
@@ -1672,57 +2294,32 @@ fn md_row_blank() -> MdRow {
         cells: None,
         table_header: false,
         gap: true,
+        images: Vec::new(),
         ix: 0,
+        src_line: 0,
+        map: Vec::new(),
     }
 }
 
 /// Flatten spans into one string plus its styling runs.
 fn md_flatten(spans: &[md::Span], size: f32, prefix: &str) -> MdRow {
+    md_flatten_at(spans, &[], size, prefix)
+}
+
+/// The same, told where each span's content lives in the document, so the row
+/// it builds can be edited.
+fn md_flatten_at(spans: &[md::Span], at: &[usize], size: f32, prefix: &str) -> MdRow {
     let mut text = String::from(prefix);
     let mut highlights = Vec::new();
     let mut mono = Vec::new();
-    for span in spans {
-        let start = text.len();
-        match span {
-            md::Span::Text(t) => text.push_str(t),
-            md::Span::Code(c) => {
-                text.push_str(c);
-                highlights.push((
-                    start..text.len(),
-                    gpui::HighlightStyle {
-                        background_color: Some(rgb(CURRENT_LINE).into()),
-                        ..Default::default()
-                    },
-                ));
-                mono.push(start..text.len());
-            }
-            md::Span::Bold(t) => {
-                text.push_str(t);
-                highlights.push((
-                    start..text.len(),
-                    gpui::HighlightStyle {
-                        color: Some(rgb(SEL_TEXT).into()),
-                        font_weight: Some(gpui::FontWeight::BOLD),
-                        ..Default::default()
-                    },
-                ));
-            }
-            md::Span::Italic(t) => {
-                text.push_str(t);
-                highlights.push((
-                    start..text.len(),
-                    gpui::HighlightStyle {
-                        font_style: Some(gpui::FontStyle::Italic),
-                        ..Default::default()
-                    },
-                ));
-            }
-        }
-    }
+    let mut images = Vec::new();
+    let mut map = Vec::new();
+    md_push(spans, at, false, false, &mut text, &mut highlights, &mut mono, &mut images, &mut map);
     MdRow {
         text: text.into(),
         highlights,
         mono,
+        images,
         size,
         heading: false,
         fence: false,
@@ -1731,6 +2328,90 @@ fn md_flatten(spans: &[md::Span], size: f32, prefix: &str) -> MdRow {
         table_header: false,
         gap: false,
         ix: 0,
+        src_line: 0,
+        map,
+    }
+}
+
+/// Re-parse the inside of an emphasis span, with its offsets moved into the
+/// document's frame. `None` for a caller with no source behind it.
+fn md_spans_at(text: &str, base: Option<usize>) -> (Vec<md::Span>, Vec<usize>) {
+    let pairs = md::spans_at(text);
+    let at = match base {
+        Some(b) => pairs.iter().map(|(_, o)| b + o).collect(),
+        None => Vec::new(),
+    };
+    (pairs.into_iter().map(|(s, _)| s).collect(), at)
+}
+
+/// Flatten spans into one string plus its styling runs, recursing into emphasis
+/// so a code span inside bold is still a code span. Without the recursion the
+/// inner backticks survive into the text: `**under `pkg/x`**` rendered as bold
+/// text with the backticks showing.
+#[allow(clippy::too_many_arguments)]
+fn md_push(
+    spans: &[md::Span],
+    // where each span's content sits in the document, in step with `spans`.
+    // Empty when the caller has no source to point at (a table cell, a chip in
+    // the transcript), and then nothing is mapped and nothing is editable.
+    at: &[usize],
+    bold: bool,
+    italic: bool,
+    text: &mut String,
+    highlights: &mut Vec<(std::ops::Range<usize>, gpui::HighlightStyle)>,
+    mono: &mut Vec<std::ops::Range<usize>>,
+    images: &mut Vec<(String, String)>,
+    map: &mut Vec<(usize, usize, usize)>,
+) {
+    // the emphasis a leaf inherits from whatever it's nested in
+    let inherited = |bold: bool, italic: bool| gpui::HighlightStyle {
+        color: bold.then(|| rgb(SEL_TEXT).into()),
+        font_weight: bold.then_some(gpui::FontWeight::BOLD),
+        font_style: italic.then_some(gpui::FontStyle::Italic),
+        ..Default::default()
+    };
+    for (i, span) in spans.iter().enumerate() {
+        let start = text.len();
+        let src = at.get(i).copied();
+        // a run of rendered text and the source it came from, same length
+        let mapped = |text: &String, map: &mut Vec<(usize, usize, usize)>| {
+            if let Some(s) = src {
+                if text.len() > start {
+                    map.push((start, text.len() - start, s));
+                }
+            }
+        };
+        match span {
+            md::Span::Text(t) => {
+                text.push_str(t);
+                if bold || italic {
+                    highlights.push((start..text.len(), inherited(bold, italic)));
+                }
+                mapped(text, map);
+            }
+            md::Span::Code(c) => {
+                text.push_str(c);
+                let mut style = inherited(bold, italic);
+                style.background_color = Some(rgb(CURRENT_LINE).into());
+                highlights.push((start..text.len(), style));
+                mono.push(start..text.len());
+                mapped(text, map);
+            }
+            // the inner text is markdown too: `**a `b` c**` has a code span in
+            // it. The inner offsets are relative to the inner text, so they are
+            // shifted by where that text starts in the document.
+            md::Span::Bold(t) => {
+                let (sp, inner) = md_spans_at(t, src);
+                md_push(&sp, &inner, true, italic, text, highlights, mono, images, map)
+            }
+            md::Span::Italic(t) => {
+                let (sp, inner) = md_spans_at(t, src);
+                md_push(&sp, &inner, bold, true, text, highlights, mono, images, map)
+            }
+            // the picture draws under the line; nothing goes into the text, so
+            // a line holding only an image renders as the image alone
+            md::Span::Image { alt, src } => images.push((alt.clone(), src.clone())),
+        }
     }
 }
 
@@ -1747,6 +2428,19 @@ fn md_prepare(text: &str) -> Arc<Vec<MdRow>> {
     if let Some(hit) = CACHE.get_or_init(Default::default).lock().ok().and_then(|c| c.get(&key).cloned()) {
         return hit;
     }
+
+    // byte offset of every source line, so a row's map can be in the
+    // document's own frame rather than its line's
+    let mut starts: Vec<usize> = vec![0];
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' {
+            starts.push(i + 1);
+        }
+    }
+    let at_of = |line: usize, offs: &[usize]| -> Vec<usize> {
+        let base = starts.get(line).copied().unwrap_or(0);
+        offs.iter().map(|o| base + o).collect()
+    };
 
     let mut rows: Vec<MdRow> = Vec::new();
     let mut fence: Vec<String> = Vec::new();
@@ -1788,15 +2482,22 @@ fn md_prepare(text: &str) -> Arc<Vec<MdRow>> {
             cells: None,
             table_header: false,
             gap: false,
+            images: Vec::new(),
             ix: rows.len(),
+            src_line: 0,
+            map: Vec::new(),
         });
     };
 
+    // the line a fenced block opened on: the whole block collapses to one row,
+    // and that row's edits belong to the fence's first line
+    let mut fence_line = 0usize;
     for line in md::parse(text) {
         if let Some(cells) = line.cells {
             let mut row = md_flatten(&[], 13.5, "");
             row.cells = Some(cells.iter().map(|c| md_flatten(c, 13.5, "")).collect());
             row.table_header = line.header;
+            row.src_line = line.line;
             table.push(row);
             continue;
         }
@@ -1804,6 +2505,9 @@ fn md_prepare(text: &str) -> Arc<Vec<MdRow>> {
             rows.append(&mut table);
         }
         if line.code {
+            if fence.is_empty() {
+                fence_line = line.line;
+            }
             if !line.lang.is_empty() {
                 fence_lang = line.lang.clone();
             }
@@ -1813,7 +2517,15 @@ fn md_prepare(text: &str) -> Arc<Vec<MdRow>> {
             });
             continue;
         }
+        let had = rows.len();
         flush_fence(&mut fence, &fence_lang, &mut rows);
+        if rows.len() > had {
+            let base = starts.get(fence_line).copied().unwrap_or(0);
+            if let Some(r) = rows.last_mut() {
+                r.src_line = fence_line;
+                r.map = vec![(0, r.text.len(), base)];
+            }
+        }
         let size = match line.heading {
             1 => 23.0,
             2 => 19.0,
@@ -1822,19 +2534,31 @@ fn md_prepare(text: &str) -> Arc<Vec<MdRow>> {
             _ => 14.5,
         };
         if line.spans.is_empty() && line.bullet.is_none() {
-            rows.push(md_row_blank());
+            let mut blank = md_row_blank();
+            blank.src_line = line.line;
+            blank.map = vec![(0, 0, starts.get(line.line).copied().unwrap_or(0))];
+            rows.push(blank);
             continue;
         }
         let prefix = line.bullet.map(|b| format!("{b}  ")).unwrap_or_default();
-        let mut row = md_flatten(&line.spans, size, &prefix);
+        let mut row = md_flatten_at(&line.spans, &at_of(line.line, &line.at), size, &prefix);
         row.heading = line.heading > 0;
         row.indent = line.indent as f32 * 16.0;
+        row.src_line = line.line;
         rows.push(row);
     }
     if !table.is_empty() {
         rows.append(&mut table);
     }
+    let had = rows.len();
     flush_fence(&mut fence, &fence_lang, &mut rows);
+    if rows.len() > had {
+        let base = starts.get(fence_line).copied().unwrap_or(0);
+        if let Some(r) = rows.last_mut() {
+            r.src_line = fence_line;
+            r.map = vec![(0, r.text.len(), base)];
+        }
+    }
 
     let mut rows = rows;
     for (i, r) in rows.iter_mut().enumerate() {
@@ -1852,8 +2576,76 @@ fn md_prepare(text: &str) -> Arc<Vec<MdRow>> {
     out
 }
 
+/// `at`, moved back to the nearest character boundary. Offsets arrive from a
+/// text layout and can land inside a multi-byte character; slicing there
+/// panics.
+fn char_floor(text: &str, at: usize) -> usize {
+    let mut at = at.min(text.len());
+    while at > 0 && !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+/// The word around `at` in `text`, as a byte range — what a double-click in
+/// the rendered document takes. Letters, digits and the joiners that read as
+/// part of a word in prose and in code alike.
+fn word_at(text: &str, at: usize) -> std::ops::Range<usize> {
+    let part = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
+    let at = char_floor(text, at);
+    let mut start = at;
+    for (i, c) in text[..at].char_indices().rev() {
+        if !part(c) {
+            break;
+        }
+        start = i;
+    }
+    let mut end = at;
+    for (i, c) in text[at..].char_indices() {
+        if !part(c) {
+            break;
+        }
+        end = at + i + c.len_utf8();
+    }
+    start..end
+}
+
+/// The other way: where a source offset shows up on screen, as
+/// `(row, byte in that row)`. `None` when that part of the source isn't drawn
+/// at all — the `**` of a bold run, a fence's ``` line — and the caller then
+/// walks to the nearest offset that is.
+fn md_src_to_rc(rows: &[MdRow], src: usize) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, usize)> = None;
+    for (i, r) in rows.iter().enumerate() {
+        for &(start, len, at) in &r.map {
+            if src >= at && src <= at + len {
+                // a position at the very end of one row is also the start of
+                // the next; the first row that holds it wins, except for the
+                // empty rows a blank line makes, which hold nothing
+                if len > 0 || best.is_none() {
+                    best = Some((i, start + (src - at)));
+                }
+                if src < at + len {
+                    return best;
+                }
+            }
+        }
+    }
+    best
+}
+
+/// A plain row as one `StyledText`, so the caller can keep its layout and turn
+/// a pointer position into a byte offset. `None` for the rows that aren't a
+/// single run of text: spacers, tables, and fenced blocks.
+fn md_row_text(row: &MdRow, selected: Sel) -> Option<gpui::StyledText> {
+    if row.gap || row.cells.is_some() || row.fence {
+        return None;
+    }
+    Some(md_styled_sel(row, row.heading, selected))
+}
+
 /// Draw one prepared row.
-fn md_row_el(row: &MdRow, selected: bool) -> AnyElement {
+fn md_row_el(row: &MdRow, selected: Sel) -> AnyElement {
     if row.gap {
         return div().h(px(8.)).into_any_element();
     }
@@ -1947,8 +2739,32 @@ fn merged_highlights(
     out
 }
 
-fn md_styled_sel(row: &MdRow, bold: bool, selected: bool) -> gpui::StyledText {
+fn md_styled_sel(row: &MdRow, bold: bool, selected: Sel) -> gpui::StyledText {
     md_styled_links(row, bold, selected, &[])
+}
+
+/// How much of a row is selected: nothing, all of it, or a byte range (the
+/// first and last rows of a drag, where the selection starts or stops mid-line).
+#[derive(Clone, Copy, PartialEq)]
+enum Sel {
+    None,
+    All,
+    Range(usize, usize),
+}
+
+impl Sel {
+    fn is_some(self) -> bool {
+        !matches!(self, Sel::None)
+    }
+
+    /// The range within a row of `len` bytes, or None when nothing is selected.
+    fn range(self, len: usize) -> Option<std::ops::Range<usize>> {
+        match self {
+            Sel::None => None,
+            Sel::All => Some(0..len),
+            Sel::Range(a, b) => (a < b).then(|| a.min(len)..b.min(len)),
+        }
+    }
 }
 
 /// As `md_styled_sel`, plus `links` drawn underlined in the accent colour — the
@@ -1956,7 +2772,7 @@ fn md_styled_sel(row: &MdRow, bold: bool, selected: bool) -> gpui::StyledText {
 fn md_styled_links(
     row: &MdRow,
     bold: bool,
-    selected: bool,
+    selected: Sel,
     links: &[std::ops::Range<usize>],
 ) -> gpui::StyledText {
     let mut hl: Vec<(std::ops::Range<usize>, gpui::HighlightStyle)> = row
@@ -1964,12 +2780,27 @@ fn md_styled_links(
         .iter()
         .cloned()
         .map(|(r, mut style)| {
-            if selected {
+            // the row's own backgrounds (inline code) would fight the selection
+            if selected.is_some() {
                 style.background_color = None;
             }
             (r, style)
         })
         .collect();
+    // the selection itself: a background over exactly the bytes covered, so a
+    // drag that stops mid-sentence looks like it stopped mid-sentence
+    if let Some(r) = selected.range(row.text.len()) {
+        let (a, b) = clamp_span_str(&row.text, r.start, r.end);
+        if a < b {
+            hl.push((
+                a..b,
+                gpui::HighlightStyle {
+                    background_color: Some(rgb(SELECTION).into()),
+                    ..Default::default()
+                },
+            ));
+        }
+    }
     if bold {
         hl.push((
             0..row.text.len(),
@@ -2022,6 +2853,12 @@ fn clamp_span_str(text: &str, a: usize, b: usize) -> (usize, usize) {
 /// fenced blocks as one monospaced slab, and blank lines kept as spacing. Shares
 /// the parser with `md_text`; only the sizing differs.
 fn md_doc(text: &str) -> Div {
+    md_doc_w(text, 720.0)
+}
+
+/// The same, told how much room it has, so a picture can be sized to the pane
+/// rather than to itself.
+fn md_doc_w(text: &str, width: f32) -> Div {
     // the caller decides the padding: a file preview wants a margin, an agent
     // bubble sits flush in the transcript
     let rows = md_prepare(text);
@@ -2039,17 +2876,74 @@ fn md_doc(text: &str) -> Div {
                 .rounded_md()
                 .overflow_hidden();
             while i < rows.len() && rows[i].cells.is_some() {
-                grid = grid.child(md_row_el(&rows[i], false));
+                grid = grid.child(md_row_el(&rows[i], Sel::None));
                 i += 1;
             }
             col = col.child(grid);
             continue;
         }
         let row = &rows[i];
-        col = col.child(div().text_size(px(row.size.max(1.0))).child(md_row_el(row, false)));
+        // a line that is nothing but a picture has no text to draw
+        if !(row.images.is_empty() && row.text.is_empty()) && !row.text.is_empty() {
+            col = col.child(div().text_size(px(row.size.max(1.0))).child(md_row_el(row, Sel::None)));
+        }
+        for (alt, src) in &row.images {
+            col = col.child(md_img_el(alt, src, width, None));
+        }
         i += 1;
     }
     col
+}
+
+/// One `![…](…)` as it draws: the picture once it is here, a placeholder while
+/// it is on its way, and the alt text when it will never arrive.
+fn md_img_el(alt: &str, src: &str, max_w: f32, base: Option<PathBuf>) -> AnyElement {
+    let state = md_img_cache().lock().ok().and_then(|c| match c.get(src) {
+        Some(MdImg::Ready(img, dims)) => Some(Ok((img.clone(), *dims))),
+        Some(MdImg::Failed) => Some(Err(true)),
+        Some(MdImg::Loading) => Some(Err(false)),
+        None => None,
+    });
+    let note = |text: String, colour: u32| {
+        div()
+            .my_1()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .text_size(px(11.))
+            .text_color(rgb(colour))
+            .child(text)
+    };
+    match state {
+        // a diagram drawn at document width is a thumbnail of itself: clicking
+        // hands the file to Preview, which zooms and pans better than anything
+        // worth writing here
+        Some(Ok((img, dims))) => {
+            let (want, base) = (src.to_string(), base.clone());
+            div()
+                .id(SharedString::from(format!("md-img-{src}")))
+                .my_1()
+                .cursor_pointer()
+                .tooltip(tip("Click to open it in Preview"))
+                .child(shot_img(img, dims, max_w))
+                .on_click(move |_e, _w, _cx| open_img(&want, base.as_deref()))
+                .into_any_element()
+        }
+        Some(Err(true)) => note(
+            if alt.is_empty() { format!("couldn't load {src}") } else { format!("{alt} (couldn't load)") },
+            MUTED,
+        )
+        .into_any_element(),
+        _ => note(if alt.is_empty() { "loading…".into() } else { format!("{alt} — loading…") }, LINE_NUMBER)
+            .into_any_element(),
+    }
+}
+
+/// Every picture a document points at, so the caller can start fetching them.
+fn md_images_in(text: &str) -> Vec<String> {
+    md_prepare(text).iter().flat_map(|r| r.images.iter().map(|(_, src)| src.clone())).collect()
 }
 
 /// The `packages/<name>` dirs this branch touches — the same set `wwp` watches:
@@ -2217,6 +3111,39 @@ fn usage_color(pct: f32) -> u32 {
 
 /// A short random lowercase-alphanumeric id (e.g. for `wip: <id>` commits),
 /// seeded from the system clock and mixed so successive calls differ.
+/// A category as the list stores it: one of TIDE's conventional-commit keys,
+/// or empty for anything it doesn't recognise.
+fn category_key(raw: &str) -> &'static str {
+    TITLE_TYPES.iter().find(|(k, _, _)| *k == raw).map(|(k, _, _)| *k).unwrap_or("")
+}
+
+/// The phone's token, made once and kept. Everything else TIDE hands out is
+/// random per launch, which is right for a control channel an agent reads from
+/// its environment — but a link you bookmark on a phone has to be the same
+/// tomorrow, or you go looking for it again every morning.
+///
+/// It is deliberately not a workspace's control token: that one opens `/agent`,
+/// `/shot` and the rest on another port, and the phone has no business holding
+/// it.
+fn remote_token() -> Option<String> {
+    let path = PathBuf::from(std::env::var("HOME").ok()?).join(".config/tide/remote-token");
+    if let Ok(t) = std::fs::read_to_string(&path) {
+        let t = t.trim().to_string();
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    let t = random_id() + &random_id() + &random_id();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    std::fs::write(&path, &t).ok()?;
+    // nobody else on the machine needs to read it
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    Some(t)
+}
+
 fn random_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let mut n = SystemTime::now()
@@ -2467,6 +3394,906 @@ fn git_pr_base(root: &Path) -> String {
     git_default_branch(root)
 }
 
+/// Pixel dimensions from an image header, or `None` for a format we don't read.
+/// Layout needs them: gpui sizes an image's box from the constraints it is
+/// given and then paints the picture inside that box, so a box that isn't the
+/// picture's shape shows up as empty space around it. PNG, GIF and JPEG cover
+/// everything that reaches the transcript.
+fn image_size(b: &[u8]) -> Option<(u32, u32)> {
+    let be16 = |i: usize| -> Option<u32> { Some(u16::from_be_bytes([*b.get(i)?, *b.get(i + 1)?]) as u32) };
+    let be32 = |i: usize| -> Option<u32> {
+        Some(u32::from_be_bytes([*b.get(i)?, *b.get(i + 1)?, *b.get(i + 2)?, *b.get(i + 3)?]))
+    };
+    // PNG: the IHDR chunk is always first, at a fixed offset
+    if b.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some((be32(16)?, be32(20)?));
+    }
+    // GIF: the logical screen descriptor, little-endian
+    if b.starts_with(b"GIF8") {
+        let le16 = |i: usize| -> Option<u32> {
+            Some(u16::from_le_bytes([*b.get(i)?, *b.get(i + 1)?]) as u32)
+        };
+        return Some((le16(6)?, le16(8)?));
+    }
+    // JPEG: walk the segments to whichever start-of-frame comes first
+    if b.starts_with(b"\xff\xd8") {
+        let mut i = 2;
+        // the reads below are all bounds-checked, so this only has to hold a
+        // marker pair
+        while i + 1 < b.len() {
+            if b[i] != 0xFF {
+                return None; // not where a marker should be: give up rather than guess
+            }
+            let marker = b[i + 1];
+            // padding between segments
+            if marker == 0xFF {
+                i += 1;
+                continue;
+            }
+            // every SOF but the four that aren't frames (DHT, JPG, DAC, DNL)
+            if (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+                return Some((be16(i + 7)?, be16(i + 5)?)); // height comes first
+            }
+            i += 2 + be16(i + 2)? as usize;
+        }
+    }
+    None
+}
+
+/// Where this branch stands against its base on the remote: how much of the
+/// base it is missing, and whether taking that would land in conflicts.
+#[derive(Clone, Default, PartialEq, Debug)]
+struct BaseSync {
+    /// The base, remote-qualified — `origin/next`.
+    base: String,
+    /// Commits on the base this branch doesn't have.
+    behind: usize,
+    /// Paths a merge would leave conflicted.
+    conflicts: Vec<String>,
+    /// GitHub's own verdict on the open PR. It judges the *pushed* head, so it
+    /// can say "conflicting" about work this checkout has already merged.
+    gh_conflict: bool,
+    /// Commits here that the PR's head on the remote doesn't have. When GitHub
+    /// complains and this isn't zero, the fix is a push, not a merge.
+    unpushed: usize,
+}
+
+impl BaseSync {
+    /// Level with the base and agreed with GitHub, so there is nothing to show
+    /// and nothing to do.
+    fn clean(&self) -> bool {
+        self.behind == 0 && self.conflicts.is_empty() && !self.gh_conflict
+    }
+
+    /// The base without its remote, for chips and prose.
+    fn short(&self) -> &str {
+        self.base.strip_prefix("origin/").unwrap_or(&self.base)
+    }
+}
+
+/// Ask git where `HEAD` stands against `base` (`origin/next`). Fetches first —
+/// the answer is only worth anything against what is actually on the remote —
+/// then counts what's missing and merges in memory to see what would break.
+/// `git merge-tree --write-tree` writes a tree to the object store and touches
+/// neither the index nor the working tree, so this is safe to run behind the UI
+/// while you work.
+fn base_sync(root: &Path, base: &str) -> Option<BaseSync> {
+    let short = base.strip_prefix("origin/").unwrap_or(base);
+    if short.is_empty() {
+        return None;
+    }
+    let _ = Command::new("git")
+        .args(["fetch", "origin", short, "--quiet"])
+        .current_dir(root)
+        .output();
+    let behind: usize = Command::new("git")
+        .args(["rev-list", "--count", &format!("HEAD..{base}")])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())?
+        .trim()
+        .parse()
+        .ok()?;
+    let (gh_conflict, unpushed) = pr_merge_state(root);
+    let mut sync =
+        BaseSync { base: base.to_string(), behind, conflicts: Vec::new(), gh_conflict, unpushed };
+    // nothing to take means nothing to collide with: the base is an ancestor
+    if behind == 0 {
+        return Some(sync);
+    }
+    let out = Command::new("git")
+        .args(["merge-tree", "--write-tree", "--name-only", "HEAD", base])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    // 0 is a clean merge and 1 is conflicts; anything else is git failing to
+    // answer, and an unknown answer is not a conflict report
+    if out.status.code() == Some(1) {
+        sync.conflicts = merge_tree_conflicts(&String::from_utf8_lossy(&out.stdout));
+    }
+    Some(sync)
+}
+
+/// What GitHub thinks of the open PR, and how far this checkout has run ahead
+/// of what it is judging. GitHub merges the *pushed* head, so a branch that was
+/// merged and not pushed reads as conflicting there and clean here — which is
+/// the one case where the honest answer is "push it".
+fn pr_merge_state(root: &Path) -> (bool, usize) {
+    let out = Command::new("gh")
+        .args(["pr", "view", "--json", "mergeable,headRefName"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success());
+    let Some(v) = out.and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
+    else {
+        return (false, 0); // no PR, or no gh: nothing GitHub-side to report
+    };
+    let conflicting = v.get("mergeable").and_then(|m| m.as_str()) == Some("CONFLICTING");
+    let head = v.get("headRefName").and_then(|h| h.as_str()).unwrap_or("");
+    let range = if head.is_empty() {
+        "@{u}..HEAD".to_string() // no name to work with: fall back to the tracking branch
+    } else {
+        format!("origin/{head}..HEAD")
+    };
+    let unpushed = Command::new("git")
+        .args(["rev-list", "--count", &range])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    (conflicting, unpushed)
+}
+
+/// The conflicted paths out of `git merge-tree --name-only`: the first line is
+/// the tree it wrote, then the paths, then a blank line and prose about them.
+fn merge_tree_conflicts(out: &str) -> Vec<String> {
+    out.lines()
+        .skip(1)
+        .take_while(|l| !l.trim().is_empty())
+        .map(|l| l.trim().to_string())
+        .collect()
+}
+
+/// What a PR body tab knows besides its text. Kept beside the document rather
+/// than written into it: a state is a colour and a shape, and markdown has no
+/// way to say either.
+/// One file in the merge confirmation: its path and what the PR does to it.
+#[derive(Clone, Debug, PartialEq)]
+struct PrFile {
+    path: String,
+    added: usize,
+    removed: usize,
+    /// ADDED, MODIFIED, REMOVED, RENAMED — GitHub's own word for it.
+    change: String,
+}
+
+impl PrFile {
+    /// The colour the project tree paints a file of this status: added green,
+    /// deleted red, renamed tan, modified blue. The name carries it, exactly as
+    /// it does in the PR pane.
+    fn colour(&self) -> u32 {
+        match self.change.as_str() {
+            "ADDED" => GIT_NEW,
+            "REMOVED" => GIT_DELETED,
+            "RENAMED" => FOLDER_ICON,
+            _ => GIT_MODIFIED,
+        }
+    }
+}
+
+/// One line of the merge dialog's tree: a folder, or a file with its stats.
+#[derive(Debug, PartialEq)]
+struct MergeRow {
+    depth: usize,
+    /// The folder's own name, or the file's.
+    name: String,
+    /// Full path from the repo root — what a collapsed folder is keyed by.
+    path: String,
+    /// `None` for a folder row.
+    file: Option<PrFile>,
+}
+
+/// Flatten a PR's files into the shape the project tree draws: a folder row for
+/// each directory, its contents indented under it, parents before children.
+/// Paths come back from GitHub as full paths, which read as a wall when listed
+/// verbatim — the nesting is what makes a 200-file PR legible.
+fn merge_tree_rows(files: &[PrFile]) -> Vec<MergeRow> {
+    let mut rows = Vec::new();
+    let mut open: Vec<&str> = Vec::new(); // the folders we are currently inside
+    for f in files {
+        let mut parts: Vec<&str> = f.path.split('/').collect();
+        let name = parts.pop().unwrap_or("");
+        // leave the folders this file isn't in
+        let shared = open
+            .iter()
+            .zip(parts.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        open.truncate(shared);
+        // and enter the ones it is
+        for dir in &parts[shared..] {
+            open.push(dir);
+            rows.push(MergeRow {
+                depth: open.len() - 1,
+                name: (*dir).to_string(),
+                path: open.join("/"),
+                file: None,
+            });
+        }
+        rows.push(MergeRow {
+            depth: open.len(),
+            name: name.to_string(),
+            path: f.path.clone(),
+            file: Some(f.clone()),
+        });
+    }
+    rows
+}
+
+/// Everything the merge dialog shows: which PR, and every file it would land.
+struct MergeConfirm {
+    doc: PrDoc,
+    files: Vec<PrFile>,
+    /// Folders the reader has folded away, by full path.
+    collapsed: HashSet<String>,
+    /// Confirmed, and GitHub hasn't answered yet. The dialog stays up so the
+    /// button can say so rather than everything vanishing into a flash.
+    merging: bool,
+    /// Whether to tell the agent it landed. On by default, because the usual
+    /// next thing is asking it what's next; off for the merge you do while the
+    /// agent is in the middle of something else.
+    tell: bool,
+}
+
+/// The PR's files, newest read, for the merge confirmation.
+fn pr_files(root: &Path, number: u64) -> Vec<PrFile> {
+    let out = Command::new("gh")
+        .args(["pr", "view", &number.to_string(), "--json", "files"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success());
+    let Some(v) = out.and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
+    else {
+        return Vec::new();
+    };
+    let Some(arr) = v.get("files").and_then(|f| f.as_array()) else { return Vec::new() };
+    let mut files: Vec<PrFile> = arr
+        .iter()
+        .filter_map(|f| {
+            let num = |k: &str| f.get(k).and_then(|n| n.as_u64()).unwrap_or(0) as usize;
+            Some(PrFile {
+                path: f.get("path")?.as_str()?.to_string(),
+                added: num("additions"),
+                removed: num("deletions"),
+                change: f
+                    .get("changeType")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("MODIFIED")
+                    .to_string(),
+            })
+        })
+        .collect();
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files
+}
+
+/// What CI says about a PR: the counts, and the names of whatever isn't green.
+#[derive(Clone, Default, PartialEq, Debug)]
+struct PrChecks {
+    passed: usize,
+    failed: usize,
+    running: usize,
+    /// Cancelled or superseded with nothing newer to replace it. Neither a pass
+    /// nor a failure: the check never reached a verdict, which is why GitHub
+    /// draws it grey rather than red.
+    stalled: usize,
+    /// Failing first, then still-running — the ones worth naming in a tooltip.
+    notable: Vec<String>,
+}
+
+impl PrChecks {
+    fn total(&self) -> usize {
+        self.passed + self.failed + self.running + self.stalled
+    }
+
+    /// How it reads on the chip, and in what colour.
+    fn summary(&self) -> (String, u32) {
+        let total = self.total();
+        if self.failed > 0 {
+            (format!("{} of {total} checks failing", self.failed), GIT_DELETED)
+        } else if self.running > 0 {
+            (format!("{} of {total} checks running", self.running), FOLDER_ICON)
+        } else if self.stalled > 0 {
+            (format!("{} of {total} checks cancelled", self.stalled), MUTED)
+        } else {
+            (format!("{total} check{} passed", if total == 1 { "" } else { "s" }), GIT_NEW)
+        }
+    }
+}
+
+/// When an attempt ran, for picking the newest of several with one name. The
+/// later of the two stamps: a skipped run can report a `completedAt` before its
+/// own `startedAt`, and either may be missing.
+fn attempt_time(c: &serde_json::Value) -> &str {
+    let at = |k: &'static str| c.get(k).and_then(|x| x.as_str()).unwrap_or("");
+    at("startedAt").max(at("completedAt"))
+}
+
+/// Read `statusCheckRollup` the way GitHub means it: a check run reports
+/// `status` (plus `conclusion` once it finishes), a status context reports
+/// `state`, and anything unfinished counts as running rather than passing.
+fn pr_checks(v: &serde_json::Value) -> PrChecks {
+    let Some(arr) = v.get("statusCheckRollup").and_then(|x| x.as_array()) else {
+        return PrChecks::default();
+    };
+    // GitHub keeps every attempt in the rollup. Push while a run is in flight
+    // and it cancels that one and starts another, so the branch ends up with
+    // two entries per check: a CANCELLED one and the SUCCESS that replaced it.
+    // The PR page shows the newest attempt per name, and counting the rest
+    // reads a perfectly green rerun as half failing.
+    let mut latest: Vec<(String, &serde_json::Value)> = Vec::new();
+    for c in arr {
+        let name = c
+            .get("name")
+            .or_else(|| c.get("context"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("check")
+            .to_string();
+        match latest.iter_mut().find(|(n, _)| *n == name) {
+            // ties go to the one listed later, which is the order `gh` returns
+            // attempts in when neither carries a usable stamp
+            Some(slot) => {
+                if attempt_time(c) >= attempt_time(slot.1) {
+                    slot.1 = c;
+                }
+            }
+            None => latest.push((name, c)),
+        }
+    }
+    let mut out = PrChecks::default();
+    let mut running = Vec::new();
+    for (name, c) in latest {
+        if c.get("status").and_then(|s| s.as_str()).is_some_and(|s| s != "COMPLETED") {
+            out.running += 1;
+            running.push(name);
+            continue;
+        }
+        let outcome = c
+            .get("conclusion")
+            .and_then(|s| s.as_str())
+            .or_else(|| c.get("state").and_then(|s| s.as_str()))
+            .unwrap_or("")
+            .to_uppercase();
+        match outcome.as_str() {
+            "SUCCESS" | "NEUTRAL" | "SKIPPED" => out.passed += 1,
+            // it never finished and nothing newer took its place
+            "CANCELLED" | "STALE" => out.stalled += 1,
+            "" | "PENDING" | "EXPECTED" | "IN_PROGRESS" | "QUEUED" | "WAITING" => {
+                out.running += 1;
+                running.push(name);
+            }
+            _ => {
+                out.failed += 1;
+                out.notable.push(name); // failures lead the list
+            }
+        }
+    }
+    out.notable.extend(running);
+    out
+}
+
+#[derive(Clone)]
+struct PrDoc {
+    number: u64,
+    /// Nothing has been read yet: the tab is open so you can see it happening,
+    /// and the header holds back the chips rather than showing made-up ones.
+    loading: bool,
+    /// What CI makes of it, as of the last read.
+    checks: PrChecks,
+    /// How big it is: files touched, lines added, lines removed.
+    files: usize,
+    added: usize,
+    removed: usize,
+    /// What the PR is called. It heads the document and names the tab, so the
+    /// tab bar says what you're reading rather than which file it came in.
+    title: String,
+    state: PrState,
+    base: String,
+    head: String,
+    author: String,
+    url: String,
+}
+
+/// The open pull request as a markdown document: a heading and the body as
+/// written. `None` when there is no PR or no `gh`.
+/// Where a PR's last-read JSON lives, so reopening it is instant and offline.
+fn pr_cache_path(number: u64) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(format!(".config/tide/pr-cache/{number}.json")))
+}
+
+/// The last thing GitHub said about this PR, if anything. Parsed through the
+/// same function as a fresh read, so a cached body can't render differently
+/// from a live one.
+fn pr_body_cached(number: u64) -> Option<(String, String, PrDoc)> {
+    let raw = std::fs::read_to_string(pr_cache_path(number)?).ok()?;
+    pr_body_from(&serde_json::from_str(&raw).ok()?)
+}
+
+fn save_pr_cache(number: u64, raw: &str) {
+    let Some(path) = pr_cache_path(number) else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, raw);
+}
+
+fn pr_body_doc(root: &Path, number: Option<u64>) -> Option<(String, String, PrDoc)> {
+    let mut out = Command::new("gh");
+    let out = out.args(["pr", "view"]);
+    // no number means the one on this branch, which is what `gh` does by default
+    if let Some(n) = number {
+        out.arg(n.to_string());
+    }
+    let out = out
+        .args([
+            "--json",
+            "number,title,body,url,state,isDraft,baseRefName,headRefName,author,\
+             changedFiles,additions,deletions,statusCheckRollup",
+        ])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let raw = String::from_utf8(out.stdout).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let doc = pr_body_from(&v)?;
+    // keep it: the next open of this PR shows instantly from here
+    save_pr_cache(doc.2.number, &raw);
+    Some(doc)
+}
+
+/// The document itself, from `gh`'s answer.
+fn pr_body_from(v: &serde_json::Value) -> Option<(String, String, PrDoc)> {
+    let number = v.get("number")?.as_u64()?;
+    let str_of = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let title = str_of("title");
+    let body = str_of("body");
+    let author = v
+        .get("author")
+        .and_then(|a| a.get("login"))
+        .and_then(|l| l.as_str())
+        .unwrap_or("")
+        .to_string();
+    let count = |k: &str| v.get(k).and_then(|n| n.as_u64()).unwrap_or(0) as usize;
+    let meta = PrDoc {
+        number,
+        loading: false,
+        checks: pr_checks(v),
+        files: count("changedFiles"),
+        added: count("additions"),
+        removed: count("deletions"),
+        title: title.clone(),
+        state: PrState::from_json(v),
+        base: str_of("baseRefName"),
+        head: str_of("headRefName"),
+        author,
+        url: str_of("url"),
+    };
+
+    // the body alone, exactly as it is on GitHub — the title and the rest are
+    // the header's, so Raw shows the document someone actually wrote
+    let mut doc =
+        if body.trim().is_empty() { "*No description.*".to_string() } else { body.trim().to_string() };
+    doc.push('\n');
+    // `.md` so the tab renders it rather than showing the source
+    Some((format!("PR #{number}.md"), doc, meta))
+}
+
+/// Which pull request, if any, to put on screen after a read of the branch's
+/// link. `asked` is set only by an agent's own `/refresh`; `had` and `now` are
+/// the PR numbers before and after that read.
+///
+/// The number has to have changed. A branch's PR is read again on every
+/// refresh, and an agent in a long turn refreshes repeatedly, so opening on
+/// "there is a PR" would drag the reader onto that tab over and over and
+/// reopen one they had closed on purpose.
+fn pr_tab_to_open(asked: bool, had: Option<u64>, now: Option<u64>) -> Option<u64> {
+    now.filter(|_| asked).filter(|n| Some(*n) != had)
+}
+
+/// What TIDE says to the agent after a merge. The title and base are there so
+/// a session that has been resumed, or was working on something else by then,
+/// doesn't have to go and look up which PR this was.
+fn merged_note(number: u64, about: Option<&PrDoc>) -> String {
+    let title = about.map(|d| d.title.trim()).filter(|t| !t.is_empty());
+    let base = about.map(|d| d.base.trim()).filter(|b| !b.is_empty());
+    let what = match (title, base) {
+        (Some(t), Some(b)) => format!("#{number} “{t}” is merged into {b}."),
+        (Some(t), None) => format!("#{number} “{t}” is merged."),
+        (None, Some(b)) => format!("#{number} is merged into {b}."),
+        (None, None) => format!("#{number} is merged."),
+    };
+    format!("{what}\n\nWhat's next?")
+}
+
+/// What TIDE says when you press Tour. The schema is in the briefing too, but
+/// an agent writes a better tour with the shape in front of it, and this is the
+/// one message where the shape is the whole point.
+///
+/// `about` names the subject. `None` means the conversation itself, which is
+/// the usual case: you read an answer, you want to walk the code it describes.
+/// `answer` is one of its own messages, quoted back to it — the references are
+/// already in it, in the right order, and a resumed session may not remember
+/// writing them.
+fn tour_question(tour: &str, at: usize, total: usize, stop: &Stop, q: &str) -> String {
+    let named = match tour.trim() {
+        "" => String::new(),
+        t => format!(" of “{t}”"),
+    };
+    let title = match stop.title.trim() {
+        "" => String::new(),
+        t => format!(" — “{t}”"),
+    };
+    let said = match stop.said.trim() {
+        "" => String::new(),
+        s => format!(", where you wrote:\n> {}\n", s.replace('\n', "\n> ")),
+    };
+    format!(
+        "{}\n\n\
+         (I'm standing on stop {at}/{total}{named}: `{}`{title}{said})\n\
+         Answer the question. Don't rebuild the tour unless I ask for it.\n",
+        q.trim(),
+        stop_label(stop),
+    )
+}
+
+fn tour_request(about: Option<&str>, answer: Option<&str>) -> String {
+    // the answer is the route: it already has the references, in the order it
+    // walked them
+    let answer = answer.map(str::trim).filter(|a| !a.is_empty());
+    let subject = match about.map(str::trim).filter(|a| !a.is_empty()) {
+        Some(a) => format!("of {a}"),
+        None if answer.is_some() => "of the answer at the end of this message".to_string(),
+        None => "of what we have been talking about".to_string(),
+    };
+    let source = match answer {
+        Some(a) => {
+            let a: String = a.chars().take(12_000).collect();
+            format!(
+                "\nBuild it out of this answer of yours, keeping its order. Every file \
+                 and line it points at is a stop, and what you wrote around each one is \
+                 where that stop's text starts — say the rest of what you meant there. \
+                 Check each line still holds before you send it, and leave out \
+                 references that aren't part of the flow.\n\n--- the answer ---\n{a}\n\
+                 --- end ---\n"
+            )
+        }
+        None => String::new(),
+    };
+    format!(
+        "Take me on a code tour {subject}.\n\n\
+         A tour is a walkthrough I step through in the editor the way I'd step \
+         through a debugger, except nothing is running: each stop opens its \
+         file, lights up its lines, and shows what you wrote about them. Post \
+         the whole thing in one call:\n\
+         \x20 curl -s -X POST \"$TIDE_RPC/tour\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n\
+         \x20   -d '{{\"title\":\"Background task dispatch\",\"steps\":[\
+         {{\"file\":\"packages/x/src/TaskService.ts\",\"line\":67,\"end\":72,\
+         \"title\":\"trigger() saves the task\",\"text\":\"The upload handler \
+         calls this. It writes the task as pending and hands it to the \
+         transport; nothing has run yet at this point.\"}}]}}'\n\n\
+         In the order the code runs, start to finish: the first stop is where \
+         it begins, the last is where it ends or where the thing I asked about \
+         goes wrong. `line` and `end` are the lines that matter, not the whole \
+         function. `title` is a few words. `text` is two or three sentences — \
+         what happens here, what it does with what the stop before handed it, \
+         and anything that would surprise me. I'll be reading the code right \
+         next to it, so don't retell the lines; say what I can't see from them.\n\n\
+         Where the tour moves from one stretch of the work to another, name \
+         the stretch with `group` on each stop in it (\"The AWS side\", \
+         \"Standalone\") — consecutive stops sharing one become a section with \
+         a heading. Two to five of them; skip it if the tour is one run.\n\n\
+         Check every file and line before you send it: a stop that lands in the \
+         wrong place costs me more than a missing one. Ten to twenty stops is a \
+         flow. Then say in one line what the tour covers and stop — don't \
+         repeat the stops in your reply, they're on screen.\n{source}"
+    )
+}
+
+/// "Is the description still true?", which is otherwise typed by hand after
+/// every round of changes. `base` is what the PR merges into, so the commands
+/// compare against the right branch rather than against `main` by habit.
+fn pr_body_check(number: u64, base: &str, update: bool) -> String {
+    let base = match base.trim() {
+        "" => "the base branch".to_string(),
+        b => b.to_string(),
+    };
+    let ending = if update {
+        "Then bring it up to date: keep what is still right, rewrite what \
+         isn't, and post it with `gh pr edit` and a body file. Follow this \
+         repo's own rules for PR bodies if it has any (a skill, a template, \
+         the last few merged PRs). Afterwards POST /refresh so TIDE re-reads \
+         it, and tell me in two or three lines what you changed and why.\n"
+    } else {
+        "Don't edit anything — tell me what you'd change and I'll say go. If \
+         it still reads true, say so in one line and stop.\n"
+    };
+    format!(
+        "Is #{number}'s description still true?\n\n\
+         Read it (`gh pr view {number} --json title,body`) against what the \
+         branch actually does now: `git log {base}..HEAD --oneline`, \
+         `git diff {base}...HEAD --stat`, and the diff itself wherever the \
+         body makes a claim about behaviour. What I'm after is the drift — \
+         something the body says the code does that it no longer does, work \
+         that landed after the body was written and isn't in it, a changelog \
+         line that doesn't match the shape it ended up with, a file table \
+         that is out of date. Check the title too.\n\n\
+         {ending}"
+    )
+}
+
+/// The PR pane's Tour button: the same tour, built from the change rather
+/// than from the conversation, and ordered the way the change wants to be
+/// read. Reviewing a 26-file PR top to bottom in the files list is reading a
+/// story in the order the pages were printed.
+fn pr_tour_request(number: u64, base: &str) -> String {
+    let about = format!("#{number} — what it changes, in the order it should be read");
+    let against = match base.trim() {
+        "" => "its base".to_string(),
+        b => format!("`{b}`"),
+    };
+    format!(
+        "{}\n\
+         Build it from the change itself: `gh pr diff {number}`, and the diff \
+         against {against} where you need more than the patch shows. Order the \
+         stops the way the change wants to be read — the entry point first, \
+         then what it calls, then what it changed underneath, then the tests. \
+         Every stop points at the new code, and its text says what changed \
+         there and why it matters, not what the file does in general. Leave out \
+         what adds nothing to read: version bumps, renames, generated files. \
+         If something in the diff looks wrong to you, make it a stop and say \
+         so.\n",
+        tour_request(Some(&about), None),
+    )
+}
+
+/// What the transcript shows in place of the path list. A hundred paths in the
+/// reader's own thread is noise: they are looking at the tree the list came
+/// from.
+fn ask_changed_label(paths: &[String]) -> String {
+    match paths {
+        [one] => format!("What changed in {one}?"),
+        _ => format!("What changed in these {} files?", paths.len()),
+    }
+}
+
+/// Ask the agent to read the diff for exactly these paths. `base` is what the
+/// panel is diffing against, and `all` is false when the tree is filtered, so
+/// the agent is told the list is a slice rather than the whole change and
+/// doesn't wander off into the rest of it.
+fn ask_changed_note(paths: &[String], base: &str, all: bool) -> String {
+    let list: String = paths.iter().map(|p| format!("- {p}\n")).collect();
+    let base = base.trim();
+    let (against, how) = if base.is_empty() {
+        ("its base".to_string(), "Read the diff for those paths".to_string())
+    } else {
+        (format!("`{base}`"), format!("Read the diff for those paths (`git diff {base}...HEAD -- <paths>`)"))
+    };
+    let scope = if all {
+        "That is every file in the change."
+    } else {
+        "That is what the file tree is filtered down to, a slice of a bigger change — stay inside it."
+    };
+    format!(
+        "What changed in these files, against {against}?\n\n\
+         {list}\n\
+         {scope} {how} and tell me what the change does and why, grouped by what the files have in \
+         common rather than an entry per file. Skip the hunk-by-hunk retelling, and say if something \
+         looks wrong or half-finished. This is a read: don't edit anything.\n"
+    )
+}
+
+/// The plan windows that are spent, as (what it is, when it comes back). Empty
+/// when there's room, or when no reading has arrived — an absent reading is not
+/// a full one, and guessing would block work for nothing.
+fn usage_spent(limits: Option<&usage::Limits>) -> Vec<(&'static str, i64)> {
+    let Some(l) = limits else { return Vec::new() };
+    [("The 5-hour session window", &l.five_hour), ("The weekly window", &l.seven_day)]
+        .into_iter()
+        .filter_map(|(label, w)| match w {
+            Some(w) if w.pct >= 100.0 => Some((label, w.resets_at)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Why sending is off, in one sentence, or None when nothing is spent. The
+/// soonest window back is the one quoted: that's the wait that actually ends.
+fn usage_block_text(spent: &[(&'static str, i64)]) -> Option<String> {
+    let (first, _) = *spent.first()?;
+    let back = spent
+        .iter()
+        .map(|(_, r)| *r)
+        .filter(|r| *r > 0)
+        .min()
+        .map(usage::fmt_left)
+        .filter(|s| !s.is_empty());
+    Some(match (spent.len(), back) {
+        (1, Some(l)) => format!("{first} is at 100%, back in {l}"),
+        (1, None) => format!("{first} is at 100%"),
+        (_, Some(l)) => format!("Both plan windows are at 100%, the first back in {l}"),
+        (_, None) => "Both plan windows are at 100%".to_string(),
+    })
+}
+
+/// An image id for the phone, as a string.
+///
+/// The id is gpui's content hash, a full u64. JavaScript parses JSON numbers as
+/// doubles, so anything past 2^53 comes back rounded — `13116841340227802995`
+/// arrives as `...803000`, and the phone then asks for a picture that doesn't
+/// exist. A string crosses intact and `/img` parses it back.
+fn img_id(id: u64) -> String {
+    id.to_string()
+}
+
+/// One line on the pull-request screen. Everything here comes out of a single
+/// `gh pr list`, so the screen never needs a second call per row.
+#[derive(Clone)]
+struct PrRow {
+    number: u64,
+    title: String,
+    url: String,
+    state: PrState,
+    base: String,
+    head: String,
+    author: String,
+    checks: PrChecks,
+    files: usize,
+    added: usize,
+    removed: usize,
+    /// `APPROVED`, `CHANGES_REQUESTED`, `REVIEW_REQUIRED`, or empty.
+    review: String,
+    /// `MERGEABLE`, `CONFLICTING` or `UNKNOWN` — GitHub computes it lazily, so
+    /// a fresh PR says UNKNOWN for a few seconds and that isn't a problem.
+    mergeable: String,
+    /// Unix seconds of the last update, for the age on the right.
+    updated: u64,
+}
+
+impl PrRow {
+    /// A release PR is cut from a `release/*` branch. They head the screen in
+    /// their own boxes because they're the ones you check on rather than write.
+    fn is_release(&self) -> bool {
+        self.head.starts_with("release/")
+    }
+
+    /// What a release PR is for: `release/6.5.0` reads as `6.5.0`.
+    fn release_name(&self) -> &str {
+        self.head.strip_prefix("release/").unwrap_or(&self.head)
+    }
+
+    /// Everything the filter box matches against, lowercased once per keystroke
+    /// rather than per field.
+    fn haystack(&self) -> String {
+        format!("{} {} {} {} {}", self.number, self.title, self.head, self.base, self.author)
+            .to_lowercase()
+    }
+}
+
+/// The fields the screen needs. Kept in one place because the cached JSON has
+/// to parse through the same reader as a fresh read.
+const PR_LIST_FIELDS: &str = "number,title,url,state,isDraft,baseRefName,headRefName,author,\
+     updatedAt,statusCheckRollup,reviewDecision,additions,deletions,changedFiles,mergeable";
+
+fn pr_row_from(v: &serde_json::Value) -> Option<PrRow> {
+    let str_of = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let count = |k: &str| v.get(k).and_then(|n| n.as_u64()).unwrap_or(0) as usize;
+    Some(PrRow {
+        number: v.get("number")?.as_u64()?,
+        title: str_of("title"),
+        url: str_of("url"),
+        state: PrState::from_json(v),
+        base: str_of("baseRefName"),
+        head: str_of("headRefName"),
+        author: v
+            .get("author")
+            .and_then(|a| a.get("login"))
+            .and_then(|l| l.as_str())
+            .unwrap_or("")
+            .to_string(),
+        checks: pr_checks(v),
+        files: count("changedFiles"),
+        added: count("additions"),
+        removed: count("deletions"),
+        review: str_of("reviewDecision"),
+        mergeable: str_of("mergeable"),
+        updated: iso_secs(&str_of("updatedAt")),
+    })
+}
+
+/// `2026-10-09T07:21:04Z` as unix seconds. GitHub always answers in UTC with
+/// this exact shape, so a parser beats a date crate here.
+fn iso_secs(s: &str) -> u64 {
+    let num = |r: std::ops::Range<usize>| s.get(r).and_then(|x| x.parse::<i64>().ok());
+    let (Some(y), Some(m), Some(d)) = (num(0..4), num(5..7), num(8..10)) else { return 0 };
+    let (h, mi, sec) = (num(11..13).unwrap_or(0), num(14..16).unwrap_or(0), num(17..19).unwrap_or(0));
+    // days from the civil calendar (Howard Hinnant's algorithm), epoch 1970-01-01
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    (days * 86_400 + h * 3600 + mi * 60 + sec).max(0) as u64
+}
+
+/// Ask GitHub for a list of open pull requests. `extra` is the part that
+/// differs: `--author @me` for yours, a `--search` for the release branches.
+fn pr_list_raw(root: &Path, extra: &[&str]) -> Option<serde_json::Value> {
+    let out = Command::new("gh")
+        .args(["pr", "list", "--state", "open", "--limit", "50", "--json", PR_LIST_FIELDS])
+        .args(extra)
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    serde_json::from_slice(&out.stdout).ok()
+}
+
+fn pr_rows(v: &serde_json::Value) -> Vec<PrRow> {
+    v.as_array().map(|a| a.iter().filter_map(pr_row_from).collect()).unwrap_or_default()
+}
+
+fn pr_list_cache_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".config/tide/pr-list.json"))
+}
+
+/// The last read of the screen, so opening it shows the list now and the fetch
+/// only replaces it. `gh pr list` takes about five seconds; nobody should watch
+/// an empty panel for five seconds to learn what they already saw.
+fn pr_list_cached() -> Option<(Vec<PrRow>, Vec<PrRow>, u64)> {
+    let raw = std::fs::read_to_string(pr_list_cache_path()?).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    Some((
+        pr_rows(v.get("mine")?),
+        pr_rows(v.get("releases")?),
+        v.get("at").and_then(|a| a.as_u64()).unwrap_or(0),
+    ))
+}
+
+fn save_pr_list(mine: &serde_json::Value, releases: &serde_json::Value) {
+    let Some(path) = pr_list_cache_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let blob = serde_json::json!({ "at": now_secs(), "mine": mine, "releases": releases });
+    let _ = std::fs::write(path, blob.to_string());
+}
+
+/// Which sibling checkout holds each branch, so the screen can say that #5966
+/// is already open in `wby-next3`. Reads `.git/HEAD` directly: no subprocess
+/// per folder, and a detached head simply has no branch to report.
+fn checkouts_by_branch(dir: &Path) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(dir) else { return out };
+    for e in entries.flatten() {
+        let Ok(head) = std::fs::read_to_string(e.path().join(".git/HEAD")) else { continue };
+        if let Some(branch) = head.trim().strip_prefix("ref: refs/heads/") {
+            out.insert(branch.to_string(), e.file_name().to_string_lossy().to_string());
+        }
+    }
+    out
+}
+
 /// The PR's GraphQL node id for the current branch (used to mark files viewed).
 fn gh_pr_node_id(root: &Path) -> Option<String> {
     Command::new("gh")
@@ -2629,6 +4456,37 @@ fn git_commit_files(root: &Path, sha: &str) -> Vec<(PathBuf, GitState)> {
 /// PR changes: files changed on this branch since it diverged from `base`,
 /// as (absolute path, status). Uses the three-dot (merge-base) diff, comparing
 /// against `origin/<base>` to match GitHub's "Files changed".
+/// Lines added and removed per file against `base`, from `git diff --numstat`.
+/// Local, so it costs nothing and agrees with the diff the pane opens — the
+/// same numbers GitHub shows, worked out from the same comparison.
+fn git_pr_numstat(root: &Path, base: &str) -> HashMap<PathBuf, (usize, usize)> {
+    let base_ref = resolve_base_ref(root, base);
+    let out = Command::new("git")
+        .args(["diff", "--numstat", &format!("{}...HEAD", base_ref)])
+        .current_dir(root)
+        .output();
+    let Ok(out) = out.map_err(|_| ()).and_then(|o| if o.status.success() { Ok(o) } else { Err(()) })
+    else {
+        return HashMap::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut map = HashMap::new();
+    for line in text.lines() {
+        let mut parts = line.split('\t');
+        let (Some(add), Some(del), Some(path)) = (parts.next(), parts.next(), parts.last()) else {
+            continue;
+        };
+        let path = path.trim();
+        if path.is_empty() {
+            continue;
+        }
+        // a binary file reports "-" for both, which is not a line count
+        let (Ok(add), Ok(del)) = (add.parse::<usize>(), del.parse::<usize>()) else { continue };
+        map.insert(root.join(path), (add, del));
+    }
+    map
+}
+
 fn git_pr_files(root: &Path, base: &str) -> Vec<(PathBuf, GitState)> {
     let base_ref = resolve_base_ref(root, base);
     let out = Command::new("git")
@@ -2688,6 +4546,44 @@ fn git_log_range(root: &Path, range: &str) -> Vec<(String, String)> {
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| l.split_once('\0').map(|(h, s)| (h.to_string(), s.to_string())))
+        .collect()
+}
+
+/// A commit on this branch, for the PR pane's Commits tab.
+#[derive(Clone)]
+struct BranchCommit {
+    sha: String,
+    short: String,
+    subject: String,
+    who: String,
+    when: String,
+}
+
+/// The commits this branch adds on top of `base`, newest first. This is the
+/// "what did the agent actually commit" view: the PR's file list flattens a
+/// dozen commits into one diff, which is where a stray change hides.
+fn git_branch_commits(root: &Path, base: &str) -> Vec<BranchCommit> {
+    let base_ref = resolve_base_ref(root, base);
+    let out = Command::new("git")
+        .args(["log", "--format=%H%x1f%h%x1f%s%x1f%an%x1f%cr", &format!("{base_ref}..HEAD")])
+        .current_dir(root)
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut p = l.split('\u{1f}');
+            Some(BranchCommit {
+                sha: p.next()?.to_string(),
+                short: p.next()?.to_string(),
+                subject: p.next()?.to_string(),
+                who: p.next()?.to_string(),
+                when: p.next().unwrap_or("").to_string(),
+            })
+        })
         .collect()
 }
 
@@ -2884,9 +4780,15 @@ enum Cmd {
     GitPopup,
     ShowDiff,
     MyPrs,
+    MyPrsWeb,
     ReleasePrs,
     CopyBranch,
     CopyRenameSession,
+    AskForTour,
+    ShowTours,
+    HandOff,
+    AgentBriefing,
+    PhoneLink,
     ProcessManager,
     ToggleReadOnly,
     ResolveConflicts,
@@ -2894,12 +4796,17 @@ enum Cmd {
     SetWorkspaceTitle,
     ResetWorkspace,
     ResetWorkspaceClose,
+    CloseWorkspace,
     ResetWorkspacePause,
     TogglePause,
     AddComment,
     ShowComments,
     SendComments,
+    LocalReview,
+    Reviewers,
+    Todo,
     OpenRepository,
+    OpenPrNumber,
     InstallUsageBars,
 }
 
@@ -2909,8 +4816,10 @@ const PALETTE: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::WipPush, "WIP Commit & Push", IC_PUSH, ""),
     (Cmd::OpenPr, "Open Pull Request", IC_PR, ""),
     (Cmd::CreatePr, "Create Pull Request", IC_PR, ""),
-    (Cmd::MyPrs, "My PRs", IC_PR, ""),
-    (Cmd::ReleasePrs, "Release PRs", IC_PR, ""),
+    (Cmd::MyPrs, "My Pull Requests", IC_PR, "⌘⇧P"),
+    (Cmd::OpenPrNumber, "Open PR by Number", IC_PR, ""),
+    (Cmd::MyPrsWeb, "My Pull Requests on GitHub", IC_PR, ""),
+    (Cmd::ReleasePrs, "Release PRs on GitHub", IC_PR, ""),
     (Cmd::CheckoutNext, "Checkout / Pull Next", IC_HOME, ""),
     (Cmd::Build, "Build", IC_TOOLS, "⌘⇧B"),
     (Cmd::InstallBuild, "Install and Build", IC_TOOLS, ""),
@@ -2928,18 +4837,27 @@ const PALETTE: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::GoToLine, "Go to Line", IC_HOME, "⌘L"),
     (Cmd::CopyBranch, "Copy Branch Name", IC_BRANCH, ""),
     (Cmd::CopyRenameSession, "Copy Claude /rename Command", IC_COPY, ""),
+    (Cmd::AskForTour, "Ask the Agent for a Code Tour", IC_AGENT, ""),
+    (Cmd::ShowTours, "Code Tours", IC_TOUR, ""),
+    (Cmd::HandOff, "Send to Another Workspace  (⌥⇧↩)", IC_AGENT, ""),
+    (Cmd::AgentBriefing, "Show the Agent Briefing", IC_GEAR, ""),
+    (Cmd::PhoneLink, "Copy the Phone Link", IC_BROWSER, ""),
     (Cmd::ProcessManager, "Process Manager", IC_TOOLS, ""),
     (Cmd::ToggleReadOnly, "Toggle Read-Only / Edit Mode", IC_HOME, ""),
     (Cmd::ResolveConflicts, "Resolve Merge Conflicts", IC_BRANCH, ""),
-    (Cmd::OpenAdmin, "Open Admin", IC_BROWSER, ""),
+    (Cmd::OpenAdmin, "Open the Local App", IC_BROWSER, ""),
     (Cmd::SetWorkspaceTitle, "Set Workspace Title…", IC_HOME, ""),
     (Cmd::ResetWorkspace, "Reset Workspace", IC_HOME, ""),
+    (Cmd::CloseWorkspace, "Close Workspace  (leaves the checkout as it is)", IC_HOME, ""),
     (Cmd::ResetWorkspaceClose, "Reset Workspace & Close", IC_HOME, ""),
     (Cmd::ResetWorkspacePause, "Reset Workspace & Pause", IC_HOME, ""),
     (Cmd::TogglePause, "Pause / Resume Workspace  (⌥Tab skips paused)", IC_HOME, ""),
     (Cmd::AddComment, "Comment on This Line…", IC_COMMIT, "⌥C"),
     (Cmd::ShowComments, "Review Comments…", IC_COMMIT, "⌥⇧C"),
     (Cmd::SendComments, "Send Comments to Agent", IC_PUSH, "⌥↩ / ⌘F12"),
+    (Cmd::LocalReview, "Review This Branch (CodeRabbit CLI → the agent)", IC_PR, ""),
+    (Cmd::Reviewers, "Send In the Reviewers (slop cop + code rabbit)", IC_PR, ""),
+    (Cmd::Todo, "New Task…", IC_CHECK, "⌘⇧L"),
     (Cmd::OpenRepository, "Open Repository or Project…  (clones a GitHub URL into ~/dev)", IC_FILES, "⌘O"),
     (Cmd::InstallUsageBars, "Install Plan Usage Bars (statusline shim)", IC_GRAPH, ""),
 ];
@@ -3128,7 +5046,7 @@ fn git_branch_parent(root: &Path, branch: &str) -> Option<String> {
 /// (or `gh` is unavailable). Runs on a background thread, so the network call
 /// never blocks the UI.
 /// CI/checks rollup status for a PR, shown as a colored dot by the PR link.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum PrStatus {
     Passing, // all checks green
     Pending, // something still running / queued
@@ -3148,7 +5066,7 @@ impl PrStatus {
 }
 
 /// A PR's lifecycle state, shown as a small pill next to its number.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum PrState {
     Draft,
     Open,
@@ -3198,37 +5116,25 @@ fn pr_state_pill(state: PrState, size: f32) -> Div {
         .child(state.label())
 }
 
-/// Aggregate a PR's `statusCheckRollup` array into a single status.
+/// The dot next to the PR number in the topbar, from the same reading of the
+/// rollup the PR document uses. It used to walk the raw array itself, which
+/// counted every attempt: a push that cancelled a running job and a rerun that
+/// went green left a CANCELLED entry behind, and the dot went red under a PR
+/// GitHub (and the body right below it) called passing.
 fn rollup_status(v: &serde_json::Value) -> PrStatus {
-    let Some(arr) = v.get("statusCheckRollup").and_then(|x| x.as_array()).filter(|a| !a.is_empty())
-    else {
+    let c = pr_checks(v);
+    if c.total() == 0 {
         return PrStatus::None;
-    };
-    let mut pending = false;
-    for c in arr {
-        // CheckRun reports `status` (+ `conclusion`); StatusContext reports `state`
-        if let Some(status) = c.get("status").and_then(|s| s.as_str()) {
-            if status != "COMPLETED" {
-                pending = true;
-                continue;
-            }
-        }
-        let outcome = c
-            .get("conclusion")
-            .and_then(|s| s.as_str())
-            .or_else(|| c.get("state").and_then(|s| s.as_str()))
-            .unwrap_or("");
-        match outcome.to_uppercase().as_str() {
-            "SUCCESS" | "NEUTRAL" | "SKIPPED" => {}
-            "" | "PENDING" | "EXPECTED" | "IN_PROGRESS" | "QUEUED" | "WAITING" => pending = true,
-            _ => return PrStatus::Failing, // FAILURE, ERROR, CANCELLED, TIMED_OUT, ACTION_REQUIRED…
-        }
     }
-    if pending {
-        PrStatus::Pending
-    } else {
-        PrStatus::Passing
+    if c.failed > 0 {
+        return PrStatus::Failing;
     }
+    // cancelled with nothing newer in its place isn't a failure and isn't a
+    // pass: amber is "go and look", which is what it deserves
+    if c.running > 0 || c.stalled > 0 {
+        return PrStatus::Pending;
+    }
+    PrStatus::Passing
 }
 
 fn fetch_pr_link(root: &Path, branch: &str) -> Option<(u64, String, PrStatus, String, String, PrState)> {
@@ -3458,6 +5364,28 @@ const TITLE_TYPES: &[(&str, &str, &str)] = &[
     ("release", "🚀", "Release tasks"),
 ];
 
+/// Standing instructions for every agent session, kept in
+/// `~/.config/tide/agent-notes.md`. Whatever is in there is appended to the
+/// briefing as written. Absent, empty or unreadable means nothing is added.
+fn agent_notes() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let body = std::fs::read_to_string(PathBuf::from(home).join(".config/tide/agent-notes.md")).ok()?;
+    let body = body.trim();
+    (!body.is_empty()).then(|| body.to_string())
+}
+
+/// `fix: something` in a description field: take the type, drop the prefix.
+/// Returns the index into [`TITLE_TYPES`] when one was recognized, so the
+/// workspace title and a todo can share the shortcut.
+fn type_prefix(f: &mut Field) -> Option<usize> {
+    let text = f.text.clone();
+    let (head, rest) = text.split_once(':')?;
+    let key = head.trim().to_lowercase();
+    let i = TITLE_TYPES.iter().position(|(k, _, _)| *k == key)?;
+    f.set(rest.trim_start().to_string());
+    Some(i)
+}
+
 /// Split a stored title back into (type index, description) by its emoji prefix,
 /// so reopening the dialog shows the type that was picked last time.
 fn split_title(title: &str) -> (Option<usize>, String) {
@@ -3519,6 +5447,16 @@ fn idle_badge(size: f32) -> Div {
         .text_size(px(size))
         .text_color(rgb(BG))
         .child("FREE")
+}
+
+/// Colour a todo's status shows up as: red still to do, amber in progress,
+/// green done — the same three the agent states already use.
+fn todo_color(s: todo::Status) -> u32 {
+    match s {
+        todo::Status::Todo => GIT_DELETED,
+        todo::Status::Doing => 0xe0af68,
+        todo::Status::Done => GIT_NEW,
+    }
 }
 
 /// Colour an agent state shows up as (pane border, chip, tab dot).
@@ -3592,7 +5530,10 @@ fn rc_button(
 const RC_NOTE_H: f32 = 20.0;
 /// Chrome around the comment input: header, padding, borders, button row.
 const RC_BOX_CHROME: f32 = 74.0;
-const RC_LINE_H: f32 = 16.0;
+/// One line in the comment box and its thread. Follows the 14px text it wraps:
+/// too tight and the box under-reserves its own height, which shows up as the
+/// code below it being overlapped.
+const RC_LINE_H: f32 = 19.0;
 /// Inset from the line's left edge, so the box doesn't start hard against the
 /// gutter.
 const RC_BOX_PAD: f32 = 6.0;
@@ -3602,6 +5543,50 @@ const RC_BOX_VPAD: f32 = 12.0;
 /// The input always looks like a text area, never a one-line field.
 const RC_MIN_LINES: usize = 3;
 const RC_MAX_LINES: usize = 20;
+
+/// The tour card that sits under the stop you're standing on. Wide enough for
+/// a paragraph at 13px without running the width of a 4K window.
+const TOUR_CARD_W: f32 = 760.0;
+/// Characters that fit a card row at 13px, near enough to reserve space with.
+const TOUR_CARD_COLS: usize = 96;
+/// One wrapped row of the description.
+const TOUR_LINE_H: f32 = 20.0;
+/// Rows before the description scrolls inside the card instead of pushing the
+/// file further apart.
+const TOUR_CARD_ROWS: usize = 8;
+/// Header row, the file line under it, the note box, padding and borders.
+const TOUR_CARD_CHROME: f32 = 87.0;
+/// Air above and below the card, so the code it parts doesn't touch it.
+const TOUR_CARD_VPAD: f32 = 8.0;
+
+/// Rows the description takes at the card's width.
+fn tour_card_rows(text: &str) -> usize {
+    let rows: usize =
+        text.trim().split('\n').map(|l| 1 + l.chars().count() / TOUR_CARD_COLS).sum();
+    rows.clamp(1, TOUR_CARD_ROWS)
+}
+
+/// Space the thread adds to the card: its turns, capped where the thread
+/// starts scrolling inside the card instead of pushing the file further apart.
+fn tour_thread_h(turns: &[ReviewReply]) -> f32 {
+    if turns.is_empty() {
+        return 0.0;
+    }
+    let rows: usize = turns
+        .iter()
+        .map(|t| {
+            // a name line, then the text at the card's width
+            1 + t.text.split('\n').map(|l| 1 + l.chars().count() / TOUR_CARD_COLS).sum::<usize>()
+        })
+        .sum();
+    (rows.min(11) as f32 * TOUR_LINE_H) + 10.0
+}
+
+/// Space the editor reserves under a stop's last line for the card.
+fn tour_gap_h(text: &str) -> f32 {
+    let body = if text.trim().is_empty() { 0.0 } else { tour_card_rows(text) as f32 * TOUR_LINE_H };
+    TOUR_CARD_CHROME + body + TOUR_CARD_VPAD * 2.0
+}
 
 /// Visible row count of a comment body, wrapping included, clamped to the box's
 /// range. The box is ~90 chars wide at 12px, the same estimate the thread area
@@ -3694,6 +5679,249 @@ struct FileRef {
     range: std::ops::Range<usize>,
     path: String,
     line: usize,
+    /// The last line of a range (`Foo.ts:43-51`), else the same as `line`.
+    end: usize,
+}
+
+/// A reviewer running in its own ACP session: a second (and third) opinion on
+/// the branch, gathered in parallel and handed to the main thread when they're
+/// all done. Each has its own adapter process, so nothing they do touches the
+/// conversation you're in.
+struct Reviewer {
+    name: &'static str,
+    acp: Arc<acp::Acp>,
+    /// What it has said so far; the assistant text, concatenated.
+    text: String,
+    /// What it has been doing: one line per tool call, newest last. Without
+    /// this a reviewer is a black box for however long it takes.
+    log: Vec<String>,
+    /// Set when its turn ended (or its adapter died).
+    done: bool,
+    /// When that happened, so the chip can stop counting. A clock that keeps
+    /// running after the work finished is just a bigger number.
+    finished: Option<std::time::Instant>,
+    /// Its report has gone to the main thread; the tab stays until you close it.
+    reported: bool,
+    /// The turn hasn't been sent until the session says it's ready.
+    sent: bool,
+    started: std::time::Instant,
+}
+
+/// Split pasted images into what the wire needs and what the transcript shows.
+/// The chips under the bubble say what was attached, which is why the bubble
+/// needs its own copy rather than only the base64.
+fn split_images(imgs: Vec<PastedImage>) -> (Vec<(String, String)>, Vec<SentImage>) {
+    let wire = imgs.iter().map(|i| (i.mime.clone(), i.b64.clone())).collect();
+    let kept = imgs
+        .into_iter()
+        .map(|i| SentImage { label: i.label, mime: i.mime, bytes: i.bytes, image: i.image })
+        .collect();
+    (wire, kept)
+}
+
+/// Who put a message in the transcript. TIDE sends plenty of its own — a button
+/// handing over a merge, a batch of review comments — and they read as things
+/// you typed unless they say otherwise.
+#[derive(Clone, Copy, PartialEq)]
+enum Sender {
+    You,
+    Tide,
+}
+
+/// A prompt waiting for the current turn to end. It carries its images with it:
+/// they used to be left in the composer, which both lost them from this message
+/// and attached them to whatever was sent next.
+struct Queued {
+    text: String,
+    /// Who it is from, kept so a queued handoff still reads as TIDE's when it
+    /// finally goes out.
+    by: Sender,
+    /// What the transcript shows in place of the prompt, when they differ.
+    label: Option<String>,
+    imgs: Vec<PastedImage>,
+}
+
+/// One stop on a walk through an answer's code references: the file, the lines,
+/// and the sentence the agent wrote around it.
+#[derive(Clone)]
+struct Stop {
+    path: String,
+    line: usize,
+    end: usize,
+    /// A few words naming the stop. Empty on a walk through an answer, where
+    /// the prose it sat in is the only label there is.
+    title: String,
+    /// The part of the tour this stop belongs to, when the tour named its
+    /// parts: "The AWS side", "Standalone". Empty when it didn't.
+    group: String,
+    /// The prose the reference sat in, so the code and the explanation are on
+    /// screen together rather than a scroll apart.
+    said: String,
+}
+
+/// One visit to a file on a tour's map: the run of stops the tour spends there
+/// before it moves on, and whether it had been in that file earlier.
+struct TourNode {
+    file: String,
+    dir: String,
+    /// The part of the tour this visit falls in, from its first stop.
+    group: String,
+    /// Stop indices in this visit, in order and consecutive.
+    steps: Vec<usize>,
+    /// The tour has been in this file before and has come back to it.
+    repeat: bool,
+}
+
+/// The tour as the route it actually walks: a node per *visit*, not per file.
+/// Grouping every stop in a file into one box made the column read as a
+/// straight run down the page when the walk really goes 10 → 4 → 11; with a
+/// node per visit every arrow points at the stop that genuinely follows, and a
+/// file the tour returns to shows up again where it is returned to.
+fn tour_nodes(stops: &[Stop]) -> Vec<TourNode> {
+    let mut out: Vec<TourNode> = Vec::new();
+    for (i, s) in stops.iter().enumerate() {
+        if out.last().is_some_and(|n| file_key(n) == s.path) {
+            out.last_mut().expect("just checked").steps.push(i);
+            continue;
+        }
+        let (dir, file) = match s.path.rsplit_once('/') {
+            Some((d, f)) => (d.to_string(), f.to_string()),
+            None => (String::new(), s.path.clone()),
+        };
+        let repeat = out.iter().any(|n| file_key(n) == s.path);
+        out.push(TourNode { file, dir, group: s.group.clone(), steps: vec![i], repeat });
+    }
+    out
+}
+
+/// The path a node was built from, so a second stop in the same file finds it.
+fn file_key(n: &TourNode) -> String {
+    if n.dir.is_empty() {
+        n.file.clone()
+    } else {
+        format!("{}/{}", n.dir, n.file)
+    }
+}
+
+/// The tail of a path, enough to tell two `index.ts` apart without filling a
+/// 300px column: `…/api/features/TaskService`.
+fn dir_tail(dir: &str, parts: usize) -> String {
+    let all: Vec<&str> = dir.split('/').filter(|p| !p.is_empty()).collect();
+    if all.len() <= parts {
+        return all.join("/");
+    }
+    format!("…/{}", all[all.len() - parts..].join("/"))
+}
+
+/// What the clarify button writes. It is the note that gets typed out most
+/// often on a walk, and typing it twenty times is twenty chances to say it
+/// less clearly than this.
+const CLARIFY_NOTE: &str = "This step isn't clear to me. Explain what happens \
+     here and why it matters, in plainer terms, and say what I'd have to know \
+     to follow it.";
+
+/// The route drawn small, for the cards at either end of it: three stops and
+/// the arrows between them, with the end you are standing at lit. A card that
+/// is only words reads as a dialog; this says "you are at one end of a walk".
+fn tour_mini(at_start: bool, accent: u32) -> Div {
+    let cell = |lit: bool, w: f32| {
+        div().w(px(w)).h(px(9.)).rounded_sm().bg(rgb(if lit { accent } else { BORDER }))
+    };
+    let link = |lit: bool| {
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .child(div().w(px(2.)).h(px(7.)).bg(rgb(if lit { accent } else { BORDER })))
+            .child(
+                div()
+                    .text_size(px(8.))
+                    .line_height(px(8.))
+                    .text_color(rgb(if lit { accent } else { BORDER }))
+                    .child("▼"),
+            )
+    };
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .flex_shrink_0()
+        .gap(px(1.))
+        .w(px(46.))
+        .child(cell(at_start, 42.))
+        .child(link(at_start))
+        .child(cell(false, 34.))
+        .child(link(!at_start))
+        .child(cell(!at_start, 42.))
+}
+
+/// Where a stop is, written the way the agent would have written it.
+fn stop_label(s: &Stop) -> String {
+    if s.end > s.line {
+        format!("{}:{}-{}", s.path, s.line, s.end)
+    } else if s.line > 0 {
+        format!("{}:{}", s.path, s.line)
+    } else {
+        s.path.clone()
+    }
+}
+
+/// A tour as it is kept between sessions: the stops, where you had got to, and
+/// when it arrived. The list of these is the tour pane.
+#[derive(Clone)]
+struct TourRec {
+    id: String,
+    title: String,
+    /// The stop you were standing on when you last looked.
+    at: usize,
+    /// Unix seconds it was posted, for "2h ago" in the list.
+    made: u64,
+    /// Put away with ✕. It stays in the list, it just doesn't reopen itself
+    /// next launch.
+    closed: bool,
+    stops: Vec<Stop>,
+}
+
+/// A walk in progress: every reference in one answer, in the order it was
+/// written, and where you are in it.
+///
+/// A tour is the same walk with the stops chosen on purpose: the agent picked
+/// the order and wrote a description for each one, instead of TIDE scraping
+/// them out of whatever an answer happened to mention. Everything downstream —
+/// the strip, the arrows, the highlight — treats the two the same.
+struct Walk {
+    stops: Vec<Stop>,
+    at: usize,
+    /// The message it came from, so the strip can go back to the prose. `None`
+    /// on a tour: a tour belongs to the work, not to one answer.
+    msg: Option<usize>,
+    /// What the tour is called. `None` means this is a walk through an answer.
+    tour: Option<String>,
+    /// Standing at the start, before the first stop. A tour opens here: what
+    /// it covers before you are dropped into the middle of it.
+    intro: bool,
+    /// Walked off the end: the last stop is behind you and the card shows
+    /// what the tour added up to. Neither is stored — they are where you are,
+    /// not what the tour is.
+    done: bool,
+    /// Which stored tour this is, so stepping can write back where you got to.
+    /// `None` on a walk through an answer, which isn't stored at all.
+    id: Option<String>,
+    /// The step list is showing: the whole route at once, rather than the stop
+    /// you are standing on.
+    list: bool,
+    /// Where the current stop resolved to on disk, so the editor can be told
+    /// which lines to light up without resolving the path on every frame.
+    here: Option<(PathBuf, usize, usize)>,
+}
+
+/// Which box an attached image's `[Image #n]` token is typed into.
+#[derive(Clone, Copy, PartialEq)]
+enum ImgToken {
+    /// The agent composer.
+    Composer,
+    /// A review comment or a reply in its thread.
+    Comment,
 }
 
 /// What a link in the transcript points at.
@@ -3702,6 +5930,67 @@ enum LinkTarget {
     /// A file in the project, at a line (0 = no line given).
     File(String, usize),
     Url(String),
+}
+
+/// Scan `text` for pull-request references: `#5619`, and `owner/repo#5619`
+/// when the answer is talking about another repo. Only what reads as a PR
+/// number counts — it has to start a word, so `abc#12` is not one, and it caps
+/// at five digits, which keeps six-digit hex colours (`#2b2d30`, `#112233`)
+/// out of it while staying well clear of any repo's real numbering.
+fn pr_refs(text: &str) -> Vec<(std::ops::Range<usize>, String, u64)> {
+    let mut out = Vec::new();
+    let b = text.as_bytes();
+    for (i, _) in text.char_indices().filter(|(_, c)| *c == '#') {
+        let digits = b[i + 1..]
+            .iter()
+            .take_while(|c| c.is_ascii_digit())
+            .count()
+            .min(6); // one more than we accept, so a longer run is rejected whole
+        if digits == 0 || digits > 5 {
+            continue;
+        }
+        // the digits have to end the word too, or `#2b2d30` reads as PR 2
+        if b.get(i + 1 + digits).is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_') {
+            continue;
+        }
+        let num: u64 = text[i + 1..i + 1 + digits].parse().unwrap_or(0);
+        if num == 0 {
+            continue;
+        }
+        // a number inside one of TIDE's own tokens — `[Image #2]`, `[Pasted
+        // text #3 +12 lines]` — counts the attachment, not a pull request
+        let head = &text[..i];
+        if in_tide_token(head) {
+            continue;
+        }
+        let repo = head
+            .rsplit(|c: char| c.is_whitespace() || c == '(' || c == '[')
+            .next()
+            .unwrap_or("");
+        let owned = repo.contains('/')
+            && repo.split('/').count() == 2
+            && repo.split('/').all(|p| {
+                !p.is_empty() && p.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+            });
+        if !owned && !repo.is_empty() {
+            continue; // glued to a word: not a reference
+        }
+        let start = if owned { i - repo.len() } else { i };
+        out.push((start..i + 1 + digits, if owned { repo.to_string() } else { String::new() }, num));
+    }
+    out
+}
+
+/// Is the text that ends here inside an unclosed `[Image …` or `[Pasted text …`
+/// token? Those carry their own numbering, so the `#2` in them is a count and
+/// not a reference to anything.
+fn in_tide_token(head: &str) -> bool {
+    let Some(open) = head.rfind('[') else { return false };
+    if head[open..].contains(']') {
+        return false; // that bracket is already closed, so we are outside it
+    }
+    let inside = head[open + 1..].trim_start();
+    inside.starts_with("Image") || inside.starts_with("Pasted")
 }
 
 /// Scan `text` for `http(s)://…` runs. A URL ends at whitespace, and trailing
@@ -3774,16 +6063,28 @@ fn file_refs(text: &str) -> Vec<FileRef> {
         if !EXTS.contains(&ext) || word.starts_with('.') && !word[1..].contains('.') {
             continue;
         }
-        // optional ":line" (and a second number after a comma, which we ignore)
+        // optional ":line", then optionally a range or a second number
         let mut ref_end = end;
-        let mut line = 0usize;
+        let (mut line, mut last) = (0usize, 0usize);
         if text[end..].starts_with(':') {
             let digits: String = text[end + 1..].chars().take_while(|c| c.is_ascii_digit()).collect();
             if !digits.is_empty() {
                 line = digits.parse().unwrap_or(0);
+                last = line;
                 ref_end = end + 1 + digits.len();
-                // `Icon.tsx:14,25` — a second line number belongs to the same ref
-                if text[ref_end..].starts_with(',') {
+                // `Icon.tsx:43-51`, and the en dash a model writes half the time
+                let rest = &text[ref_end..];
+                let dash = ["-", "–", "—"].iter().find(|d| rest.starts_with(**d)).copied();
+                if let Some(d) = dash {
+                    let after = ref_end + d.len();
+                    let more: String =
+                        text[after..].chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if !more.is_empty() {
+                        last = more.parse().unwrap_or(line).max(line);
+                        ref_end = after + more.len();
+                    }
+                } else if rest.starts_with(',') {
+                    // `Icon.tsx:14,25` — a second line belongs to the same ref
                     let more: String =
                         text[ref_end + 1..].chars().take_while(|c| c.is_ascii_digit()).collect();
                     if !more.is_empty() {
@@ -3792,7 +6093,7 @@ fn file_refs(text: &str) -> Vec<FileRef> {
                 }
             }
         }
-        out.push(FileRef { range: start..ref_end, path: word.to_string(), line });
+        out.push(FileRef { range: start..ref_end, path: word.to_string(), line, end: last })
     }
     out
 }
@@ -3806,6 +6107,118 @@ fn review_path(root: &Path) -> Option<PathBuf> {
             .join(".config/tide/comments")
             .join(format!("{}.json", usage::project_slug(root))),
     )
+}
+
+/// Where this workspace's open code tour is kept. One per checkout: a tour is
+/// about this branch's code, and two workspaces on the same repo are usually
+/// two different pieces of work.
+fn tours_path(root: &Path) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(
+        PathBuf::from(home)
+            .join(".config/tide/tours")
+            .join(format!("{}.json", usage::project_slug(root))),
+    )
+}
+
+/// Every tour this workspace has been given, newest first. One file: a tour is
+/// a few kilobytes of text, and the list is read once at launch.
+fn tours_to_json(list: &[TourRec]) -> String {
+    let items: Vec<serde_json::Value> = list
+        .iter()
+        .map(|t| {
+            let steps: Vec<serde_json::Value> = t
+                .stops
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "file": s.path,
+                        "line": s.line,
+                        "end": s.end,
+                        "title": s.title,
+                        "group": s.group,
+                        "text": s.said,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "id": t.id,
+                "title": t.title,
+                "at": t.at,
+                "made": t.made,
+                "closed": t.closed,
+                "steps": steps,
+            })
+        })
+        .collect();
+    serde_json::json!({ "tours": items }).to_string()
+}
+
+/// One stored tour. Separate from `tours_from_json` so the single-tour file
+/// the first version wrote still loads.
+fn tour_rec_from_json(v: &serde_json::Value) -> Option<TourRec> {
+    let stops: Vec<Stop> = v
+        .get("steps")?
+        .as_array()?
+        .iter()
+        .filter_map(|s| {
+            let path = s.get("file")?.as_str()?.to_string();
+            let line = s.get("line").and_then(|l| l.as_u64()).unwrap_or(0) as usize;
+            Some(Stop {
+                path,
+                line,
+                end: s.get("end").and_then(|e| e.as_u64()).unwrap_or(line as u64) as usize,
+                title: s.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+                group: s.get("group").and_then(|g| g.as_str()).unwrap_or("").to_string(),
+                said: s.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+            })
+        })
+        .collect();
+    if stops.is_empty() {
+        return None;
+    }
+    let at = v.get("at").and_then(|a| a.as_u64()).unwrap_or(0) as usize;
+    Some(TourRec {
+        id: v.get("id").and_then(|i| i.as_str()).map(|i| i.to_string()).unwrap_or_else(random_id),
+        title: v.get("title").and_then(|t| t.as_str()).unwrap_or("Code tour").to_string(),
+        at: at.min(stops.len() - 1),
+        made: v.get("made").and_then(|m| m.as_u64()).unwrap_or(0),
+        closed: v.get("closed").and_then(|c| c.as_bool()).unwrap_or(false),
+        stops,
+    })
+}
+
+fn tours_from_json(body: &str) -> Vec<TourRec> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else { return Vec::new() };
+    match v.get("tours").and_then(|t| t.as_array()) {
+        Some(items) => items.iter().filter_map(tour_rec_from_json).collect(),
+        // the shape the first version wrote: one tour, no list around it
+        None => tour_rec_from_json(&v).into_iter().collect(),
+    }
+}
+
+fn load_tours(root: &Path) -> Vec<TourRec> {
+    tours_path(root)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|b| tours_from_json(&b))
+        .unwrap_or_default()
+}
+
+/// Stand a stored tour up as something to walk. It comes back pointing at
+/// nothing: the first step (or a click in the list) is what opens a file, so a
+/// restart never hijacks the editor on its own.
+fn walk_from_rec(t: &TourRec, restart: bool) -> Walk {
+    Walk {
+        at: if restart { 0 } else { t.at.min(t.stops.len().saturating_sub(1)) },
+        stops: t.stops.clone(),
+        msg: None,
+        tour: Some(t.title.clone()),
+        id: Some(t.id.clone()),
+        intro: restart, // walking it again starts at the beginning, card and all
+        done: false,
+        list: true, // reopened the same way it arrives: map up
+        here: None,
+    }
 }
 
 /// Serialise comments with **repo-relative** paths, so a moved or re-cloned
@@ -3930,7 +6343,7 @@ fn format_review(items: &[ReviewItem], note: &str) -> String {
     // each comment is a thread in TIDE; answering by id puts your reply in the
     // thread instead of only in this transcript
     out.push_str(
-        "When you've handled one, post a one-or-two-sentence answer back to its thread:\n         curl -s -X POST \"$TIDE_RPC/comment\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n           -d '{\"id\":\"<id in brackets above>\",\"text\":\"<what you did>\"}'\n\nThe reply renders as markdown in TIDE, so use it where it helps: `backticks` for\nidentifiers, paths, and values, **bold** for the one thing that matters most, and\n- bullets when there's more than one point. Prose is fine for a one-liner — don't\ndress up a short answer.\n",
+        "When you've handled one, post a one-or-two-sentence answer back to its thread:\n         curl -s -X POST \"$TIDE_RPC/comment\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n           -d '{\"id\":\"<id in brackets above>\",\"text\":\"<what you did>\"}'\n\nThe reply renders as markdown in TIDE, so use it where it helps: `backticks` for\nidentifiers, paths, and values, **bold** for the one thing that matters most, and\n- bullets when there's more than one point. Prose is fine for a one-liner — don't\ndress up a short answer.\n\nWhen every comment has an answer, post one summary of the batch — what you\nchanged, what you pushed back on, anything still open:\n         curl -s -X POST \"$TIDE_RPC/summary\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n           -d '{\"text\":\"<what happened, in markdown>\"}'\nIt lands as a card in the transcript, which is where I look for it.\n",
     );
     out
 }
@@ -4066,6 +6479,17 @@ struct Tab {
     scratch: bool, // unsaved in-memory scratch buffer (gone when closed)
     /// Markdown files can show rendered instead of raw (⌘⇧V / the crumb button).
     preview: bool,
+    /// What the tab bar shows instead of the filename, when the filename isn't
+    /// the useful name — a PR is its title, not `PR #5828.md`.
+    label: Option<String>,
+    /// A fetched pull-request body rather than a file. Its state, branches and
+    /// link are drawn as a header row, which is why they aren't in the text.
+    pr: Option<PrDoc>,
+    /// The live browser, not a file. It rides in a tab because that's where you
+    /// look when you want to see something. It carries an editor like any other
+    /// tab — an empty scratch one, so everything that walks the tab list keeps
+    /// working — but nothing ever renders or saves it.
+    browser: bool,
 }
 
 struct Storm {
@@ -4118,6 +6542,9 @@ struct Storm {
     show_terminal: bool,
     term_width: f32,
     resizing_term: bool,
+    /// Height of the terminal under the editor, and its drag.
+    term_h: f32,
+    resizing_term_h: bool,
     // read-only Run console (command output)
     run_open: bool,
     run_cmd: String,
@@ -4156,6 +6583,8 @@ struct Storm {
     git_status: HashMap<PathBuf, GitState>,
     // pull-request review
     pr_files: Vec<(PathBuf, GitState)>,
+    /// Lines added and removed per changed file, for the counts on each row.
+    pr_stats: HashMap<PathBuf, (usize, usize)>,
     pr_viewed: HashSet<PathBuf>,
     /// Viewed-state changes made here that GitHub hasn't confirmed yet, as
     /// `path -> viewed`. A refresh reads the PR's state from `gh`, which lags a
@@ -4179,6 +6608,13 @@ struct Storm {
     pr_view_filter: PrViewFilter,
     // flattened rows for the virtualized PR list + scroll handle
     pr_rows: Vec<CommitRow>,
+    /// The PR pane's Commits tab: the branch's own commits, and the one opened.
+    pr_commits_tab: bool,
+    pr_commits: Vec<BranchCommit>,
+    pr_commit_open: Option<String>,        // sha
+    pr_commit_files: Vec<(PathBuf, GitState)>,
+    /// Collapsed folders inside the open commit's tree.
+    pr_commit_collapsed: HashSet<PathBuf>,
     pr_shown_files: Vec<PathBuf>,
     pr_scroll: UniformListScrollHandle,
     // fuzzy file finder
@@ -4198,6 +6634,37 @@ struct Storm {
     // the file index is scanned lazily (the finder, or the first transcript
     // reference that needs resolving); true once that scan has been kicked off
     files_scanned: bool,
+    // the scratch todo list (global, shared by every workspace)
+    todos: Vec<todo::Todo>,
+    /// Filter over the list in the left bar (text, details, scope, client,
+    /// group, or the workspace it came from).
+    todo_filter: Field,
+    todo_filter_focus: FocusHandle,
+    /// Show only what was written in this workspace. On by default: most of the
+    /// time the list you want is the one about what's in front of you.
+    todo_here_only: bool,
+    /// The "new task" form.
+    todo_open: bool,
+    todo_focus: FocusHandle,
+    todo_cat: Option<usize>, // index into TITLE_TYPES
+    todo_status: usize,      // index into todo::Status::ALL
+    todo_desc: Field,
+    todo_details: Field,
+    todo_link: Field,
+    todo_scope: Field,
+    todo_client: Field,
+    todo_group: Field,
+    /// Which text field the typing goes to, in the order the form lists them:
+    /// 0 description, 1 details, 2 link, 3 scope, 4 client, 5 group.
+    todo_field: usize,
+    /// Set when the form is editing an existing line rather than writing one.
+    todo_edit: Option<String>,
+    /// Details shown as rendered markdown rather than as raw text. A task you
+    /// open is there to be read; a task you're writing is there to be typed.
+    todo_details_md: bool,
+    /// The list lives in one file for all workspaces; this is the copy's age, so
+    /// another workspace's edit shows up here without re-reading on every poll.
+    todo_mtime: Option<u64>,
     // go-to-line dialog
     goto_open: bool,
     goto_focus: FocusHandle,
@@ -4214,6 +6681,13 @@ struct Storm {
     // (number, url, checks status, base, head, lifecycle state)
     pr_link: Option<(u64, String, PrStatus, String, String, PrState)>,
     pr_link_branch: String,
+    /// An agent said something git-visible changed (`POST /refresh`). If that
+    /// turns out to be a pull request this branch didn't have a moment ago,
+    /// the next read of the link opens its body in a tab.
+    pr_show_new: bool,
+    // how far this branch trails its base on the remote, and what a merge would
+    // break. Re-checked whenever the PR status is.
+    base_sync: Option<BaseSync>,
     mem_mb: u64,
     read_only: bool, // when on, editors block manual edits (nav/select/copy still work)
     left_view: LeftView,
@@ -4291,6 +6765,9 @@ struct Storm {
     find_results: Vec<FindResult>,
     find_selected: usize,
     find_scope: Vec<PathBuf>,
+    /// What to call the scope when the paths themselves don't say it — "5
+    /// changed files in .github/workflows" rather than "5 locations".
+    find_scope_label: Option<String>,
     find_gen: u64,
     find_preview: Option<FindPreview>,
     find_scroll: ScrollHandle, // keeps the selected result row in view
@@ -4363,9 +6840,7 @@ struct Storm {
     ws_open: bool, // project-switcher dropdown expanded
     // ── native agent panel (ACP) ───────────────────────────────────────────
     agent_open: bool,                // right-side dock visible
-    agent_share: f32,                // fraction of the terminal dock's height
-    resizing_agent: bool,            // dragging the divider under the agent
-    agent_zoomed: bool,              // ⌘⇧↩ on the agent: take the whole dock
+    term_folded: bool,              // ⌘⇧↩ on the agent: take the whole dock
     /// ⌘⇧↩ on a terminal pane: the mirror image — the panes take the whole dock
     /// and the agent is hidden until it's toggled back.
     term_zoomed: bool,
@@ -4388,15 +6863,25 @@ struct Storm {
     /// The agent was started over here (reset, or ⌃N) and hasn't been prompted
     /// since. Persisted, so a restart doesn't resume what was thrown away.
     agent_fresh: bool,
+    /// The current title was written by an agent, so an agent may improve it.
+    agent_titled: bool,
     agent_picker: bool,              // the resume list is open
     /// The briefing panel: what TIDE tells the agent before your first prompt.
+    /// The text is built when the panel opens, not per frame — it reads files.
     agent_brief_open: bool,
+    agent_brief_text: String,
     agent_title: Option<String>,     // the adapter's title for this session
     /// Rows selected in one agent message: `(message, anchor row, current row)`.
     /// Row granularity on purpose — pixel→byte mapping through gpui's text
     /// layout was unreliable (it can't address headings, fences or table cells at
     /// all), and a paragraph is the unit you actually want to ask about.
     agent_sel: Option<(usize, usize, usize)>,
+    /// The same drag, to the character: `(message, row, byte, row, byte)`. Rows
+    /// alone can't express "from here to there", which is what selecting text
+    /// means everywhere else.
+    agent_sel_ch: Option<(usize, usize, usize, usize, usize)>,
+    /// Where a drag started: `(message, row, byte)`.
+    agent_sel_anchor: Option<(usize, usize, usize)>,
     agent_sel_drag: bool,
     /// Row a press landed on, before any movement: `(message, row)`. Holding it
     /// here keeps a plain click free for the file links inside the row.
@@ -4431,6 +6916,9 @@ struct Storm {
     /// Ghost completion for the composer: the rest of the most recent message
     /// that starts with what's typed. ⇥ accepts it.
     agent_ghost: Option<String>,
+    /// Shell-style history: how far back ↑ has walked through your own turns.
+    /// `None` when you're writing rather than recalling.
+    agent_hist: Option<usize>,
     /// The "my messages" jump list in the agent header is open, and its filter.
     /// `@` completion in the composer: what's typed after the `@`, the matches,
     /// and where the `@` sits in the text.
@@ -4438,6 +6926,34 @@ struct Storm {
     at_start: usize,
     at_sel: usize,
     at_items: Vec<Mention>,
+    /// The screenshot a right-click menu is open on.
+    ctx_shot: Option<Arc<gpui::Image>>,
+    /// Every tour this workspace has been given, newest first.
+    tours: Vec<TourRec>,
+    /// ⌘F over the rendered document: the query, where in the matches you are,
+    /// and the scroll handle that puts each one on screen.
+    md_find: Field,
+    md_find_focus: FocusHandle,
+    md_find_open: bool,
+    md_find_at: usize,
+    md_scroll: gpui::ScrollHandle,
+    /// The question box on the tour card: what you're typing, and its focus.
+    /// A tour answers "what happens here"; this is for "but why".
+    tour_ask: Field,
+    tour_ask_focus: FocusHandle,
+    /// The thread turn that was right-clicked, kept whole: the menu's actions
+    /// are about that answer's text, and the thread is rebuilt every frame.
+    ctx_reply: Option<String>,
+    /// A walk through one answer's file references, or a tour the agent
+    /// prepared (⌥] / ⌥[).
+    walk: Option<Walk>,
+    /// A stop to stand on as soon as there's a Window to do it with: a tour
+    /// arrives on the RPC poll, which has none.
+    tour_jump: Option<usize>,
+    /// Reviewers working on this branch right now.
+    reviewers: Vec<Reviewer>,
+    /// Which tab the pane is showing: 0 is the conversation, 1.. a reviewer.
+    agent_tab: usize,
     /// `@token` → what the agent is sent in its place, for every mention picked
     /// since the composer was last cleared.
     agent_mentions: HashMap<String, String>,
@@ -4446,7 +6962,7 @@ struct Storm {
     agent_jump_focus: FocusHandle,
     /// Prompts typed while a turn was still running, sent in order as each turn
     /// ends — the same queueing Claude Code does in the terminal.
-    agent_queue: Vec<(String, Option<String>)>,
+    agent_queue: Vec<Queued>,
     /// Virtualized transcript state, and the item count it was last told about.
     agent_list: gpui::ListState,
     agent_list_len: usize,
@@ -4471,12 +6987,52 @@ struct Storm {
     git_details_files: Vec<(PathBuf, GitState)>, // its changed files
     git_scroll: ScrollHandle,                // commit list scroll
     // ── in-pane browser (shares the right dock with the terminal) ──────────
-    browser_open: bool,
-    browser: Option<browser::Browser>, // embedded WebView, created on first open
+    #[allow(dead_code)] // the parked WebView path; see `mod browser`
+    browser: Option<browser::Browser>,
     browser_url: Field,                // address bar
+    // the live mirror of agent-browser's Chromium: the connection, the frame
+    // being painted, and the textures the last frames left behind
+    mirror: Option<mirror::Mirror>,
+    mirror_frame: Option<mirror::Frame>,
+    mirror_drop: Vec<Arc<gpui::RenderImage>>,
+    mirror_polling: bool,
+    /// Is the browser tab the one on top? Frames are only worth taking — and
+    /// only worth asking for — while it is.
+    mirror_watching: bool,
+    /// Where the page is painted and how its pixels map to the page's own
+    /// coordinates, recorded each render so a click can be placed.
+    mirror_origin: (f32, f32),
+    mirror_width: f32,
+    mirror_focus: FocusHandle,
+    /// The last page the stream reported, so the address bar follows a real
+    /// navigation instead of overwriting itself on every frame.
+    mirror_url_seen: String,
+    /// `https://github.com/org/repo` for this checkout, read once. A `#5619` in
+    /// an answer becomes a link against it.
+    repo_web: Option<String>,
     browser_focus: FocusHandle,
+    /// The pull-request screen: every open PR of yours, with the release PRs
+    /// boxed above them. Open, what it last read, and where the cursor is.
+    prs_open: bool,
+    prs_mine: Vec<PrRow>,
+    prs_rel: Vec<PrRow>,
+    /// When the list on screen was read, so it can say how stale it is.
+    prs_at: u64,
+    prs_loading: bool,
+    prs_sel: usize,
+    /// Which release box the cursor was last on, so ↑ out of the list comes
+    /// back to it rather than to the first one.
+    prs_box: usize,
+    prs_query: Field,
+    /// Branch to the checkout holding it, so a row can say "wby-next3".
+    prs_where: HashMap<String, String>,
+    prs_focus: FocusHandle,
     // wby-next admin health: None = unknown, Some(true/false) = up/down
     admin_up: Option<bool>,
+    /// The host portless has registered for this checkout, re-read on every
+    /// health tick. It beats guessing from the folder name, which is only a
+    /// fallback for when nothing is serving yet.
+    app_url_live: Option<String>,
     /// Pane running the `admin` watch, when it was started from the topbar. Its
     /// own terminal tab, so the build log is there when it's wanted and out of
     /// the way when it isn't.
@@ -4493,14 +7049,85 @@ struct Storm {
     /// Plan usage windows, as last reported to the statusline shim, and whether
     /// the topbar chip's detail panel is open.
     limits: Option<usage::Limits>,
+    /// The resets this workspace was told to send through anyway. A spent plan
+    /// window stops TIDE sending prompts; this is the "send anyway" the composer
+    /// offers, keyed to the reset it was taken against so it lapses by itself
+    /// when the window rolls over instead of staying off for the next one.
+    usage_skip: Option<i64>,
     limits_open: bool,
     // custom workspace title (persisted); overrides the folder name in the UI
     ws_title: Option<String>,
+    /// The checkpoint inside the titled work — "UI auto syncing" under "AI
+    /// Chat". Short-lived by design: the agent moves it as the work moves.
+    ws_subtitle: Option<String>,
+    /// The open merge confirmation: merging is not undoable, so it is shown
+    /// against the full list of files it would land rather than a second click.
+    merge_confirm: Option<MergeConfirm>,
+    merge_focus: FocusHandle,
+    /// When review comments last went to the agent, and how many — the answer
+    /// to "did I send those?" without scrolling the transcript back.
+    review_sent: Option<(u64, usize)>,
+    // "open PR #…": a number to read, typed rather than filtered
+    prnum_open: bool,
+    prnum_query: Field,
+    prnum_focus: FocusHandle,
+    /// The markdown behind the rendered view, for the copy action.
+    md_source: String,
+    /// Drag selection in the rendered markdown view, as `(row, byte)` for each
+    /// end. Character-precise, like the agent transcript's: a rendered document
+    /// you can read but not quote is half a document.
+    md_sel: Option<(usize, usize, usize, usize)>,
+    md_sel_drag: bool,
+    /// A preview that just opened and hasn't been focused yet — focus needs a
+    /// Window, and the fetch that opens a PR body doesn't have one.
+    md_focus_pending: bool,
+    /// Handing work to another workspace: what goes, which one is picked, and
+    /// the focus the picker holds while it is up.
+    hand_open: bool,
+    hand_sel: usize,
+    hand_text: String,
+    hand_focus: FocusHandle,
+    /// Something was handed to this workspace's composer: claim focus for it
+    /// once there is a Window to do it with.
+    agent_focus_pending: bool,
+    /// A paste prompt that opened from a context menu, which has no Window.
+    paste_focus_pending: bool,
+    // rename prompt: the path being renamed and the name being typed
+    rn_path: Option<PathBuf>,
+    /// A paste waiting on its name: what to copy, where to, and whether the
+    /// source should be removed afterwards.
+    rn_paste: Option<(PathBuf, PathBuf, bool)>,
+    rn_query: Field,
+    rn_focus: FocusHandle,
+    /// Focus for the rendered-markdown view. Without it nothing in the pane
+    /// holds the `Editor` key context while a preview is up, so ⌘W and friends
+    /// have nowhere to dispatch from.
+    md_focus: FocusHandle,
+    /// A merge that is in flight, so the button can say so and refuse a second
+    /// click while GitHub is still thinking about the first.
+    pr_merging: Option<u64>,
+    /// A `/e2e` or `/vitest` comment on its way to the PR, so the button it
+    /// came from can say so and refuse a second click.
+    pr_cmd_posting: Option<&'static str>,
+    /// The window's phone link, pushed down from the Workspace so the agent
+    /// pane can hand it to you. Read-only here.
+    remote_url: Option<String>,
+    /// The same page by IP address, for a phone that won't resolve `.local`.
+    remote_url_ip: Option<String>,
+    /// Whether the link still works once you leave the house.
+    remote_far: bool,
+    /// PRs whose body is being re-read right now, so the header can say so
+    /// while you are already reading the cached one.
+    pr_syncing: HashSet<u64>,
+    /// What the squash actually landed as: the commit's short id and its full
+    /// message, which GitHub composes and nothing else shows you.
+    pr_merged_as: Option<(String, String)>,
     title_open: bool,
     title_focus: FocusHandle,
     title_query: Field,
     title_type: Option<usize>, // index into TITLE_TYPES; None = plain title
     title_client: Field,       // "who is this for" — optional, persisted
+    title_sub: Field,          // where the work stands inside the title
     title_field: usize,        // 0 = title, 1 = client (⇥ moves between them)
     ws_client: Option<String>, // the saved client for this workspace
 }
@@ -4508,6 +7135,10 @@ struct Storm {
 /// Navigation requests a project view sends up to the workspace.
 enum ProjectNav {
     Switch(usize),
+    /// Give another workspace something to work on: `send` posts it to its
+    /// agent, otherwise it waits in its composer. Either way TIDE switches to
+    /// it, because handing work over means going with it.
+    HandOff { to: usize, text: String, send: bool },
     /// Open the ⌘E switcher (the dialog lives on the parent).
     Switcher,
     Open,
@@ -4546,15 +7177,22 @@ fn git_ignored_paths(root: &Path) -> HashSet<PathBuf> {
 
 impl Storm {
     fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
+        // read once: a `#5619` in an answer is scanned per rendered row, and
+        // that is no place for a `git remote` call
+        let repo_web = github_base_url(&root);
+        let sent_at = load_review_sent(&root);
         let mut expanded = HashSet::new();
         expanded.insert(root.clone());
         let browser_default = default_browser_url(&root);
         let ws_title = load_ws_title(&root);
+        let ws_subtitle = load_ws_subtitle(&root);
         let ws_idle = load_ws_idle(&root);
         let ws_paused = load_ws_paused(&root);
         let ws_client = load_ws_client(&root);
         let agent_fresh = load_ws_fresh(&root);
+        let agent_titled = load_agent_titled(&root);
         let review = load_review(&root);
+        let todos = todo::load();
         let mut s = Self {
             root,
             expanded,
@@ -4569,6 +7207,7 @@ impl Storm {
             confirm_focus: cx.focus_handle(),
             confirm_revert: None,
             pr_files: Vec::new(),
+            pr_stats: HashMap::new(),
             pr_viewed: HashSet::new(),
             pr_viewed_pending: Arc::new(Mutex::new(HashMap::new())),
             pr_viewed_queued: Vec::new(),
@@ -4584,6 +7223,11 @@ impl Storm {
             pr_filter_focus: cx.focus_handle(),
             pr_view_filter: PrViewFilter::Unviewed, // start on what's left to review
             pr_rows: Vec::new(),
+            pr_commits_tab: false,
+            pr_commits: Vec::new(),
+            pr_commit_open: None,
+            pr_commit_files: Vec::new(),
+            pr_commit_collapsed: HashSet::new(),
             pr_shown_files: Vec::new(),
             pr_scroll: UniformListScrollHandle::new(),
             term_tabs: Vec::new(),
@@ -4626,6 +7270,8 @@ impl Storm {
             flash: None,
             flash_gen: 0,
             resizing_term: false,
+            term_h: 280.,
+            resizing_term_h: false,
             win_width: 1280.,
             win_height: 800.,
             editor_ctx: None,
@@ -4646,6 +7292,24 @@ impl Storm {
             ref_hits: HashMap::new(),
             files_scanned: false,
             all_dirs: Vec::new(),
+            todos,
+            todo_filter: Field::default(),
+            todo_filter_focus: cx.focus_handle(),
+            todo_here_only: true,
+            todo_open: false,
+            todo_focus: cx.focus_handle(),
+            todo_cat: None,
+            todo_status: 0,
+            todo_desc: Field::default(),
+            todo_details: Field::multiline(), // ↩ writes a line, ⌘↩ files the task
+            todo_link: Field::default(),
+            todo_scope: Field::default(),
+            todo_client: Field::default(),
+            todo_group: Field::default(),
+            todo_field: 0,
+            todo_edit: None,
+            todo_details_md: false,
+            todo_mtime: todo::mtime(),
             goto_open: false,
             goto_focus: cx.focus_handle(),
             goto_query: Field::default(),
@@ -4655,7 +7319,9 @@ impl Storm {
             branch: String::new(),
             branch_parent: None,
             pr_link: None,
+            pr_show_new: false,
             pr_link_branch: String::new(),
+            base_sync: None,
             mem_mb: 0,
             read_only: true, // read-only by default
             left_view: LeftView::Files,
@@ -4714,6 +7380,7 @@ impl Storm {
             find_results: Vec::new(),
             find_selected: 0,
             find_scope: Vec::new(),
+            find_scope_label: None,
             find_gen: 0,
             find_preview: None,
             find_scroll: ScrollHandle::new(),
@@ -4773,9 +7440,7 @@ impl Storm {
             agent_open: true,
             // when the terminal is revealed it gets a strip at the bottom, not
             // half the dock
-            agent_share: 0.78,
-            resizing_agent: false,
-            agent_zoomed: true,
+            term_folded: true,
             term_zoomed: false,
             acp: None,
             acp_polling: false,
@@ -4790,10 +7455,14 @@ impl Storm {
             agent_autoresume: false,
             agent_resumed: false,
             agent_fresh,
+            agent_titled,
             agent_picker: false,
             agent_brief_open: false,
+            agent_brief_text: String::new(),
             agent_title: None,
             agent_sel: None,
+            agent_sel_ch: None,
+            agent_sel_anchor: None,
             agent_sel_drag: false,
             agent_sel_armed: None,
             agent_sel_moved: false,
@@ -4809,10 +7478,25 @@ impl Storm {
             agent_turn_start: None,
             agent_briefed: false,
             agent_ghost: None,
+            agent_hist: None,
             at_open: false,
             at_start: 0,
             at_sel: 0,
             at_items: Vec::new(),
+            ctx_shot: None,
+            tours: Vec::new(),
+            md_find: Field::default(),
+            md_find_focus: cx.focus_handle(),
+            md_find_open: false,
+            md_find_at: 0,
+            md_scroll: gpui::ScrollHandle::new(),
+            tour_ask: Field::default(),
+            tour_ask_focus: cx.focus_handle(),
+            ctx_reply: None,
+            walk: None,
+            tour_jump: None,
+            reviewers: Vec::new(),
+            agent_tab: 0,
             agent_mentions: HashMap::new(),
             agent_jump_open: false,
             agent_jump_query: Field::default(),
@@ -4836,7 +7520,6 @@ impl Storm {
             git_details_msg: String::new(),
             git_details_files: Vec::new(),
             git_scroll: ScrollHandle::new(),
-            browser_open: false,
             browser: None,
             browser_url: {
                 let mut f = Field::default();
@@ -4844,20 +7527,72 @@ impl Storm {
                 f
             },
             browser_focus: cx.focus_handle(),
+            mirror: None,
+            mirror_frame: None,
+            mirror_drop: Vec::new(),
+            mirror_polling: false,
+            mirror_watching: false,
+            mirror_origin: (0., 0.),
+            mirror_width: 0.,
+            mirror_focus: cx.focus_handle(),
+            mirror_url_seen: String::new(),
+            repo_web: repo_web.clone(),
+            prs_open: false,
+            prs_mine: Vec::new(),
+            prs_rel: Vec::new(),
+            prs_at: 0,
+            prs_loading: false,
+            prs_sel: 0,
+            prs_box: 0,
+            prs_query: Field::default(),
+            prs_where: HashMap::new(),
+            prs_focus: cx.focus_handle(),
             admin_up: None,
+            app_url_live: None,
             admin_pane: None,
             watch_pane: None,
             watch_pkgs: Vec::new(),
             admin_spin: 0,
             admin_autoopen: false,
             limits: None,
+            usage_skip: None,
             limits_open: false,
             ws_title,
+            ws_subtitle,
+            merge_confirm: None,
+            merge_focus: cx.focus_handle(),
+            review_sent: sent_at,
+            prnum_open: false,
+            prnum_query: Field::default(),
+            prnum_focus: cx.focus_handle(),
+            md_source: String::new(),
+            md_sel: None,
+            md_sel_drag: false,
+            md_focus_pending: false,
+            hand_open: false,
+            hand_sel: 0,
+            hand_text: String::new(),
+            hand_focus: cx.focus_handle(),
+            agent_focus_pending: false,
+            paste_focus_pending: false,
+            rn_path: None,
+            rn_paste: None,
+            rn_query: Field::default(),
+            rn_focus: cx.focus_handle(),
+            md_focus: cx.focus_handle(),
+            pr_merging: None,
+            pr_cmd_posting: None,
+            remote_url: None,
+            remote_url_ip: None,
+            remote_far: false,
+            pr_syncing: HashSet::new(),
+            pr_merged_as: None,
             title_open: false,
             title_focus: cx.focus_handle(),
             title_query: Field::default(),
             title_type: None,
             title_client: Field::default(),
+            title_sub: Field::default(),
             title_field: 0,
             ws_client,
         };
@@ -4881,13 +7616,17 @@ impl Storm {
         s.start_agent_poll(cx);
         s.start_pane_cmd_poll(cx);
         s.lsp = Lsp::new(&s.root);
-        // One plain shell. Claude Code itself lives in the agent pane now, so
-        // there's no `cc --continue` pane to reserve half the dock for.
-        let root = s.root.clone();
-        let rpc = s.rpc_env();
-        let shell = cx.new(|cx| Terminal::new(root, rpc, cx));
+        // No shell at startup. The agent pane is the surface you land on, and a
+        // terminal that nobody asked for is a tab in the way: ⌘T, ⌥F12, or
+        // anything that runs a command (wdev, wwp, a build) opens its own.
+        // every tour this workspace has been given; the one left open comes
+        // back, standing where it was
+        s.tours = load_tours(&s.root);
+        s.walk = s.tours.iter().find(|t| !t.closed).map(|t| walk_from_rec(t, false));
+        if s.walk.is_some() {
+            s.load_tour_diff(cx); // a restored tour draws in the same colours
+        }
         s.sync_comment_gutters(cx); // markers for comments restored from disk
-        s.term_tabs.push(TermTab::new(shell));
         s
     }
 
@@ -4896,6 +7635,8 @@ impl Storm {
     fn input_visible(&self) -> bool {
         self.finder_open
             || self.goto_open
+            || self.todo_open
+            || self.prs_open
             || self.br_open
             || self.nf_open
             || self.prc_open
@@ -4932,10 +7673,23 @@ impl Storm {
         }
         let running = self.watch_terminal(cx).is_some();
         let n = pkgs.len();
+        // which packages, and which set: this counts everything the branch
+        // changes, not what is still uncommitted, so it rarely matches the
+        // Commit panel's number and the tooltip has to say why
+        let base = self.review_base();
+        let base = base.strip_prefix("origin/").unwrap_or(&base).to_string();
         let tip_text = if running {
-            format!("Watching:\n{}\n\nclick for its log, ⌥click to stop", pkgs.join("\n"))
+            format!(
+                "Watching the {n} package{} this branch changes vs {base}:\n{}\n\nclick for its log, ⌥click to stop",
+                if n == 1 { "" } else { "s" },
+                pkgs.join("\n")
+            )
         } else {
-            format!("Run `wwp` to watch:\n{}", pkgs.join("\n"))
+            format!(
+                "Run `wwp` to watch the {n} package{} this branch changes vs {base}:\n{}",
+                if n == 1 { "" } else { "s" },
+                pkgs.join("\n")
+            )
         };
         Some(
             div()
@@ -4973,6 +7727,12 @@ impl Storm {
     /// which is why the id is a parameter.
     fn admin_play_btn(&self, id: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
         let ours = self.admin_terminal(cx).is_some(); // started from here, so stoppable
+        // the release lines have no standalone server, so say which one runs
+        let run_tip = if self.legacy_admin() {
+            "Run `admin` in its own terminal tab (this branch targets a release line)"
+        } else {
+            "Run `wdev` in its own terminal tab (api + admin on one URL)"
+        };
         let up = self.admin_up == Some(true);
         let building = ours && !up;
         const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -4997,20 +7757,20 @@ impl Storm {
             .child(glyph)
             .tooltip(move |_w, cx| {
                 let text = if building {
-                    "admin is building — opens in your browser when it answers; click to stop, ⌥click for its log"
+                    "building — opens in your browser when it answers; click to stop, ⌥click for its log"
                 } else if up && ours {
-                    "admin is up — click to stop it, ⌥click for its log"
+                    "up — click to stop it, ⌥click for its log"
                 } else if up {
-                    "admin is up, but it wasn't started from TIDE"
+                    "the project is up, but it wasn't started from TIDE"
                 } else {
-                    "Run `admin` in its own terminal tab"
+                    run_tip
                 };
                 cx.new(|_| TooltipView { text: text.into() }).into()
             })
             .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
                 match (running, ev.modifiers().alt) {
                     // no pane of ours to stop or show: it was started elsewhere
-                    (true, _) if !ours => this.show_flash("Admin wasn't started from TIDE", cx),
+                    (true, _) if !ours => this.show_flash("It wasn't started from TIDE", cx),
                     (true, true) => this.show_admin_log(window, cx),
                     (true, false) => this.stop_admin(cx),
                     _ => this.start_admin(window, cx),
@@ -5018,12 +7778,41 @@ impl Storm {
             }))
     }
 
+    /// True when this workspace's work targets an old release line, so the local
+    /// app is `admin` rather than `wdev`. The PR's base branch decides it; with
+    /// no PR yet, whatever the branch came off does.
+    fn legacy_admin(&self) -> bool {
+        let target = self
+            .pr_link
+            .as_ref()
+            .map(|(_, _, _, b, _, _)| b.clone())
+            .filter(|b| !b.is_empty())
+            .or_else(|| self.branch_parent.clone());
+        legacy_admin(&self.branch, target.as_deref())
+    }
+
+    /// Where this workspace's local app serves, if it has one. The live portless
+    /// route wins; the name-based guess only fills in before anything is up.
+    fn app_url(&self) -> Option<String> {
+        self.app_url_live.clone().or_else(|| admin_url(&self.root, self.legacy_admin()))
+    }
+
     /// Poll the wby-next admin URL periodically (every ~15s) and cache up/down.
     fn start_admin_health(&self, cx: &mut Context<Self>) {
-        let Some(url) = admin_url(&self.root) else { return };
-        let host = url.trim_start_matches("https://").trim_start_matches("http://").to_string();
-        let open_url = url.clone();
+        if self.app_url().is_none() {
+            return; // not a wby-next project: nothing to poll
+        }
         cx.spawn(async move |this, cx| loop {
+            // re-read every tick: checking out a release branch moves the app
+            // from wby{N}.localhost to admin{N}.localhost
+            let Ok(root) = this.read_with(cx, |this, _| this.root.clone()) else { break };
+            let live = cx.background_executor().spawn(async move { portless_url(&root) }).await;
+            if this.update(cx, |this, _| this.app_url_live = live).is_err() {
+                break;
+            }
+            let Ok(Some(url)) = this.read_with(cx, |this, _| this.app_url()) else { break };
+            let host = url.trim_start_matches("https://").trim_start_matches("http://").to_string();
+            let open_url = url.clone();
             let u = url.clone();
             let up = cx.background_executor().spawn(async move { admin_reachable(&u) }).await;
             // while a build we started is still coming up, check often so the
@@ -5032,7 +7821,7 @@ impl Storm {
                 let became_up = up && this.admin_up != Some(true);
                 this.admin_up = Some(up);
                 if became_up && this.admin_pane.is_some() {
-                    this.show_flash(&format!("Admin is up — {host}"), cx);
+                    this.show_flash(&format!("Up — {host}"), cx);
                     // the build we kicked off just started serving: show it
                     if std::mem::take(&mut this.admin_autoopen) {
                         open_browser(&open_url);
@@ -5135,6 +7924,44 @@ impl Storm {
         .detach();
     }
 
+    /// The plan windows that are spent, as (what it is, when it comes back).
+    /// Empty when there's room, or when no reading has arrived — an absent
+    /// reading is not a full one, and guessing would block work for nothing.
+    fn usage_spent(&self) -> Vec<(&'static str, i64)> {
+        usage_spent(self.limits.as_ref())
+    }
+
+    /// What the skip is taken against: the last of the spent windows to come
+    /// back. Skipping while both are full shouldn't have to be done twice, and
+    /// a skip shouldn't survive the window it was meant for.
+    fn usage_skip_key(&self) -> Option<i64> {
+        self.usage_spent().iter().map(|(_, r)| *r).max()
+    }
+
+    /// Why sending is off, in one sentence, or None when it isn't.
+    ///
+    /// At 100% a prompt can only come back as a rate-limit error, and an error
+    /// is a worse answer than not sending: the turn is gone and the message
+    /// with it. Turns already running are left alone — stopping one mid-flight
+    /// would throw away work that has already been paid for.
+    fn usage_block(&self) -> Option<String> {
+        if self.usage_skip.is_some() && self.usage_skip == self.usage_skip_key() {
+            return None;
+        }
+        usage_block_text(&self.usage_spent())
+    }
+
+    /// Send anyway, until this window rolls over. Anything held in the queue
+    /// goes now rather than waiting for a turn that can't start on its own.
+    fn skip_usage_block(&mut self, cx: &mut Context<Self>) {
+        self.usage_skip = self.usage_skip_key();
+        self.show_flash("Sending anyway until the window resets", cx);
+        if !self.agent_busy {
+            self.agent_next_queued();
+        }
+        cx.notify();
+    }
+
     /// Re-read the statusline dump so the usage chip follows the session. Cheap:
     /// one small file, and only when it changed.
     fn start_usage_poll(&self, cx: &mut Context<Self>) {
@@ -5143,7 +7970,14 @@ impl Storm {
             if this
                 .update(cx, |this, cx| {
                     if this.limits != l {
+                        let was_blocked = this.usage_block().is_some();
                         this.limits = l;
+                        // the window rolled over while something sat in the
+                        // queue: send it rather than wait for a turn that can
+                        // never end, since none is running
+                        if was_blocked && this.usage_block().is_none() && !this.agent_busy {
+                            this.agent_next_queued();
+                        }
                         cx.notify();
                     }
                 })
@@ -5243,14 +8077,19 @@ impl Storm {
         let (was_tab, was_terminal) = (self.active_term, self.show_terminal);
         self.new_terminal(window, cx);
         let Some(t) = self.focused_pane(window, cx) else { return };
-        t.read(cx).send_text("admin\n");
+        // `wdev` puts api and admin behind one portless URL (wby{N}.localhost),
+        // which is the whole project rather than the admin app on its own. The
+        // 6.4 / 6.5 release lines have no standalone server, so work aimed there
+        // still runs the admin app by itself.
+        let legacy = self.legacy_admin();
+        t.read(cx).send_text(if legacy { "admin\n" } else { "wdev\n" });
         self.admin_pane = Some(t.entity_id().as_u64());
         self.admin_up = None; // unknown until it answers
         self.admin_spin = 0;
         self.admin_autoopen = true; // show it as soon as it's actually serving
         self.start_admin_spinner(cx);
         if let Some(tab) = self.term_tabs.get_mut(self.active_term) {
-            tab.title = Some("Admin".into());
+            tab.title = Some(if legacy { "Admin".into() } else { "Dev".to_string() });
         }
         // hand focus back: this is meant to run in the background
         if was_tab < self.term_tabs.len() {
@@ -5258,14 +8097,15 @@ impl Storm {
         }
         self.show_terminal = was_terminal;
         self.focus_active(window, cx);
-        self.show_flash("Started admin — logs in its own terminal tab", cx);
+        let cmd = if legacy { "admin" } else { "wdev" };
+        self.show_flash(&format!("Started {cmd} — logs in its own terminal tab"), cx);
         cx.notify();
     }
 
     /// Jump to the admin tab (its build log).
     fn show_admin_log(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(t) = self.admin_terminal(cx) else {
-            self.show_flash("admin isn't running", cx);
+            self.show_flash("nothing is running", cx);
             return;
         };
         let id = t.entity_id();
@@ -5286,14 +8126,25 @@ impl Storm {
         let Some(t) = self.admin_terminal(cx) else { return };
         t.read(cx).send_text("\x03");
         self.admin_autoopen = false; // a stop cancels the pending browser open
-        self.show_flash("Stopped admin", cx);
+        self.show_flash("Stopped the local app", cx);
         cx.notify();
     }
 
-    /// Re-check admin health now (used by the summary Refresh button).
+    /// Re-check admin health now (used by the summary Refresh button). Re-reads
+    /// the portless route too, so ⌘R also catches a watch that moved host.
     fn check_admin_now(&self, cx: &mut Context<Self>) {
-        let Some(url) = admin_url(&self.root) else { return };
+        if self.app_url().is_none() {
+            return;
+        }
+        let root = self.root.clone();
         cx.spawn(async move |this, cx| {
+            let live = cx.background_executor().spawn(async move { portless_url(&root) }).await;
+            let Ok(Some(url)) = this.update(cx, |this, _| {
+                this.app_url_live = live;
+                this.app_url()
+            }) else {
+                return;
+            };
             let up = cx.background_executor().spawn(async move { admin_reachable(&url) }).await;
             this.update(cx, |this, cx| { this.admin_up = Some(up); cx.notify(); }).ok();
         })
@@ -5340,7 +8191,7 @@ impl Storm {
     }
 
     fn focus_pane(&mut self, t: &Entity<Terminal>, window: &mut Window, cx: &mut Context<Self>) {
-        self.agent_zoomed = false; // a pane can't take focus while the agent covers it
+        self.term_folded = false; // a pane can't take focus while the agent covers it
         if let Some(tab) = self.term_tabs.get_mut(self.active_term) {
             tab.active = t.entity_id();
         }
@@ -5351,6 +8202,561 @@ impl Storm {
     /// `(url, token)` handed to every pane shell so agents can report back.
     fn rpc_env(&self) -> Option<(String, String)> {
         self.agent_rpc.as_ref().map(|s| (s.url(), s.token.clone()))
+    }
+
+    /// Hand a task to this workspace's agent and mark it in progress. The
+    /// point is not having to copy the thing you already wrote down.
+    fn start_todo(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(t) = self.todos.iter().find(|t| t.id == id).cloned() else { return };
+        todo::set_status(&mut self.todos, id, todo::Status::Doing);
+        self.save_todos();
+        // everything the line knows, in the order it reads: what, then why,
+        // then the trimmings that narrow it down
+        let mut prompt = format!("Start working on this, from my todo list:\n\n{}", t.text);
+        if !t.details.is_empty() {
+            prompt.push_str(&format!("\n\n{}", t.details));
+        }
+        let mut about: Vec<String> = Vec::new();
+        if !t.category.is_empty() {
+            about.push(format!("type: {}", t.category));
+        }
+        if !t.scope.is_empty() {
+            about.push(format!("scope: {}", t.scope));
+        }
+        if !t.client.is_empty() {
+            about.push(format!("client: {}", t.client));
+        }
+        if !t.group.is_empty() {
+            about.push(format!("part of: {}", t.group));
+        }
+        if !t.link.is_empty() {
+            about.push(t.link.clone());
+        }
+        if !about.is_empty() {
+            prompt.push_str(&format!("\n\n({})", about.join("  ·  ")));
+        }
+        self.focus_agent(window, cx);
+        self.send_agent_prompt_as(prompt, None, cx);
+        self.show_flash("Handed to the agent — marked in progress", cx);
+        cx.notify();
+    }
+
+    /// What a review diffs against: the *remote* base branch. The local one can
+    /// be days behind — that's the same staleness the PR pane warns about — and
+    /// a review of `next...HEAD` against a stale `next` reports a thousand files
+    /// that aren't in the PR at all.
+    fn review_base(&self) -> String {
+        let name = self
+            .pr_link
+            .as_ref()
+            .map(|(_, _, _, b, _, _)| b.clone())
+            .filter(|b| !b.is_empty())
+            .or_else(|| self.branch_parent.clone())
+            .unwrap_or_else(|| git_default_branch(&self.root));
+        format!("origin/{name}")
+    }
+
+    /// Start the reviewers: one session per reviewer, in parallel, each with its
+    /// own brief. They report into the main thread when the last one finishes.
+    fn run_reviewers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.reviewers.iter().any(|r| !r.done) {
+            self.show_flash("The reviewers are still working", cx);
+            return;
+        }
+        // two more sessions is the most expensive thing on this menu, so it
+        // waits out a spent window like anything else
+        if let Some(why) = self.usage_block() {
+            self.show_flash(&format!("{why}. Send anyway from the composer."), cx);
+            return;
+        }
+        // last round's tabs go when a new one starts
+        for r in self.reviewers.drain(..) {
+            r.acp.shutdown();
+        }
+        self.agent_tab = 0;
+        let base = self.review_base();
+        let briefs: [(&'static str, String); 2] = [
+            (
+                "slop cop",
+                format!(
+                    "You are reviewing the branch in this repo against `{base}`, the way the \
+                     Slop Cop check does in CI. Run `git fetch origin --quiet` first: the \
+                     local base branch is often days behind, and diffing against it reports \
+                     hundreds of files that aren't in this branch at all.\n\n\
+                     Two questions, nothing else.\n\n\
+                     1. Integrity. Read the diff (`git diff {base}...HEAD`) and the commits \
+                     against what the branch says it does (its PR title and body if it has a \
+                     PR, `gh pr view` — otherwise the commit messages). Does the footprint \
+                     match the stated intent? Flag anything that looks like it shouldn't be \
+                     here: files from a bad rebase or merge, wiped commits, leaked secrets, \
+                     committed debug code, conflict markers.\n\n\
+                     2. House style. Read every rule in `ai-context/code-style/*.md` and check \
+                     the diff's ADDED lines against them. Cite the rule file you're applying.\n\n\
+                     Report findings only. Don't change code, don't commit, don't push. Be \
+                     specific: file, line, what's wrong, and why it matters. If there is \
+                     nothing to report, say so in one line."
+                ),
+            ),
+            (
+                "code rabbit",
+                format!(
+                    "Run `git fetch origin --quiet` first (a stale local base branch makes \
+                     the review hundreds of files too big), then run CodeRabbit's CLI over \
+                     this branch and triage what it says:\n\n\
+                     \x20 coderabbit review --agent --base {base}\n\n\
+                     Then go through its findings and sort them: which are real problems in \
+                     this diff, which are noise or already handled, and which need a human \
+                     decision. For each real one, name the file and line and say what's \
+                     actually wrong in your own words — don't copy the tool's wording. Don't \
+                     change code, don't commit, don't push. If the CLI can't run, say why in \
+                     one line and stop."
+                ),
+            ),
+        ];
+        for (name, brief) in briefs {
+            let Some(acp) = acp::Acp::new(&self.root, self.rpc_env()) else {
+                self.show_flash("Can't start a reviewer — is `npx` (Node 22+) on PATH?", cx);
+                self.reviewers.clear();
+                return;
+            };
+            self.reviewers.push(Reviewer {
+                name,
+                acp,
+                text: brief, // holds the brief until the session is ready to take it
+                log: Vec::new(),
+                done: false,
+                reported: false,
+                sent: false,
+                started: std::time::Instant::now(),
+                finished: None,
+            });
+        }
+        // a card in the transcript, so the pane says what it is waiting for
+        self.agent_msgs.retain(|m| !matches!(m, AgentMsg::Reviewing));
+        self.agent_msgs.push(AgentMsg::Reviewing);
+        self.agent_cur = None;
+        self.agent_list.scroll_to_end();
+        self.start_reviewer_poll(cx);
+        self.show_flash("Two reviewers reading the branch…", cx);
+        self.focus_agent(window, cx);
+        cx.notify();
+    }
+
+    /// Drive the reviewer sessions: send each its brief once its adapter is up,
+    /// collect what it says, and hand everything to the main thread when the
+    /// last one is done.
+    fn start_reviewer_poll(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_millis(150)).await;
+            let alive = this.update(cx, |this, cx| {
+                if this.reviewers.is_empty() {
+                    return false;
+                }
+                let before: Vec<(usize, usize, bool)> = this
+                    .reviewers
+                    .iter()
+                    .map(|r| (r.text.len(), r.log.len(), r.done))
+                    .collect();
+                for r in this.reviewers.iter_mut() {
+                    // a reviewer that has said nothing for a quarter of an hour
+                    // is stuck, not thinking: take what it has and move on
+                    if r.sent && !r.done && r.started.elapsed().as_secs() > 900 {
+                        r.text.push_str("\n(gave up waiting on this reviewer)");
+                        r.done = true;
+                        r.finished = Some(std::time::Instant::now());
+                        continue;
+                    }
+                    if !r.sent {
+                        if r.acp.is_ready() {
+                            let brief = std::mem::take(&mut r.text);
+                            r.acp.prompt(&brief);
+                            r.sent = true;
+                        } else if r.started.elapsed().as_secs() > 90 {
+                            r.text = "(this reviewer's adapter never came up)".into();
+                            r.done = true;
+                            r.finished = Some(std::time::Instant::now());
+                        }
+                        continue;
+                    }
+                    for ev in r.acp.drain() {
+                        match ev {
+                            acp::AcpEvent::Text(t) => r.text.push_str(&t),
+                            // what it's doing, so a long read is legible
+                            acp::AcpEvent::Tool { title, .. } => {
+                                let line = title.lines().next().unwrap_or_default().to_string();
+                                if !line.is_empty() && r.log.last() != Some(&line) {
+                                    r.log.push(line);
+                                }
+                                if r.log.len() > 200 {
+                                    r.log.remove(0);
+                                }
+                            }
+                            acp::AcpEvent::ToolUpdate { title: Some(t), .. } => {
+                                let line = t.lines().next().unwrap_or_default().to_string();
+                                if !line.is_empty() {
+                                    // the announcement comes before the input has
+                                    // finished streaming; this is the real command
+                                    if let Some(last) = r.log.last_mut() {
+                                        *last = line;
+                                    }
+                                }
+                            }
+                            acp::AcpEvent::TurnEnd => {
+                                r.done = true;
+                                r.finished = Some(std::time::Instant::now());
+                            }
+                            acp::AcpEvent::Error(e) => {
+                                r.text.push_str(&format!("\n(reviewer failed: {e})"));
+                                r.done = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if this.reviewers.iter().all(|r| r.done) && this.reviewers.iter().any(|r| !r.reported)
+                {
+                    let reports: Vec<(&'static str, String)> = this
+                        .reviewers
+                        .iter_mut()
+                        .map(|r| {
+                            r.acp.shutdown(); // its question is answered; the tab is just text now
+                            r.reported = true;
+                            (r.name, r.text.trim().to_string())
+                        })
+                        .collect();
+                    this.deliver_reviews(reports, cx);
+                    return false; // the tabs stay; nothing left to poll
+                }
+                // repaint only when something actually moved
+                let after: Vec<(usize, usize, bool)> = this
+                    .reviewers
+                    .iter()
+                    .map(|r| (r.text.len(), r.log.len(), r.done))
+                    .collect();
+                if before != after || this.agent_tab > 0 {
+                    cx.notify();
+                }
+                true
+            });
+            if !matches!(alive, Ok(true)) {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// Hand both reports to the session you're actually talking to.
+    fn deliver_reviews(&mut self, reports: Vec<(&'static str, String)>, cx: &mut Context<Self>) {
+        let body: String = reports
+            .iter()
+            .map(|(name, text)| {
+                let text = if text.is_empty() { "(said nothing)" } else { text.as_str() };
+                format!("## {name}\n\n{text}\n\n")
+            })
+            .collect();
+        let names: Vec<&str> = reports.iter().map(|(n, _)| *n).collect();
+        let n = names.len();
+        let who = names.join(" and ");
+        // the summary is sectioned by reviewer, and the sections are named here
+        // rather than in the briefing, so adding a third reviewer sections the
+        // card for it without anything else changing
+        let headings = names.iter().map(|n| format!("`## {n}`")).collect::<Vec<_>>().join(", ");
+        let prompt = format!(
+            "{n} reviewers read this branch in their own sessions — {who}. Their reports:\n\n\
+             {body}\
+             Work through them: fix what's real, and for anything you disagree with, say why \
+             rather than changing code to satisfy a reviewer. They saw the diff and nothing \
+             else, so they may be wrong about intent — you have the conversation.\n\n\
+             When you're done, post the summary with one section per reviewer — {headings} — \
+             saying what you took from that reviewer and what you turned down. Anything that \
+             wasn't either reviewer's point goes under `## Other`. Title it \"Reviewers\"."
+        );
+        // the reports replace the waiting card
+        self.agent_msgs.retain(|m| !matches!(m, AgentMsg::Reviewing));
+        self.send_agent_prompt_as(
+            prompt,
+            Some(format!("Reviewers · {}", names.join(" + "))),
+            cx,
+        );
+        self.show_flash("Reviews handed to the agent", cx);
+        cx.notify();
+    }
+
+    /// Run CodeRabbit's CLI over the working tree and hand its findings to the
+    /// agent in this workspace. The point is the round trip: a review you'd
+    /// otherwise wait for CI to run, read by the agent that can act on it.
+    fn run_local_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let base = self.review_base();
+        let root = self.root.clone();
+        self.show_flash(&format!("CodeRabbit is reviewing against {base}…"), cx);
+        self.focus_agent(window, cx);
+        cx.spawn(async move |this, cx| {
+            let out = cx
+                .background_executor()
+                .spawn(async move {
+                    // the remote base is the one the PR is measured against, and
+                    // it has to be current before anything is diffed
+                    let _ = Command::new("git")
+                        .args(["fetch", "origin", "--quiet"])
+                        .current_dir(&root)
+                        .output();
+                    let res = Command::new("coderabbit")
+                        .args(["review", "--agent", "--base", &base])
+                        .current_dir(&root)
+                        .output();
+                    match res {
+                        Ok(o) => {
+                            let mut text = String::from_utf8_lossy(&o.stdout).to_string();
+                            if text.trim().is_empty() {
+                                text = String::from_utf8_lossy(&o.stderr).to_string();
+                            }
+                            // a review can run long; keep the prompt sane
+                            text.chars().take(24_000).collect::<String>()
+                        }
+                        Err(e) => format!("could not run `coderabbit`: {e}"),
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                let prompt = format!(
+                    "I ran CodeRabbit over this branch locally. Its findings are below.\n\n\
+                     Work through them: fix what's real, and for anything you disagree with, \
+                     say why rather than changing code to satisfy it. Don't paste the report \
+                     back at me.\n\n{out}"
+                );
+                this.send_agent_prompt_as(prompt, Some("Local review · CodeRabbit".into()), cx);
+                this.show_flash("Review handed to the agent", cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// A screenshot the agent posted to `/shot`: read it off disk and put it in
+    /// the transcript, next to whatever it was saying about it.
+    fn show_agent_shot(&mut self, shot: &rpc::Shot, cx: &mut Context<Self>) {
+        // a relative path is relative to the workspace, so `./shot.png` works
+        let path = PathBuf::from(&shot.path);
+        let path = if path.is_absolute() { path } else { self.root.join(path) };
+        let Ok(bytes) = std::fs::read(&path) else {
+            self.show_flash(&format!("No screenshot at {}", shot.path), cx);
+            return;
+        };
+        const MAX: usize = 12 * 1024 * 1024;
+        if bytes.len() > MAX {
+            self.show_flash("That screenshot is too large to show", cx);
+            return;
+        }
+        let format = match path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase().as_str() {
+            "jpg" | "jpeg" => gpui::ImageFormat::Jpeg,
+            "gif" => gpui::ImageFormat::Gif,
+            "webp" => gpui::ImageFormat::Webp,
+            _ => gpui::ImageFormat::Png,
+        };
+        self.agent_msgs.push(AgentMsg::Shot {
+            note: shot.note.clone(),
+            dims: image_size(&bytes).map(|(w, h)| (w as f32, h as f32)),
+            image: Arc::new(gpui::Image::from_bytes(format, bytes)),
+            path,
+        });
+        self.agent_list.scroll_to_end();
+        cx.notify();
+    }
+
+    /// Tasks the agent filed through `/todo`. A batch out of one session belongs
+    /// together, so anything that didn't name a group gets this workspace's
+    /// title (its folder when it has no title) — that's the grouping you'd have
+    /// typed yourself.
+    fn file_agent_todos(&mut self, filed: Vec<rpc::NewTodo>, cx: &mut Context<Self>) {
+        let fallback = self
+            .ws_title
+            .clone()
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| self.folder_name());
+        let origin = self.folder_name();
+        self.todos = todo::load(); // another workspace may have written since
+        let (mut added, mut edited, mut removed, mut unknown) = (0, 0, 0, 0);
+        for t in filed {
+            // an id says which line this is about; without one it's a new task,
+            // which is what makes an unknown id worth reporting rather than
+            // quietly filing as a duplicate
+            if !t.id.is_empty() {
+                if !self.todos.iter().any(|x| x.id == t.id) {
+                    unknown += 1;
+                    continue;
+                }
+                if t.delete {
+                    todo::remove(&mut self.todos, &t.id);
+                    removed += 1;
+                    continue;
+                }
+                if let Some(cur) = self.todos.iter_mut().find(|x| x.id == t.id) {
+                    // only what the request actually carried
+                    if let Some(v) = t.text.filter(|v| !v.is_empty()) {
+                        cur.text = v;
+                    }
+                    if let Some(v) = t.details {
+                        cur.details = v;
+                    }
+                    if let Some(v) = t.category {
+                        cur.category = category_key(&v).to_string();
+                    }
+                    if let Some(s) = t.status.as_deref().and_then(todo::Status::parse) {
+                        cur.status = s;
+                    }
+                    if let Some(v) = t.link {
+                        cur.link = v;
+                    }
+                    if let Some(v) = t.scope {
+                        cur.scope = v;
+                    }
+                    if let Some(v) = t.client {
+                        cur.client = v;
+                    }
+                    if let Some(v) = t.group.filter(|v| !v.is_empty()) {
+                        cur.group = v;
+                    }
+                    edited += 1;
+                }
+                continue;
+            }
+            let group = t.group.filter(|g| !g.is_empty()).unwrap_or_else(|| fallback.clone());
+            let status =
+                t.status.as_deref().and_then(todo::Status::parse).unwrap_or(todo::Status::Todo);
+            added += todo::add(
+                &mut self.todos,
+                random_id(),
+                &t.text.unwrap_or_default(),
+                &t.details.unwrap_or_default(),
+                category_key(&t.category.unwrap_or_default()),
+                status,
+                &t.link.unwrap_or_default(),
+                &t.scope.unwrap_or_default(),
+                &t.client.unwrap_or_default(),
+                &group,
+                &origin,
+            ) as usize;
+        }
+        self.save_todos();
+        let mut parts = Vec::new();
+        if added > 0 {
+            parts.push(format!("filed {added}"));
+        }
+        if edited > 0 {
+            parts.push(format!("updated {edited}"));
+        }
+        if removed > 0 {
+            parts.push(format!("removed {removed}"));
+        }
+        let what = if parts.is_empty() {
+            "changed nothing on".to_string()
+        } else {
+            format!("{} on", parts.join(", "))
+        };
+        let mut msg = format!("Agent {what} the todo list");
+        if unknown > 0 {
+            msg.push_str(&format!(" — {unknown} unknown id(s) ignored"));
+        }
+        self.show_flash(&msg, cx);
+        cx.notify();
+    }
+
+    /// The transcript as the phone renders it: who said it, what kind of thing
+    /// it is, and the text. Tool calls are their command line and nothing else
+    /// — on a phone the output is noise you can't act on.
+    fn thread_json(&self) -> String {
+        let msgs: Vec<serde_json::Value> = self
+            .agent_msgs
+            .iter()
+            .rev()
+            .take(60) // the recent end is what you came back for
+            .rev()
+            .map(|m| match m {
+                AgentMsg::User { text, by, imgs } => serde_json::json!({
+                    "k": if *by == Sender::Tide { "tide" } else { "you" },
+                    "w": if *by == Sender::Tide { "TIDE" } else { "You" },
+                    "t": text,
+                    "imgs": imgs.iter().map(|i| img_id(i.image.id())).collect::<Vec<_>>(),
+                }),
+                AgentMsg::Agent(t) => serde_json::json!({ "k": "agent", "w": "Claude", "t": t }),
+                AgentMsg::Thought(t) => {
+                    serde_json::json!({ "k": "tool", "w": "thinking", "t": t })
+                }
+                AgentMsg::Summary { title, text } => serde_json::json!({
+                    "k": "sum",
+                    "w": if title.trim().is_empty() { "summary" } else { title.as_str() },
+                    "t": text,
+                }),
+                AgentMsg::Reviewing => serde_json::json!({
+                    "k": "tool", "w": "reviewers", "t": "reading the branch…",
+                }),
+                // the picture itself, not a note saying one exists elsewhere:
+                // "look at the screenshot" is useless on a phone that can't
+                AgentMsg::Shot { note, image, .. } => serde_json::json!({
+                    "k": "shot",
+                    "w": "screenshot",
+                    "t": note,
+                    "imgs": [img_id(image.id())],
+                }),
+                AgentMsg::Tool { title, status, .. } => serde_json::json!({
+                    "k": "tool",
+                    "w": status,
+                    "t": title.lines().next().unwrap_or_default(),
+                }),
+            })
+            .collect();
+        serde_json::json!({
+            "folder": self.folder_name(),
+            "title": self.ws_title.clone().unwrap_or_default(),
+            "busy": self.agent_busy,
+            "msgs": msgs,
+        })
+        .to_string()
+    }
+
+    /// Every picture the serialised transcript points at. The caller uploads
+    /// the ones the phone doesn't have yet; the id is gpui's content hash, so
+    /// the same picture is never sent twice.
+    fn thread_images(&self) -> Vec<(u64, String, Arc<gpui::Image>)> {
+        self.agent_msgs
+            .iter()
+            .rev()
+            .take(60)
+            .flat_map(|m| match m {
+                AgentMsg::User { imgs, .. } => imgs
+                    .iter()
+                    .map(|i| (i.image.id(), i.mime.clone(), i.image.clone()))
+                    .collect::<Vec<_>>(),
+                AgentMsg::Shot { image, .. } => {
+                    vec![(image.id(), image.format.mime_type().to_string(), image.clone())]
+                }
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    /// This workspace as JSON: the folder it lives in, the title TIDE shows for
+    /// it, and the branch. An agent naming its workspace in a PR body reads this
+    /// rather than guessing from the path.
+    fn workspace_info(&self) -> String {
+        // the branch this one merges into: what a local review diffs against
+        let base = self
+            .pr_link
+            .as_ref()
+            .map(|(_, _, _, b, _, _)| b.clone())
+            .filter(|b| !b.is_empty())
+            .or_else(|| self.branch_parent.clone())
+            .unwrap_or_default();
+        serde_json::json!({
+            "folder": self.folder_name(),
+            "title": self.ws_title.clone().unwrap_or_default(),
+            "subtitle": self.ws_subtitle.clone().unwrap_or_default(),
+            "root": self.root.to_string_lossy(),
+            "branch": self.branch,
+            "base": base,
+        })
+        .to_string()
     }
 
     /// Drain agent reports into `agent_states` a few times a second.
@@ -5370,18 +8776,77 @@ impl Storm {
                         ),
                         None => (Vec::new(), Vec::new(), false, Vec::new(), Vec::new()),
                     };
+                    let filed = this.agent_rpc.as_ref().map(|s| s.drain_todos()).unwrap_or_default();
+                    if !filed.is_empty() {
+                        this.file_agent_todos(filed, cx);
+                    }
+                    let shots = this.agent_rpc.as_ref().map(|s| s.drain_shots()).unwrap_or_default();
+                    for shot in shots {
+                        this.show_agent_shot(&shot, cx);
+                    }
+                    let tours = this.agent_rpc.as_ref().map(|s| s.drain_tours()).unwrap_or_default();
+                    for tour in tours {
+                        this.start_tour(tour, cx);
+                    }
+                    let summaries =
+                        this.agent_rpc.as_ref().map(|s| s.drain_summaries()).unwrap_or_default();
+                    for summary in summaries {
+                        this.agent_msgs
+                            .push(AgentMsg::Summary { title: summary.title, text: summary.text });
+                        this.agent_cur = None; // anything after it is a new bubble
+                        this.agent_list.scroll_to_end();
+                        cx.notify();
+                    }
                     for batch in viewed {
                         this.apply_agent_viewed(&batch, false, cx);
                     }
-                    // a proposed name is only taken when this workspace has none:
-                    // an agent never renames work you named yourself
-                    if let Some(t) = titles.into_iter().next().map(|t| typed_title(&t)) {
-                        if this.ws_title.as_ref().map(|t| t.trim().is_empty()).unwrap_or(true) {
+                    // another workspace may have written to the shared todo file
+                    let m = todo::mtime();
+                    if m != this.todo_mtime {
+                        this.todo_mtime = m;
+                        this.todos = todo::load();
+                        cx.notify();
+                    }
+                    // what `GET /workspace` answers: the title is the human's and
+                    // moves while the session runs, so it can't live in the env
+                    if let Some(s) = this.agent_rpc.as_ref() {
+                        s.set_info(this.workspace_info());
+                    }
+                    // a proposed name is taken when this workspace has none, so
+                    // an agent naming fresh work can't rewrite a name you chose.
+                    // A rename you asked for arrives with `force`.
+                    if let Some(proposed) = titles.into_iter().next() {
+                        // the subtitle is the agent's to keep current — it says
+                        // where the work is right now, so there is nothing to
+                        // protect it from
+                        if let Some(sub) = proposed.subtitle.clone() {
+                            let sub = sub.trim().to_string();
+                            this.ws_subtitle = (!sub.is_empty()).then(|| sub.clone());
+                            save_ws_subtitle(&this.root, this.ws_subtitle.as_deref());
+                            if !sub.is_empty() {
+                                this.show_flash(&format!("Now on “{sub}”"), cx);
+                            }
+                            cx.notify();
+                        }
+                        let named = this.ws_title.as_ref().is_some_and(|t| !t.trim().is_empty());
+                        // an agent can always improve a name it wrote itself;
+                        // a name you typed needs `force`, which means you asked.
+                        // An empty name is a subtitle-only call and says nothing
+                        // about the name at all.
+                        if !proposed.text.trim().is_empty()
+                            && (!named || this.agent_titled || proposed.force)
+                        {
+                            let t = typed_title(&proposed.text);
                             this.ws_title = Some(t.clone());
                             save_ws_title(&this.root, Some(&t));
+                            this.agent_titled = !proposed.force;
+                            save_agent_titled(&this.root, this.agent_titled);
                             this.ws_idle = false;
                             save_ws_idle(&this.root, false);
-                            this.show_flash(&format!("Workspace named “{t}”"), cx);
+                            this.ws_paused = false; // a named workspace isn't parked
+                            save_ws_paused(&this.root, false);
+                            let what = if named { "renamed" } else { "named" };
+                            this.show_flash(&format!("Workspace {what} “{t}”"), cx);
                             cx.notify();
                         }
                     }
@@ -5389,8 +8854,16 @@ impl Storm {
                         // an agent opened a PR or switched branch: re-read now
                         // instead of waiting for ⌘R
                         this.pr_link_branch.clear(); // forces the git poll to re-query
+                        // the usual reason an agent calls this is that it just
+                        // opened the PR, and the body is what you'd go looking
+                        // for next
+                        this.pr_show_new = true;
                         this.refresh_pr_link(cx);
                         this.load_pr(cx);
+                        // and any PR body open in a tab — an agent that rewrites
+                        // the description is the common case for this call, and
+                        // the text on screen is the thing it just changed
+                        this.reload_pr_doc(cx);
                         this.check_admin_now(cx);
                         cx.notify();
                     }
@@ -5534,7 +9007,6 @@ impl Storm {
     /// ⌘D / ⌘⇧D: halve the focused pane — a fresh shell lands beside it
     /// (`horizontal`) or below it — and takes focus.
     fn split_terminal(&mut self, horizontal: bool, window: &mut Window, cx: &mut Context<Self>) {
-        self.hide_browser(); // terminal + browser share the right dock
         self.show_terminal = true;
         self.ensure_terminal(cx);
         let Some(target) = self.focused_pane(window, cx).map(|t| t.entity_id()) else { return };
@@ -5555,7 +9027,7 @@ impl Storm {
     fn act_toggle_zoom(&mut self, _: &ToggleTermZoom, window: &mut Window, cx: &mut Context<Self>) {
         // the agent is zoomable in its own right — it's half of the dock
         if AGENT_PANEL && self.agent_open && self.agent_focus.is_focused(window) {
-            self.agent_zoomed = !self.agent_zoomed;
+            self.term_folded = !self.term_folded;
             cx.notify();
             return;
         }
@@ -5586,7 +9058,7 @@ impl Storm {
             if forward {
                 if let Some(tab) = self.term_tabs.get(self.active_term) {
                     let target = tab.panes.edge_leaf(false).clone();
-                    self.agent_zoomed = false;
+                    self.term_folded = false;
                     self.focus_pane(&target, window, cx);
                     cx.notify();
                 }
@@ -5609,7 +9081,6 @@ impl Storm {
             return;
         }
         let Some(mut path) = tab.panes.path_to(cur) else { return };
-        let at_top = !horizontal && !forward;
         while let Some(ix) = path.pop() {
             let Some(TermPane::Split { horizontal: axis, kids, .. }) = tab.panes.at(&path) else { break };
             if *axis != horizontal {
@@ -5623,10 +9094,10 @@ impl Storm {
                 return;
             }
         }
-        // nothing above this pane inside the tab → the agent is what's up there
-        if at_top && agent_shown {
-            self.focus_agent(window, cx);
-        }
+        // nothing in that direction inside the tab: ⌘arrows move between
+        // terminal panes and stop there. They used to carry on into the agent,
+        // from when it sat above them in the same dock; it has its own column
+        // now, so leaving the terminal by accident was all that was left of it.
     }
 
     /// Move focus into the agent UI (and make sure it's running).
@@ -5669,11 +9140,27 @@ impl Storm {
     /// holds the dock on its own until then); after that it adds tabs the way it
     /// always has.
     fn act_new_terminal(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {
-        if self.terminal_visible() {
-            self.new_terminal(window, cx);
-        } else {
+        // ⌘T walks toward the terminal: bring it up, then put the caret in it,
+        // and only then start adding tabs. Pressing it from the editor to get a
+        // shell you already have open was making a tab you didn't ask for.
+        if !self.terminal_visible() {
             self.reveal_terminal(window, cx);
+        } else if !self.term_focused(window, cx) {
+            if let Some(t) = self.active_terminal().cloned() {
+                self.focus_pane(&t, window, cx);
+                cx.notify();
+            }
+        } else {
+            self.new_terminal(window, cx);
         }
+    }
+
+    /// True when a terminal pane holds the keyboard.
+    fn term_focused(&self, window: &Window, cx: &App) -> bool {
+        self.term_tabs
+            .iter()
+            .flat_map(|t| t.terminals())
+            .any(|p| p.read(cx).focus_handle.is_focused(window))
     }
 
     /// True when the terminal strip is actually on screen: it's toggled on, it
@@ -5681,15 +9168,14 @@ impl Storm {
     fn terminal_visible(&self) -> bool {
         self.show_terminal
             && !self.term_tabs.is_empty()
-            && !(AGENT_PANEL && self.agent_open && self.agent_zoomed)
+            && !(AGENT_PANEL && self.agent_open && self.term_folded)
     }
 
     /// Put the terminal strip back under the agent and focus it, starting one
     /// if this workspace has none yet.
     fn reveal_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.agent_zoomed = false;
+        self.term_folded = false;
         self.show_terminal = true;
-        self.hide_browser(); // terminal + browser share the right dock
         self.ensure_terminal(cx);
         if let Some(t) = self.active_terminal() {
             let fh = t.read(cx).focus_handle.clone();
@@ -5824,6 +9310,8 @@ impl Storm {
                     if let Some(link) = pr_update {
                         this.pr_link = link;
                         this.pr_link_branch = branch;
+                        this.base_sync = None; // a different branch, a different answer
+                        this.refresh_base_sync(cx);
                     }
                     // pick up external edits (e.g. from Claude Code) on any open
                     // tab whose buffer has no unsaved changes
@@ -5957,6 +9445,7 @@ impl Storm {
         let any_open = self.palette_open
             || self.finder_open
             || self.goto_open
+            || self.todo_open
             || self.br_open
             || self.nf_open
             || self.prc_open
@@ -5966,11 +9455,14 @@ impl Storm {
             || self.gitp_open
             || self.mc_open
             || self.ws_open
-            || self.limits_open;
+            || self.prs_open
+            || self.limits_open
+            || self.hand_open;
         if any_open {
             self.palette_open = false;
             self.finder_open = false;
             self.goto_open = false;
+            self.todo_open = false;
             self.br_open = false;
             self.nf_open = false;
             self.mc_open = false;
@@ -5980,16 +9472,32 @@ impl Storm {
             self.find_open = false;
             self.gitp_open = false;
             self.ws_open = false;
+            self.prs_open = false;
             self.limits_open = false;
+            self.hand_open = false;
             self.gitp_action_branch = None;
             self.focus_active(window, cx);
             cx.notify();
+            return;
         }
+        // nothing else was open: escape puts the walk (or tour) away. Last,
+        // because a popup over it is the thing escape is aimed at.
+        self.end_walk(cx);
     }
 
     fn focus_active(&self, window: &mut Window, cx: &mut App) {
         if let Some(tab) = self.tabs.get(self.active) {
-            let fh = tab.editor.read(cx).focus_handle.clone();
+            // the browser tab's editor is a placeholder nobody sees; typing
+            // belongs to the page
+            let fh = if tab.browser {
+                self.mirror_focus.clone()
+            } else if is_image_file(&tab.path) || (tab.preview && is_markdown(&tab.path)) {
+                // the rendered view, where the editor isn't on screen to hold
+                // the key context for ⌘W and the rest
+                self.md_focus.clone()
+            } else {
+                tab.editor.read(cx).focus_handle.clone()
+            };
             window.focus(&fh, cx);
         } else {
             // no open file → keep focus on the root so global shortcuts work
@@ -6065,12 +9573,15 @@ impl Storm {
             match ks.key.as_str() {
                 "c" => {
                     if let Some(p) = self.tree_selected.clone() {
+                        // the system pasteboard too, so it pastes in Finder
+                        set_system_clip_files(std::slice::from_ref(&p));
                         *tree_clip().lock().unwrap() = Some((p, false));
                         self.show_flash("Copied", cx);
                     }
                 }
                 "x" => {
                     if let Some(p) = self.tree_selected.clone() {
+                        set_system_clip_files(std::slice::from_ref(&p));
                         *tree_clip().lock().unwrap() = Some((p, true));
                         self.show_flash("Cut", cx);
                     }
@@ -6080,16 +9591,10 @@ impl Storm {
             }
             return;
         }
-        // enter opens the selected file, else the first matching file
+        // ↩ renames what's selected, the way Finder does; F4 and a click open
         if ks.key == "enter" {
-            let target = self
-                .tree_selected
-                .clone()
-                .filter(|p| p.is_file())
-                .or_else(|| self.entries.iter().find(|e| !e.is_dir).map(|e| e.path.clone()));
-            if let Some(p) = target {
-                self.tree_selected = Some(p.clone());
-                self.open_file(p, window, cx);
+            if let Some(p) = self.tree_selected.clone() {
+                self.open_rename_prompt(p, window, cx);
             }
             return;
         }
@@ -6107,11 +9612,23 @@ impl Storm {
         cx.notify();
     }
 
-    /// Paste the copied file/folder into the selected folder (recursively for
-    /// directories), avoiding clobbering by adding a " copy" suffix on collision.
+    /// Paste into the selected folder (recursively for directories), avoiding
+    /// clobbering by adding a " copy" suffix on collision.
+    ///
+    /// The macOS pasteboard wins when it holds files, so a copy made in Finder
+    /// — or anywhere else — pastes here. TIDE's own cut is the one thing the
+    /// pasteboard can't express, so a path that was cut here still moves rather
+    /// than copies.
     fn paste_into_selected(&mut self, cx: &mut Context<Self>) {
-        let Some((src, is_cut)) = tree_clip().lock().unwrap().clone() else { return };
-        if !src.exists() {
+        let held = tree_clip().lock().unwrap().clone();
+        let from_system = system_clip_files();
+        let sources: Vec<PathBuf> = if from_system.is_empty() {
+            held.as_ref().map(|(p, _)| vec![p.clone()]).unwrap_or_default()
+        } else {
+            from_system
+        };
+        if sources.is_empty() {
+            self.show_flash("Nothing to paste", cx);
             return;
         }
         // target dir: the selected folder, or the selected file's parent, or root
@@ -6120,21 +9637,75 @@ impl Storm {
             Some(p) => p.parent().map(|d| d.to_path_buf()).unwrap_or_else(|| self.root.clone()),
             None => self.root.clone(),
         };
-        let Some(name) = src.file_name() else { return };
-        let dest = unique_dest(target_dir.join(name));
-        if src == dest || copy_path(&src, &dest).is_err() {
-            return;
+
+        // one file: show the name it would land under, so it can be changed
+        // before anything is written. A batch doesn't ask — twelve prompts is
+        // not a confirmation, it is an obstacle.
+        if sources.len() == 1 {
+            let src = sources[0].clone();
+            if src.exists() && !target_dir.starts_with(&src) {
+                let cut = held.as_ref().is_some_and(|(p, c)| *c && *p == src);
+                let suggested = unique_dest(target_dir.join(src.file_name().unwrap_or_default()));
+                let name = suggested
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let stem_end = name.rfind('.').filter(|i| *i > 0).unwrap_or(name.len());
+                self.rn_query.set(name);
+                self.rn_query.move_to(stem_end);
+                self.rn_paste = Some((src, target_dir, cut));
+                self.md_focus_pending = false;
+                self.paste_focus_pending = true;
+                cx.notify();
+                return;
+            }
         }
-        // a cut moves: remove the source after a successful copy, clear the clipboard
-        if is_cut {
-            let _ = if src.is_dir() { std::fs::remove_dir_all(&src) } else { std::fs::remove_file(&src) };
-            *tree_clip().lock().unwrap() = None;
+
+        let mut done = 0usize;
+        let mut moved = false;
+        let mut last = None;
+        for src in sources {
+            if !src.exists() {
+                continue;
+            }
+            let Some(name) = src.file_name() else { continue };
+            let dest = unique_dest(target_dir.join(name));
+            // a folder can't be pasted into itself or into its own child
+            if src == dest || target_dir.starts_with(&src) {
+                continue;
+            }
+            if copy_path(&src, &dest).is_err() {
+                continue;
+            }
+            // a cut moves: remove the source once the copy is safely there
+            let is_cut = held.as_ref().is_some_and(|(p, cut)| *cut && *p == src);
+            if is_cut {
+                let _ = if src.is_dir() {
+                    std::fs::remove_dir_all(&src)
+                } else {
+                    std::fs::remove_file(&src)
+                };
+                *tree_clip().lock().unwrap() = None;
+                moved = true;
+            }
+            done += 1;
+            last = Some(dest);
+        }
+        if done == 0 {
+            self.show_flash("Nothing pasted", cx);
+            return;
         }
         self.expanded.insert(target_dir);
         self.rebuild();
-        self.tree_selected = Some(dest.clone());
-        self.reveal_in_tree(&dest);
-        self.show_flash(if is_cut { "Moved" } else { "Pasted" }, cx);
+        if let Some(dest) = last {
+            self.tree_selected = Some(dest.clone());
+            self.reveal_in_tree(&dest);
+        }
+        let verb = if moved { "Moved" } else { "Pasted" };
+        self.show_flash(
+            &if done == 1 { verb.to_string() } else { format!("{verb} {done} items") },
+            cx,
+        );
         cx.notify();
     }
 
@@ -6352,6 +9923,9 @@ impl Storm {
                         // if it left unresolved conflicts
                         let cl = this.run_cmd.to_lowercase();
                         if cl.contains("merge") || cl.contains("pull") || cl.contains("rebase") || cl.contains("cherry-pick") {
+                            // whatever it did, the branch now sits somewhere
+                            // else against its base
+                            this.refresh_base_sync(cx);
                             let files = conflicted_files(&this.root);
                             if !files.is_empty() {
                                 this.mc_files = files;
@@ -6432,7 +10006,15 @@ impl Storm {
         // synthetic path just for the tab label; the editor itself has no path
         // (so save() is a no-op — nothing hits disk)
         let path = PathBuf::from(format!("scratch {n}"));
-        self.tabs.push(Tab { path, editor: editor.clone(), scratch: true, preview: false });
+        self.tabs.push(Tab {
+            path,
+            editor: editor.clone(),
+            scratch: true,
+            preview: false,
+            browser: false,
+            pr: None,
+            label: None,
+        });
         self.active = self.tabs.len() - 1;
         window.focus(&editor.read(cx).focus_handle.clone(), cx);
         cx.notify();
@@ -6451,7 +10033,9 @@ impl Storm {
             ed.update(cx, |e, cx| e.reload_if_changed(cx));
         } else {
             let lsp = self.lsp.clone();
-            let ro = self.read_only;
+            // a picture's buffer is empty (a PNG isn't text): read-only, so a
+            // stray keystroke can't save nothing over the file
+            let ro = self.read_only || is_image_file(&path);
             let editor = cx.new(|cx| Editor::new(lsp, cx));
             editor.update(cx, |e, cx| {
                 e.set_read_only(ro);
@@ -6484,7 +10068,15 @@ impl Storm {
             .detach();
             // a markdown file opens rendered; ⌘⇧V flips it back to the source
             let preview = is_markdown(&path);
-            self.tabs.push(Tab { path: path.clone(), editor, scratch: false, preview });
+            self.tabs.push(Tab {
+                path: path.clone(),
+                editor,
+                scratch: false,
+                preview,
+                browser: false,
+                pr: None,
+                label: None,
+            });
             self.active = self.tabs.len() - 1;
         }
         self.tree_selected = Some(path.clone());
@@ -6617,6 +10209,9 @@ impl Storm {
         }
         self.save_tab(ix, cx); // auto-save before closing
         self.stash_comment_draft(ix, cx); // don't lose an open comment box
+        if self.tabs[ix].browser {
+            self.drop_mirror();
+        }
         self.tabs.remove(ix);
         if self.active >= self.tabs.len() && !self.tabs.is_empty() {
             self.active = self.tabs.len() - 1;
@@ -6665,7 +10260,7 @@ impl Storm {
             // the dock belongs to the agent; this folds the terminal strip under
             // it away and back, and never hides the agent along with it
             if self.terminal_visible() {
-                self.agent_zoomed = true; // fold the strip away; the agent takes the dock
+                self.term_folded = true; // fold the strip away; the agent takes the dock
                 self.focus_agent(window, cx);
                 cx.notify();
             } else {
@@ -6675,8 +10270,7 @@ impl Storm {
         }
         self.show_terminal = !self.show_terminal;
         if self.show_terminal {
-            self.hide_browser(); // terminal + browser share the right dock
-            self.ensure_terminal(cx);
+                self.ensure_terminal(cx);
             if let Some(t) = self.active_terminal() {
                 let fh = t.read(cx).focus_handle.clone();
                 window.focus(&fh, cx);
@@ -6687,45 +10281,193 @@ impl Storm {
         cx.notify();
     }
 
-    /// Close the browser dock and hide the WebView (terminal ↔ browser swap).
-    fn hide_browser(&mut self) {
-        self.browser_open = false;
-        if let Some(b) = &self.browser {
-            b.set_visible(false);
-        }
+    /// Which tab holds the browser, if one is open. There is only ever one:
+    /// there is only ever one browser behind it.
+    fn browser_tab(&self) -> Option<usize> {
+        self.tabs.iter().position(|t| t.browser)
     }
 
-    /// Hide this project's native WebView without changing `browser_open`, so a
-    /// background project's browser doesn't float over the active one. It
-    /// re-shows when this project becomes active again (render_browser_dock).
-    fn park_browser(&self) {
-        if let Some(b) = &self.browser {
-            b.set_visible(false);
-        }
-    }
-
+    /// Open the browser tab, or close it if it's already the one you're on.
+    /// Anywhere else, this brings it to the front rather than closing it —
+    /// clicking "Browser" while reading a file means "show me the browser".
     fn toggle_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !BROWSER_PANEL {
-            return; // feature parked; flip BROWSER_PANEL to re-enable
+            return; // parked; see `mod mirror` for what it costs to un-park
         }
-        self.browser_open = !self.browser_open;
-        if self.browser_open {
-            self.show_terminal = false; // shares the right dock with the terminal
-            window.focus(&self.browser_focus, cx);
-            // the WebView is created + shown on the next render (needs &Window)
-        } else if let Some(b) = &self.browser {
-            b.set_visible(false);
+        match self.browser_tab() {
+            Some(ix) if ix == self.active => self.close_tab(ix, window, cx),
+            Some(ix) => self.switch_tab(ix, window, cx),
+            None => {
+                self.save_tab(self.active, cx);
+                // a scratch editor it never shows: it keeps every walk over the
+                // tab list — save, close, switch — working without a special case
+                let editor = cx.new(|cx| Editor::new(None, cx));
+                self.tabs.push(Tab {
+                    path: PathBuf::from("Browser"),
+                    editor,
+                    scratch: true,
+                    preview: false,
+                    browser: true,
+                    pr: None,
+                    label: None,
+                });
+                self.active = self.tabs.len() - 1;
+                self.connect_mirror(cx);
+                window.focus(&self.mirror_focus, cx);
+                cx.notify();
+            }
         }
-        cx.notify();
+    }
+
+    /// The tab is going: let the stream go with it. The browser itself keeps
+    /// running — the agent is driving it, and this was only ever a window onto
+    /// it.
+    fn drop_mirror(&mut self) {
+        self.mirror = None;
+        self.mirror_polling = false;
+        self.mirror_url_seen.clear();
+        self.release_frame();
+    }
+
+    /// Attach to the Chromium `agent-browser` is driving, and start the poll
+    /// that turns its frames into redraws.
+    fn connect_mirror(&mut self, cx: &mut Context<Self>) {
+        if self.mirror.is_none() {
+            self.mirror = mirror::Mirror::start();
+            if self.mirror.is_none() {
+                self.show_flash("No agent-browser stream — is it installed?", cx);
+                return;
+            }
+        }
+        if !self.mirror_polling {
+            self.mirror_polling = true;
+            self.start_mirror_poll(cx);
+        }
+    }
+
+    /// Take the newest frame and ask for a redraw. The decode already happened
+    /// on the mirror's own thread, so this only swaps an Arc — but the redraw
+    /// it asks for rebuilds the whole window, which is the expensive part and
+    /// the reason everything here is rationed.
+    fn start_mirror_poll(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            let watching = this.update(cx, |this, cx| {
+                let Some(m) = this.mirror.as_ref() else {
+                    this.mirror_polling = false;
+                    return None;
+                };
+                // nobody is looking at a tab that isn't on top, so the stream is
+                // throttled to a trickle and its frames are left where they are.
+                // Without this, reading the page once would cost a full window
+                // redraw ten times a second for as long as the tab stayed open.
+                let watching = this.tabs.get(this.active).is_some_and(|t| t.browser);
+                if watching != this.mirror_watching {
+                    this.mirror_watching = watching;
+                    m.set_fps(if watching { 10 } else { 1 });
+                }
+                if !watching {
+                    return Some(false);
+                }
+                // the agent navigates too, so the address bar follows the page
+                // rather than the last thing typed into it
+                let url = m.url();
+                if !url.is_empty() && url != this.mirror_url_seen {
+                    this.mirror_url_seen = url.clone();
+                    this.browser_url.set(url);
+                    cx.notify();
+                }
+                if m.dirty() {
+                    if let Some(f) = m.frame() {
+                        // the outgoing frame's texture is released on the next
+                        // render, where there's a Window to release it against
+                        if let Some(old) = this.mirror_frame.replace(f) {
+                            this.mirror_drop.push(old.image);
+                        }
+                        cx.notify();
+                    }
+                }
+                Some(true)
+            });
+            match watching {
+                // checking faster than frames arrive only burns wakeups
+                Ok(Some(true)) => {
+                    cx.background_executor().timer(Duration::from_millis(50)).await
+                }
+                Ok(Some(false)) => {
+                    cx.background_executor().timer(Duration::from_millis(400)).await
+                }
+                _ => break,
+            }
+        })
+        .detach();
+    }
+
+    /// Let go of the frame on screen, so its texture goes back on the next
+    /// render rather than living as long as the window does.
+    fn release_frame(&mut self) {
+        if let Some(f) = self.mirror_frame.take() {
+            self.mirror_drop.push(f.image);
+        }
+    }
+
+    /// Where a point in the window lands on the page, in the page's own pixels.
+    fn mirror_point(&self, pos: gpui::Point<gpui::Pixels>) -> (f32, f32) {
+        let (ox, oy) = self.mirror_origin;
+        // the page is drawn to the column's width, so one factor carries both
+        // axes back to the page's own pixels
+        let scale = match self.mirror_frame.as_ref() {
+            Some(f) if self.mirror_width > 0. && f.page_w > 0. => f.page_w / self.mirror_width,
+            _ => 1.,
+        };
+        ((f32::from(pos.x) - ox) * scale, (f32::from(pos.y) - oy) * scale)
+    }
+
+    /// Keys typed at the page go to the browser, not to TIDE.
+    fn mirror_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(m) = self.mirror.as_ref() else { return };
+        let ks = &ev.keystroke;
+        // a shortcut is TIDE's; only plain typing belongs to the page
+        if ks.modifiers.platform || ks.modifiers.control || ks.modifiers.function {
+            return;
+        }
+        let named = |k: &str, text: &str| Some((k.to_string(), text.to_string()));
+        let mapped = match ks.key.as_str() {
+            "enter" => named("Enter", "\r"),
+            "tab" => named("Tab", "\t"),
+            "backspace" => named("Backspace", ""),
+            "delete" => named("Delete", ""),
+            "escape" => named("Escape", ""),
+            "up" => named("ArrowUp", ""),
+            "down" => named("ArrowDown", ""),
+            "left" => named("ArrowLeft", ""),
+            "right" => named("ArrowRight", ""),
+            "space" => named(" ", " "),
+            _ => ks
+                .key_char
+                .clone()
+                .filter(|c| !c.is_empty())
+                .map(|c| (c.clone(), c)),
+        };
+        if let Some((key, text)) = mapped {
+            m.key(&key, &text);
+            cx.stop_propagation();
+        }
+    }
+
+    /// Drive the mirrored browser from outside the stream: it carries frames
+    /// and input, but navigation is the CLI's job.
+    fn mirror_cmd(&self, args: &[&str]) {
+        let mut c = Command::new("agent-browser");
+        c.args(args);
+        c.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        let _ = c.spawn();
     }
 
     /// Navigate the browser to the address-bar text (adds a scheme if missing).
     fn browser_navigate(&mut self, cx: &mut Context<Self>) {
         let url = normalize_url(self.browser_url.text.trim());
         self.browser_url.set(url.clone());
-        if let Some(b) = &self.browser {
-            b.navigate(&url);
-        }
+        self.mirror_cmd(&["open", &url]);
         cx.notify();
     }
 
@@ -6886,6 +10628,47 @@ impl Storm {
         cx.notify();
     }
 
+    fn open_prnum_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.prnum_open = true;
+        self.prnum_query.clear();
+        window.focus(&self.prnum_focus, cx);
+        cx.notify();
+    }
+
+    fn prnum_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match ev.keystroke.key.as_str() {
+            "escape" => {
+                self.prnum_open = false;
+                self.focus_active(window, cx);
+            }
+            "enter" => {
+                // a pasted link works as well as a number: the digits are the
+                // only part that matters
+                let typed = self.prnum_query.text.clone();
+                let digits: String = typed
+                    .trim()
+                    .trim_start_matches('#')
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                self.prnum_open = false;
+                self.focus_active(window, cx);
+                match digits.parse::<u64>() {
+                    Ok(n) if n > 0 => self.open_pr_number(Some(n), cx),
+                    _ => self.show_flash("Not a pull request number", cx),
+                }
+            }
+            _ => {
+                // digits, plus whatever a pasted URL brings with it
+                Self::field_input(&mut self.prnum_query, &ev.keystroke, cx, |_| true);
+            }
+        }
+        cx.notify();
+    }
+
     fn goto_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         match ks.key.as_str() {
@@ -6919,6 +10702,7 @@ impl Storm {
         self.title_type = ty;
         self.title_query.set(desc);
         self.title_client.set(self.ws_client.clone().unwrap_or_default());
+        self.title_sub.set(self.ws_subtitle.clone().unwrap_or_default());
         self.title_field = 0;
         window.focus(&self.title_focus, cx);
         cx.notify();
@@ -6944,9 +10728,15 @@ impl Storm {
                 let t = self.composed_title();
                 self.ws_title = (!t.is_empty()).then(|| t.clone());
                 save_ws_title(&self.root, if t.is_empty() { None } else { Some(&t) });
+                // you named it: an agent stops being allowed to rewrite it
+                self.agent_titled = false;
+                save_agent_titled(&self.root, false);
                 let c = self.title_client.text.trim().to_string();
                 self.ws_client = (!c.is_empty()).then(|| c.clone());
                 save_ws_client(&self.root, if c.is_empty() { None } else { Some(&c) });
+                let sub = self.title_sub.text.trim().to_string();
+                self.ws_subtitle = (!sub.is_empty()).then(|| sub.clone());
+                save_ws_subtitle(&self.root, self.ws_subtitle.as_deref());
                 // naming a workspace means you're picking it up: it's neither
                 // parked nor free any more
                 if !t.is_empty() {
@@ -6962,12 +10752,14 @@ impl Storm {
                 self.title_open = false;
                 self.focus_active(window, cx);
             }
-            // ⇥ moves between the title and the client (types are chips, or a
+            // ⇥ cycles title → subtitle → client (types are chips, or a
             // "fix:" prefix in the title)
-            "tab" => self.title_field = 1 - self.title_field,
+            "tab" => self.title_field = (self.title_field + 1) % 3,
             _ => {
-                if self.title_field == 1 {
+                if self.title_field == 2 {
                     Self::field_input(&mut self.title_client, &ev.keystroke, cx, |_| true);
+                } else if self.title_field == 1 {
+                    Self::field_input(&mut self.title_sub, &ev.keystroke, cx, |_| true);
                 } else {
                     Self::field_input(&mut self.title_query, &ev.keystroke, cx, |_| true);
                     self.consume_type_prefix();
@@ -6980,12 +10772,8 @@ impl Storm {
     /// Typing `fix:` (or `ci: `) picks that type and drops the prefix from the
     /// description — the fast path when you already know the type you want.
     fn consume_type_prefix(&mut self) {
-        let text = self.title_query.text.clone();
-        let Some((head, rest)) = text.split_once(':') else { return };
-        let key = head.trim().to_lowercase();
-        if let Some(i) = TITLE_TYPES.iter().position(|(k, _, _)| *k == key) {
+        if let Some(i) = type_prefix(&mut self.title_query) {
             self.title_type = Some(i);
-            self.title_query.set(rest.trim_start().to_string());
         }
     }
 
@@ -7062,6 +10850,44 @@ impl Storm {
                     .text_color(rgb(TEXT))
                     .child(self.title_query.render(self.caret_if(self.title_field == 0), SELECTION)),
             )
+            // where the work stands inside that name — the checkpoint, which
+            // the agent also moves as it goes
+            .child(
+                div()
+                    .mx_3()
+                    .mt_2()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(div().w(px(44.)).text_size(px(10.)).text_color(rgb(MUTED)).child("Now on"))
+                    .child(
+                        div()
+                            .id("title-sub")
+                            .flex_grow(1.0)
+                            .px_2()
+                            .py_1()
+                            .bg(rgb(BG))
+                            .border_1()
+                            .border_color(rgb(if self.title_field == 1 { ACCENT } else { BORDER }))
+                            .rounded_md()
+                            .text_size(px(12.))
+                            .cursor_pointer()
+                            .text_color(rgb(TEXT))
+                            .child(if self.title_sub.is_empty() && self.title_field != 1 {
+                                div()
+                                    .text_color(rgb(MUTED))
+                                    .child("optional — e.g. UI auto syncing")
+                                    .into_any_element()
+                            } else {
+                                self.title_sub.render(self.caret_if(self.title_field == 1), SELECTION)
+                            })
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                this.title_field = 1;
+                                cx.notify();
+                            })),
+                    ),
+            )
             // who the work is for — optional, and only shown on the workspace when set
             .child(
                 div()
@@ -7080,18 +10906,18 @@ impl Storm {
                             .py_1()
                             .bg(rgb(BG))
                             .border_1()
-                            .border_color(rgb(if self.title_field == 1 { ACCENT } else { BORDER }))
+                            .border_color(rgb(if self.title_field == 2 { ACCENT } else { BORDER }))
                             .rounded_md()
                             .text_size(px(12.))
                             .cursor_pointer()
                             .text_color(rgb(TEXT))
-                            .child(if self.title_client.is_empty() && self.title_field != 1 {
+                            .child(if self.title_client.is_empty() && self.title_field != 2 {
                                 div().text_color(rgb(MUTED)).child("optional — e.g. Acme").into_any_element()
                             } else {
-                                self.title_client.render(self.caret_if(self.title_field == 1), SELECTION)
+                                self.title_client.render(self.caret_if(self.title_field == 2), SELECTION)
                             })
                             .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.title_field = 1;
+                                this.title_field = 2;
                                 cx.notify();
                             })),
                     ),
@@ -7133,6 +10959,172 @@ impl Storm {
         self.nf_query.clear();
         window.focus(&self.nf_focus, cx);
         cx.notify();
+    }
+
+    /// Rename the selected entry. The name comes up with the caret after the
+    /// stem and the extension selected-off, so typing replaces the part you
+    /// almost always mean and `.env` survives a rename of `example copy`.
+    fn open_rename_prompt(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        if name.is_empty() {
+            return;
+        }
+        // where the extension starts, ignoring a leading dot (`.gitignore` is
+        // all stem)
+        let stem_end = name.rfind('.').filter(|i| *i > 0).unwrap_or(name.len());
+        self.rn_query.set(name);
+        self.rn_query.move_to(stem_end);
+        self.rn_path = Some(path);
+        window.focus(&self.rn_focus, cx);
+        cx.notify();
+    }
+
+    fn rn_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        match ks.key.as_str() {
+            "escape" => {
+                self.rn_path = None;
+                self.rn_paste = None;
+                window.focus(&self.tree_focus, cx);
+            }
+            "enter" if self.rn_paste.is_some() => {
+                let Some((src, dir, cut)) = self.rn_paste.take() else { return };
+                let name = self.rn_query.text.trim().to_string();
+                window.focus(&self.tree_focus, cx);
+                if name.is_empty() || name.contains('/') {
+                    self.show_flash("Not a file name", cx);
+                    cx.notify();
+                    return;
+                }
+                let dest = dir.join(&name);
+                if dest.exists() {
+                    self.show_flash(&format!("{name} already exists"), cx);
+                    cx.notify();
+                    return;
+                }
+                if copy_path(&src, &dest).is_err() {
+                    self.show_flash("Paste failed", cx);
+                    cx.notify();
+                    return;
+                }
+                if cut {
+                    let _ = if src.is_dir() {
+                        std::fs::remove_dir_all(&src)
+                    } else {
+                        std::fs::remove_file(&src)
+                    };
+                    *tree_clip().lock().unwrap() = None;
+                }
+                self.expanded.insert(dir);
+                self.rebuild();
+                self.tree_selected = Some(dest.clone());
+                self.reveal_in_tree(&dest);
+                self.show_flash(if cut { "Moved" } else { "Pasted" }, cx);
+                cx.notify();
+            }
+            "enter" => {
+                let Some(from) = self.rn_path.take() else { return };
+                let name = self.rn_query.text.trim().to_string();
+                // a name with a slash would move the file somewhere else, which
+                // is not what a rename is
+                if name.is_empty() || name.contains('/') {
+                    self.show_flash("Not a file name", cx);
+                    window.focus(&self.tree_focus, cx);
+                    cx.notify();
+                    return;
+                }
+                let to = from.with_file_name(&name);
+                if to == from {
+                    window.focus(&self.tree_focus, cx);
+                    cx.notify();
+                    return;
+                }
+                if to.exists() {
+                    self.show_flash(&format!("{name} already exists"), cx);
+                    window.focus(&self.tree_focus, cx);
+                    cx.notify();
+                    return;
+                }
+                match std::fs::rename(&from, &to) {
+                    Ok(()) => {
+                        // an open tab is now pointing at a path that is gone
+                        for tab in self.tabs.iter_mut() {
+                            if tab.path == from {
+                                tab.path = to.clone();
+                            } else if let Ok(rest) = tab.path.strip_prefix(&from) {
+                                tab.path = to.join(rest); // a renamed folder took it along
+                            }
+                        }
+                        if self.expanded.remove(&from) {
+                            self.expanded.insert(to.clone());
+                        }
+                        self.rebuild();
+                        self.tree_selected = Some(to.clone());
+                        self.reveal_in_tree(&to);
+                        self.show_flash(&format!("Renamed to {name}"), cx);
+                    }
+                    Err(e) => self.show_flash(&format!("Rename failed — {e}"), cx),
+                }
+                window.focus(&self.tree_focus, cx);
+            }
+            _ => {
+                Self::field_input(&mut self.rn_query, ks, cx, |s| !s.contains('/'));
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_rename_prompt(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let w = 420.0_f32;
+        let left = ((self.win_width - w) / 2.0).max(0.);
+        let subject = self.rn_path.clone().or_else(|| self.rn_paste.as_ref().map(|(s, ..)| s.clone()));
+        let what = subject.map(|p| if p.is_dir() { "folder" } else { "file" }).unwrap_or("file");
+        let head = match &self.rn_paste {
+            Some((_, dir, cut)) => format!(
+                "{} {what} into {}  ·  ↩ paste · esc cancel",
+                if *cut { "Move" } else { "Paste" },
+                {
+                    let r = self.rel(dir);
+                    if r.is_empty() { ".".into() } else { r }
+                }
+            ),
+            None => format!("Rename {what}  ·  ↩ rename · esc cancel"),
+        };
+        div()
+            .absolute()
+            .top(px(120.))
+            .left(px(left))
+            .w(px(w))
+            .bg(rgb(PANEL_BG))
+            .border_1()
+            .border_color(rgb(ACCENT))
+            .rounded_md()
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .track_focus(&self.rn_focus)
+            .on_key_down(cx.listener(Self::rn_key))
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .child(head),
+            )
+            .child(
+                div()
+                    .mx_3()
+                    .mb_3()
+                    .px_2()
+                    .py_1()
+                    .bg(rgb(BG))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .rounded_md()
+                    .text_color(rgb(TEXT))
+                    .child(self.rn_query.render(self.caret(), SELECTION)),
+            )
     }
 
     fn nf_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -7350,6 +11342,9 @@ impl Storm {
     fn act_refresh_pr(&mut self, _: &RefreshPr, _window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_pr_link(cx);
         self.check_admin_now(cx);
+        // and any PR body on screen, so the header beside it doesn't go on
+        // claiming `open` after it merged
+        self.reload_pr_doc(cx);
         // with the review pane open, also re-diff the changed files
         if self.show_left && self.left_view == LeftView::PullRequest {
             self.load_pr(cx);
@@ -7421,7 +11416,174 @@ impl Storm {
         cx.notify();
     }
 
-    /// cmd+shift+n: open the "New Project" dialog (type a folder path or pick one).
+    /// ⌘⇧L: the "new task" form. The list itself lives in the left bar.
+    fn act_todo(&mut self, _: &TodoList, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_todo(window, cx);
+    }
+
+    /// Write the list and remember the file's new age, so our own save doesn't
+    /// read back as someone else's edit on the next poll.
+    fn save_todos(&mut self) {
+        todo::save(&self.todos);
+        self.todo_mtime = todo::mtime();
+    }
+
+    /// The form, empty, for a new task.
+    fn open_todo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.todos = todo::load(); // every workspace writes to the same file
+        self.todo_edit = None;
+        self.todo_cat = None;
+        self.todo_status = 0;
+        self.todo_desc.clear();
+        self.todo_details.clear();
+        self.todo_link.clear();
+        self.todo_scope.clear();
+        // client work in this workspace is probably client work on the list too;
+        // it's a starting point, not a rule — clear it and it's gone
+        self.todo_client.set(self.ws_client.clone().unwrap_or_default());
+        self.todo_group.clear();
+        self.todo_field = 0;
+        self.todo_details_md = false; // writing, not reading
+        self.todo_open = true;
+        window.focus(&self.todo_focus, cx);
+        cx.notify();
+    }
+
+    /// The form, filled in, for a line that already exists.
+    fn edit_todo(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(t) = self.todos.iter().find(|t| t.id == id).cloned() else { return };
+        self.todo_edit = Some(t.id);
+        self.todo_cat = TITLE_TYPES.iter().position(|(k, _, _)| *k == t.category);
+        self.todo_status = todo::Status::ALL.iter().position(|s| *s == t.status).unwrap_or(0);
+        self.todo_desc.set(t.text);
+        self.todo_details.set(t.details);
+        self.todo_link.set(t.link);
+        self.todo_scope.set(t.scope);
+        self.todo_client.set(t.client);
+        self.todo_group.set(t.group);
+        self.todo_field = 0;
+        // an existing task opens as it reads: the agent writes markdown in here
+        self.todo_details_md = !self.todo_details.text.trim().is_empty();
+        self.todo_open = true;
+        window.focus(&self.todo_focus, cx);
+        cx.notify();
+    }
+
+    /// ⌘↩ / the button: file the form as a task (or save the edit).
+    fn commit_todo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.todo_desc.text.trim().to_string();
+        if text.is_empty() {
+            self.show_flash("A task needs a description", cx);
+            return;
+        }
+        let category =
+            self.todo_cat.and_then(|i| TITLE_TYPES.get(i)).map(|(k, _, _)| *k).unwrap_or("");
+        let status = todo::Status::ALL[self.todo_status.min(2)];
+        let details = self.todo_details.text.trim().to_string();
+        let link = self.todo_link.text.trim().to_string();
+        let scope = self.todo_scope.text.trim().to_string();
+        let client = self.todo_client.text.trim().to_string();
+        let group = self.todo_group.text.trim().to_string();
+        match self.todo_edit.clone() {
+            Some(id) => {
+                if let Some(t) = self.todos.iter_mut().find(|t| t.id == id) {
+                    t.text = text;
+                    t.details = details;
+                    t.category = category.to_string();
+                    t.status = status;
+                    t.link = link;
+                    t.scope = scope;
+                    t.client = client;
+                    t.group = group;
+                }
+                self.show_flash("Task updated", cx);
+            }
+            None => {
+                let origin = self.folder_name();
+                todo::add(
+                    &mut self.todos,
+                    random_id(),
+                    &text,
+                    &details,
+                    category,
+                    status,
+                    &link,
+                    &scope,
+                    &client,
+                    &group,
+                    &origin,
+                );
+                self.show_flash("Task created", cx);
+            }
+        }
+        self.save_todos();
+        self.todo_open = false;
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    /// Keys in the form. ⇥ walks the three text fields, ⌘↩ files it, and the
+    /// two pickers answer to ←/→ so the whole thing works without the mouse.
+    fn todo_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        match ks.key.as_str() {
+            "escape" => {
+                self.todo_open = false;
+                self.focus_active(window, cx);
+            }
+            "enter" if ks.modifiers.platform => self.commit_todo(window, cx),
+            "tab" => {
+                self.todo_details_md = false; // moving through the form means editing it
+                let n = 6;
+                self.todo_field = if ks.modifiers.shift {
+                    (self.todo_field + n - 1) % n
+                } else {
+                    (self.todo_field + 1) % n
+                };
+            }
+            // ⌃←/⌃→ walks the status. The category deliberately has no arrow
+            // binding: ⌥← and ⌥→ are word motion, and a form that eats them
+            // isn't a text field any more. Click a chip, or type `fix:`.
+            "left" | "right" if ks.modifiers.control && !ks.modifiers.alt => {
+                self.todo_status = if ks.key == "right" {
+                    (self.todo_status + 1) % 3
+                } else {
+                    (self.todo_status + 2) % 3
+                };
+            }
+            // printable text arrives through the input handler instead; this
+            // path is for the editing keys (arrows, ⌫, ⌘A/C/V/Z, …)
+            _ if Self::text_comes_via_input_handler(ks) => {}
+            _ => match self.todo_field {
+                1 => {
+                    Self::field_input(&mut self.todo_details, ks, cx, |_| true);
+                }
+                2 => {
+                    Self::field_input(&mut self.todo_link, ks, cx, |_| true);
+                }
+                3 => {
+                    Self::field_input(&mut self.todo_scope, ks, cx, |_| true);
+                }
+                4 => {
+                    Self::field_input(&mut self.todo_client, ks, cx, |_| true);
+                }
+                5 => {
+                    Self::field_input(&mut self.todo_group, ks, cx, |_| true);
+                }
+                _ => {
+                    Self::field_input(&mut self.todo_desc, ks, cx, |_| true);
+                    // same shortcut as the workspace title: `fix:` picks the
+                    // category and leaves the description clean
+                    if let Some(i) = type_prefix(&mut self.todo_desc) {
+                        self.todo_cat = Some(i);
+                    }
+                }
+            },
+        }
+        cx.notify();
+    }
+
+    /// cmd+shift+n: open the "New Project" dialog (type a folder path or pick one).    /// cmd+shift+n: open the "New Project" dialog (type a folder path or pick one).
     fn act_new_project(&mut self, _: &NewProject, window: &mut Window, cx: &mut Context<Self>) {
         self.newproj_open = true;
         self.newproj_path.clear();
@@ -7777,13 +11939,690 @@ impl Storm {
                 .spawn(async move { fetch_pr_link(&root, &fetch_branch) })
                 .await;
             this.update(cx, |this, cx| {
+                let had = this.pr_link.as_ref().map(|l| l.0);
                 this.pr_link = link;
                 this.pr_link_branch = branch;
+                // a PR this branch didn't have before, found on an agent's own
+                // refresh: open it. Gated on the number having changed so that
+                // repeat refreshes during a long turn don't keep dragging you
+                // back onto a tab you read once, or reopen one you closed.
+                let now = this.pr_link.as_ref().map(|l| l.0);
+                if let Some(n) = pr_tab_to_open(std::mem::take(&mut this.pr_show_new), had, now) {
+                    this.open_pr_number(Some(n), cx);
+                }
+                // the base only becomes knowable once the PR answers, so this
+                // rides behind it rather than running in parallel
+                this.refresh_base_sync(cx);
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Re-check how far this branch trails its base, off the main thread. The
+    /// fetch inside is a network call, so it rides the moments the PR status
+    /// already does: a branch change, ⌘R, the ↻ button, `/refresh`.
+    fn refresh_base_sync(&mut self, cx: &mut Context<Self>) {
+        let base = self.review_base();
+        // standing on the base itself — it can't be behind anything
+        if self.branch.is_empty() || base == format!("origin/{}", self.branch) {
+            self.base_sync = None;
+            return;
+        }
+        let root = self.root.clone();
+        cx.spawn(async move |this, cx| {
+            let sync = cx.background_executor().spawn(async move { base_sync(&root, &base) }).await;
+            this.update(cx, |this, cx| {
+                this.base_sync = sync;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Hand the drift to the agent. One job covers both chips: the conflicts
+    /// only exist because of the commits we're missing, so resolving them and
+    /// catching up are the same merge.
+    fn merge_base_with_agent(&mut self, cx: &mut Context<Self>) {
+        let Some(sync) = self.base_sync.clone() else { return };
+        let (base, n) = (sync.base.clone(), sync.behind);
+        // nothing to merge here, and GitHub still complaining, means it is
+        // judging a head this checkout has already moved past
+        if n == 0 && sync.conflicts.is_empty() && sync.gh_conflict {
+            let (p, label) = if sync.unpushed > 0 {
+                (
+                    format!(
+                        "GitHub reports this PR as conflicting, but that is the pushed branch: \
+                         here the merge is already done — {base} goes in cleanly and this \
+                         checkout has {} commit{} that were never pushed. Push the branch, then \
+                         POST /refresh so TIDE re-reads, and check the PR page agrees the \
+                         conflict is gone. Don't merge the pull request — that is mine to press. \
+                         Post what happened to $TIDE_RPC/summary at the end, including whether \
+                         the PR now reads as mergeable.",
+                        sync.unpushed,
+                        if sync.unpushed == 1 { "" } else { "s" }
+                    ),
+                    "Push the resolved branch".to_string(),
+                )
+            } else {
+                (
+                    format!(
+                        "GitHub reports this PR as conflicting, but merging {base} here is clean \
+                         and there is nothing unpushed, so the two disagree. Work out why before \
+                         changing anything: GitHub computes mergeability asynchronously and may \
+                         simply be stale, or the PR's base may not be what this checkout compares \
+                         against, or someone may have force-pushed over the branch. Tell me which \
+                         it is, as a summary to $TIDE_RPC/summary."
+                    ),
+                    "Check the PR's conflict report".to_string(),
+                )
+            };
+            self.send_agent_prompt_as(p, Some(label), cx);
+            return;
+        }
+        let mut p =
+            format!("This branch is {n} commit{} behind {base}.", if n == 1 { "" } else { "s" });
+        if sync.conflicts.is_empty() {
+            p.push_str(" Merging it in is clean.\n\n");
+        } else {
+            let c = sync.conflicts.len();
+            p.push_str(&format!(
+                " Merging it in conflicts in {c} file{}:\n{}\n\n",
+                if c == 1 { "" } else { "s" },
+                sync.conflicts.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n")
+            ));
+        }
+        p.push_str(&format!(
+            "Bring the branch up to date: fetch, merge {base} in, and resolve every conflict by \
+             working out what each side was trying to do and keeping both — not by taking one \
+             side wholesale. Where a hunk is unclear, read the commits it came from instead of \
+             guessing. When the tree is clean, rebuild the project with the `yyb` shell alias — \
+             it installs and builds, and a merge that takes new dependencies in needs both — then \
+             test what you touched, commit the merge, and post what you resolved and anything \
+             you were unsure about to $TIDE_RPC/summary.\n\n\
+             Then push, and POST /refresh so TIDE re-reads the branch. Stop there: merging the \
+             pull request is mine to press, not yours, however green the checks are. Say in the \
+             summary whether it is ready to go in, and call out anything that isn't settled — a \
+             conflict you resolved by guessing, a test you couldn't run, a failing check, a \
+             question you want to put to me. I would rather answer a question than undo a \
+             merge."
+        ));
+        let label = if sync.conflicts.is_empty() {
+            format!("Merge {base}")
+        } else {
+            format!("Merge {base} and resolve the conflicts")
+        };
+        self.send_agent_prompt_as(p, Some(label), cx);
+    }
+
+    /// Open a pull request's body as a markdown tab. It's a document — the
+    /// description of the work, often the only place the reasoning is written
+    /// down — so it belongs where you read documents, not behind a browser tab.
+    /// ⌘click the chip for GitHub itself.
+    ///
+    /// `None` means the one on this branch, which is what `gh` defaults to —
+    /// but it skips the cache, since a cache is keyed by number. Callers that
+    /// know the number should say so.
+    fn open_pr_number(&mut self, number: Option<u64>, cx: &mut Context<Self>) {
+        let root = self.root.clone();
+        // the tab opens now, not when GitHub answers: from the last read if
+        // there is one, otherwise empty with the reading note. Either way the
+        // fetch below replaces it.
+        if let Some(n) = number {
+            match pr_body_cached(n) {
+                Some((name, text, meta)) => self.show_pr_doc(name, text, meta, cx),
+                None => {
+                    let waiting = PrDoc {
+                        number: n,
+                        loading: true,
+                        title: format!("Pull request #{n}"),
+                        checks: PrChecks::default(),
+                        files: 0,
+                        added: 0,
+                        removed: 0,
+                        state: PrState::Open,
+                        base: String::new(),
+                        head: String::new(),
+                        author: String::new(),
+                        url: String::new(),
+                    };
+                    self.show_pr_doc(format!("PR #{n}.md"), format!("Reading #{n}…"), waiting, cx);
+                }
+            }
+            self.pr_syncing.insert(n);
+        } else {
+            self.show_flash("Reading the pull request…", cx);
+        }
+        cx.spawn(async move |this, cx| {
+            let doc = cx.background_executor().spawn(async move { pr_body_doc(&root, number) }).await;
+            this.update(cx, |this, cx| {
+                if let Some(n) = number {
+                    this.pr_syncing.remove(&n);
+                }
+                let Some((name, text, meta)) = doc else {
+                    this.show_flash(
+                        &match number {
+                            Some(n) => format!("Couldn't read #{n}"),
+                            None => "Couldn't read the pull request".to_string(),
+                        },
+                        cx,
+                    );
+                    cx.notify();
+                    return;
+                };
+                this.show_pr_doc(name, text, meta, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The pull-request screen: every open PR with your name on it, with the
+    /// release branches boxed above them. Those two questions — "what am I
+    /// waiting on" and "is a release in flight" — are the whole reason the
+    /// browser stays open, and both answers already live in `gh`.
+    fn act_pr_screen(&mut self, _: &PrScreen, window: &mut Window, cx: &mut Context<Self>) {
+        if self.prs_open {
+            self.prs_open = false;
+            self.focus_active(window, cx);
+            cx.notify();
+            return;
+        }
+        self.prs_open = true;
+        self.prs_sel = 0;
+        self.prs_query.clear();
+        // the last read shows now; the fetch below replaces it when it lands
+        if let Some((mine, rel, at)) = pr_list_cached() {
+            self.prs_mine = mine;
+            self.prs_rel = rel;
+            self.prs_at = at;
+        }
+        window.focus(&self.prs_focus, cx);
+        self.refresh_pr_list(cx);
+        cx.notify();
+    }
+
+    /// Re-read both lists. `gh pr list` takes about five seconds, so the two
+    /// calls go out together rather than one after the other.
+    fn refresh_pr_list(&mut self, cx: &mut Context<Self>) {
+        if self.prs_loading {
+            return;
+        }
+        self.prs_loading = true;
+        let (mine_root, rel_root) = (self.root.clone(), self.root.clone());
+        let parent = self.root.parent().map(|p| p.to_path_buf());
+        cx.spawn(async move |this, cx| {
+            // both spawns start immediately, so awaiting them in order still
+            // runs them at the same time
+            let mine = cx
+                .background_executor()
+                .spawn(async move { pr_list_raw(&mine_root, &["--author", "@me"]) });
+            let rel = cx
+                .background_executor()
+                .spawn(async move { pr_list_raw(&rel_root, &["--search", "head:release"]) });
+            let places = cx
+                .background_executor()
+                .spawn(async move { parent.map(|p| checkouts_by_branch(&p)).unwrap_or_default() });
+            let (mine, rel, places) = (mine.await, rel.await, places.await);
+            this.update(cx, |this, cx| {
+                this.prs_loading = false;
+                this.prs_where = places;
+                if let (Some(m), Some(r)) = (&mine, &rel) {
+                    save_pr_list(m, r);
+                    this.prs_at = now_secs();
+                }
+                if let Some(m) = &mine {
+                    this.prs_mine = pr_rows(m);
+                }
+                if let Some(r) = &rel {
+                    this.prs_rel = pr_rows(r);
+                }
+                if mine.is_none() && rel.is_none() {
+                    this.show_flash("Couldn't read your pull requests", cx);
+                }
+                let total = this.prs_rel.len() + this.prs_mine.len();
+                this.prs_sel = this.prs_sel.min(total.saturating_sub(1));
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The screen as it reads: the release boxes, then your own rows, both
+    /// narrowed by whatever has been typed.
+    fn pr_screen_rows(&self) -> (Vec<PrRow>, Vec<PrRow>) {
+        let q = self.prs_query.text.trim().to_lowercase();
+        let keep = |r: &PrRow| q.is_empty() || r.haystack().contains(&q);
+        let rel: Vec<PrRow> = self.prs_rel.iter().filter(|r| keep(r)).cloned().collect();
+        // a release PR is boxed above, so it doesn't repeat in the list below
+        let mine: Vec<PrRow> =
+            self.prs_mine.iter().filter(|r| !r.is_release() && keep(r)).cloned().collect();
+        (rel, mine)
+    }
+
+    /// The row the cursor is on, counting the release boxes first.
+    fn pr_screen_selected(&self) -> Option<PrRow> {
+        let (rel, mine) = self.pr_screen_rows();
+        rel.into_iter().chain(mine).nth(self.prs_sel)
+    }
+
+    /// Open a row: the body as a tab, the way the PR chip does it. ⌘ sends it
+    /// to GitHub instead, for the things TIDE doesn't show — the file diff
+    /// conversation, the reviewers, the merge queue.
+    fn open_pr_row(&mut self, row: &PrRow, on_github: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.prs_open = false;
+        self.focus_active(window, cx);
+        if on_github {
+            open_browser(&row.url);
+        } else {
+            self.open_pr_number(Some(row.number), cx);
+        }
+        cx.notify();
+    }
+
+    fn pr_screen_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        let (rel_n, total) = {
+            let (rel, mine) = self.pr_screen_rows();
+            (rel.len(), rel.len() + mine.len())
+        };
+        match ks.key.as_str() {
+            "escape" => {
+                self.prs_open = false;
+                self.focus_active(window, cx);
+            }
+            // the releases are a row of boxes and the rest is a list, so the
+            // arrows follow the shapes: ←→ along the boxes, ↑↓ down the rows
+            // and between the two
+            "left" if rel_n > 0 && self.prs_sel < rel_n => {
+                self.prs_sel = self.prs_sel.saturating_sub(1);
+                self.prs_box = self.prs_sel;
+            }
+            "right" if rel_n > 0 && self.prs_sel < rel_n => {
+                self.prs_sel = (self.prs_sel + 1).min(rel_n - 1);
+                self.prs_box = self.prs_sel;
+            }
+            "up" => {
+                if self.prs_sel == rel_n && rel_n > 0 {
+                    self.prs_sel = self.prs_box.min(rel_n - 1); // back to the box you left
+                } else if self.prs_sel > rel_n || rel_n == 0 {
+                    self.prs_sel = self.prs_sel.saturating_sub(1);
+                }
+            }
+            "down" => {
+                if rel_n > 0 && self.prs_sel < rel_n {
+                    self.prs_box = self.prs_sel;
+                    self.prs_sel = rel_n.min(total.saturating_sub(1));
+                } else {
+                    self.prs_sel = (self.prs_sel + 1).min(total.saturating_sub(1));
+                }
+            }
+            "enter" => {
+                if let Some(row) = self.pr_screen_selected() {
+                    let on_github = ks.modifiers.secondary();
+                    self.open_pr_row(&row, on_github, window, cx);
+                }
+            }
+            "r" if ks.modifiers.secondary() => self.refresh_pr_list(cx),
+            // the release boxes' own action: cutting a beta is a comment on
+            // the release PR, and the CI picks it up from there
+            "b" if ks.modifiers.secondary() => {
+                match self.pr_screen_selected().filter(|r| r.is_release()) {
+                    Some(r) => self.post_pr_command(r.number, "/beta", cx),
+                    None => self.show_flash("Pick a release first", cx),
+                }
+            }
+            _ => {
+                if Self::field_input(&mut self.prs_query, ks, cx, |_| true) == Edit::Changed {
+                    self.prs_sel = 0; // the old cursor means nothing against a new list
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Open the merge confirmation: everything the header says, plus every file
+    /// the merge would land. A merge can't be taken back, so the question is
+    /// worth asking against the actual contents rather than a second click.
+    fn open_merge_confirm(&mut self, number: u64, window: &mut Window, cx: &mut Context<Self>) {
+        // the tab for *this* PR. `find_map` took the first tab holding any PR
+        // and then checked its number, so with two PR tabs open the merge
+        // button on the second one did nothing at all.
+        let Some(doc) =
+            self.tabs.iter().filter_map(|t| t.pr.clone()).find(|d| d.number == number)
+        else {
+            return;
+        };
+        let root = self.root.clone();
+        self.show_flash("Reading what it would merge…", cx);
+        window.focus(&self.merge_focus, cx);
+        cx.spawn(async move |this, cx| {
+            let files =
+                cx.background_executor().spawn(async move { pr_files(&root, number) }).await;
+            this.update(cx, |this, cx| {
+                this.merge_confirm =
+                    Some(MergeConfirm {
+                        doc,
+                        files,
+                        collapsed: HashSet::new(),
+                        merging: false,
+                        tell: true,
+                    });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn merge_confirm_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match ev.keystroke.key.as_str() {
+            "escape" => {
+                // nothing to cancel once GitHub has been asked
+                if self.merge_confirm.as_ref().is_some_and(|c| c.merging) {
+                    return;
+                }
+                self.merge_confirm = None;
+                self.focus_active(window, cx);
+                cx.notify();
+            }
+            // ⌥↩ merges without telling the agent, the same as unticking
+            // the box: a hand on the keyboard shouldn't have to reach for it
+            "enter" => {
+                if ev.keystroke.modifiers.alt {
+                    if let Some(c) = self.merge_confirm.as_mut() {
+                        c.tell = false;
+                    }
+                }
+                self.do_confirmed_merge(window, cx)
+            }
+            _ => {}
+        }
+    }
+
+    fn do_confirmed_merge(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(c) = self.merge_confirm.as_mut() else { return };
+        if c.merging {
+            return; // already asked
+        }
+        c.merging = true;
+        let number = c.doc.number;
+        let tell = c.tell;
+        self.pr_merging = Some(number);
+        self.merge_pr(number, tell, cx);
+        cx.notify();
+    }
+
+    /// Post a slash command as a PR comment. `/e2e` and `/vitest` are what the
+    /// repo's workflows listen for, so the button is a comment and nothing more
+    /// — GitHub decides what runs.
+    fn post_pr_command(&mut self, number: u64, cmd: &'static str, cx: &mut Context<Self>) {
+        if self.pr_cmd_posting.is_some() {
+            return;
+        }
+        self.pr_cmd_posting = Some(cmd);
+        let root = self.root.clone();
+        self.show_flash(&format!("Commenting {cmd} on #{number}…"), cx);
+        cx.spawn(async move |this, cx| {
+            let out = cx
+                .background_executor()
+                .spawn(async move {
+                    Command::new("gh")
+                        .args(["pr", "comment", &number.to_string(), "--body", cmd])
+                        .current_dir(&root)
+                        .output()
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.pr_cmd_posting = None;
+                match out {
+                    Ok(o) if o.status.success() => {
+                        this.show_flash(&format!("{cmd} posted on #{number}"), cx)
+                    }
+                    Ok(o) => {
+                        let why = String::from_utf8_lossy(&o.stderr);
+                        let why = why.lines().find(|l| !l.trim().is_empty()).unwrap_or("gh refused");
+                        this.show_flash(&format!("Couldn't comment — {why}"), cx);
+                    }
+                    Err(e) => this.show_flash(&format!("Couldn't run gh — {e}"), cx),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Tell the running agent its pull request landed. Without this the human
+    /// types "#5981 is merged, what next" by hand after every merge, which is
+    /// the one thing TIDE knows for certain the moment the merge returns.
+    ///
+    /// Only when a session is already up: starting one here would mean a merge
+    /// in a workspace nobody is pairing in launches an agent on its own. A turn
+    /// in flight is fine, `send_agent_prompt_as` queues behind it.
+    fn tell_agent_merged(&mut self, number: u64, about: Option<PrDoc>, cx: &mut Context<Self>) -> bool {
+        if self.acp.is_none() {
+            return false;
+        }
+        self.send_agent_prompt_as(merged_note(number, about.as_ref()), None, cx);
+        true
+    }
+
+    /// Merge the pull request, the way the GitHub button next to it does:
+    /// squash, with `--admin` to bypass the review requirement — the "bypass
+    /// rules and merge" tick. `--squash` is passed explicitly because `gh`
+    /// needs a method when it isn't talking to a terminal; it is the same
+    /// method the repo defaults to.
+    ///
+    /// It merges now, whatever CI is doing. The confirmation shows the check
+    /// state, so "20 checks running" is on screen when you say yes.
+    fn merge_pr(&mut self, number: u64, tell: bool, cx: &mut Context<Self>) {
+        let root = self.root.clone();
+        // read while the dialog is still up: the success branch clears it, and
+        // the tab's own copy is about to be re-read as `merged`
+        let about = self
+            .merge_confirm
+            .as_ref()
+            .map(|c| c.doc.clone())
+            .filter(|d| d.number == number)
+            .or_else(|| self.tabs.iter().filter_map(|t| t.pr.clone()).find(|d| d.number == number));
+        self.show_flash("Merging…", cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut args = vec![
+                        "pr".to_string(),
+                        "merge".to_string(),
+                        number.to_string(),
+                        "--squash".to_string(),
+                    ];
+                    args.push("--admin".to_string());
+                    Command::new("gh").args(&args).current_dir(&root).output()
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.pr_merging = None;
+                this.merge_confirm = None; // the dialog was holding the answer
+                match result {
+                    Ok(out) if out.status.success() => {
+                        // everything on screen still says `open`: the topbar, the
+                        // file list, and the header of the body you're reading
+                        this.refresh_pr_link(cx);
+                        this.load_pr(cx);
+                        this.reload_pr_doc(cx);
+                        this.read_merge_commit(number, cx);
+                        // and the agent, which otherwise waits to be told by
+                        // hand that the thing it just built has landed
+                        let told = tell && this.tell_agent_merged(number, about, cx);
+                        let flash = if told {
+                            format!("Merged #{number} · told the agent")
+                        } else {
+                            format!("Merged #{number}")
+                        };
+                        this.show_flash(&flash, cx);
+                    }
+                    Ok(out) => {
+                        // gh's own words, which say what GitHub refused and why
+                        let why = String::from_utf8_lossy(&out.stderr);
+                        let why = why.lines().find(|l| !l.trim().is_empty()).unwrap_or("gh refused");
+                        this.show_flash(&format!("Merge failed — {why}"), cx);
+                    }
+                    Err(e) => this.show_flash(&format!("Couldn't run gh — {e}"), cx),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Re-read the pull request into the tab that is showing it, so its header
+    /// stops claiming a state it left behind.
+    fn reload_pr_doc(&mut self, cx: &mut Context<Self>) {
+        // each open body is re-read by its own number. A tab can be a PR other
+        // than this branch's — opened by number, or left behind by a branch
+        // switch — and fetching "the current PR" for it would quietly replace
+        // one PR's body with another's.
+        let numbers: Vec<u64> = self.tabs.iter().filter_map(|t| t.pr.as_ref()).map(|p| p.number).collect();
+        if numbers.is_empty() {
+            return;
+        }
+        let root = self.root.clone();
+        cx.spawn(async move |this, cx| {
+            let docs = cx
+                .background_executor()
+                .spawn(async move {
+                    numbers.into_iter().filter_map(|n| pr_body_doc(&root, Some(n))).collect::<Vec<_>>()
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                for (name, text, meta) in docs {
+                    this.put_pr_doc(name, text, meta, false, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// What the squash actually landed as. GitHub composes that message from
+    /// the repo's own setting — the PR title, the commits, or the body — and
+    /// nothing in the merge output tells you which you got.
+    fn read_merge_commit(&mut self, number: u64, cx: &mut Context<Self>) {
+        let root = self.root.clone();
+        cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async move {
+                    let sha = Command::new("gh")
+                        .args([
+                            "pr",
+                            "view",
+                            &number.to_string(),
+                            "--json",
+                            "mergeCommit",
+                            "-q",
+                            ".mergeCommit.oid",
+                        ])
+                        .current_dir(&root)
+                        .output()
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .and_then(|o| String::from_utf8(o.stdout).ok())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())?;
+                    let message = Command::new("gh")
+                        .args([
+                            "api",
+                            &format!("repos/{{owner}}/{{repo}}/commits/{sha}"),
+                            "-q",
+                            ".commit.message",
+                        ])
+                        .current_dir(&root)
+                        .output()
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .and_then(|o| String::from_utf8(o.stdout).ok())?;
+                    Some((sha.chars().take(7).collect::<String>(), message.trim().to_string()))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Some((sha, message)) = found {
+                    let subject = message.lines().next().unwrap_or("").to_string();
+                    this.show_flash(&format!("Merged as {sha} — {subject}"), cx);
+                    this.pr_merged_as = Some((sha, message));
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Put the fetched body in a tab, reusing the one already showing this PR
+    /// so re-clicking refreshes rather than piling up tabs.
+    fn show_pr_doc(&mut self, name: String, text: String, meta: PrDoc, cx: &mut Context<Self>) {
+        self.put_pr_doc(name, text, meta, true, cx);
+    }
+
+    /// `activate` is false for a refresh: re-reading a body in the background
+    /// shouldn't drag you onto its tab from whatever you were doing.
+    fn put_pr_doc(
+        &mut self,
+        name: String,
+        text: String,
+        meta: PrDoc,
+        activate: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let path = PathBuf::from(&name);
+        // the merge line belongs to the PR it came from, not to the next one
+        if self.tabs.iter().any(|t| t.pr.as_ref().is_some_and(|p| p.number != meta.number)) {
+            self.pr_merged_as = None;
+        }
+        if let Some(ix) = self.tabs.iter().position(|t| t.path == path) {
+            let editor = self.tabs[ix].editor.clone();
+            // a refresh that found nothing new leaves the buffer alone: setting
+            // it reflows the document and, in the raw view, throws your scroll
+            // and selection away. The header below still takes the new meta,
+            // since checks go green without a word of the body changing.
+            if editor.read(cx).text() != text {
+                editor.update(cx, |e, cx| e.set_document(text, cx));
+            }
+            // a re-read can find it merged, or retitled, since
+            self.tabs[ix].label = Some(meta.title.clone());
+            self.tabs[ix].pr = Some(meta);
+            if activate {
+                self.active = ix;
+                self.md_focus_pending = true;
+            }
+            cx.notify();
+            return;
+        }
+        self.save_tab(self.active, cx);
+        let editor = cx.new(|cx| Editor::new(None, cx));
+        editor.update(cx, |e, cx| {
+            e.set_document(text, cx);
+            e.set_read_only(true); // it lives on GitHub; editing it here means nothing
+        });
+        self.tabs.push(Tab {
+            path,
+            editor,
+            scratch: true, // never written to disk
+            preview: true, // rendered, since that is how a PR body is meant to read
+            browser: false,
+            pr: Some(meta.clone()),
+            label: Some(meta.title.clone()),
+        });
+        if activate {
+            self.active = self.tabs.len() - 1;
+            self.md_focus_pending = true;
+        }
+        cx.notify();
     }
 
     /// Load the PR's changed files (base..HEAD) off the main thread.
@@ -7793,12 +12632,13 @@ impl Storm {
         let gen = self.pr_gen;
         let root = self.root.clone();
         cx.spawn(async move |this, cx| {
-            let (base, files, node_id, viewed, stale) = cx
+            let (base, files, node_id, viewed, stale, commits, stats) = cx
                 .background_executor()
                 .spawn(async move {
                     let meta = gh_pr_meta(&root);
                     let base = meta.as_ref().map(|m| m.base.clone()).unwrap_or_else(|| git_pr_base(&root));
                     let files = git_pr_files(&root, &base);
+                    let stats = git_pr_numstat(&root, &base);
                     let node_id = match meta.as_ref().map(|m| m.node_id.clone()).filter(|s| !s.is_empty()) {
                         Some(id) => Some(id),
                         None => gh_pr_node_id(&root),
@@ -7806,13 +12646,17 @@ impl Storm {
                     // restore the "viewed" state from the actual PR on GitHub
                     let viewed = gh_pr_viewed_files(&root);
                     let stale = meta.as_ref().and_then(|m| pr_stale_note(&root, m, files.len()));
-                    (base, files, node_id, viewed, stale)
+                    // the branch's own commits, for the Commits tab
+                    let commits = git_branch_commits(&root, &base);
+                    (base, files, node_id, viewed, stale, commits, stats)
                 })
                 .await;
             this.update(cx, |this, cx| {
                 if this.pr_gen == gen {
                     this.pr_base = base;
                     this.pr_files = files;
+                    this.pr_stats = stats;
+                    this.pr_commits = commits;
                     this.pr_stale = stale;
                     this.pr_node_id = node_id;
                     let mut viewed = viewed;
@@ -8088,6 +12932,16 @@ impl Storm {
 
     fn act_find_in_files(&mut self, _: &FindInFiles, window: &mut Window, cx: &mut Context<Self>) {
         self.save_tab(self.active, cx);
+        // a selection in the changed-files tree scopes to those files: searching
+        // "the folder" there would also read everything in it the branch didn't
+        // touch, which is not what the pane is showing
+        self.find_scope_label = None;
+        if let Some((paths, label)) = self.changed_files_scope() {
+            self.find_scope = paths;
+            self.find_scope_label = Some(label);
+            self.open_find_panel(window, cx);
+            return;
+        }
         // scope to the shift-selected paths, else the single selected folder,
         // else the whole project
         self.find_scope = if !self.tree_multi.is_empty() {
@@ -8100,6 +12954,34 @@ impl Storm {
                 _ => vec![self.root.clone()],
             }
         };
+        self.open_find_panel(window, cx);
+    }
+
+    /// The changed files a selection in the PR or Changes pane stands for, and
+    /// what to call them. `None` when neither pane is showing, or nothing in it
+    /// is selected.
+    fn changed_files_scope(&self) -> Option<(Vec<PathBuf>, String)> {
+        let under = self.commit_selected.clone()?;
+        let all: Vec<PathBuf> = match self.left_view {
+            LeftView::PullRequest => self.pr_shown_files.clone(),
+            LeftView::Changes => {
+                let mut v: Vec<PathBuf> = self.git_status.keys().cloned().collect();
+                v.sort();
+                v
+            }
+            _ => return None,
+        };
+        let paths: Vec<PathBuf> = all.into_iter().filter(|p| p.starts_with(&under)).collect();
+        if paths.is_empty() {
+            return None;
+        }
+        let where_ = self.rel(&under);
+        let where_ = if where_.is_empty() { "this branch".to_string() } else { where_ };
+        let n = paths.len();
+        Some((paths, format!("{n} changed file{} in {where_}", if n == 1 { "" } else { "s" })))
+    }
+
+    fn open_find_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.find_open = true;
         self.find_query.clear();
         self.find_results.clear();
@@ -8565,13 +13447,13 @@ impl Storm {
 
     /// Fuzzy-filtered, ranked command list.
     fn palette_items(&self) -> Vec<(Cmd, String, &'static str, &'static str)> {
-        let admin = admin_url(&self.root);
+        let admin = self.app_url();
         let mut scored: Vec<(i32, (Cmd, String, &'static str, &'static str))> = Vec::new();
         for &(c, label, icon, hint) in PALETTE {
             // Open Admin: wby-next* only, and show the target URL in the label
             let label = if c == Cmd::OpenAdmin {
                 match &admin {
-                    Some(u) => format!("Open Admin ({u})"),
+                    Some(u) => format!("Open the Local App ({u})"),
                     None => continue,
                 }
             } else {
@@ -8614,7 +13496,8 @@ impl Storm {
             Cmd::GoToLine => self.act_goto(&GotoLine, window, cx),
             Cmd::GitPopup => self.act_git_popup(&GitPopup, window, cx),
             Cmd::ShowDiff => self.act_show_diff(&ShowDiff, window, cx),
-            Cmd::MyPrs => {
+            Cmd::MyPrs => self.act_pr_screen(&PrScreen, window, cx),
+            Cmd::MyPrsWeb => {
                 let url = "https://github.com/webiny/webiny-js/pulls?q=sort%3Aupdated-desc+is%3Apr+is%3Aopen+author%3Aadrians5j";
                 let _ = Command::new("open").arg(url).spawn();
             }
@@ -8635,11 +13518,33 @@ impl Storm {
                 cx.write_to_clipboard(ClipboardItem::new_string(format!("/rename ⭐ {branch}")));
                 self.show_flash("/rename command copied", cx);
             }
+            Cmd::AskForTour => self.ask_for_tour(None, cx),
+            Cmd::ShowTours => self.open_tours_pane(cx),
+            Cmd::HandOff => {
+                self.open_handoff(cx);
+                if self.hand_open {
+                    window.focus(&self.hand_focus, cx);
+                }
+            }
+            // what TIDE says to the agent before your first word: not a secret,
+            // just not worth a button
+            Cmd::AgentBriefing => {
+                self.agent_open = true;
+                self.agent_brief_text = self.tide_briefing();
+                self.agent_brief_open = true;
+            }
+            Cmd::PhoneLink => match self.remote_url.clone() {
+                Some(url) => {
+                    cx.write_to_clipboard(ClipboardItem::new_string(url));
+                    self.show_flash("Link copied — open it on your phone", cx);
+                }
+                None => self.show_flash("No phone link: the remote hub isn't up", cx),
+            },
             Cmd::ProcessManager => self.open_process_manager(window, cx),
             Cmd::ToggleReadOnly => self.toggle_read_only(cx),
             Cmd::ResolveConflicts => self.open_conflicts(window, cx),
             Cmd::OpenAdmin => {
-                if let Some(u) = admin_url(&self.root) {
+                if let Some(u) = self.app_url() {
                     open_browser(&u);
                 }
             }
@@ -8647,12 +13552,20 @@ impl Storm {
             Cmd::AddComment => self.open_comment_prompt(window, cx),
             Cmd::ShowComments => self.open_comment_list(window, cx),
             Cmd::SendComments => self.send_review(window, cx),
+            Cmd::LocalReview => self.run_local_review(window, cx),
+            Cmd::Reviewers => self.run_reviewers(window, cx),
+            Cmd::Todo => self.open_todo(window, cx),
             Cmd::OpenRepository => self.act_new_project(&NewProject, window, cx),
+            Cmd::OpenPrNumber => self.open_prnum_prompt(window, cx),
             Cmd::InstallUsageBars => self.install_usage_bars(cx),
             Cmd::TogglePause => self.toggle_pause(cx),
             Cmd::ResetWorkspace => self.reset_workspace(cx),
             // reset, then hand the workspace back — the git work keeps running in
             // its own thread, so closing here doesn't cancel the checkout/pull
+            // closing is only TIDE letting go: the branch, the working tree and
+            // the session all stay as they are, and reopening the folder picks
+            // them up again
+            Cmd::CloseWorkspace => cx.emit(ProjectNav::Remove(self.ws_active)),
             Cmd::ResetWorkspaceClose => {
                 self.reset_workspace(cx);
                 cx.emit(ProjectNav::Remove(self.ws_active));
@@ -8683,6 +13596,10 @@ impl Storm {
     fn reset_workspace(&mut self, cx: &mut Context<Self>) {
         self.ws_title = None;
         save_ws_title(&self.root, None);
+        self.ws_subtitle = None;
+        save_ws_subtitle(&self.root, None);
+        self.agent_titled = false;
+        save_agent_titled(&self.root, false);
         self.ws_client = None;
         save_ws_client(&self.root, None);
         self.title_type = None;
@@ -8797,6 +13714,16 @@ impl Storm {
 
     fn rc_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
+        // ⌘V with a picture on the clipboard: a screenshot belongs in the note
+        // as often as in the composer, and it rides out with the comments
+        if ks.key == "v" && ks.modifiers.platform && !ks.modifiers.alt {
+            if self.attach_clipboard_image(ImgToken::Comment, cx) {
+                self.show_flash("Image attached — it goes with the next send", cx);
+                self.sync_comment_gutters(cx); // the token made the box taller
+                cx.notify();
+                return;
+            }
+        }
         match ks.key.as_str() {
             "escape" => self.cancel_comment(window, cx),
             // ⌘↩ commits; a bare ↩ is a newline (handled by the field below)
@@ -9001,6 +13928,8 @@ impl Storm {
     /// so the code moves down instead of being covered.
     fn sync_comment_gutters(&mut self, cx: &mut Context<Self>) {
         let editing = self.rc_open.then(|| self.rc_target.clone()).flatten();
+        // the tour stop being stood on, if its file is one of the open ones
+        let here = self.walk.as_ref().and_then(|w| w.here.clone());
         for tab in &self.tabs {
             // spans, not individual lines: the editor draws one icon plus a bar
             // down the side of each range
@@ -9031,17 +13960,51 @@ impl Storm {
                     }
                 }
             }
+            // and the space the tour card needs under the stop it is about,
+            // the thread pinned to those lines included
+            if let Some((p, start, end)) = here.as_ref().filter(|(p, _, _)| p == &tab.path) {
+                let said = self
+                    .walk
+                    .as_ref()
+                    .and_then(|w| w.stops.get(w.at))
+                    .map(|s| s.said.clone())
+                    .unwrap_or_default();
+                let turns: Vec<ReviewReply> = self
+                    .review
+                    .iter()
+                    .find(|c| &c.path == p && c.line == *start && c.end == *end)
+                    .map(|c| {
+                        let mut v = vec![ReviewReply { who: "you".into(), text: c.text.clone() }];
+                        v.extend(c.replies.iter().cloned());
+                        v
+                    })
+                    .unwrap_or_default();
+                let h = tour_gap_h(&said) + tour_thread_h(&turns);
+                match gaps.iter_mut().find(|(l, _)| l == end) {
+                    Some(g) => g.1 += h,
+                    None => gaps.push((*end, h)),
+                }
+            }
             gaps.sort_by_key(|(l, _)| *l);
             // the span being written keeps its bar until it's saved or dropped
             let pending = editing
                 .as_ref()
                 .filter(|(p, _, _)| p == &tab.path)
                 .map(|(_, a, b)| (*a, *b));
+            let tour_span = here
+                .as_ref()
+                .filter(|(p, _, _)| p == &tab.path)
+                .map(|(_, a, b)| (*a, *b));
             tab.editor.update(cx, |e, cx| {
-                if e.comment_spans != spans || e.inline_gaps != gaps || e.pending_span != pending {
+                if e.comment_spans != spans
+                    || e.inline_gaps != gaps
+                    || e.pending_span != pending
+                    || e.tour_span != tour_span
+                {
                     e.comment_spans = spans;
                     e.inline_gaps = gaps;
                     e.pending_span = pending;
+                    e.tour_span = tour_span;
                     cx.notify();
                 }
             });
@@ -9156,6 +14119,9 @@ impl Storm {
         self.review_note.clear();
         self.sync_comment_gutters(cx);
         self.save_review();
+        let when = now_secs();
+        self.review_sent = Some((when, n));
+        save_review_sent(&self.root, when, n);
         match pane {
             Some(pane) => self.focus_pane(&pane, window, cx),
             None => self.focus_agent(window, cx),
@@ -9624,12 +14590,10 @@ impl Storm {
             let max_w = (self.win_width * 0.92).max(200.);
             self.term_width = (self.win_width - f32::from(ev.position.x)).clamp(200., max_w);
             cx.notify();
-        } else if self.resizing_agent {
-            // the agent sits on top of the terminal panes; this divider splits the
-            // dock vertically, so the share follows the cursor's y within it
-            let top = 44.0; // topbar
-            let h = (self.win_height - top).max(1.0);
-            self.agent_share = ((f32::from(ev.position.y) - top) / h).clamp(0.15, 0.85);
+        } else if self.resizing_term_h {
+            // the terminal sits at the bottom of the centre column: drag up to
+            // grow it, and leave room for the editor above
+            self.term_h = (self.win_height - f32::from(ev.position.y)).clamp(80., (self.win_height - 200.).max(120.));
             cx.notify();
         } else if self.resizing_git {
             // bottom dock: divider on its top edge; drag up grows it
@@ -9706,7 +14670,7 @@ impl Storm {
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if self.resizing
             || self.resizing_term
-            || self.resizing_agent
+            || self.resizing_term_h
             || self.resizing_git
             || self.find_resize.is_some()
             || self.find_moving
@@ -9714,19 +14678,31 @@ impl Storm {
             || self.pane_drag.is_some()
             || self.rc_resize.is_some()
             || self.agent_sel_drag
+            || self.md_sel_drag
         {
             self.resizing = false;
             self.resizing_term = false;
-            self.resizing_agent = false;
+            self.resizing_term_h = false;
             self.resizing_git = false;
             self.find_resize = None;
             self.find_moving = false;
             self.find_split_dragging = false;
             self.pane_drag = None;
             self.rc_resize = None;
+            if self.agent_sel_drag && !self.agent_sel_moved {
+                // a press that never moved is a click, not a selection
+                self.agent_sel_ch = None;
+                self.agent_sel = None;
+            }
+            // a press that never moved is a click, not a selection
+            if self.md_sel_drag && self.md_sel.is_some_and(|(ra, ba, rb, bb)| (ra, ba) == (rb, bb)) {
+                self.md_sel = None;
+            }
+            self.md_sel_drag = false;
             self.agent_sel_drag = false;
             self.agent_sel_moved = false;
             self.agent_sel_armed = None;
+            self.agent_sel_anchor = None;
             for t in self.all_terminals() {
                 t.update(cx, |t, _| t.defer_resize = false);
             }
@@ -9756,6 +14732,25 @@ fn input_sink(focus: FocusHandle, storm: Entity<Storm>) -> impl IntoElement {
     .size_full()
 }
 
+/// Records where the mirrored page is actually painted, so a click can be put
+/// back on the page. Measured during paint rather than computed from the
+/// layout: the column's origin moves with the tree, the docks and the window,
+/// and a click that lands a few pixels out is worse than no click at all.
+fn mirror_probe(storm: Entity<Storm>) -> impl IntoElement {
+    gpui::canvas(
+        |_, _, _| (),
+        move |bounds, _, _window, cx| {
+            storm.update(cx, |s, _| {
+                s.mirror_origin =
+                    (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
+                s.mirror_width = f32::from(bounds.size.width);
+            });
+        },
+    )
+    .absolute()
+    .size_full()
+}
+
 /// Dictation, IME, and the emoji picker deliver text through macOS's
 /// `insertText:`, never as key events — so the chrome inputs need a real input
 /// handler or a dictated sentence arrives as a single stray character.
@@ -9772,6 +14767,25 @@ impl Storm {
         }
         if self.agent_jump_focus.is_focused(window) {
             return Some(&mut self.agent_jump_query);
+        }
+        if self.tour_ask_focus.is_focused(window) {
+            return Some(&mut self.tour_ask);
+        }
+        if self.md_find_focus.is_focused(window) {
+            return Some(&mut self.md_find);
+        }
+        if self.todo_focus.is_focused(window) {
+            return Some(match self.todo_field {
+                1 => &mut self.todo_details,
+                2 => &mut self.todo_link,
+                3 => &mut self.todo_scope,
+                4 => &mut self.todo_client,
+                5 => &mut self.todo_group,
+                _ => &mut self.todo_desc,
+            });
+        }
+        if self.todo_filter_focus.is_focused(window) {
+            return Some(&mut self.todo_filter);
         }
         None
     }
@@ -9823,11 +14837,19 @@ impl EntityInputHandler for Storm {
             return;
         }
         let agent = self.agent_focus.is_focused(window);
+        // dictating "fix: …" into the task form should pick the type, exactly as
+        // typing it does
+        let todo_desc = self.todo_focus.is_focused(window) && self.todo_field == 0;
         if let Some(f) = self.focused_field(window) {
             f.insert_text(&new_text);
             self.recompute_agent_ghost();
             if agent {
                 self.recompute_mentions(cx);
+            }
+            if todo_desc {
+                if let Some(i) = type_prefix(&mut self.todo_desc) {
+                    self.todo_cat = Some(i);
+                }
             }
             self.sync_comment_gutters(cx); // the comment box may have grown
             cx.notify();
@@ -9881,23 +14903,45 @@ impl Render for Storm {
             self.inited = true;
             window.focus(&self.focus, cx);
         }
+        // a preview opened from somewhere without a Window (a fetched PR body):
+        // claim focus now, so its shortcuts work without a click first
+        if std::mem::take(&mut self.md_focus_pending) {
+            window.focus(&self.md_focus, cx);
+        }
+        // something was handed to this workspace: put the caret where the rest
+        // of the sentence goes
+        if std::mem::take(&mut self.agent_focus_pending) {
+            window.focus(&self.agent_focus, cx);
+        }
+        // a tour just arrived from the agent: stand on its first stop. The poll
+        // that received it had no Window to open a file with; this does — after
+        // the frame, rather than opening a tab halfway through drawing one.
+        if let Some(i) = std::mem::take(&mut self.tour_jump) {
+            let me = cx.entity();
+            window.defer(cx, move |window, cx| {
+                me.update(cx, |this, cx| this.goto_walk_stop(i, window, cx));
+            });
+        }
+        if std::mem::take(&mut self.paste_focus_pending) {
+            window.focus(&self.rn_focus, cx);
+        }
 
-        // WebStorm-style title: "<project> - <open file>"
+        // "<project> — ~/dev/<folder> - <open file>": the window title is where
+        // the checkout on disk belongs. It is the one place with room for a
+        // path, and it answers "which copy is this?" without the topbar
+        // carrying a grey chip for it.
         let project = self.project_name();
-        let title = match self.active_path() {
-            Some(p) => format!(
-                "{} - {}",
-                project,
-                p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
-            ),
-            None => project.clone(),
-        };
+        let mut title = format!("{project}  —  {}", tilde_path(&self.root));
+        if let Some(name) =
+            self.active_path().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string())
+        {
+            title.push_str(&format!("  -  {name}"));
+        }
         window.set_window_title(&title);
 
         // Build pieces as locals first (each borrows self/cx sequentially).
         let topbar = self.render_topbar(project.clone(), cx);
         let act_left = self.render_activity_left(cx);
-        let act_right = self.render_activity_right(cx);
         let run_dock = if self.run_open { Some(self.render_run(cx).into_any_element()) } else { None };
         let git_dock = if self.git_open {
             let panel = self.render_git_log(window, cx);
@@ -9924,6 +14968,8 @@ impl Render for Storm {
                 LeftView::Changes => self.render_changes(window, cx).into_any_element(),
                 LeftView::PullRequest => self.render_pr(window, cx).into_any_element(),
                 LeftView::Review => self.render_review_pane(window, cx).into_any_element(),
+                LeftView::Todos => self.render_todo_pane(window, cx).into_any_element(),
+                LeftView::Tours => self.render_tours_pane(cx).into_any_element(),
             })
         } else {
             None
@@ -9942,100 +14988,79 @@ impl Render for Storm {
                 middle = middle.child(d);
             }
         }
-        middle = middle.child(self.render_editor_wrap(center, cx));
-
-        // The right dock: the agent pane on top, the terminal under it. The
-        // agent is always in it — closing the terminal hands the whole dock to
-        // the agent rather than taking the dock away with it.
-        let show_agent = AGENT_PANEL && self.agent_open && !self.term_zoomed;
-        let show_panes = show_term && !(show_agent && self.agent_zoomed);
-        if show_agent || show_term {
-            // built first: each of these borrows self on its own
-            let term_parts =
-                show_panes.then(|| (self.render_term_panes(window, cx), self.render_term_tabs(cx)));
-            let agent = show_agent.then(|| self.render_agent(window, cx));
-            middle = middle
-                .child(
+        // Centre column: the editor, the walk strip, and the terminal under
+        // them. The terminal used to live in the right dock under the agent,
+        // which meant the pane you work in shrank every time you opened a
+        // shell; here it takes width it already has and leaves the agent alone.
+        let walk = self.render_walk(cx);
+        let show_panes = show_term && !self.term_folded;
+        let term_parts =
+            show_panes.then(|| (self.render_term_panes(window, cx), self.render_term_tabs(cx)));
+        let zoomed = show_panes && self.term_zoomed; // ⌘⇧↩: the terminal takes the column
+        let mut centre = div().flex().flex_col().flex_grow(1.0).min_w(px(0.));
+        if !zoomed {
+            // the editor, and the tour's step list beside it when it's open
+            let steps = self.render_tour_steps(cx);
+            centre = centre.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_grow(1.0)
+                    .min_h(px(0.))
+                    .child(
+                        div()
+                            .flex_grow(1.0)
+                            .min_w(px(0.))
+                            .h_full()
+                            .child(self.render_editor_wrap(center, cx)),
+                    )
+                    .children(steps),
+            );
+        }
+        if let Some(strip) = walk {
+            centre = centre.child(strip);
+        }
+        if let Some((panes, tab_bar)) = term_parts {
+            centre = centre
+                .when(!zoomed, |d| {
+                    d.child(
                     div()
-                        .w(px(4.))
-                        .h_full()
+                        .h(px(4.))
+                        .w_full()
                         .flex_shrink_0()
-                        .bg(rgb(if self.resizing_term { ACCENT } else { BORDER }))
-                        .cursor(CursorStyle::ResizeLeftRight)
+                        .bg(rgb(if self.resizing_term_h { ACCENT } else { BORDER }))
+                        .cursor(CursorStyle::ResizeUpDown)
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _ev, _window, cx| {
-                                this.resizing_term = true;
+                                this.resizing_term_h = true;
                                 for t in this.all_terminals() {
                                     t.update(cx, |t, _| t.defer_resize = true);
                                 }
                                 cx.notify();
                             }),
                         ),
-                )
-                .child({
-                    let mut dock = div()
-                        .w(px(self.term_width))
-                        .h_full()
-                        .flex_shrink_0()
+                    )
+                })
+                .child(
+                    div()
+                        .when(!zoomed, |d| {
+                            d.h(px(self.term_h.clamp(80., (self.win_height - 200.).max(120.))))
+                                .flex_shrink_0()
+                        })
+                        .when(zoomed, |d| d.flex_grow(1.0).min_h(px(0.)))
                         .flex()
                         .flex_col()
-                        .bg(rgb(PANEL_BG));
-                    let split = agent.is_some() && term_parts.is_some();
-                    if let Some(agent) = agent {
-                        // with no terminal under it, the agent is the dock
-                        let share = if split { self.agent_share } else { 1.0 };
-                        dock = dock.child(
-                            div()
-                                .flex_grow(share)
-                                .flex_basis(relative(0.))
-                                .min_h(px(0.))
-                                .overflow_hidden()
-                                .child(agent),
-                        );
-                    }
-                    // the height divider only exists while there are two things
-                    // to divide
-                    if split {
-                        dock = dock.child(
-                            div()
-                                .h(px(4.))
-                                .w_full()
-                                .flex_shrink_0()
-                                .bg(rgb(if self.resizing_agent { ACCENT } else { BORDER }))
-                                .cursor(CursorStyle::ResizeUpDown)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _ev, _window, cx| {
-                                        this.resizing_agent = true;
-                                        for t in this.all_terminals() {
-                                            t.update(cx, |t, _| t.defer_resize = true);
-                                        }
-                                        cx.notify();
-                                    }),
-                                ),
-                        );
-                    }
-                    if let Some((panes, tab_bar)) = term_parts {
-                        let rest = if split { 1.0 - self.agent_share } else { 1.0 };
-                        dock = dock.child(
-                            div()
-                                .flex_grow(rest)
-                                .flex_basis(relative(0.))
-                                .min_h(px(0.))
-                                .flex()
-                                .flex_col()
-                                .child(tab_bar)
-                                .child(div().flex_grow(1.0).flex().min_h(px(0.)).child(panes)),
-                        );
-                    }
-                    dock
-                });
+                        .bg(rgb(PANEL_BG))
+                        .child(tab_bar)
+                        .child(div().flex_grow(1.0).flex().min_h(px(0.)).child(panes)),
+                );
         }
-        // browser shares the right dock with the terminal (never both — the
-        // toggles are mutually exclusive); its WebView floats over the dock
-        if self.browser_open {
-            let dock = self.render_browser_dock(window, cx);
+        middle = middle.child(centre);
+
+        // The right dock is the agent's, full height, always.
+        if AGENT_PANEL && self.agent_open {
+            let agent = self.render_agent(window, cx);
             middle = middle
                 .child(
                     div()
@@ -10052,12 +15077,17 @@ impl Render for Storm {
                             }),
                         ),
                 )
-                .child(dock);
-        } else if let Some(b) = &self.browser {
-            b.set_visible(false); // dock closed → hide the floating WebView
+                .child(
+                    div()
+                        .w(px(self.term_width))
+                        .h_full()
+                        .flex_shrink_0()
+                        .flex()
+                        .flex_col()
+                        .bg(rgb(PANEL_BG))
+                        .child(agent),
+                );
         }
-        middle = middle.child(act_right);
-
         let mut root = div()
             .flex()
             .flex_col()
@@ -10073,6 +15103,16 @@ impl Render for Storm {
             .on_action(cx.listener(Self::act_toggle_term))
             .on_action(cx.listener(Self::act_open_finder))
             .on_action(cx.listener(Self::act_goto))
+            .on_action(cx.listener(Self::act_todo))
+            .on_action(cx.listener(Self::act_pr_screen))
+            .on_action(cx.listener(|this, _: &SendElsewhere, window, cx| {
+                this.open_handoff(cx);
+                if this.hand_open {
+                    window.focus(&this.hand_focus, cx);
+                }
+            }))
+            .on_action(cx.listener(Self::act_walk_next))
+            .on_action(cx.listener(Self::act_walk_prev))
             .on_action(cx.listener(Self::act_new_terminal))
             .on_action(cx.listener(Self::act_close_terminal))
             .on_action(cx.listener(Self::act_close_other_terminals))
@@ -10121,8 +15161,29 @@ impl Render for Storm {
         if self.goto_open {
             root = root.child(self.render_goto(cx));
         }
+        if self.prnum_open {
+            root = root.child(self.render_prnum(cx));
+        }
+        if self.merge_confirm.is_some() {
+            root = root.child(self.render_merge_confirm(cx));
+        }
+        if self.todo_open {
+            root = root.child(self.render_todo(cx));
+        }
+        if self.prs_open {
+            root = root.child(self.render_pr_screen(cx));
+        }
+        if let Some(card) = self.render_tour_card(cx) {
+            root = root.child(card);
+        }
+        if self.hand_open {
+            root = root.child(self.render_handoff(cx));
+        }
         if self.nf_open {
             root = root.child(self.render_new_file_prompt(cx));
+        }
+        if self.rn_path.is_some() || self.rn_paste.is_some() {
+            root = root.child(self.render_rename_prompt(cx));
         }
         if self.mc_open {
             root = root.child(self.render_conflicts(cx));
@@ -10309,12 +15370,12 @@ impl Storm {
     }
 
     fn render_topbar(&self, project: String, cx: &mut Context<Self>) -> impl IntoElement {
-        // the real folder, shown grayed next to a custom title (redundant otherwise)
-        let folder = self
-            .root
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .filter(|n| *n != project);
+        // the folder lives in the window title now, as a full path, and the
+        // type's emoji comes off the front of the title so it can be drawn as
+        // its own element
+        let (ty, rest) = split_title(&project);
+        let icon = ty.and_then(|i| TITLE_TYPES.get(i)).map(|(_, emoji, _)| *emoji);
+        let name = if icon.is_some() { rest } else { project.clone() };
         let mut bar = div()
             .h(px(44.)) // match the activity-bar width
             .flex_shrink_0() // never let a tall panel squeeze the top bar
@@ -10343,105 +15404,97 @@ impl Storm {
                             .flex_row()
                             .items_center()
                             .gap_1()
-                            // workspace number (1-based position in the project
-                            // switcher) — same key-cap as the switcher's ⌘E rows
-                            .child(
-                                key_cap(format!("{}", self.ws_active + 1), true)
-                                    .id("ws-number")
-                                    .tooltip(|_w, cx| {
-                                        cx.new(|_| TooltipView {
-                                            text: "Workspace number  ·  ⌘E to switch".into(),
-                                        })
-                                        .into()
-                                    }),
-                            )
                             .child(
                                 div()
                                     .id("project-switcher")
                                     .flex()
                                     .flex_row()
                                     .items_center()
-                                    .gap_1()
-                                    .px_1()
-                                    .rounded_md()
+                                    .gap_1p5()
+                                    // the pencil is gone, so the name itself is
+                                    // the way in: clicking what you want to
+                                    // change is where you would reach anyway
                                     .cursor_pointer()
                                     .hover(|s| s.bg(rgb(HOVER)))
+                                    .tooltip(tip("Rename this workspace, or set where the work stands"))
+                                    .on_click(cx.listener(|this, _e, window, cx| {
+                                        this.open_title_prompt(window, cx)
+                                    }))
+                                    // full height, so the icon and the two lines
+                                    // centre against the bar rather than against
+                                    // a box already exactly as tall as they are
+                                    .h_full()
+                                    .px_1()
+                                    .rounded_md()
                                     .text_color(rgb(TEXT))
                                     .text_size(px(12.))
-                                    .child(project)
-                                    .when_some(folder, |d, f| {
-                                        d.child(
-                                            div()
-                                                .flex_shrink_0()
-                                                .text_size(px(10.))
-                                                .text_color(rgb(LINE_NUMBER))
-                                                .child(f),
-                                        )
+                                    // the type's emoji is its own element now.
+                                    // Inside the title string it set where the
+                                    // name began, and the subtitle underneath
+                                    // had to guess at that width to line up.
+                                    .when_some(icon, |d, i| {
+                                        d.child(div().flex_shrink_0().text_size(px(13.)).child(i))
                                     })
-                                    // who this work is for, when it's client work
-                                    .when_some(self.ws_client.clone(), |d, c| {
-                                        d.child(
-                                            div()
-                                                .flex_shrink_0()
-                                                .px_1()
-                                                .rounded_md()
-                                                .bg(rgb(HOVER))
-                                                .text_size(px(9.))
-                                                .text_color(rgb(FOLDER_ICON))
-                                                .child(c),
-                                        )
-                                    })
-                                    .child(div().text_color(rgb(MUTED)).text_size(px(9.)).child("▾"))
-                                    .on_click(cx.listener(|this, _e, _w, cx| {
-                                        this.ws_open = !this.ws_open;
-                                        cx.notify();
-                                    })),
+                                    .child(
+                                        div()
+                                            .flex()
+                                            // name over checkpoint, both starting
+                                            // at the same edge
+                                            .flex_col()
+                                            .justify_center()
+                                            .gap(px(1.))
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .gap_1()
+                                                    .line_height(px(16.))
+                                                    .child(name)
+                                                    // who this work is for, when
+                                                    // it's client work
+                                                    .when_some(
+                                                        self.ws_client.clone(),
+                                                        |d, c| {
+                                                            d.child(
+                                                                div()
+                                                                    .flex_shrink_0()
+                                                                    .px_1()
+                                                                    .rounded_md()
+                                                                    .bg(rgb(HOVER))
+                                                                    .text_size(px(9.))
+                                                                    .text_color(rgb(FOLDER_ICON))
+                                                                    .child(c),
+                                                            )
+                                                        },
+                                                    ),
+                                            )
+                                            // the checkpoint: the title is the
+                                            // feature, this moves while the title
+                                            // stays put
+                                            .when_some(self.ws_subtitle.clone(), |d, sub| {
+                                                d.child(
+                                                    div()
+                                                        .text_size(px(10.))
+                                                        .line_height(px(12.))
+                                                        .text_color(rgb(MUTED))
+                                                        .child(sub),
+                                                )
+                                            }),
+                                    ),
                             )
-                            // edit workspace title
-                            .child(
-                                div()
-                                    .id("edit-ws-title")
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .h(px(18.))
-                                    .px_1()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .text_size(px(11.))
-                                    .text_color(rgb(MUTED))
-                                    .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                                    .child("✎")
-                                    .tooltip(|_w, cx| {
-                                        cx.new(|_| TooltipView { text: "Set workspace title".into() }).into()
-                                    })
-                                    .on_click(cx.listener(|this, _e, window, cx| this.open_title_prompt(window, cx))),
-                            )
-                            // pause: keep this workspace out of the ⌥Tab rotation
-                            .child({
-                                let paused = self.ws_paused;
-                                div()
-                                    .id("ws-pause")
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .h(px(18.))
-                                    .px_1()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .text_size(px(10.))
-                                    .text_color(rgb(if paused { GIT_MODIFIED } else { MUTED }))
-                                    .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                                    .child(if paused { "❙❙ PAUSED" } else { "❙❙" })
-                                    .tooltip(move |_w, cx| {
-                                        let text = if paused {
-                                            "Paused — ⌥Tab skips this workspace. Click to resume."
-                                        } else {
-                                            "Pause: keep this workspace out of the ⌥Tab rotation"
-                                        };
-                                        cx.new(|_| TooltipView { text: text.into() }).into()
-                                    })
-                                    .on_click(cx.listener(|this, _e, _w, cx| this.toggle_pause(cx)))
+                            // the pencil and the pause button are gone: both are
+                            // palette commands, and the topbar is for what the
+                            // workspace *is*. A paused one still says so, since
+                            // that is state rather than a control.
+                            .when(self.ws_paused, |d| {
+                                d.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(9.))
+                                        .text_color(rgb(GIT_MODIFIED))
+                                        .child("PAUSED"),
+                                )
                             })
                             // agent state for this workspace: the loud badge when
                             // nothing's running, a dot + word otherwise
@@ -10542,8 +15595,17 @@ impl Storm {
                                 .child(format!("#{}", num))
                                 // draft / merged / closed pill (open needs no label)
                                 .when(state != PrState::Open, |d| d.child(pr_state_pill(state, 10.)))
-                                .on_click(cx.listener(move |_this, _e, _w, _cx| {
-                                    let _ = Command::new("open").arg(&url).spawn();
+                                .tooltip(tip("Read the PR body here  ·  ⌘click to open it on GitHub"))
+                                .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, _w, cx| {
+                                    // ⌘click is the browser, the way a link
+                                    // behaves everywhere else
+                                    if ev.modifiers().platform {
+                                        let _ = Command::new("open").arg(&url).spawn();
+                                    } else {
+                                        // by number, so the cached copy opens
+                                        // now and the read happens behind it
+                                        this.open_pr_number(Some(num), cx);
+                                    }
                                 })),
                         )
                     })
@@ -10576,16 +15638,128 @@ impl Storm {
                                 .on_click(cx.listener(|this, _e, _w, cx| this.refresh_pr_link(cx))),
                         )
                     })
-                    // Open Admin (wby-next* only): the host opens admin{N}.localhost
-                    // in the default browser; the ▶ beside it carries up/down
-                    .when_some(admin_url(&self.root), |d, url| {
+                    // out of step with the base: how far behind, and whether
+                    // catching up would conflict. Either chip hands the same
+                    // merge to the agent.
+                    .when_some(
+                        self.base_sync.clone().filter(|s| !s.clean()),
+                        |d, sync| {
+                            let base = sync.short().to_string();
+                            let n = sync.conflicts.len();
+                            let behind = sync.behind;
+                            let behind_tip = format!(
+                                "{behind} commit{} behind {base}  ·  click to have the agent merge it in",
+                                if behind == 1 { "" } else { "s" }
+                            );
+                            let gh_tip = if sync.unpushed > 0 {
+                                format!(
+                                    "GitHub still sees a conflict on the pushed branch, but this checkout merges {base} cleanly and has {} commit{} it hasn't pushed  ·  click to have the agent push",
+                                    sync.unpushed,
+                                    if sync.unpushed == 1 { "" } else { "s" }
+                                )
+                            } else {
+                                format!(
+                                    "GitHub reports this PR as conflicting, but merging {base} here is clean  ·  click to have the agent work out which is right"
+                                )
+                            };
+                            let conflict_tip = format!(
+                                "{} would conflict with {base}  ·  click to have the agent merge and resolve",
+                                match n {
+                                    1 => "1 file".to_string(),
+                                    n => format!("{n} files"),
+                                }
+                            );
+                            d.child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    .when(behind > 0, |d| {
+                                        d.child(
+                                            div()
+                                                .id("base-behind")
+                                                .px_1()
+                                                .rounded_sm()
+                                                .border_1()
+                                                .border_color(rgb(FOLDER_ICON))
+                                                .text_size(px(10.))
+                                                .text_color(rgb(FOLDER_ICON))
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(rgb(HOVER)))
+                                                .child(format!("↓{behind} behind {base}"))
+                                                .tooltip(move |_w, cx| {
+                                                    cx.new(|_| TooltipView {
+                                                        text: behind_tip.clone().into(),
+                                                    })
+                                                    .into()
+                                                })
+                                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                                    this.merge_base_with_agent(cx)
+                                                })),
+                                        )
+                                    })
+                                    // GitHub judging the pushed head, when the
+                                    // local tree has nothing to say
+                                    .when(sync.gh_conflict && n == 0, |d| {
+                                        d.child(
+                                            div()
+                                                .id("pr-conflicts")
+                                                .px_1()
+                                                .rounded_sm()
+                                                .border_1()
+                                                .border_color(rgb(GIT_DELETED))
+                                                .text_size(px(10.))
+                                                .text_color(rgb(GIT_DELETED))
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(rgb(HOVER)))
+                                                .child("⚠ PR conflicts")
+                                                .tooltip(move |_w, cx| {
+                                                    cx.new(|_| TooltipView { text: gh_tip.clone().into() })
+                                                        .into()
+                                                })
+                                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                                    this.merge_base_with_agent(cx)
+                                                })),
+                                        )
+                                    })
+                                    .when(n > 0, |d| {
+                                        d.child(
+                                            div()
+                                                .id("base-conflicts")
+                                                .px_1()
+                                                .rounded_sm()
+                                                .border_1()
+                                                .border_color(rgb(GIT_DELETED))
+                                                .text_size(px(10.))
+                                                .text_color(rgb(GIT_DELETED))
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(rgb(HOVER)))
+                                                .child(format!("⚠ {n} conflict{}", if n == 1 { "" } else { "s" }))
+                                                .tooltip(move |_w, cx| {
+                                                    cx.new(|_| TooltipView {
+                                                        text: conflict_tip.clone().into(),
+                                                    })
+                                                    .into()
+                                                })
+                                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                                    this.merge_base_with_agent(cx)
+                                                })),
+                                        )
+                                    }),
+                            )
+                        },
+                    )
+                    // wby-next* only: the host opens wby{N}.localhost in the
+                    // default browser; the ▶ beside it carries up/down
+                    .when_some(self.app_url(), |d, url| {
                         // the play button carries the up/down colour now; this is
                         // just the hover text on the host itself
                         let up = self.admin_up == Some(true);
                         let tip = if up {
-                            "Admin is up  ·  click to open  ·  ⌘R to re-check"
+                            "The project is up  ·  click to open  ·  ⌘R to re-check"
                         } else {
-                            "Admin is down  ·  click to start it  ·  ⌘R to re-check"
+                            "Nothing serving  ·  click to run `wdev`  ·  ⌘R to re-check"
                         };
                         d.child(div().w(px(1.)).h(px(16.)).mx_1().bg(rgb(BORDER))) // separator
                             // host + ▶ read as one control, so they sit tight
@@ -10640,6 +15814,7 @@ impl Storm {
                     d.child(div().w(px(1.)).h(px(14.)).bg(rgb(BORDER)))
                 })
                 .children(self.render_ws_tally(cx))
+                .children(self.render_todo_chip(cx))
                 .children(self.render_usage_chip(cx))
                 .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(format!("{} MB", self.mem_mb)))
                 // last item in the bar, hard against the right edge
@@ -10773,6 +15948,8 @@ impl Storm {
         let changes_active = self.show_left && self.left_view == LeftView::Changes;
         let pr_active = self.show_left && self.left_view == LeftView::PullRequest;
         let review_active = self.show_left && self.left_view == LeftView::Review;
+        let todos_active = self.show_left && self.left_view == LeftView::Todos;
+        let tours_active = self.show_left && self.left_view == LeftView::Tours;
         div()
             .w(px(44.))
             .flex_shrink_0()
@@ -10813,7 +15990,7 @@ impl Storm {
                 }
                 cx.notify();
             })))
-            .child(activity_icon("act-review", IC_COMMENT, "Review Comments  (⌥⇧C)", review_active, self.review.len(), cx.listener(|this, _ev, _w, cx| {
+            .child(activity_icon("act-review", IC_COMMENT, "Review Comments  (⌥⇧C)", review_active, self.review.iter().filter(|c| !c.resolved).count(), cx.listener(|this, _ev, _w, cx| {
                 if this.show_left && this.left_view == LeftView::Review {
                     this.show_left = false;
                 } else {
@@ -10822,35 +15999,41 @@ impl Storm {
                 }
                 cx.notify();
             })))
-            // push Run + Git to the bottom-left corner
+            .child(activity_icon("act-tours", IC_TOUR, "Code Tours", tours_active, 0, cx.listener(|this, _ev, _w, cx| {
+                if this.show_left && this.left_view == LeftView::Tours {
+                    this.show_left = false;
+                } else {
+                    this.left_view = LeftView::Tours;
+                    this.show_left = true;
+                }
+                cx.notify();
+            })))
+            // no badge: the list is a list, not an inbox — a number that only
+            // ever grows is noise, not a nudge
+            .child(activity_icon("act-todo", IC_CHECK, "Todo  (⌘⇧L writes one)", todos_active, 0, cx.listener(|this, _ev, _w, cx| {
+                if this.show_left && this.left_view == LeftView::Todos {
+                    this.show_left = false;
+                } else {
+                    this.left_view = LeftView::Todos;
+                    this.show_left = true;
+                }
+                cx.notify();
+            })))
+            // push the docks to the bottom-left corner: the terminal used to
+            // have a bar of its own on the right, 44px of chrome for one icon
             .child(div().flex_grow(1.0))
+            .child(activity_icon("act-term", IC_TERMINAL, "Terminal  (⌥F12)", self.show_terminal && !(AGENT_PANEL && self.agent_open && self.term_folded), 0, cx.listener(|this, _ev, window, cx| {
+                this.toggle_terminal(window, cx);
+            })))
+            .when(BROWSER_PANEL, |d| d.child(activity_icon("act-browser", IC_BROWSER, "Browser", self.browser_tab().is_some(), 0, cx.listener(|this, _ev, window, cx| {
+                this.toggle_browser(window, cx);
+            }))))
             .child(activity_icon("act-run", IC_RUN, "Run console", self.run_open, 0, cx.listener(|this, _ev, _w, cx| {
                 this.toggle_run(cx);
             })))
             .child(activity_icon("act-git", IC_BRANCH, "Git  (⌘9)", self.git_open, 0, cx.listener(|this, _ev, window, cx| {
                 this.toggle_git_log(window, cx);
             })))
-    }
-
-    fn render_activity_right(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .w(px(44.))
-            .flex_shrink_0()
-            .h_full()
-            .flex()
-            .flex_col()
-            .items_center()
-            .py_2()
-            .gap_3()
-            .bg(rgb(PANEL_BG))
-            .border_l_1()
-            .border_color(rgb(BORDER))
-            .child(activity_icon("act-term", IC_TERMINAL, "Terminal  (⌥F12)", self.show_terminal && !(AGENT_PANEL && self.agent_open && self.agent_zoomed), 0, cx.listener(|this, _ev, window, cx| {
-                this.toggle_terminal(window, cx);
-            })))
-            .when(BROWSER_PANEL, |d| d.child(activity_icon("act-browser", IC_BROWSER, "Browser", self.browser_open, 0, cx.listener(|this, _ev, window, cx| {
-                this.toggle_browser(window, cx);
-            }))))
     }
 
     /// The active tab's pane tree.
@@ -11151,33 +16334,10 @@ impl Storm {
                 })),
         );
 
-        // send pending review comments straight from here — the agent pane is
-        // right below this bar, so this is where you are when you want to send
-        let ready = self.review.iter().filter(|c| !c.draft && !c.resolved).count();
-        bar.when(ready > 0, |b| {
-            b.child(div().flex_grow(1.0)).child(
-                div()
-                    .id("term-send-comments")
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .mr_2()
-                    .px_1p5()
-                    .py(px(1.))
-                    .rounded_md()
-                    .cursor_pointer()
-                    .border_1()
-                    .border_color(rgb(COMMENT_MARK))
-                    .text_size(px(10.))
-                    .text_color(rgb(COMMENT_MARK))
-                    .hover(|s| s.bg(rgba(COMMENT_TINT)))
-                    .child(div().font_family(ICON_FONT).text_size(px(11.)).child(IC_COMMENT))
-                    .child(format!("Send {ready} comment{}", if ready == 1 { "" } else { "s" }))
-                    .tooltip(tip("Send review comments to the agent  (⌥↩)"))
-                    .on_click(cx.listener(|this, _e, window, cx| this.send_review(window, cx))),
-            )
-        })
+        // the send button used to live here, from when the agent pane sat above
+        // this bar. It doesn't any more: the composer and the review pane both
+        // carry one, and a terminal tab strip is a place for terminal tabs.
+        bar
     }
 
     /// Bottom-right status toast for a running/finished command. Click to open
@@ -11343,6 +16503,37 @@ impl Storm {
     /// How the other workspaces are doing, as the ⌘E switcher counts them: a
     /// coloured dot and a number per state, most urgent first. `None` with a
     /// single workspace open — there's nothing to compare.
+    /// Open todos, in the topbar. Absent when there are none — an empty list is
+    /// not news, and the shortcut still opens it.
+    fn render_todo_chip(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let n = todo::open_count(&self.todos);
+        if n == 0 {
+            return None;
+        }
+        Some(
+            div()
+                .id("todo-chip")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .px_1()
+                .rounded_md()
+                .cursor_pointer()
+                .text_size(px(11.))
+                .text_color(rgb(MUTED))
+                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                .child(div().font_family(ICON_FONT).text_size(px(10.)).child(IC_CHECK))
+                .child(format!("{n}"))
+                .tooltip(tip("Todo list  ·  ⌘⇧L writes one"))
+                .on_click(cx.listener(|this, _e, _w, cx| {
+                    this.left_view = LeftView::Todos;
+                    this.show_left = true;
+                    cx.notify();
+                })),
+        )
+    }
+
     fn render_ws_tally(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         if self.ws_states.len() < 2 {
             return None;
@@ -11430,17 +16621,20 @@ impl Storm {
         // the tooltip is where the numbers get their names
         let line = |label: &str, w: &Option<usage::Window>| match w {
             Some(w) if w.resets_at > 0 => format!(
-                "{label}: {}%  ·  resets {}",
+                "{label}: {}%  ·  {} left (resets {})",
                 w.pct.round() as i64,
+                usage::fmt_left(w.resets_at),
                 usage::fmt_reset(w.resets_at)
             ),
             Some(w) => format!("{label}: {}%", w.pct.round() as i64),
             None => format!("{label}: no reading yet"),
         };
+        let held = self.usage_block().is_some();
         let tip_text = format!(
-            "{}\n{}",
+            "{}\n{}{}",
             line("Session (5 hours)", &l.five_hour),
-            line("Weekly", &l.seven_day)
+            line("Weekly", &l.seven_day),
+            if held { "\n\nPrompts to the agent are held. Click for Send anyway." } else { "" }
         );
         let open = self.limits_open;
         Some(
@@ -11460,6 +16654,17 @@ impl Storm {
                 .child(div().text_color(rgb(five_color)).child(five_txt))
                 .child(div().text_color(rgb(LINE_NUMBER)).child("/"))
                 .child(div().text_color(rgb(week_color)).child(week_txt))
+                .when(held, |d| {
+                    d.child(
+                        div()
+                            .px_1()
+                            .rounded_sm()
+                            .bg(rgba((GIT_MODIFIED << 8) | 0x22))
+                            .text_size(px(10.))
+                            .text_color(rgb(GIT_MODIFIED))
+                            .child("held"),
+                    )
+                })
                 .tooltip(move |_w, cx| {
                     let text = tip_text.clone();
                     cx.new(|_| TooltipView { text: text.into() }).into()
@@ -11481,7 +16686,7 @@ impl Storm {
                 .absolute()
                 .inset_0()
                 .id("usage-backdrop")
-                .child(self.render_usage_panel(&l))
+                .child(self.render_usage_panel(&l, cx))
                 .on_click(cx.listener(|this, _e, _w, cx| {
                     this.limits_open = false;
                     cx.notify();
@@ -11489,7 +16694,7 @@ impl Storm {
         )
     }
 
-    fn render_usage_panel(&self, l: &usage::Limits) -> impl IntoElement {
+    fn render_usage_panel(&self, l: &usage::Limits, cx: &mut Context<Self>) -> impl IntoElement {
         let row = |label: &'static str, w: &Option<usage::Window>, color: u32| {
             let w = w.clone();
             div()
@@ -11539,9 +16744,18 @@ impl Storm {
                 .child(
                     div()
                         .text_size(px(10.))
-                        .text_color(rgb(LINE_NUMBER))
+                        // the same grey as the labels above it: this line is
+                        // the one you actually read, so it can't be the dimmest
+                        // thing in the panel
+                        .text_color(rgb(MUTED))
                         .child(match &w {
-                            Some(w) if w.resets_at > 0 => format!("resets {}", usage::fmt_reset(w.resets_at)),
+                            // the wait first: "how long do I have to hold off"
+                            // is the question, the clock time is the footnote
+                            Some(w) if w.resets_at > 0 => format!(
+                                "{} left  ·  resets {}",
+                                usage::fmt_left(w.resets_at),
+                                usage::fmt_reset(w.resets_at)
+                            ),
                             Some(_) => String::new(),
                             None => "no reading yet".to_string(),
                         }),
@@ -11563,6 +16777,45 @@ impl Storm {
             .shadow_lg()
             .child(row("SESSION", &l.five_hour, ACCENT))
             .child(row("WEEKLY", &l.seven_day, GIT_MODIFIED))
+            // the same notice the composer carries, for when the agent pane
+            // isn't on screen — this chip is where you look at the number, so
+            // it's where you should be able to act on it
+            .when_some(self.usage_block(), |d, _why| {
+                d.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .pt_2()
+                        .border_t_1()
+                        .border_color(rgb(BORDER))
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(rgb(GIT_MODIFIED))
+                                .child("Prompts to the agent are held until this resets."),
+                        )
+                        .child(
+                            div()
+                                .id("usage-skip-panel")
+                                .self_start()
+                                .px_1p5()
+                                .py(px(1.))
+                                .rounded_md()
+                                .cursor_pointer()
+                                .border_1()
+                                .border_color(rgb(BORDER))
+                                .text_size(px(10.))
+                                .text_color(rgb(MUTED))
+                                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                .child("Send anyway")
+                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                    this.skip_usage_block(cx);
+                                    this.limits_open = false;
+                                })),
+                        ),
+                )
+            })
     }
 
     /// The read-only Run console: a bottom dock streaming command output.
@@ -11786,6 +17039,7 @@ impl Storm {
                                 cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
                                     this.tree_ctx = Some((f32::from(ev.position.x), f32::from(ev.position.y)));
                                     this.tree_ctx_path = Some(dir_ctx.clone());
+                                    this.tree_ctx_kind = CtxKind::PrTree;
                                     this.commit_selected = Some(dir_ctx.clone());
                                     window.focus(&this.tree_ctx_focus, cx);
                                     cx.notify();
@@ -11868,6 +17122,7 @@ impl Storm {
                                 cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
                                     this.tree_ctx = Some((f32::from(ev.position.x), f32::from(ev.position.y)));
                                     this.tree_ctx_path = Some(path_ctx.clone());
+                                    this.tree_ctx_kind = CtxKind::PrTree;
                                     this.commit_selected = Some(path_ctx.clone());
                                     window.focus(&this.tree_ctx_focus, cx);
                                     cx.notify();
@@ -11910,6 +17165,24 @@ impl Storm {
                                         cx.notify();
                                     })),
                             )
+                            // what the change costs, the way the merge dialog
+                            // and GitHub both put it
+                            .when_some(self.pr_stats.get(&path).copied(), |d, (add, del)| {
+                                d.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(10.))
+                                        .text_color(rgb(GIT_NEW))
+                                        .child(format!("+{add}")),
+                                )
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(10.))
+                                        .text_color(rgb(GIT_DELETED))
+                                        .child(format!("−{del}")),
+                                )
+                            })
                             // pending review comments on this file
                             .when(self.comment_count(&path) > 0, |d| {
                                 d.child(comment_marker(self.comment_count(&path), 11.))
@@ -12343,6 +17616,25 @@ impl Storm {
                             .text_color(rgb(if is_sel { SEL_TEXT } else { color }))
                             .child(name),
                     )
+                    // what the file costs, the way GitHub puts it: the number
+                    // is how much there is to read before you open it
+                    .when_some(self.pr_stats.get(&path).copied(), |d, (add, del)| {
+                        d.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(px(10.))
+                                .text_color(rgb(if is_sel { SEL_TEXT } else { GIT_NEW }))
+                                .child(format!("+{add}")),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(px(10.))
+                                .text_color(rgb(if is_sel { SEL_TEXT } else { GIT_DELETED }))
+                                .child(format!("−{del}")),
+                        )
+                        .child(diffstat_squares(add, del))
+                    })
                     // pending review comments on this file
                     .when(self.comment_count(&path) > 0, |d| {
                         d.child(
@@ -12413,14 +17705,13 @@ impl Storm {
         .flex_grow(1.0);
 
         // progress bar (viewed / total)
-        let bar_w = f32::from(width) - 24.0;
-        let filled = (bar_w * (pct as f32 / 100.0)).max(0.0);
         let progress = div()
             .px_3()
-            .py_2()
+            .py_3()
             .flex()
             .flex_col()
-            .gap_1()
+            .gap_2()
+            .flex_shrink_0()
             .border_t_1()
             .border_color(rgb(BORDER))
             .child(
@@ -12433,14 +17724,7 @@ impl Storm {
                     .child(format!("{}/{} viewed", viewed, total))
                     .child(format!("{}%", pct)),
             )
-            .child(
-                div()
-                    .w(px(bar_w))
-                    .h(px(6.))
-                    .rounded_sm()
-                    .bg(rgb(HOVER))
-                    .child(div().w(px(filled)).h_full().rounded_sm().bg(rgb(progress_color(pct)))),
-            );
+            .child(segmented_bar(pct, progress_color(pct), 10.));
 
         div()
             .flex()
@@ -12554,10 +17838,32 @@ impl Storm {
                     } else {
                         div().flex_grow(1.0).text_size(px(12.)).text_color(rgb(TEXT)).child(self.pr_filter.render(self.caret_if(filter_focused), SELECTION))
                     })
+                    .child(self.ask_changed_btn("ask-pr", self.pr_shown_files.clone(), cx))
                     .child(self.copy_paths_btn("copy-pr", self.pr_shown_files.clone(), cx)),
             )
-            // viewed-state segmented control
-            .child(
+            // what this pane is showing: the PR's files, or the branch's own
+            // commits (the file list flattens them, which is where a stray
+            // commit hides)
+            .child({
+                let tab = |id: &'static str, label: String, on: bool, commits: bool, cx: &mut Context<Self>| {
+                    div()
+                        .id(id)
+                        .px_2()
+                        .py(px(2.))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_size(px(11.))
+                        .bg(rgb(if on { SELECTED_BG } else { BG }))
+                        .border_1()
+                        .border_color(rgb(if on { ACCENT } else { BORDER }))
+                        .text_color(rgb(if on { SEL_TEXT } else { MUTED }))
+                        .child(label)
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            this.pr_commits_tab = commits;
+                            cx.notify();
+                        }))
+                };
+                let n = self.pr_commits.len();
                 div()
                     .flex()
                     .flex_row()
@@ -12567,11 +17873,31 @@ impl Storm {
                     .px_3()
                     .border_b_1()
                     .border_color(rgb(BORDER))
-                    .child(self.pr_filter_chip("pr-vf-all", "All", PrViewFilter::All, cx))
-                    .child(self.pr_filter_chip("pr-vf-unviewed", "Unviewed", PrViewFilter::Unviewed, cx))
-                    .child(self.pr_filter_chip("pr-vf-viewed", "Viewed", PrViewFilter::Viewed, cx)),
-            )
-            .child(if shown == 0 {
+                    // what you filter by sits on the left, where the list it
+                    // filters begins; which list you're looking at sits on the
+                    // right
+                    .when(!self.pr_commits_tab, |d| {
+                        d.child(self.pr_filter_chip("pr-vf-all", "All", PrViewFilter::All, cx))
+                            .child(self.pr_filter_chip(
+                                "pr-vf-unviewed",
+                                "Unviewed",
+                                PrViewFilter::Unviewed,
+                                cx,
+                            ))
+                            .child(self.pr_filter_chip(
+                                "pr-vf-viewed",
+                                "Viewed",
+                                PrViewFilter::Viewed,
+                                cx,
+                            ))
+                    })
+                    .child(div().flex_grow(1.0))
+                    .child(tab("pr-tab-files", format!("Files  {total}"), !self.pr_commits_tab, false, cx))
+                    .child(tab("pr-tab-commits", format!("Commits  {n}"), self.pr_commits_tab, true, cx))
+            })
+            .child(if self.pr_commits_tab {
+                self.render_pr_commits(cx).into_any_element()
+            } else if shown == 0 {
                 div()
                     .flex_grow(1.0)
                     .px_3()
@@ -12583,6 +17909,216 @@ impl Storm {
                 list.into_any_element()
             })
             .child(progress)
+    }
+
+    /// The branch's commits, newest first. Click one to see what it touched;
+    /// click a file to open that commit's diff for it.
+    fn render_pr_commits(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.pr_commits.is_empty() {
+            return div()
+                .flex_grow(1.0)
+                .px_3()
+                .py_2()
+                .text_size(px(12.))
+                .text_color(rgb(MUTED))
+                .child("No commits on this branch yet.")
+                .into_any_element();
+        }
+        let mut list = div()
+            .id("pr-commits")
+            .flex_grow(1.0)
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col();
+        for (i, c) in self.pr_commits.iter().enumerate() {
+            let open = self.pr_commit_open.as_deref() == Some(c.sha.as_str());
+            let sha = c.sha.clone();
+            list = list.child(
+                div()
+                    .id(("pr-commit", i))
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.))
+                    .px_3()
+                    .py_1p5()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .cursor_pointer()
+                    .when(open, |d| d.bg(rgb(SELECTED_BG)))
+                    .when(!open, |d| d.hover(|s| s.bg(rgb(HOVER))))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .font_family("Menlo")
+                                    .text_size(px(10.))
+                                    .text_color(rgb(COMMENT_MARK))
+                                    .child(c.short.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_grow(1.0)
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(if open { SEL_TEXT } else { TEXT }))
+                                    .child(c.subject.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(rgb(LINE_NUMBER))
+                            .child(format!("{}  ·  {}", c.who, c.when)),
+                    )
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                        // clicking the open one closes it again
+                        if this.pr_commit_open.as_deref() == Some(sha.as_str()) {
+                            this.pr_commit_open = None;
+                            this.pr_commit_files.clear();
+                        } else {
+                            this.pr_commit_files = git_commit_files(&this.root, &sha);
+                            this.pr_commit_open = Some(sha.clone());
+                        }
+                        cx.notify();
+                    })),
+            );
+            if !open {
+                continue;
+            }
+            // the commit's own files, as the same tree the Files tab draws:
+            // compressed directory chains, file badges, one row per file
+            let files = self.pr_commit_files.clone();
+            let mut node = ChangeDir::default();
+            for (p, st) in &files {
+                let rel = self.rel(p);
+                let comps: Vec<&str> = rel.split('/').filter(|c| !c.is_empty()).collect();
+                node.insert(&comps, p.clone(), *st);
+            }
+            let mut rows = Vec::new();
+            flatten_changes(&node, Path::new(""), 0, &self.pr_commit_collapsed, &mut rows);
+            let order: Vec<PathBuf> = files.iter().map(|(p, _)| p.clone()).collect();
+            for (ri, row) in rows.into_iter().enumerate() {
+                let key = (i * 1000 + ri) as usize;
+                match row {
+                    CommitRow::Dir { depth, key: dir_key, label, files: in_dir } => {
+                        let collapsed = self.pr_commit_collapsed.contains(&dir_key);
+                        list = list.child(
+                            div()
+                                .id(("pr-commit-dir", key))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
+                                .pl(px(20. + depth as f32 * 14.))
+                                .pr_3()
+                                .h(px(22.))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(HOVER)))
+                                // the same size the file trees use everywhere else
+                                .text_size(px(14.))
+                                .child(
+                                    div()
+                                        .w(px(12.))
+                                        .text_size(px(11.))
+                                        .text_color(rgb(MUTED))
+                                        .child(if collapsed { "▸" } else { "▾" }),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(ICON_FONT)
+                                        .text_size(px(12.))
+                                        .text_color(rgb(FOLDER_ICON))
+                                        .child(IC_FOLDER),
+                                )
+                                .child(
+                                    div()
+                                        .flex_grow(1.0)
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .text_color(rgb(DIR))
+                                        .child(label),
+                                )
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(11.))
+                                        .text_color(rgb(LINE_NUMBER))
+                                        .child(format!("{}", in_dir.len())),
+                                )
+                                .on_click(cx.listener(move |this, _e, _w, cx| {
+                                    if !this.pr_commit_collapsed.remove(&dir_key) {
+                                        this.pr_commit_collapsed.insert(dir_key.clone());
+                                    }
+                                    cx.notify();
+                                })),
+                        );
+                    }
+                    CommitRow::File { depth, path, name, state } => {
+                        let fi = order.iter().position(|p| *p == path).unwrap_or(0);
+                        let files_for_diff = order.clone();
+                        let sha = c.sha.clone();
+                        let badge = ext_badge(&path);
+                        list = list.child(
+                            div()
+                                .id(("pr-commit-file", key))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
+                                .pl(px(20. + depth as f32 * 14.))
+                                .pr_3()
+                                .h(px(22.))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(HOVER)))
+                                .text_size(px(14.))
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(9.))
+                                        .text_color(rgb(badge.1))
+                                        .child(badge.0),
+                                )
+                                .child(
+                                    div()
+                                        .flex_grow(1.0)
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .text_color(rgb(match state {
+                                            GitState::New => GIT_NEW,
+                                            GitState::Deleted => GIT_DELETED,
+                                            _ => GIT_MODIFIED,
+                                        }))
+                                        .child(name),
+                                )
+                                .on_click(cx.listener(move |this, _e, _w, cx| {
+                                    // just this commit: its parent on the left,
+                                    // it on the right
+                                    this.open_diff_window(
+                                        files_for_diff.clone(),
+                                        fi,
+                                        Some(format!("{sha}^")),
+                                        Some(sha.clone()),
+                                        false,
+                                        String::new(),
+                                        PrViewFilter::All,
+                                        cx,
+                                    );
+                                })),
+                        );
+                    }
+                }
+            }
+        }
+        list.into_any_element()
     }
 
 
@@ -12658,6 +18194,15 @@ impl Storm {
                 replies.extend(c.replies.iter().cloned());
             }
         }
+        // resolve the thread's file references once, up front: the rows below
+        // are built from `&self` and can't look anything up themselves
+        let linkable: HashSet<String> = {
+            let paths: Vec<String> = replies
+                .iter()
+                .flat_map(|r| r.text.lines().flat_map(file_refs).map(|f| f.path))
+                .collect();
+            paths.into_iter().filter(|p| self.file_ref_target(p, cx).is_some()).collect()
+        };
         let thread_h = self.rc_thread_h.unwrap_or(rc_thread_rows(&replies) as f32 * RC_LINE_H);
         let box_h = rc_box_h(&self.rc_query.text, &replies) + self.rc_thread_extra(&replies);
         let body_h = rc_lines(&self.rc_query.text) as f32 * RC_LINE_H;
@@ -12717,7 +18262,7 @@ impl Storm {
                         div()
                             .text_size(px(10.))
                             .text_color(rgb(LINE_NUMBER))
-                            .child("⌘↩ save · ↩ newline · esc cancel"),
+                            .child("⌘↩ save · ↩ newline · ⌘V image · esc cancel"),
                     ),
             )
             // the answers, read here rather than in the terminal transcript
@@ -12735,23 +18280,52 @@ impl Storm {
                         .flex()
                         .flex_col()
                         .gap(px(2.))
-                        .children(replies.iter().map(|r| {
+                        .children(replies.iter().enumerate().map(|(ri, r)| {
                             let agent = r.who == "agent";
+                            let said = r.text.clone();
                             div()
                                 .flex()
                                 .flex_col()
                                 .gap(px(1.))
+                                // right-click a turn: tour it, or copy it
+                                .on_mouse_down(
+                                    MouseButton::Right,
+                                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                                        this.ctx_reply = Some(said.clone());
+                                        this.tree_ctx = Some((
+                                            f32::from(ev.position.x),
+                                            f32::from(ev.position.y),
+                                        ));
+                                        this.tree_ctx_path = None;
+                                        this.tree_ctx_kind = CtxKind::ThreadReply;
+                                        window.focus(&this.tree_ctx_focus, cx);
+                                        cx.notify();
+                                    }),
+                                )
                                 .pl_2()
                                 .border_l_2()
                                 .border_color(rgb(if agent { GIT_NEW } else { COMMENT_MARK }))
                                 .child(
                                     div()
-                                        .text_size(px(10.))
+                                        .text_size(px(11.))
                                         .text_color(rgb(if agent { GIT_NEW } else { COMMENT_MARK }))
                                         .child(if agent { "Agent" } else { "You" }),
                                 )
-                                // the agent writes markdown; render it as such
-                                .child(md_text(&r.text, 12.0, TEXT).min_w(px(0.)))
+                                // the agent writes markdown, and names files in
+                                // it: render both
+                                .child({
+                                    let known = |p: &str| linkable.contains(p);
+                                    md_links(
+                                        &r.text,
+                                        14.0,
+                                        TEXT,
+                                        ri,
+                                        cx.entity().downgrade(),
+                                        &known,
+                                        self.repo_web.as_deref(),
+                                    )
+                                        .min_w(px(0.))
+                                })
                         })),
                 )
             })
@@ -12772,7 +18346,9 @@ impl Storm {
                     .border_color(rgb(BORDER))
                     .rounded_md()
                     .overflow_hidden()
-                    .text_size(px(12.))
+                    // what you type sits next to what the thread says; the two
+                    // should read at the same size
+                    .text_size(px(14.))
                     .text_color(rgb(TEXT))
                     // the box can open unfocused (an existing thread): clicking
                     // the reply area is what starts typing
@@ -13051,6 +18627,11 @@ impl Storm {
             // long threads collapse to the last two turns; the row stays scannable
             let expanded = self.review_expanded.contains(&c.id);
             let hidden = if expanded { 0 } else { replies.len().saturating_sub(2) };
+            // anything cut short is reason enough to offer the switch: a thread
+            // with one long answer has nothing folded away, and used to leave
+            // the answer unreadable with no way to open it
+            let clipped = Self::clip_turn(&c.text) != c.text
+                || replies.iter().any(|r| Self::clip_turn(&r.text) != r.text);
             let cid = c.id.clone();
             list = list.child(
                 div()
@@ -13161,7 +18742,7 @@ impl Storm {
                         Self::clip_turn(&c.text)
                     }))
                     // how many turns are folded away, and the switch to unfold them
-                    .when(hidden > 0 || (expanded && replies.len() > 2), |d| {
+                    .when(hidden > 0 || clipped || (expanded && (clipped || replies.len() > 2)), |d| {
                         let cid = cid.clone();
                         d.child(
                             div()
@@ -13174,8 +18755,10 @@ impl Storm {
                                 .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
                                 .child(if hidden > 0 {
                                     format!("▸ {hidden} earlier turn{}", if hidden == 1 { "" } else { "s" })
+                                } else if expanded {
+                                    "▾ show less".to_string()
                                 } else {
-                                    "▾ collapse thread".to_string()
+                                    "▸ show more".to_string()
                                 })
                                 .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
                                 .on_click(cx.listener(move |this, _e, _w, cx| {
@@ -13454,10 +19037,11 @@ impl Storm {
         let h = self.find_h.clamp(300.0, (self.win_height - 120.0).max(300.0));
         let left = self.find_left.clamp(0.0, (self.win_width - w).max(0.0));
         let top = self.find_top.clamp(40.0, (self.win_height - h).max(40.0));
-        let scope_label = match self.find_scope.as_slice() {
-            [one] if *one == self.root => "Project".to_string(),
-            [one] => self.rel(one),
-            many => format!("{} locations", many.len()),
+        let scope_label = match (&self.find_scope_label, self.find_scope.as_slice()) {
+            (Some(label), _) => label.clone(),
+            (None, [one]) if *one == self.root => "Project".to_string(),
+            (None, [one]) => self.rel(one),
+            (None, many) => format!("{} locations", many.len()),
         };
         let count = self.find_results.len();
         let SearchQuery { excludes, globs, .. } = parse_search_query(&self.find_query.text);
@@ -14913,6 +20497,103 @@ impl Storm {
                 }),
             ];
         }
+        if kind == CtxKind::ThreadReply {
+            return vec![
+                // the answer in a thread is the one most worth touring: it is
+                // where the agent laid the whole flow out
+                ("Tour This Answer", |this, window, cx| {
+                    let answer = this.ctx_reply.clone();
+                    this.ask_tour_from_comment(answer, window, cx)
+                }),
+                ("Copy", |this, _w, cx| {
+                    let Some(t) = this.ctx_reply.clone() else { return };
+                    cx.write_to_clipboard(ClipboardItem::new_string(t));
+                    this.show_flash("Copied", cx);
+                }),
+            ];
+        }
+        if kind == CtxKind::Shot {
+            return vec![
+                ("Copy Image", |this, _w, cx| {
+                    let Some(img) = this.ctx_shot.clone() else { return };
+                    cx.write_to_clipboard(ClipboardItem::new_image(&img));
+                    this.show_flash("Screenshot copied", cx);
+                }),
+                ("Copy Path", |this, _w, cx| {
+                    if let Some(p) = this.tree_ctx_path.clone() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(
+                            p.to_string_lossy().to_string(),
+                        ));
+                        this.show_flash("Path copied", cx);
+                    }
+                }),
+                ("Open", |this, _w, _cx| {
+                    if let Some(p) = this.tree_ctx_path.clone() {
+                        let _ = Command::new("open").arg(&p).spawn();
+                    }
+                }),
+                ("Reveal in Finder", |this, _w, _cx| {
+                    if let Some(p) = this.tree_ctx_path.clone() {
+                        let _ = Command::new("open").arg("-R").arg(&p).spawn();
+                    }
+                }),
+            ];
+        }
+        if kind == CtxKind::MdPreview {
+            return vec![
+                ("Copy Selection", |this, _w, cx| {
+                    let source = this.md_source.clone();
+                    match this.md_selection(&source) {
+                        Some(text) => {
+                            let n = text.chars().count();
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                            this.show_flash(&format!("Copied {n} characters"), cx);
+                        }
+                        None => this.show_flash("Nothing selected", cx),
+                    }
+                }),
+                ("Copy All", |this, _w, cx| {
+                    let text = this.md_source.clone();
+                    let lines = text.lines().count();
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    this.show_flash(&format!("Copied {lines} lines"), cx);
+                }),
+                ("Show Raw (⌘⇧V)", |this, window, cx| this.toggle_md_preview(window, cx)),
+            ];
+        }
+        if kind == CtxKind::PrTree {
+            return vec![
+                // the toolbar's copy, scoped: right-clicking a folder asks about
+                // that folder, which is the point of right-clicking it
+                ("Copy Changed Paths", |this, _w, cx| {
+                    let Some(under) = this.tree_ctx_path.clone() else { return };
+                    let paths = this.changed_paths_under(&under);
+                    if paths.is_empty() {
+                        this.show_flash("No changed paths there", cx);
+                        return;
+                    }
+                    let n = paths.len();
+                    cx.write_to_clipboard(ClipboardItem::new_string(paths.join("\n")));
+                    this.show_flash(&format!("Copied {n} path{}", if n == 1 { "" } else { "s" }), cx);
+                }),
+                ("Copy All Changed Paths", |this, _w, cx| {
+                    let paths: Vec<String> = this.pr_shown_files.iter().map(|p| this.rel(p)).collect();
+                    let n = paths.len();
+                    cx.write_to_clipboard(ClipboardItem::new_string(paths.join("\n")));
+                    this.show_flash(&format!("Copied {n} path{}", if n == 1 { "" } else { "s" }), cx);
+                }),
+                ("Reveal in Finder", |this, _w, _cx| {
+                    if let Some(p) = this.tree_ctx_path.clone() {
+                        let _ = Command::new("open").arg("-R").arg(&p).spawn();
+                    }
+                }),
+                ("Copy Path", |this, _w, cx| {
+                    if let Some(p) = this.tree_ctx_path.clone() {
+                        this.copy_reference(&p, cx);
+                    }
+                }),
+            ];
+        }
         if kind == CtxKind::ReviewFile {
             return vec![("Comment on Whole File", |this, window, cx| {
                 if let Some(p) = this.tree_ctx_path.clone() {
@@ -14922,9 +20603,31 @@ impl Storm {
         }
         vec![
             ("New File", |this, window, cx| this.open_new_file_prompt(window, cx)),
+            // copy and paste against the system pasteboard, so Finder is on the
+            // other end of both
+            ("Copy", |this, _w, cx| {
+                if let Some(p) = this.tree_ctx_path.clone() {
+                    set_system_clip_files(std::slice::from_ref(&p));
+                    *tree_clip().lock().unwrap() = Some((p, false));
+                    this.show_flash("Copied", cx);
+                }
+            }),
+            ("Paste", |this, _w, cx| {
+                // paste goes into what was right-clicked, not into whatever the
+                // keyboard had selected
+                if let Some(p) = this.tree_ctx_path.clone() {
+                    this.tree_selected = Some(p);
+                }
+                this.paste_into_selected(cx);
+            }),
             ("Reveal in Finder", |this, _w, _cx| {
                 if let Some(p) = this.tree_ctx_path.clone() {
                     let _ = Command::new("open").arg("-R").arg(&p).spawn();
+                }
+            }),
+            ("Rename… (↩)", |this, window, cx| {
+                if let Some(p) = this.tree_ctx_path.clone() {
+                    this.open_rename_prompt(p, window, cx);
                 }
             }),
             ("Copy Full Path", |this, _w, cx| {
@@ -15004,6 +20707,10 @@ impl Storm {
         let menu_w = match self.tree_ctx_kind {
             CtxKind::ReviewFile => 220.0_f32,
             CtxKind::AgentSel => 210.0_f32,
+            CtxKind::Shot => 200.0_f32,
+            CtxKind::PrTree => 220.0_f32,
+            CtxKind::MdPreview => 210.0_f32,
+            CtxKind::ThreadReply => 210.0_f32,
             CtxKind::Tree => 200.0_f32,
         };
         let row_h = 28.0_f32;
@@ -15670,6 +21377,875 @@ impl Storm {
 struct TooltipView {
     text: SharedString,
 }
+impl Storm {
+    /// Hand something over to another workspace: the thing you were just
+    /// talking about, in the agent that is going to act on it. Takes whatever
+    /// is to hand — the composer if you have typed something, otherwise what
+    /// is selected in the transcript.
+    fn open_handoff(&mut self, cx: &mut Context<Self>) {
+        let typed = self.agent_input.text.trim().to_string();
+        let text = if !typed.is_empty() {
+            typed
+        } else {
+            match self.agent_selected_text(cx) {
+                Some(t) => t,
+                None => {
+                    self.show_flash("Type something, or select it in the answer first", cx);
+                    return;
+                }
+            }
+        };
+        if self.ws_names.len() < 2 {
+            self.show_flash("There is only this workspace", cx);
+            return;
+        }
+        self.hand_text = text;
+        // the next one along, since handing to yourself is the one thing this
+        // can't be for
+        self.hand_sel = (self.ws_active + 1) % self.ws_names.len();
+        self.hand_open = true;
+        cx.notify();
+    }
+
+    /// Walk to the next workspace that isn't this one.
+    fn hand_step(&mut self, dir: i32) {
+        let n = self.ws_names.len();
+        if n < 2 {
+            return;
+        }
+        for _ in 0..n {
+            self.hand_sel = ((self.hand_sel as i32 + dir).rem_euclid(n as i32)) as usize;
+            if self.hand_sel != self.ws_active {
+                return;
+            }
+        }
+    }
+
+    /// `send` posts it to that agent now; otherwise it lands in its composer
+    /// with the caret after it, for the sentence you are about to add. Either
+    /// way TIDE switches over: handing work off means going with it.
+    fn hand_over(&mut self, send: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let to = self.hand_sel;
+        if to == self.ws_active {
+            self.show_flash("That's this workspace", cx);
+            return;
+        }
+        let text = std::mem::take(&mut self.hand_text);
+        self.hand_open = false;
+        if !send {
+            self.agent_input.clear(); // it moved; it isn't here any more
+        }
+        let name = self.ws_names.get(to).cloned().unwrap_or_default();
+        self.show_flash(
+            &format!("{} {name}", if send { "Sent to" } else { "Handed to" }),
+            cx,
+        );
+        self.focus_active(window, cx);
+        cx.emit(ProjectNav::HandOff { to, text, send });
+        cx.notify();
+    }
+
+    fn hand_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        match ks.key.as_str() {
+            "escape" => {
+                self.hand_open = false;
+                self.focus_active(window, cx);
+            }
+            "up" => self.hand_step(-1),
+            "down" | "tab" => self.hand_step(1),
+            "enter" => self.hand_over(ks.modifiers.secondary(), window, cx),
+            _ => return,
+        }
+        cx.notify();
+    }
+
+    /// The picker: every other workspace, and what the two keys do with it.
+    fn render_handoff(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let one = self.hand_text.replace('\n', " ");
+        let gist = if one.chars().count() > 90 {
+            format!("{}…", one.chars().take(90).collect::<String>())
+        } else {
+            one
+        };
+        let mut list = div().flex().flex_col().px_1().pb_1();
+        for (i, name) in self.ws_names.iter().enumerate() {
+            if i == self.ws_active {
+                continue; // handing it to yourself is not handing it over
+            }
+            let on = i == self.hand_sel;
+            let busy = self.ws_states.get(i).and_then(|s| *s) == Some(AgentState::Working);
+            let folder = self
+                .ws_roots
+                .get(i)
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            list = list.child(
+                div()
+                    .id(("handoff", i))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(on, |d| d.bg(rgb(SELECTED_BG)))
+                    .hover(|s| s.bg(rgb(if on { SELECTED_BG } else { HOVER })))
+                    .child(
+                        div()
+                            .size(px(6.))
+                            .rounded_full()
+                            .bg(rgb(if busy { GIT_NEW } else { BORDER })),
+                    )
+                    .child(
+                        div()
+                            .flex_grow(1.0)
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(12.))
+                            .text_color(rgb(if on { SEL_TEXT } else { TEXT }))
+                            .child(name.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(10.))
+                            .text_color(rgb(MUTED))
+                            .child(folder),
+                    )
+                    .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
+                        this.hand_sel = i;
+                        this.hand_over(e.modifiers().platform, window, cx);
+                    })),
+            );
+        }
+        div()
+            .absolute()
+            .top(px(120.))
+            .left(px((self.win_width / 2.0 - 230.0).max(20.)))
+            .w(px(460.))
+            .bg(rgb(POPUP_BG))
+            .border_1()
+            .border_color(rgb(ACCENT))
+            .rounded_md()
+            .shadow_lg()
+            .track_focus(&self.hand_focus)
+            .on_key_down(cx.listener(Self::hand_key))
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(MUTED))
+                            .child("Hand this to another workspace"),
+                    )
+                    .child(
+                        div()
+                            .mt_1()
+                            .truncate()
+                            .text_size(px(11.))
+                            .text_color(rgb(TEXT))
+                            .child(gist),
+                    ),
+            )
+            .child(list)
+            .child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .border_t_1()
+                    .border_color(rgb(BORDER))
+                    .text_size(px(10.))
+                    .text_color(rgb(LINE_NUMBER))
+                    .child("↩ put it in that composer  ·  ⌘↩ send it now  ·  esc cancel"),
+            )
+    }
+
+    /// The tour drawn as what it is: files, in the order the work moves through
+    /// them, joined by the arrows the tour takes. The file you are standing in
+    /// is lit, and so is the stop inside it.
+    fn render_tour_map(&self, w: &Walk, accent: u32, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let nodes = tour_nodes(&w.stops);
+        let here = nodes.iter().position(|n| n.steps.contains(&w.at));
+        let mut col = div()
+            .id("tour-map")
+            .flex()
+            .flex_col()
+            .flex_grow(1.0)
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .px_2()
+            .py_2();
+        for (ni, n) in nodes.iter().enumerate() {
+            let on = here == Some(ni);
+            // the tour leaves this file and comes back to it later
+            let returns = n.steps.len() > 1
+                && n.steps.windows(2).any(|p| p[1] != p[0] + 1);
+            let mut box_ = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .px_2()
+                .py_1p5()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(if on { accent } else { BORDER }))
+                .when(on, |d| d.bg(rgba(TOUR_TINT)))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1p5()
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .size(px(16.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_full()
+                                .bg(rgb(if on { accent } else { BORDER }))
+                                .text_size(px(9.))
+                                .text_color(rgb(if on { BG } else { MUTED }))
+                                .child(format!("{}", ni + 1)),
+                        )
+                        .child(
+                            div()
+                                .flex_grow(1.0)
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_size(px(12.))
+                                .text_color(rgb(if on { TEXT } else { DIR }))
+                                .child(n.file.clone()),
+                        )
+                        .when(returns, |d| {
+                            d.child(
+                                div()
+                                    .id(("tour-returns", ni))
+                                    .flex_shrink_0()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(MUTED))
+                                    .child("↩")
+                                    .tooltip(tip("The tour comes back to this file")),
+                            )
+                        }),
+                )
+                .when(!n.dir.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .truncate()
+                            .font_family("Menlo")
+                            .text_size(px(9.))
+                            .text_color(rgb(MUTED))
+                            .child(dir_tail(&n.dir, 2)),
+                    )
+                });
+            // the stops this file holds, as chips: the route through the file
+            let mut chips = div().flex().flex_row().flex_wrap().gap(px(3.));
+            for &si in &n.steps {
+                let cur = si == w.at;
+                let title = w
+                    .stops
+                    .get(si)
+                    .map(|s| {
+                        if s.title.trim().is_empty() { s.said.clone() } else { s.title.clone() }
+                    })
+                    .unwrap_or_default();
+                chips = chips.child(
+                    div()
+                        .id(("tour-map-step", si))
+                        .px_1p5()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_size(px(10.))
+                        .border_1()
+                        .border_color(rgb(if cur { accent } else { BORDER }))
+                        .bg(rgb(if cur { SELECTED_BG } else { BG }))
+                        .text_color(rgb(if cur { SEL_TEXT } else { MUTED }))
+                        .hover(|s| s.bg(rgb(if cur { SELECTED_BG } else { HOVER })).text_color(rgb(TEXT)))
+                        .child(format!("{}", si + 1))
+                        .tooltip(tip_owned(format!("{}. {title}", si + 1)))
+                        .on_click(cx.listener(move |this, _e, window, cx| {
+                            this.goto_walk_stop(si, window, cx)
+                        })),
+                );
+            }
+            box_ = box_.child(chips);
+            col = col.child(box_);
+            // the arrow to the next file, drawn rather than implied
+            if ni + 1 < nodes.len() {
+                let lit = here.is_some_and(|h| h == ni || h == ni + 1);
+                col = col.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .child(div().w(px(2.)).h(px(10.)).bg(rgb(if lit { accent } else { BORDER })))
+                        .child(
+                            div()
+                                .text_size(px(9.))
+                                .line_height(px(9.))
+                                .text_color(rgb(if lit { accent } else { BORDER }))
+                                .child("▼"),
+                        ),
+                );
+            }
+        }
+        col
+    }
+
+    /// The tour's whole route, as a column down the right of the editor. Opened
+    /// from `☰ N steps` in the strip. It stands beside the code rather than
+    /// under it: a 38-stop tour is a table of contents, and reading one four
+    /// rows at a time through a strip is reading it through a letterbox.
+    fn render_tour_steps(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let w = self.walk.as_ref().filter(|w| w.list)?;
+        let accent = if w.tour.is_some() { TOUR_MARK } else { COMMENT_MARK };
+        let mut list = div()
+            .id("tour-steps")
+            .flex()
+            .flex_col()
+            .flex_grow(1.0)
+            .min_h(px(0.))
+            .overflow_y_scroll();
+        for (i, s) in w.stops.iter().enumerate() {
+            let on = i == w.at;
+            let label = if s.title.trim().is_empty() { s.said.clone() } else { s.title.clone() };
+            list = list.child(
+                div()
+                    .id(("tour-step", i))
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .cursor_pointer()
+                    .when(on, |d| d.bg(rgb(SELECTED_BG)))
+                    .hover(|st| st.bg(rgb(if on { SELECTED_BG } else { HOVER })))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .w(px(20.))
+                            .text_size(px(10.))
+                            .text_color(rgb(if on { accent } else { LINE_NUMBER }))
+                            .child(format!("{}", i + 1)),
+                    )
+                    .child(
+                        div()
+                            .flex_grow(1.0)
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(if on { SEL_TEXT } else { TEXT }))
+                                    .child(label),
+                            )
+                            // the file, so a jump is a decision rather than a
+                            // surprise
+                            .child(
+                                div()
+                                    .truncate()
+                                    .font_family("Menlo")
+                                    .text_size(px(9.5))
+                                    .text_color(rgb(MUTED))
+                                    .child(stop_label(s)),
+                            ),
+                    )
+                    .on_click(cx.listener(move |this, _e, window, cx| {
+                        this.goto_walk_stop(i, window, cx)
+                    })),
+            );
+        }
+        Some(
+            div()
+                .w(px(300.))
+                .h_full()
+                .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .bg(rgb(BG))
+                .border_l_1()
+                .border_color(rgb(BORDER))
+                .child(
+                    div()
+                        .h(px(28.))
+                        .px_2()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .border_b_1()
+                        .border_color(rgb(BORDER))
+                        .text_size(px(11.))
+                        .text_color(rgb(MUTED))
+                        .child(
+                            div()
+                                .flex_grow(1.0)
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_color(rgb(accent))
+                                .child(w.tour.clone().unwrap_or_else(|| "This answer".to_string())),
+                        )
+                        .child(format!("{} steps", w.stops.len()))
+                        .child(
+                            div()
+                                .id("tour-steps-close")
+                                .px_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .flex_shrink_0()
+                                .text_color(rgb(LINE_NUMBER))
+                                .hover(|s| s.text_color(rgb(TEXT)))
+                                .child("✕")
+                                .tooltip(tip("Hide the step list"))
+                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                    if let Some(w) = this.walk.as_mut() {
+                                        w.list = false;
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(self.render_tour_map(w, accent, cx)),
+        )
+    }
+
+    /// The card at either end of the walk. `start` is the one the tour opens
+    /// on: what it covers, before you are dropped into the middle of it. The
+    /// other is where it adds up — what you wrote down while walking, and the
+    /// two things worth doing next.
+    fn render_tour_bookend(
+        &mut self,
+        start: bool,
+        left: f32,
+        top: f32,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let w = self.walk.as_ref()?;
+        let accent = if w.tour.is_some() { TOUR_MARK } else { COMMENT_MARK };
+        let name = w.tour.clone().unwrap_or_else(|| "This answer".to_string());
+        let (n, files) = (w.stops.len(), tour_nodes(&w.stops).len());
+        let notes = self.tour_notes(w);
+        let first = w.stops.first().map(stop_label).unwrap_or_default();
+        let has_id = w.id.is_some();
+        let btn = |id: &'static str, label: String, lit: bool| {
+            div()
+                .id(id)
+                .px_2()
+                .py(px(3.))
+                .rounded_md()
+                .cursor_pointer()
+                .text_size(px(11.))
+                .border_1()
+                .border_color(rgb(if lit { accent } else { BORDER }))
+                .text_color(rgb(if lit { accent } else { MUTED }))
+                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                .child(label)
+        };
+        Some(
+            div()
+                .absolute()
+                .left(px(left))
+                .top(px(top))
+                .w(px(width))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .px_3()
+                .py_2p5()
+                .rounded_md()
+                .bg(rgb(POPUP_BG))
+                .border_1()
+                .border_color(rgb(accent))
+                .border_l_2()
+                .shadow_lg()
+                .text_size(px(13.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_color(rgb(accent))
+                                .child(if start { "The tour" } else { "End of the tour" }),
+                        )
+                        .child(
+                            div()
+                                .flex_grow(1.0)
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_color(rgb(MUTED))
+                                .child(name),
+                        )
+                        .child(
+                            div()
+                                .id("bookend-close")
+                                .px_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .flex_shrink_0()
+                                .text_size(px(11.))
+                                .text_color(rgb(LINE_NUMBER))
+                                .hover(|s| s.text_color(rgb(GIT_DELETED)))
+                                .child("✕")
+                                .tooltip(tip("Put the tour away  (esc)"))
+                                .on_click(cx.listener(|this, _e, _w, cx| this.end_walk(cx))),
+                        ),
+                )
+                // the route itself, drawn small: three stops and the arrows
+                // between them, with the end you are standing at lit
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_3()
+                        .child(tour_mini(start, accent))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .flex_grow(1.0)
+                                .min_w(px(0.))
+                                .child(
+                                    div().text_size(px(12.)).text_color(rgb(TEXT)).child(format!(
+                                        "{n} stops across {files} visit{}",
+                                        if files == 1 { "" } else { "s" }
+                                    )),
+                                )
+                                .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(
+                                    if start {
+                                        format!("Starts in {first}")
+                                    } else {
+                                        match notes {
+                                            0 => "Nothing written down along the way.".to_string(),
+                                            1 => "One note is waiting to go to the agent."
+                                                .to_string(),
+                                            k => format!("{k} notes are waiting to go to the agent."),
+                                        }
+                                    },
+                                )),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .when(start, |d| {
+                            d.child(btn("bookend-go", "▸ Walk it".into(), true).on_click(
+                                cx.listener(|this, _e, window, cx| this.step_walk(1, window, cx)),
+                            ))
+                        })
+                        .when(!start, |d| {
+                            d.child(btn("bookend-again", "⟲ Walk it again".into(), false).on_click(
+                                cx.listener(|this, _e, window, cx| {
+                                    if let Some(w) = this.walk.as_mut() {
+                                        w.intro = true;
+                                        w.done = false;
+                                        w.at = 0;
+                                    }
+                                    let _ = window;
+                                    cx.notify();
+                                }),
+                            ))
+                        })
+                        .when(!start && notes > 0, |d| {
+                            d.child(
+                                btn(
+                                    "bookend-send",
+                                    format!(
+                                        "Send {notes} note{} ⌘F12",
+                                        if notes == 1 { "" } else { "s" }
+                                    ),
+                                    true,
+                                )
+                                .on_click(
+                                    cx.listener(|this, _e, window, cx| this.send_review(window, cx)),
+                                ),
+                            )
+                        })
+                        .child(div().flex_grow(1.0))
+                        .child(div().text_size(px(10.)).text_color(rgb(LINE_NUMBER)).child(
+                            if start { "⌥] to step through it" } else { "‹ back to the last stop" },
+                        ))
+                        .when(!start && has_id, |d| {
+                            d.child(
+                                div()
+                                    .id("bookend-delete")
+                                    .px_2()
+                                    .py(px(3.))
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(MUTED))
+                                    .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(GIT_DELETED)))
+                                    .child("Delete tour")
+                                    .tooltip(tip("Throw this tour away for good"))
+                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                        let Some(id) = this.walk.as_ref().and_then(|w| w.id.clone())
+                                        else {
+                                            return;
+                                        };
+                                        this.delete_tour(id, cx);
+                                    })),
+                            )
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
+}
+
+impl Storm {
+
+    /// The Tour button in a review thread: the subject is the code the thread
+    /// is pinned to, and the note itself, since that is the question the tour
+    /// has to answer.
+    fn ask_tour_from_comment(
+        &mut self,
+        answer: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((path, line, end)) = self.rc_target.clone() else {
+            self.ask_for_tour(None, cx);
+            return;
+        };
+        let where_ = if is_agent_src(&path) {
+            "your earlier answer".to_string()
+        } else if line == 0 {
+            self.rel(&path)
+        } else if end > line {
+            format!("{}:{}-{}", self.rel(&path), line, end)
+        } else {
+            format!("{}:{}", self.rel(&path), line)
+        };
+        // what the thread actually asks, so the tour answers that rather than
+        // explaining the file in general
+        let said = self
+            .review
+            .iter()
+            .find(|c| c.path == path && c.line == line && c.end == end)
+            .map(|c| c.text.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .or_else(|| {
+                let typed = self.rc_query.text.trim().to_string();
+                (!typed.is_empty()).then_some(typed)
+            });
+        let label = format!("Asked for a code tour of {where_}");
+        let about = match said {
+            Some(q) => format!("{where_} and what I asked about it: “{q}”"),
+            None => where_,
+        };
+        self.cancel_comment(window, cx);
+        self.agent_open = true;
+        self.send_agent_prompt_as(
+            tour_request(Some(&about), answer.as_deref()),
+            Some(label),
+            cx,
+        );
+        self.agent_list.scroll_to_end();
+        cx.notify();
+    }
+
+    /// Where the tour card sits: `(left, top, width)` in window space, directly
+    /// under the stop's last line. `None` when the stop's file isn't the one on
+    /// screen, or its lines are scrolled out of view — the strip then carries
+    /// the description instead.
+    fn tour_card_at(&self, cx: &App) -> Option<(f32, f32, f32)> {
+        let w = self.walk.as_ref()?;
+        let (path, _, end) = w.here.as_ref()?;
+        let tab = self.tabs.get(self.active)?;
+        if &tab.path != path {
+            return None;
+        }
+        let (x, y, avail, h) = tab.editor.read(cx).line_screen_rect(*end)?;
+        let width = (avail - RC_BOX_PAD * 2.0).clamp(280.0, TOUR_CARD_W);
+        Some((x + RC_BOX_PAD, y + h + TOUR_CARD_VPAD, width))
+    }
+
+    /// The description, where you're actually looking: pinned to the code it is
+    /// about, in the space the editor carved out under the stop. The strip at
+    /// the bottom of the window is for where you are in the tour; this is for
+    /// what you're meant to see here.
+    fn render_tour_card(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let (left, top, width) = self.tour_card_at(cx)?;
+        let w = self.walk.as_ref()?;
+        let stop = w.stops.get(w.at)?;
+        let (at, total) = (w.at + 1, w.stops.len());
+        let tour = w.tour.clone();
+        let accent = if tour.is_some() { TOUR_MARK } else { COMMENT_MARK };
+        let title = stop.title.trim().to_string();
+        let said = stop.said.trim().to_string();
+        let arrow = |id: &'static str, glyph: &'static str, hint: &'static str, dir: i32, cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .size(px(22.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .cursor_pointer()
+                .text_size(px(14.))
+                .text_color(rgb(MUTED))
+                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                .child(glyph)
+                .tooltip(tip(hint))
+                .on_click(cx.listener(move |this, _e, window, cx| this.step_walk(dir, window, cx)))
+        };
+        Some(
+            div()
+                .absolute()
+                .left(px(left))
+                .top(px(top))
+                .w(px(width))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .px_2()
+                .py_1p5()
+                .rounded_md()
+                .bg(rgb(POPUP_BG))
+                .border_1()
+                .border_color(rgb(accent))
+                .border_l_2()
+                .shadow_lg()
+                .text_size(px(13.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .child(arrow("card-prev", "‹", "Previous stop  (⌥[)", -1, cx))
+                        .child(arrow("card-next", "›", "Next stop  (⌥])", 1, cx))
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .mr_1()
+                                .text_size(px(11.))
+                                .text_color(rgb(LINE_NUMBER))
+                                .child(format!("{at}/{total}")),
+                        )
+                        .child(
+                            div()
+                                .flex_grow(1.0)
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_color(rgb(accent))
+                                .child(if title.is_empty() {
+                                    tour.clone().unwrap_or_else(|| "This answer".to_string())
+                                } else {
+                                    title
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id("card-close")
+                                .px_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .flex_shrink_0()
+                                .text_size(px(11.))
+                                .text_color(rgb(LINE_NUMBER))
+                                .hover(|s| s.text_color(rgb(GIT_DELETED)))
+                                .child("✕")
+                                .tooltip(tip("End the tour  (esc)"))
+                                .on_click(cx.listener(|this, _e, _w, cx| this.end_walk(cx))),
+                        ),
+                )
+                .when(!said.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .id("card-said")
+                            .w_full()
+                            .max_h(px(TOUR_CARD_ROWS as f32 * TOUR_LINE_H))
+                            .overflow_y_scroll()
+                            .line_height(px(TOUR_LINE_H))
+                            .text_color(rgb(TEXT))
+                            .child(said),
+                    )
+                }),
+        )
+    }
+
+    fn ask_for_tour(&mut self, about: Option<String>, cx: &mut Context<Self>) {
+        let label = match about.as_deref() {
+            Some(a) => format!("Asked for a code tour of {a}"),
+            None => "Asked for a code tour".to_string(),
+        };
+        self.agent_open = true;
+        self.send_agent_prompt_as(tour_request(about.as_deref(), None), Some(label), cx);
+        self.agent_list.scroll_to_end();
+        cx.notify();
+    }
+
+    fn load_tour_diff(&mut self, cx: &mut Context<Self>) {
+        if !self.pr_files.is_empty() {
+            return;
+        }
+        let (root, base) = (self.root.clone(), self.pr_base.clone());
+        cx.spawn(async move |this, cx| {
+            let got = cx
+                .background_executor()
+                .spawn(async move {
+                    let base = if base.trim().is_empty() { git_pr_base(&root) } else { base };
+                    let files = git_pr_files(&root, &base);
+                    (files, base)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                // the pane's own read wins if it got there first
+                if this.pr_files.is_empty() {
+                    this.pr_files = got.0;
+                    if this.pr_base.trim().is_empty() {
+                        this.pr_base = got.1;
+                    }
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn tour_notes(&self, w: &Walk) -> usize {
+        self.review
+            .iter()
+            .filter(|c| !c.draft && !c.sent && !c.resolved)
+            .filter(|c| {
+                w.stops.iter().any(|s| {
+                    let abs = self
+                        .ref_hits
+                        .get(&s.path)
+                        .cloned()
+                        .flatten()
+                        .unwrap_or_else(|| self.root.join(&s.path));
+                    c.path == abs && c.line == s.line && c.end == s.end.max(s.line)
+                })
+            })
+            .count()
+    }
+}
+
 impl Render for TooltipView {
     fn render(&mut self, _w: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -15688,6 +22264,11 @@ impl Render for TooltipView {
 
 fn tip(text: &'static str) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
     move |_w, cx| cx.new(|_| TooltipView { text: text.into() }).into()
+}
+
+/// The same for a tooltip built at runtime — a step's own title, say.
+fn tip_owned(text: String) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+    move |_w, cx| cx.new(|_| TooltipView { text: text.clone().into() }).into()
 }
 
 // ── native agent panel (ACP) ────────────────────────────────────────────────
@@ -15805,6 +22386,7 @@ impl Storm {
         if self.acp.is_some() && !self.acp_polling {
             self.acp_polling = true;
             self.start_acp_poll(cx);
+            self.start_boot_spinner(cx);
         }
     }
 
@@ -15836,9 +22418,13 @@ impl Storm {
             Usage { used, size } => self.agent_ctx = Some((used, size)),
             // a replayed turn from session/load
             User(t) => {
+                let text = strip_briefing(&t).to_string();
+                if text.is_empty() {
+                    return; // a turn that was nothing but the briefing
+                }
                 self.agent_cur = None;
                 self.agent_cur_thought = None;
-                self.agent_msgs.push(AgentMsg::User { text: t, imgs: Vec::new() });
+                self.agent_msgs.push(AgentMsg::User { text, imgs: Vec::new(), by: Sender::You });
             }
             Sessions(list) => {
                 self.agent_sessions = list;
@@ -15957,7 +22543,7 @@ impl Storm {
                     return;
                 }
                 "enter" if ks.modifiers.shift => {
-                    self.agent_zoomed = !self.agent_zoomed;
+                    self.term_folded = !self.term_folded;
                     cx.notify();
                     return;
                 }
@@ -15992,7 +22578,7 @@ impl Storm {
         }
         // ⌘V with an image on the clipboard attaches it to the next prompt
         if ks.key == "v" && ks.modifiers.platform && !ks.modifiers.alt {
-            if self.attach_clipboard_image(cx) {
+            if self.attach_clipboard_image(ImgToken::Composer, cx) {
                 return;
             }
             if self.paste_collapsed(cx) {
@@ -16082,6 +22668,16 @@ impl Storm {
                 cx.notify();
                 return;
             }
+            // ↑ on an empty box walks back through what you've sent, the way a
+            // shell does. Mid-walk it keeps going; ↓ comes back and lets go.
+            "up" | "down"
+                if !ks.modifiers.platform
+                    && !ks.modifiers.alt
+                    && (self.agent_hist.is_some() || self.agent_input.is_empty()) =>
+            {
+                self.walk_agent_history(ks.key == "up", cx);
+                return;
+            }
             "escape" if self.agent_jump_open => {
                 self.agent_jump_open = false;
                 cx.notify();
@@ -16089,6 +22685,7 @@ impl Storm {
             // a selection is what escape drops first
             "escape" if self.agent_sel.is_some() => {
                 self.agent_sel = None;
+                self.agent_sel_ch = None;
                 cx.notify();
             }
             // escape drops the jump list or a selection (above) and nothing
@@ -16108,6 +22705,7 @@ impl Storm {
                 let full = self.expand_mentions(&self.expand_pastes(&shown));
                 self.agent_input.clear();
                 self.agent_ghost = None;
+                self.agent_hist = None;
                 self.agent_pastes.clear();
                 self.agent_mentions.clear();
                 self.at_open = false;
@@ -16115,7 +22713,7 @@ impl Storm {
                 // the transcript shows what you typed (tokens and all); the
                 // agent gets the pasted content spliced back in
                 let label = (full != shown).then_some(shown);
-                self.send_agent_prompt_as(full, label, cx);
+                self.send_agent_prompt_by(full, label, Sender::You, cx);
             }
             "enter" => {
                 self.agent_input.newline(); // ⇧↩ too, since it costs nothing
@@ -16127,8 +22725,48 @@ impl Storm {
                 }
             }
         }
+        // any other key means you're writing again, not recalling
+        if !matches!(ks.key.as_str(), "up" | "down") {
+            self.agent_hist = None;
+        }
         self.recompute_agent_ghost();
         self.recompute_mentions(cx);
+        cx.notify();
+    }
+
+    /// Your own turns, newest last — what ↑ walks through.
+    fn agent_history(&self) -> Vec<String> {
+        self.agent_msgs
+            .iter()
+            .filter_map(|m| match m {
+                AgentMsg::User { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// One step through the history. `back` is ↑; ↓ walks toward the present and
+    /// eventually hands the box back empty.
+    fn walk_agent_history(&mut self, back: bool, cx: &mut Context<Self>) {
+        let hist = self.agent_history();
+        if hist.is_empty() {
+            return;
+        }
+        let next = match (self.agent_hist, back) {
+            (None, true) => Some(hist.len() - 1),
+            (None, false) => None,
+            (Some(0), true) => Some(0), // already at the oldest
+            (Some(i), true) => Some(i - 1),
+            (Some(i), false) if i + 1 < hist.len() => Some(i + 1),
+            (Some(_), false) => None, // past the newest: an empty box again
+        };
+        self.agent_hist = next;
+        match next {
+            Some(i) => self.agent_input.set(hist[i].clone()),
+            None => self.agent_input.clear(),
+        }
+        self.agent_ghost = None;
+        self.at_open = false;
         cx.notify();
     }
 
@@ -16161,28 +22799,29 @@ impl Storm {
     /// prompt. It never appears in the transcript — the label carries what you
     /// actually typed.
     fn tide_briefing(&self) -> String {
-        // The repo's own instructions come first, and they're named explicitly:
-        // the adapter picks up CLAUDE.md on its own, but AGENTS.md is the file
-        // this repo actually keeps its house rules in, and nothing loads it.
-        let mut house = String::new();
-        for name in ["AGENTS.md", "CLAUDE.md"] {
-            if self.root.join(name).is_file() {
-                if !house.is_empty() {
-                    house.push_str(" and ");
-                }
-                house.push_str(name);
-            }
-        }
-        let house = if house.is_empty() {
-            String::new()
+        // Claude Code loads CLAUDE.md by itself, and a CLAUDE.md that already
+        // points at AGENTS.md has the chain covered. Saying it again only makes
+        // the reading eager, which in a repo whose rules open with "read every
+        // file in this folder first" costs thousands of tokens at the top of
+        // every session. So this line exists for one case: an AGENTS.md that
+        // nothing else would load.
+        let linked = std::fs::read_to_string(self.root.join("CLAUDE.md"))
+            .is_ok_and(|t| t.contains("AGENTS.md"));
+        let house = if self.root.join("AGENTS.md").is_file() && !linked {
+            "Read AGENTS.md at the root of this repo and work the way it says. \
+             Those are the house rules for this codebase and they outrank \
+             anything below.\n\n"
         } else {
-            format!(
-                "Read {house} at the root of this repo before you start, and work \
-                 the way it says. Those are the house rules for this codebase and \
-                 they outrank anything below.\n\n"
-            )
+            ""
         };
-        format!("{house}{}", Self::tide_briefing_body())
+        // Your own standing instructions, read from ~/.config/tide/agent-notes.md
+        // and passed through verbatim. It lives outside the repo on purpose:
+        // this is where credentials for a local environment belong, not in a
+        // public source tree, and editing it needs no rebuild.
+        let notes = agent_notes()
+            .map(|n| format!("{n}\n\n"))
+            .unwrap_or_default();
+        format!("{house}{}{notes}", Self::tide_briefing_body())
     }
 
     /// The part of the briefing that never changes.
@@ -16191,20 +22830,166 @@ impl Storm {
          Its control channel is $TIDE_RPC, authenticated with the header \
          `X-Tide-Token: $TIDE_TOKEN` (both are already in your environment).\n\n\
          After anything that changes what TIDE shows about this branch — opening \
-         or updating a pull request, pushing, switching or creating a branch — \
+         a pull request, rewriting its title or body, pushing, switching or \
+         creating a branch — \
          tell it to re-read:\n\
          \x20 curl -s -X POST \"$TIDE_RPC/refresh\" -H \"X-Tide-Token: $TIDE_TOKEN\"\n\n\
          It costs nothing and saves the human refreshing by hand.\n\n\
-         If this workspace has no name yet, give it one once you know what the \
-         work is — three to five words, no ticket numbers, and always led by the \
-         type of work, `<type>: <name>`:\n\
+         Name the workspace. Do it in your first reply, not at the end: the \
+         moment you can say what this work is, send the title. A rough name now \
+         beats a perfect one later, and you can send a better one whenever the \
+         work turns out to be something else — TIDE keeps yours until the human \
+         renames it by hand. Three to five words, no ticket numbers, always led \
+         by the type of work, `<type>: <name>`:\n\
          \x20 curl -s -X POST \"$TIDE_RPC/title\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n\
          \x20   -d '{\"title\":\"fix: sql date off by one\"}'\n\
          The type is one of feat, fix, docs, style, refactor, perf, test, build, \
          ci, chore, bip, client, release — the same set the human picks from, and \
          TIDE turns it into that type's icon. Pick the one the work actually is.\n\
-         TIDE ignores the whole thing if the human already named this workspace, \
-         so it is always safe to send once.\n\n\
+         A name the human typed is theirs: TIDE ignores yours in that case, so \
+         the call is always safe to make. When they ask you to rename such a \
+         workspace, add `\"force\":true` to the same call — never on your own \
+         initiative.\n\
+         One workspace usually holds several stretches of work: the UI, then the \
+         backend, then the syncing. The title is the whole of it and stays put; \
+         `subtitle` says which stretch you are on now, and it is yours to keep \
+         current — no force, no permission:\n\
+         \x20 curl -s -X POST \"$TIDE_RPC/title\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n\
+         \x20   -d '{\"subtitle\":\"UI auto syncing\"}'\n\
+         Two or three words, no title needed in the same call. Move it when the \
+         work moves — after a merge, when you pick up the next piece — and send \
+         an empty one to clear it when the stretch is done. The human reads it \
+         in the topbar as `AI Chat (UI auto syncing)`, which is how they tell at \
+         a glance where a workspace was left.\n\n\
+         \"todo it\", \"note that down\", \"park it\", \"backlog this\", \"add it to \
+         the list\" — all mean one thing: put it on TIDE's todo list, not in a \
+         file and not in your answer:\n\
+         \x20 curl -s -X POST \"$TIDE_RPC/todo\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n\
+         \x20   -d '{\"todos\":[{\"text\":\"drop the WCP shim\",\"category\":\"refactor\",\
+         \"scope\":\"api\"}],\"group\":\"license gated flags\"}'\n\
+         `text` is the one-line version and is all that is required. Put the \
+         reasoning in `details` — what was decided, what to watch out for, what \
+         you would have said in the answer. `category` is one of the type words \
+         above, `status` is todo, doing or done, and `link`, `scope` and \
+         `client` are optional. Send a batch in one call and give it a `group` so the list \
+         keeps it together; TIDE groups it under this workspace's title if you \
+         don't. Only when asked.\n\
+         The same path reads the list back — every workspace's, straight off \
+         disk — so you can see what's already on it, check what you just filed, \
+         or answer \"what's on my list\":\n\
+         \x20 curl -s \"$TIDE_RPC/todo\" -H \"X-Tide-Token: $TIDE_TOKEN\"\n\
+         And it edits: send back the `id` that read gave you, with only the \
+         fields you're changing. `\"delete\":true` takes the line off the list.\n\
+         \x20 curl -s -X POST \"$TIDE_RPC/todo\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n\
+         \x20   -d '{\"todos\":[{\"id\":\"58w65\",\"status\":\"done\"}]}'\n\
+         Without an `id` every post files a new task, so an edit that leaves it \
+         out silently becomes a duplicate. An `id` TIDE doesn't know is dropped \
+         rather than filed as something new. Read the list back if you want to \
+         be sure a change landed.\n\n\
+         \"Insert this into content planner\", \"put these posts in the \
+         planner\", \"schedule these\" — the posts go to the local bridge on \
+         port 47400, not into a file and not into your answer. One event per \
+         post:\n\
+         \x20 curl -s -X POST localhost:47400/events -H \"content-type: \
+         application/json\" \\\n\
+         \x20   -d '{\"type\":\"post.drafted\",\"source\":\"tide\",\
+         \"id\":\"cp:webiny:2026-11-03-rules-tab\",\"data\":{\
+         \"space\":\"webiny\",\"day\":\"2026-11-03\",\
+         \"title\":\"Rules tab for fields\",\
+         \"body\":\"In v6, fields have a Rules tab…\",\"status\":\"draft\"}}'\n\
+         `id` is yours to pick and is the link to the post it makes. Publishing \
+         the same id again rewrites that post, wherever it has been moved to \
+         since — a correction is the same call with new text. A new id adds \
+         another post: a day holds as many as you send it, and nothing on it \
+         is replaced, including anything written by hand. So make the id \
+         something you can reproduce from the post itself, \
+         `cp:<space>:<day>-<two or three words of the title>`, or you will \
+         file a duplicate instead of fixing the first one.\n\
+         `space` is `webiny` or `personal`. `day` is `yyyy-MM-dd` and an \
+         unparseable one is dropped on the floor. `body` is the post exactly \
+         as it should go out — plain text, no markdown. `status` is `idea`, \
+         `draft` or `ready`, never `posted`. Seven posts is seven events, and \
+         they can all go at once.\n\
+         Pictures ride along as attachments, base64, in `content` — not \
+         `data`:\n\
+         \x20 \"attachments\":[{\"name\":\"rules-tab.png\",\"mime\":\
+         \"image/png\",\"content\":\"<base64>\"}]\n\
+         and they only replace that post's images when they are there, so a \
+         text-only fix leaves the screenshots alone. A request caps at 64 MB; \
+         a video goes through the bridge's inbox folder instead of base64 over \
+         HTTP.\n\
+         The planner doesn't have to be running — the bridge holds what you \
+         publish until it next opens. Check it landed rather than assuming:\n\
+         \x20 curl -s localhost:47400/consumers\n\
+         `content-planner` is in there with a `pending` count. If the bridge \
+         itself is down the curl fails outright; say so instead of reporting \
+         posts that went nowhere. Which days to use is mine to decide: if I \
+         haven't said, ask before you publish.\n\n\
+                  Open the pull request yourself when the work is worth one — a feature \
+         that holds together, a fix with its tests, a round of changes you'd be \
+         happy to have reviewed. Don't stop to ask whether I want a PR; I'd \
+         rather close one than wait for it. Push the branch and open it, say so, \
+         and carry on.\n\n\
+         Never merge a pull request into its base. Push your work to the PR's \
+         own branch, say it is ready, and leave the merge button to me — \
+         however green the checks are, that press is mine and I ask for it in \
+         so many words when I want it. \"It passes CI\", \"it's approved\" and \
+         \"it unblocks the next thing\" are not that ask. Bringing a branch up \
+         to date with its base and pushing that is ordinary work, and is not \
+         what this is about.\n\n\
+         Never use git worktrees. Each TIDE workspace is already its own \
+         checkout, and a worktree inside one puts work somewhere nothing here \
+         is looking — not the tree, not the PR pane, not the reviewers. Branch \
+         in place instead.\n\n\
+         Pictures in a PR body live in the repo: commit them under \
+         `.github/pr-assets/<pr number>/` and link the raw URL, pinned to the \
+         commit that added them:\n\
+         \x20 https://raw.githubusercontent.com/<owner>/<repo>/<sha>/.github/\
+         pr-assets/<n>/<file>.png\n\
+         The `<sha>` matters. A link through the branch name dies when the \
+         branch is deleted after the merge, which is exactly when someone reads \
+         the PR again; a commit sha is permanent. `git rev-parse HEAD` after \
+         committing the picture gives you the one to use.\n\
+         GitHub's own uploader is for comments: a body you will rewrite loses \
+         the images every time it is rewritten, and `gh` can't upload to one \
+         anyway — that endpoint is the web UI's, not the API's.\n\n\
+         Film anything a person can see or use: an admin screen, a form, a \
+         flow, a component — if the change shows up in a browser, the PR gets \
+         a video of it as well as the stills. The `demo-video` skill makes \
+         one: a storyboard, agent-browser driving the real app, an MP4 with \
+         the cursor, the zoom and the captions drawn on. Backend, infra, \
+         refactors, CI and tests don't get one; there is nothing to watch.\n\
+         A PR body plays nothing but a GIF, so make one from the video and \
+         embed that:\n\
+         \x20 ffmpeg -i out.mp4 -vf \"fps=12,scale=900:-1:flags=lanczos,\
+         split[a][b];[a]palettegen=max_colors=160[p];[b][p]paletteuse=\
+         dither=bayer\" -loop 0 demo.gif\n\
+         Commit the GIF and the MP4 under `.github/pr-assets/<pr number>/` \
+         with the pictures, embed the GIF the same way (`![demo](<raw url \
+         pinned to the sha>)`), and link the MP4 under it as the \
+         full-quality version. Keep the GIF under about 8 MB: drop to \
+         `fps=10,scale=800` or shorten the storyboard if it goes over. Don't \
+         write a `<video>` tag — GitHub strips it out of a body — and don't \
+         paste a bare `.mp4` URL expecting a player; it renders as a link \
+         that looks broken.\n\
+         If you can't bring the app up to film it, say so in the PR rather \
+         than quietly leaving the video out.\n\n\
+         A PR body is about the code, not about who said what. Never write that \
+         someone noticed, reported, asked for or complained about a thing — no \
+         names, no \"the client\", no \"as discussed\". Say what was wrong, what \
+         it affected and what changed. \"Sven noticed the dropdown closes on \
+         scroll\" is \"the dropdown closed on scroll\". The conversation that led \
+         to the work is ours; the PR outlives it and is read by people who \
+         weren't in it.\n\n\
+         When you open a pull request, name the workspace it came from in the \
+         body, so a PR can be traced back to the checkout it was written in. \
+         Ask which one this is:\n\
+         \x20 curl -s \"$TIDE_RPC/workspace\" -H \"X-Tide-Token: $TIDE_TOKEN\"\n\
+         It answers `{\"folder\":\"wby-next4\",\"title\":\"Event Van Handler\",…}`; \
+         put a line like `Workspace: wby-next4 · Event Van Handler` at the end of \
+         the body (just the folder when there is no title yet). Read it when you \
+         are about to open the PR, not earlier — the title is the human's and \
+         changes while you work.\n\n\
          When the human asks you to tick files off on the open pull request — \
          \"mark every package.json that is only a version bump as viewed\" — \
          post \
@@ -16214,10 +22999,89 @@ impl Storm {
          Paths are repo-relative, as `git diff --name-only` prints them; add \
          `\"viewed\":false` to untick. TIDE mirrors it onto GitHub, so the PR page \
          agrees. Only when asked — never tick off files on your own.\n\n\
+         Two reviewers can run here, not only in CI.\n\
+         CodeRabbit's CLI reviews the working tree:\n\
+         \x20 coderabbit review --agent --base <base branch>\n\
+         `--agent` prints structured findings; `--uncommitted` covers work in \
+         progress and `--committed` what's already committed; \
+         `coderabbit review findings` reprints the last run for free. The base \
+         branch is the `base` field from $TIDE_RPC/workspace. Run it when the \
+         human asks for a review, and on your own judgement when you think a \
+         branch is ready — once per round of changes, since each run spends from \
+         their plan. Act on what it finds or say why you disagree; don't just \
+         paste the output.\n\
+         Slop Cop is a script, not a service: \
+         `.github/workflows/wac/utils/runNodeScripts/slopCop.js` reads four env \
+         vars — PR_JSON_FILE (`gh pr view --json \
+         title,body,additions,deletions,changedFiles,commits,files,baseRefName,headRefName`), \
+         DIFF_FILE (`gh pr diff`), CODE_STYLE_DIR (`ai-context/code-style`) and \
+         SLOP_COP_OUTPUT (where it writes the report) — plus ANTHROPIC_API_KEY. \
+         With a key in the environment, run it and read the report. Without one \
+         it exits silently, so do its two checks yourself instead: does the \
+         diff's footprint match what the PR says it does (no stray files, no \
+         wiped commits, no secrets or debug code or conflict markers), and do \
+         the added lines break any rule in ai-context/code-style.\n\n\
+         Asked to check a PR or its CI: the automatic checks are half the \
+         answer. Also read what the review bots left on the PR — Slop Cop and \
+         CodeRabbit — and report what they flagged alongside the check results. \
+         A green tick with an unread bot review is not a passing PR.\n\n\
+         You can drive a real browser and show me what you saw. `agent-browser` \
+         is installed (`agent-browser skills get core` for its own guide): open \
+         a page, click through it, then\n\
+         \x20 agent-browser screenshot /tmp/shot.png\n\
+         \x20 curl -s -X POST \"$TIDE_RPC/shot\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n\
+         \x20   -d '{\"path\":\"/tmp/shot.png\",\"note\":\"admin after saving the flag\"}'\n\
+         and the picture lands in this transcript next to what you're saying \
+         about it. Use it when you checked something in a browser and I'd \
+         otherwise have to take your word for it: a page you fixed, a state you \
+         reproduced, a layout that looks wrong. `agent-browser console` and \
+         `agent-browser errors` are worth reading before you say a page works. \
+         The local sign-in details are above.\n\n\
+         When TIDE hands you a job — review comments to address, a branch to \
+         bring up to date, a conflict to sort out — finish by posting what you \
+         did. It lands as a card in the transcript rather than as the tail of a \
+         long turn, which is where the human looks for \"so what happened\":\n\
+         \x20 curl -s -X POST \"$TIDE_RPC/summary\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n\
+         \x20   -d '{\"title\":\"Merged origin/next\",\"text\":\"Resolved 3 \
+         conflicts in CommandPalette.tsx, kept both sides. yyb clean, 24 tests \
+         pass.\"}'\n\
+         `title` is two to four words naming the job — what the card is about at \
+         a glance. `text` is markdown: a short paragraph or a few bullets — what \
+         changed, what you decided, anything you were unsure about. Once, at the \
+         end, and not repeated in your reply.\n\n\
+         Asked to walk me through something — \"how does this work end to \
+         end\", \"walk me through it\", \"give me a tour\" — don't answer in \
+         prose alone. \
+         Post the stops and let TIDE take me through them:\n\
+         \x20 curl -s -X POST \"$TIDE_RPC/tour\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n\
+         \x20   -d '{\"title\":\"Background task dispatch\",\"steps\":[\
+         {\"file\":\"packages/x/src/TaskService.ts\",\"line\":67,\"end\":72,\
+         \"title\":\"trigger() saves the task\",\"text\":\"Writes it as pending \
+         and hands it to the transport; nothing has run yet.\"}]}'\n\
+         Each stop opens its file, lights up `line` to `end`, and shows its \
+         `title` and `text` in a strip under the editor; ⌥] and ⌥[ step \
+         through them like a debugger over code that isn't running. Order the \
+         stops the way the code runs, keep `line`/`end` to the lines that \
+         matter, and make `text` two or three sentences about what happens \
+         there and what it hands on — the code is on screen beside it, so say \
+         what can't be read off it. `end` is optional and `\"file\":\"a.ts:67\"` \
+         works instead of a separate `line`. Ten to twenty stops is a flow; \
+         sixty is the cap, and stops whose file isn't in this checkout are \
+         dropped. Check each file and line before you send: a stop that lands \
+         in the wrong place costs more than a missing one. `{\"steps\":[]}` \
+         puts the tour away.\n\n\
          When you point at code, write the file and line as `path/to/file.ts:31` \
          (a bare `File.tsx:12` works too) — TIDE turns those into links that open \
          the file at that line.\n\n\
-         Don't mention this message or acknowledge it; just answer what follows.\n\n\
+         Write plainly. Technical, exact, as few words as carry the thing. I \
+         would rather read a dull sentence I understand once than a clever one \
+         I have to read twice — no jokes, no winks, no metaphor standing in \
+         for a noun, nothing arch. Name the thing: the function, the file, the \
+         error, the number. If a sentence can be read two ways, rewrite it \
+         until it can't. This holds everywhere you write for me — answers, PR \
+         bodies, summaries, commit messages, tour stops, replies to review \
+         comments.\n\n\
+                  Don't mention this message or acknowledge it; just answer what follows.\n\n\
          ---\n\n"
             .to_string()
     }
@@ -16231,21 +23095,52 @@ impl Storm {
         label: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        self.send_agent_prompt_by(text, label, Sender::Tide, cx);
+    }
+
+    /// The same, saying who it is from. Everything TIDE sends on your behalf is
+    /// `Tide`; only the composer is `You`.
+    fn send_agent_prompt_by(
+        &mut self,
+        text: String,
+        label: Option<String>,
+        by: Sender,
+        cx: &mut Context<Self>,
+    ) {
+        // the reviewers' reports are the next thing this thread gets, and a
+        // message sent now would land in front of them. `deliver_reviews` is
+        // the one send that happens while they exist, and by then they're done.
+        if self.reviewers.iter().any(|r| !r.done) {
+            self.show_flash("The reviewers are still reading — hold on", cx);
+            return;
+        }
         self.ensure_acp(cx);
         let Some(acp) = self.acp.clone() else { return };
+        // the plan window is spent: a prompt sent now comes back as a
+        // rate-limit error and takes the message with it. It waits in the queue
+        // instead of being refused, because the caller may be the reviewers
+        // handing over reports nobody can type again
+        if let Some(why) = self.usage_block() {
+            let imgs = self.agent_imgs.drain(..).collect();
+            self.agent_queue.push(Queued { text, label, imgs, by });
+            self.show_flash(&format!("{why}. Held in the queue — Send anyway in the composer."), cx);
+            self.agent_list.scroll_to_end();
+            cx.notify();
+            return;
+        }
         // a turn is already running: hold this one and send it when that ends,
         // rather than firing a second session/prompt at the adapter
         if self.agent_busy {
-            self.agent_queue.push((text, label));
+            // the attachments go with it, not with the next thing you send
+            let imgs = self.agent_imgs.drain(..).collect();
+            self.agent_queue.push(Queued { text, label, imgs, by });
             self.agent_list.scroll_to_end();
             cx.notify();
             return;
         }
         // the session now has content, so the next launch can resume it again
         self.mark_agent_fresh(false);
-        let attached: Vec<PastedImage> = self.agent_imgs.drain(..).collect();
-        let imgs: Vec<(String, String)> =
-            attached.iter().map(|i| (i.mime.clone(), i.b64.clone())).collect();
+        let (imgs, kept) = split_images(self.agent_imgs.drain(..).collect());
         // the transcript shows your words; the wire carries the briefing too
         let shown = label.unwrap_or_else(|| text.clone());
         let sent = if self.agent_briefed {
@@ -16255,13 +23150,7 @@ impl Storm {
             format!("{}{text}", self.tide_briefing())
         };
         acp.prompt_with(&sent, &imgs);
-        // the chips under the bubble say what was attached, so the old
-        // "[n image(s) attached]" footer has nothing left to add
-        let kept: Vec<SentImage> = attached
-            .into_iter()
-            .map(|i| SentImage { label: i.label, mime: i.mime, bytes: i.bytes, image: i.image })
-            .collect();
-        self.agent_msgs.push(AgentMsg::User { text: shown, imgs: kept });
+        self.agent_msgs.push(AgentMsg::User { text: shown, imgs: kept, by });
         self.agent_turn_start = Some(std::time::Instant::now());
         self.start_agent_spinner(cx);
         // same signal a terminal agent's UserPromptSubmit hook sends
@@ -16269,6 +23158,13 @@ impl Storm {
         if self.ws_idle {
             self.ws_idle = false;
             save_ws_idle(&self.root, false);
+        }
+        // typing at the agent is the clearest sign this workspace is in use, so
+        // it stops being skipped by ⌥Tab and stops reading as parked
+        if self.ws_paused {
+            self.ws_paused = false;
+            save_ws_paused(&self.root, false);
+            self.show_flash("Workspace resumed", cx);
         }
         self.agent_list.scroll_to_end(); // your own turn always scrolls into view
         self.agent_cur = None;
@@ -16288,6 +23184,7 @@ impl Storm {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let rows = md_prepare(text);
+        let is_user = matches!(self.agent_msgs.get(msg), Some(AgentMsg::User { .. }));
         let cpath = self.agent_comment_path(msg);
         // rows that already carry a comment (1-based spans), and the row the open
         // box belongs under
@@ -16303,11 +23200,48 @@ impl Storm {
             .flatten()
             .filter(|(p, _, _)| *p == cpath)
             .map(|(_, _, b)| b.saturating_sub(1));
-        let sel = self.agent_sel.filter(|(m, _, _)| *m == msg).map(|(_, a, b)| (a.min(b), a.max(b)));
-        let selected = |i: usize| sel.is_some_and(|(a, b)| i >= a && i <= b);
+        // the drag, in (row, byte) pairs, normalised so a takes the earlier one
+        let span = self.agent_sel_ch.filter(|(m, ..)| *m == msg).map(|(_, ra, ba, rb, bb)| {
+            if (ra, ba) <= (rb, bb) { ((ra, ba), (rb, bb)) } else { ((rb, bb), (ra, ba)) }
+        });
+        let rowsel = self.agent_sel.filter(|(m, _, _)| *m == msg).map(|(_, a, b)| (a.min(b), a.max(b)));
+        let selected = move |i: usize| match span {
+            // a character-precise drag: the end rows are partial, the rest whole
+            Some(((ra, ba), (rb, bb))) if i >= ra && i <= rb => {
+                if ra == rb {
+                    Sel::Range(ba.min(bb), ba.max(bb))
+                } else if i == ra {
+                    Sel::Range(ba, usize::MAX)
+                } else if i == rb {
+                    Sel::Range(0, bb)
+                } else {
+                    Sel::All
+                }
+            }
+            Some(_) => Sel::None,
+            // right-click and ⌥C still select whole rows
+            None => match rowsel {
+                Some((a, b)) if i >= a && i <= b => Sel::All,
+                _ => Sel::None,
+            },
+        };
         // one wrapper per row: press anchors the selection, moving over a row
         // while dragging extends to it
-        let wrap = |i: usize, inner: AnyElement, cx: &mut Context<Self>| {
+        let wrap = |i: usize, inner: AnyElement, layout: Option<gpui::TextLayout>, cx: &mut Context<Self>| {
+            // where in the row's text the pointer is. `index_for_position`
+            // answers in bytes, and `Err` means "past the end of that line",
+            // which is exactly where a drag off the right edge should land.
+            let at = |layout: Option<gpui::TextLayout>| {
+                move |pos: gpui::Point<gpui::Pixels>| -> Option<usize> {
+                    let l = layout.as_ref()?;
+                    Some(match l.index_for_position(pos) {
+                        Ok(i) => i,
+                        Err(i) => i,
+                    })
+                }
+            };
+            let at_down = at(layout.clone());
+            let at_move = at(layout);
             div()
                 .child(inner)
                 // A press only *arms* the selection; the range appears once the
@@ -16320,6 +23254,8 @@ impl Storm {
                         this.agent_sel_armed = Some((msg, i));
                         this.agent_sel_drag = true;
                         this.agent_sel_moved = false;
+                        this.agent_sel_ch = None;
+                        this.agent_sel_anchor = at_down(ev.position).map(|b| (msg, i, b));
                         this.agent_sel_pos =
                             Some((f32::from(ev.position.x), f32::from(ev.position.y)));
                         let _ = cx;
@@ -16347,6 +23283,21 @@ impl Storm {
                 .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _w, cx| {
                     if !this.agent_sel_drag {
                         return;
+                    }
+                    // the character-precise half: anchor byte → this byte
+                    if let (Some((am, ar, ab)), Some(b)) =
+                        (this.agent_sel_anchor, at_move(ev.position))
+                    {
+                        if am == msg {
+                            this.agent_sel_ch = Some((am, ar, ab, i, b));
+                            this.agent_sel = Some((am, ar, i));
+                            this.agent_sel_armed = None;
+                            this.agent_sel_moved = true;
+                            this.agent_sel_pos =
+                                Some((f32::from(ev.position.x), f32::from(ev.position.y)));
+                            cx.notify();
+                            return;
+                        }
                     }
                     // first movement after the press starts the selection
                     if let Some((m, anchor)) = this.agent_sel_armed.take() {
@@ -16388,7 +23339,7 @@ impl Storm {
                     grid = grid.child(md_row_el(&rows[i], selected(first)));
                     i += 1;
                 }
-                built.push((first, wrap(first, grid.into_any_element(), cx)));
+                built.push((first, wrap(first, grid.into_any_element(), None, cx)));
                 continue;
             }
             let row = &rows[i];
@@ -16397,6 +23348,7 @@ impl Storm {
             // two kinds of link in one line: a file reference opens the file,
             // a URL opens the browser. Sorted and non-overlapping, since that's
             // what the highlighter and the click ranges both need.
+            let repo_web = self.repo_web.clone();
             let mut links: Vec<(std::ops::Range<usize>, LinkTarget)> = file_refs(&row.text)
                 .into_iter()
                 .filter(|r| self.file_ref_target(&r.path, cx).is_some())
@@ -16406,6 +23358,7 @@ impl Storm {
                         .into_iter()
                         .map(|r| (r.clone(), LinkTarget::Url(row.text[r].to_string()))),
                 )
+                .chain(pr_links(&row.text, repo_web.as_deref()))
                 .collect();
             links.sort_by_key(|(r, _)| r.start);
             links.dedup_by(|b, a| b.0.start < a.0.end);
@@ -16435,6 +23388,10 @@ impl Storm {
                 // every row reserves the column, so nothing shifts sideways
                 _ => div().w(px(16.)).flex_shrink_0().into_any_element(),
             };
+            // your own messages take the gutter back: a review comment on what
+            // you typed isn't a thing
+            let gutter = if is_user { div().into_any_element() } else { gutter };
+            let mut row_layout: Option<gpui::TextLayout> = None;
             let inner = div()
                 .flex()
                 .flex_row()
@@ -16446,13 +23403,21 @@ impl Storm {
                         .min_w(px(0.))
                         .text_size(px(row.size.max(1.0)))
                         .child(if links.is_empty() {
-                            md_row_el(row, selected(i))
+                            let styled = md_row_text(row, selected(i));
+                            match styled {
+                                Some(t) => {
+                                    row_layout = Some(t.layout().clone());
+                                    t.into_any_element()
+                                }
+                                None => md_row_el(row, selected(i)),
+                            }
                         } else {
                             let ranges: Vec<std::ops::Range<usize>> =
                                 links.iter().map(|(r, _)| r.clone()).collect();
                             let targets: Vec<LinkTarget> =
                                 links.iter().map(|(_, t)| t.clone()).collect();
                             let styled = md_styled_links(row, row.heading, selected(i), &ranges);
+                            row_layout = Some(styled.layout().clone());
                             let me = cx.entity().downgrade();
                             gpui::InteractiveText::new(("md-link", msg * 10_000 + i), styled)
                                 .on_click(ranges, move |ix, window, cx| {
@@ -16462,7 +23427,25 @@ impl Storm {
                                             let (path, line) = (path.clone(), *line);
                                             if let Some(me) = me.upgrade() {
                                                 me.update(cx, |this, cx| {
-                                                    this.open_file_ref(&path, line, window, cx)
+                                                    // one click opens the file and
+                                                    // arms ⌥] / ⌥[ for the rest of
+                                                    // the answer's references
+                                                    this.start_walk(msg, &path, line, cx);
+                                                    // stand on it through the
+                                                    // walk when there is one, so
+                                                    // the lines light up too
+                                                    match this
+                                                        .walk
+                                                        .as_ref()
+                                                        .and_then(|w| w.stops.get(w.at))
+                                                        .cloned()
+                                                    {
+                                                        Some(stop) => {
+                                                            this.open_walk_stop(&stop, window, cx)
+                                                        }
+                                                        None => this
+                                                            .open_file_ref(&path, line, window, cx),
+                                                    }
                                                 });
                                             }
                                         }
@@ -16473,7 +23456,7 @@ impl Storm {
                         }),
                 )
                 .into_any_element();
-            built.push((i, wrap(i, inner, cx)));
+            built.push((i, wrap(i, inner, row_layout, cx)));
             i += 1;
         }
         // a row's left bar: purple while it's selected or carries a comment, and
@@ -16481,7 +23464,7 @@ impl Storm {
         // nothing moves sideways when it lights up.
         let has_comment =
             |i: usize| commented.iter().any(|(a, b, _)| i + 1 >= *a && i + 1 <= *b);
-        let bar = |i: usize| (selected(i), has_comment(i));
+        let bar = |i: usize| (selected(i).is_some(), has_comment(i));
         let mut col = div().flex().flex_col().gap(px(4.)).text_color(rgb(TEXT));
         let mut k = 0;
         while k < built.len() {
@@ -16526,15 +23509,33 @@ impl Storm {
         };
         let rows = md_prepare(&text);
         let (a, b) = (a.min(b), a.max(b).min(rows.len().saturating_sub(1)));
+        // a character-precise drag clips its first and last rows; a row
+        // selection (right-click, ⌥C) takes whole lines
+        let span = self.agent_sel_ch.filter(|(m, ..)| *m == msg).map(|(_, ra, ba, rb, bb)| {
+            if (ra, ba) <= (rb, bb) { ((ra, ba), (rb, bb)) } else { ((rb, bb), (ra, ba)) }
+        });
         let picked: Vec<String> = rows[a..=b]
             .iter()
-            .filter(|r| !r.gap)
-            .map(|r| match &r.cells {
-                // a table row reads back as its cells, tab-separated
-                Some(cells) => {
-                    cells.iter().map(|c| c.text.to_string()).collect::<Vec<_>>().join("\t")
-                }
-                None => r.text.to_string(),
+            .enumerate()
+            .filter(|(_, r)| !r.gap)
+            .map(|(k, r)| {
+                let whole = match &r.cells {
+                    // a table row reads back as its cells, tab-separated
+                    Some(cells) => {
+                        cells.iter().map(|c| c.text.to_string()).collect::<Vec<_>>().join("\t")
+                    }
+                    None => r.text.to_string(),
+                };
+                let Some(((ra, ba), (rb, bb))) = span else { return whole };
+                let i = a + k;
+                let (from, to) = match (i == ra, i == rb) {
+                    (true, true) => (ba.min(bb), ba.max(bb)),
+                    (true, false) => (ba, whole.len()),
+                    (false, true) => (0, bb),
+                    (false, false) => (0, whole.len()),
+                };
+                let (from, to) = clamp_span_str(&whole, from, to.min(whole.len()));
+                whole[from..to].to_string()
             })
             .collect();
         let out = picked.join("\n");
@@ -16550,9 +23551,450 @@ impl Storm {
         self.quote_agent_selection(window, cx);
     }
 
+    /// The rendered document, with a selection you can drag across it.
+    ///
+    /// `md_doc_w` draws the same rows; this adds the per-row mouse handling and
+    /// the highlight, which needs an entity to hang listeners on.
+    fn md_doc_sel(&self, text: &str, width: f32, cx: &mut Context<Self>) -> Div {
+        let rows = md_prepare(text);
+        // a picture written `![](shot.png)` sits next to the document
+        let base = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.path.parent().map(|d| d.to_path_buf()));
+        // normalised so the first end is the earlier one, whichever way it was dragged
+        let span = self.md_sel.map(|(ra, ba, rb, bb)| {
+            if (ra, ba) <= (rb, bb) { ((ra, ba), (rb, bb)) } else { ((rb, bb), (ra, ba)) }
+        });
+        let selected = move |i: usize| match span {
+            Some(((ra, ba), (rb, bb))) if i >= ra && i <= rb => {
+                if ra == rb {
+                    Sel::Range(ba.min(bb), ba.max(bb))
+                } else if i == ra {
+                    Sel::Range(ba, usize::MAX)
+                } else if i == rb {
+                    Sel::Range(0, bb)
+                } else {
+                    Sel::All
+                }
+            }
+            _ => Sel::None,
+        };
+        let mut col = div().flex().flex_col().gap(px(4.)).text_color(rgb(TEXT));
+        let mut i = 0;
+        while i < rows.len() {
+            // a table is one grid; selecting inside it is not worth the seams
+            if rows[i].cells.is_some() {
+                let mut grid = div()
+                    .my_1()
+                    .flex()
+                    .flex_col()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .rounded_md()
+                    .overflow_hidden();
+                while i < rows.len() && rows[i].cells.is_some() {
+                    grid = grid.child(md_row_el(&rows[i], Sel::None));
+                    i += 1;
+                }
+                col = col.child(grid);
+                continue;
+            }
+            let row = &rows[i];
+            if !row.text.is_empty() {
+                let mut layout: Option<gpui::TextLayout> = None;
+                let inner = match md_row_text(row, selected(i)) {
+                    Some(t) => {
+                        layout = Some(t.layout().clone());
+                        t.into_any_element()
+                    }
+                    None => md_row_el(row, selected(i)),
+                };
+                // `index_for_position` answers in bytes; `Err` is "past the end
+                // of the line", which is where a drag off the right edge lands
+                let at = move |layout: Option<gpui::TextLayout>| {
+                    move |pos: gpui::Point<gpui::Pixels>| -> Option<usize> {
+                        let l = layout.as_ref()?;
+                        Some(match l.index_for_position(pos) {
+                            Ok(b) => b,
+                            Err(b) => b,
+                        })
+                    }
+                };
+                let (down, mv) = (at(layout.clone()), at(layout));
+                // the row's own text, for the double-click that takes a word
+                let words = row.text.clone();
+                col = col.child(
+                    div()
+                        .text_size(px(row.size.max(1.0)))
+                        .child(inner)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                                let b = down(ev.position).unwrap_or(0);
+                                // once starts a drag, twice takes the word
+                                // under the pointer, three times the line
+                                let (a, z) = match ev.click_count {
+                                    1 => (b, b),
+                                    2 => {
+                                        let r = word_at(&words, b);
+                                        (r.start, r.end)
+                                    }
+                                    _ => (0, words.len()),
+                                };
+                                this.md_sel = Some((i, a, i, z));
+                                this.md_sel_drag = a == z;
+                                window.focus(&this.md_focus, cx);
+                                cx.notify();
+                            }),
+                        )
+                        .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _w, cx| {
+                            if !this.md_sel_drag {
+                                return;
+                            }
+                            if let (Some((ra, ba, ..)), Some(b)) = (this.md_sel, mv(ev.position)) {
+                                this.md_sel = Some((ra, ba, i, b));
+                                cx.notify();
+                            }
+                        })),
+                );
+            }
+            for (alt, src) in &row.images {
+                col = col.child(md_img_el(alt, src, width, base.clone()));
+            }
+            i += 1;
+        }
+        col
+    }
+
+    /// What a drag over the rendered document covers, as text. Rows are joined
+    /// with newlines, which is what a paste of several lines should be.
+    fn md_selection(&self, text: &str) -> Option<String> {
+        let (ra, ba, rb, bb) = self.md_sel?;
+        let ((ra, ba), (rb, bb)) =
+            if (ra, ba) <= (rb, bb) { ((ra, ba), (rb, bb)) } else { ((rb, bb), (ra, ba)) };
+        let rows = md_prepare(text);
+        let mut out = String::new();
+        for i in ra..=rb.min(rows.len().saturating_sub(1)) {
+            let Some(row) = rows.get(i) else { break };
+            let t = row.text.as_ref();
+            // byte offsets come from the layout, so they may land mid-character
+            let clamp = |b: usize| {
+                let b = b.min(t.len());
+                (0..=b).rev().find(|&i| t.is_char_boundary(i)).unwrap_or(0)
+            };
+            let piece = match (i == ra, i == rb) {
+                (true, true) => &t[clamp(ba.min(bb))..clamp(ba.max(bb))],
+                (true, false) => &t[clamp(ba)..],
+                (false, true) => &t[..clamp(bb)],
+                _ => t,
+            };
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(piece);
+        }
+        (!out.trim().is_empty()).then_some(out)
+    }
+
+    /// ⌘F over the rendered document. The query runs against the markdown
+    /// behind it, so a match inside `**bold**` or a link's text is found the
+    /// same as any other; each hit is shown as the selection, which is what
+    /// the view already knows how to draw.
+    fn md_find_open_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.md_find_open = true;
+        // a selection is nearly always what you are about to search for
+        let text = self.md_doc_text(cx);
+        if let Some(picked) = self.md_selection(&text) {
+            if !picked.contains('\n') && picked.len() <= 120 {
+                self.md_find.set(picked);
+            }
+        }
+        self.md_find_run(0, cx);
+        window.focus(&self.md_find_focus, cx);
+        cx.notify();
+    }
+
+    /// The markdown the rendered view is showing.
+    fn md_doc_text(&self, cx: &App) -> String {
+        self.tabs.get(self.active).map(|t| t.editor.read(cx).text()).unwrap_or_default()
+    }
+
+    /// Every match of the query, as source ranges. Case-insensitive, because a
+    /// document is prose.
+    fn md_find_hits(&self, text: &str) -> Vec<std::ops::Range<usize>> {
+        let q = self.md_find.text.trim().to_lowercase();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let hay = text.to_lowercase();
+        let mut out = Vec::new();
+        let mut at = 0;
+        while let Some(i) = hay[at..].find(&q) {
+            let start = at + i;
+            out.push(start..start + q.len());
+            at = start + q.len().max(1);
+            if out.len() >= 500 {
+                break; // a query of "e" is not a search; stop being useful quietly
+            }
+        }
+        out
+    }
+
+    /// Step `by` matches (0 keeps the current one) and show it: selected, and
+    /// scrolled into view.
+    fn md_find_run(&mut self, by: i32, cx: &mut Context<Self>) {
+        let text = self.md_doc_text(cx);
+        let hits = self.md_find_hits(&text);
+        if hits.is_empty() {
+            self.md_find_at = 0;
+            self.md_sel = None;
+            cx.notify();
+            return;
+        }
+        let n = hits.len() as i32;
+        self.md_find_at = if by == 0 {
+            0
+        } else {
+            ((self.md_find_at as i32 + by).rem_euclid(n)) as usize
+        };
+        let hit = hits[self.md_find_at].clone();
+        // the match, shown the way a selection is shown: the view has no other
+        // way to point at a piece of its own text
+        let rows = md_prepare(&text);
+        if let (Some((ra, ba)), Some((rb, bb))) =
+            (md_src_to_rc(&rows, hit.start), md_src_to_rc(&rows, hit.end))
+        {
+            self.md_sel = Some((ra, ba, rb, bb));
+            self.md_scroll.scroll_to_item(ra);
+        }
+        cx.notify();
+    }
+
+    /// Keys in the find bar: ↩ next, ⇧↩ previous, esc closes.
+    fn md_find_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        match ks.key.as_str() {
+            "escape" => {
+                self.md_find_open = false;
+                window.focus(&self.md_focus, cx);
+            }
+            "enter" => self.md_find_run(if ks.modifiers.shift { -1 } else { 1 }, cx),
+            _ => {
+                if Self::text_comes_via_input_handler(ks) {
+                    return;
+                }
+                if Self::field_input(&mut self.md_find, ks, cx, |_| true) == Edit::Changed {
+                    self.md_find_run(0, cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_md_find(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let hits = self.md_find_hits(&self.md_doc_text(cx)).len();
+        let count = if self.md_find.is_empty() {
+            String::new()
+        } else if hits == 0 {
+            "No results".to_string()
+        } else {
+            format!("{} of {hits}", self.md_find_at + 1)
+        };
+        let step = |id: &'static str, glyph: &'static str, by: i32, cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .px_1()
+                .cursor_pointer()
+                .text_color(rgb(MUTED))
+                .hover(|s| s.text_color(rgb(TEXT)))
+                .child(glyph)
+                .on_click(cx.listener(move |this, _e, _w, cx| this.md_find_run(by, cx)))
+        };
+        div()
+            .absolute()
+            .top(px(6.))
+            .right(px(16.))
+            .w(px(420.))
+            .h(px(32.))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .bg(rgb(POPUP_BG))
+            .border_1()
+            .border_color(rgb(ACCENT))
+            .rounded_md()
+            .shadow_lg()
+            .track_focus(&self.md_find_focus)
+            .on_key_down(cx.listener(Self::md_find_key))
+            .child(input_sink(self.md_find_focus.clone(), cx.entity()))
+            .child(
+                div()
+                    .flex_grow(1.0)
+                    .min_w(px(0.))
+                    .text_size(px(12.))
+                    .text_color(rgb(TEXT))
+                    .child(if self.md_find.is_empty() {
+                        div().text_color(rgb(MUTED)).child("Find in this document…")
+                    } else {
+                        div().child(self.md_find.render("▏", SELECTION))
+                    }),
+            )
+            .child(div().flex_shrink_0().text_size(px(11.)).text_color(rgb(MUTED)).child(count))
+            .child(step("md-find-prev", "↑", -1, cx))
+            .child(step("md-find-next", "↓", 1, cx))
+            .child(
+                div()
+                    .id("md-find-close")
+                    .px_1()
+                    .cursor_pointer()
+                    .text_color(rgb(MUTED))
+                    .hover(|s| s.text_color(rgb(GIT_DELETED)))
+                    .child("✕")
+                    .on_click(cx.listener(|this, _e, window, cx| {
+                        this.md_find_open = false;
+                        window.focus(&this.md_focus, cx);
+                        cx.notify();
+                    })),
+            )
+    }
+
+    /// Start fetching whatever pictures this document points at.
+    ///
+    /// Called from render, which runs constantly — claiming each `src` in the
+    /// cache before spawning is what stops that turning into a fetch per frame.
+    /// `base` is the document's own folder, so a relative path resolves.
+    fn prefetch_md_images(&self, text: &str, base: Option<PathBuf>, cx: &mut Context<Self>) {
+        for src in md_images_in(text) {
+            {
+                let Ok(mut cache) = md_img_cache().lock() else { return };
+                if cache.contains_key(&src) {
+                    continue;
+                }
+                cache.insert(src.clone(), MdImg::Loading);
+            }
+            let (s, b) = (src.clone(), base.clone());
+            cx.spawn(async move |this, cx| {
+                let got = cx
+                    .background_executor()
+                    .spawn(async move { md_img_load(&s, b.as_deref()) })
+                    .await;
+                if let Ok(mut cache) = md_img_cache().lock() {
+                    cache.insert(src, got);
+                }
+                // the picture changes the layout under whatever is on screen
+                this.update(cx, |_, cx| cx.notify()).ok();
+            })
+            .detach();
+        }
+    }
+
+    /// Start reading a picture a tab is showing. Same cache (and the same one
+    /// fetch at a time) as the pictures inside a markdown document: a
+    /// screenshot in a PR body and the file itself are the same bytes.
+    fn prefetch_image(&self, key: &str, path: &Path, cx: &mut Context<Self>) {
+        {
+            let Ok(mut cache) = md_img_cache().lock() else { return };
+            if cache.contains_key(key) {
+                return;
+            }
+            cache.insert(key.to_string(), MdImg::Loading);
+        }
+        let (k, p) = (key.to_string(), path.to_path_buf());
+        cx.spawn(async move |this, cx| {
+            let src = p.to_string_lossy().to_string();
+            let got =
+                cx.background_executor().spawn(async move { md_img_load(&src, None) }).await;
+            if let Ok(mut cache) = md_img_cache().lock() {
+                cache.insert(k, got);
+            }
+            this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
+    }
+
+    /// A picture open as a tab. The editor behind it holds an empty buffer —
+    /// a PNG read as text is nothing — so this draws instead of it.
+    fn render_image_tab(&self, path: &Path, cx: &mut Context<Self>) -> impl IntoElement {
+        let key = image_key(path);
+        self.prefetch_image(&key, path, cx);
+        let state = md_img_cache().lock().ok().and_then(|c| match c.get(&key) {
+            Some(MdImg::Ready(img, dims)) => Some(Ok((img.clone(), *dims))),
+            Some(MdImg::Failed) => Some(Err(true)),
+            Some(MdImg::Loading) => Some(Err(false)),
+            None => None,
+        });
+        // the editor column, less this view's own padding
+        let max_w = (self.win_width - self.tree_width - self.term_width - 90.0).max(240.0);
+        let max_h = (self.win_height - 220.0).max(180.0);
+        let note = |text: String, colour: u32| {
+            div().text_size(px(12.)).text_color(rgb(colour)).child(text).into_any_element()
+        };
+        let body = match state {
+            Some(Ok((img, dims))) => {
+                let bytes = img.bytes.len();
+                let caption = match dims {
+                    Some((w, h)) => format!("{} × {}  ·  {}", w as u32, h as u32, size_label(bytes)),
+                    None => size_label(bytes),
+                };
+                let pic = match dims.filter(|(w, h)| *w > 0. && *h > 0.) {
+                    Some((w, h)) => {
+                        let (w, h) = shot_box(w, h, max_w, max_h);
+                        gpui::img(img).w(px(w)).h(px(h))
+                    }
+                    None => gpui::img(img).max_w(px(max_w)).max_h(px(max_h)),
+                };
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .p_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            // a checkerboard would be better for transparency,
+                            // but a flat panel reads the alpha well enough and
+                            // costs nothing to draw
+                            .bg(rgb(PANEL_BG))
+                            .child(pic),
+                    )
+                    .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(caption))
+                    .into_any_element()
+            }
+            Some(Err(true)) => note(
+                "Can't show this one — TIDE reads PNG, JPEG, GIF and WebP.".to_string(),
+                MUTED,
+            ),
+            _ => note("Reading…".to_string(), LINE_NUMBER),
+        };
+        div()
+            .id("img-view")
+            .flex_grow(1.0)
+            .min_h(px(0.))
+            .overflow_scroll()
+            .bg(rgb(BG))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            // the tab's shortcuts (⌘W and the rest) live on the Editor context,
+            // and the editor isn't on screen in this mode
+            .track_focus(&self.md_focus)
+            .key_context("Editor")
+            .child(body)
+    }
+
     /// Pull an image off the clipboard into the pending attachments. Returns
     /// false when the clipboard holds no image, so the caller can paste text.
-    fn attach_clipboard_image(&mut self, cx: &mut Context<Self>) -> bool {
+    ///
+    /// `into` is the box you were typing in when you pressed ⌘V: the token has
+    /// to land there, or the picture arrives with nothing pointing at it.
+    fn attach_clipboard_image(&mut self, into: ImgToken, cx: &mut Context<Self>) -> bool {
         let Some(item) = cx.read_from_clipboard() else { return false };
         let Some(img) = item.entries().iter().find_map(|e| match e {
             gpui::ClipboardEntry::Image(i) => Some(i.clone()),
@@ -16571,7 +24013,10 @@ impl Storm {
         let label = format!("Image #{}", self.agent_img_seq);
         // the token goes into the text at the caret, so the question can point
         // at a specific picture ("what's wrong in [Image #2]?")
-        self.agent_input.insert_text(&format!("[{label}] "));
+        match into {
+            ImgToken::Composer => self.agent_input.insert_text(&format!("[{label}] ")),
+            ImgToken::Comment => self.rc_query.insert_text(&format!("[{label}] ")),
+        }
         self.agent_imgs.push(PastedImage {
             mime: img.format.mime_type().to_string(),
             b64: acp::base64(&img.bytes),
@@ -16581,6 +24026,34 @@ impl Storm {
         });
         cx.notify();
         true
+    }
+
+    /// A picture that arrived from the phone. Same shape as a desktop paste —
+    /// a chip in the composer and an `[Image #n]` token for the text to point
+    /// at — so the transcript reads identically whichever device sent it.
+    /// Returns the label, or None when the bytes aren't usable.
+    fn attach_remote_image(&mut self, mime: &str, b64: &str) -> Option<String> {
+        let bytes = acp::base64_decode(b64)?;
+        const MAX: usize = 6 * 1024 * 1024;
+        if bytes.is_empty() || bytes.len() > MAX {
+            return None;
+        }
+        let format = match mime {
+            "image/jpeg" | "image/jpg" => gpui::ImageFormat::Jpeg,
+            "image/gif" => gpui::ImageFormat::Gif,
+            "image/webp" => gpui::ImageFormat::Webp,
+            _ => gpui::ImageFormat::Png,
+        };
+        self.agent_img_seq += 1;
+        let label = format!("Image #{}", self.agent_img_seq);
+        self.agent_imgs.push(PastedImage {
+            mime: mime.to_string(),
+            b64: b64.to_string(),
+            bytes: bytes.len(),
+            image: Arc::new(gpui::Image::from_bytes(format, bytes)),
+            label: label.clone(),
+        });
+        Some(label)
     }
 
     /// A long clipboard paste lands as `[Pasted text #3 +216 lines]` rather than
@@ -16649,6 +24122,33 @@ impl Storm {
 
     /// Animate the "thinking" row while a turn is in flight. Runs only for the
     /// duration of the turn, so nothing ticks when the agent is idle.
+    /// Turn the spinner while the pane is still coming up. The turn spinner only
+    /// runs during a turn, and starting an adapter and resuming a session is the
+    /// one wait that happens before there can be one.
+    fn start_boot_spinner(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_millis(120)).await;
+            let Ok(going) = this.update(cx, |this, cx| {
+                let ready = this.acp.as_ref().map(|a| a.is_ready()).unwrap_or(false);
+                // done once the adapter is up, the resume has landed, or
+                // anything at all is on screen to look at instead
+                let going =
+                    this.acp.is_some() && this.agent_msgs.is_empty() && (!ready || this.agent_autoresume);
+                if going {
+                    this.agent_spin = this.agent_spin.wrapping_add(1);
+                    cx.notify();
+                }
+                going
+            }) else {
+                break;
+            };
+            if !going {
+                break;
+            }
+        })
+        .detach();
+    }
+
     fn start_agent_spinner(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_millis(120)).await;
@@ -16729,6 +24229,749 @@ impl Storm {
             .ok();
         })
         .detach();
+    }
+
+    /// Every resolvable file reference in one answer, in writing order, each
+    /// with the line of prose it appeared in.
+    fn walk_stops(&mut self, msg: usize, cx: &mut Context<Self>) -> Vec<Stop> {
+        let Some(AgentMsg::Agent(text)) = self.agent_msgs.get(msg) else { return Vec::new() };
+        let text = text.clone();
+        let mut out: Vec<Stop> = Vec::new();
+        for line in text.lines() {
+            for r in file_refs(line) {
+                if self.file_ref_target(&r.path, cx).is_none() {
+                    continue;
+                }
+                // the same file twice in one sentence is one stop
+                if out.iter().any(|s| s.path == r.path && s.line == r.line) {
+                    continue;
+                }
+                out.push(Stop {
+                    path: r.path,
+                    line: r.line,
+                    end: r.end,
+                    title: String::new(),
+                    group: String::new(),
+                    said: line.trim().trim_start_matches(['#', '-', '*', ' ']).to_string(),
+                });
+            }
+        }
+        out
+    }
+
+    /// Start (or restart) a walk through `msg`, standing on the stop nearest to
+    /// what was clicked.
+    fn start_walk(&mut self, msg: usize, path: &str, line: usize, cx: &mut Context<Self>) {
+        let stops = self.walk_stops(msg, cx);
+        if stops.len() < 2 {
+            self.end_walk(cx); // one reference isn't a walk
+            return;
+        }
+        let at = stops.iter().position(|s| s.path == path && s.line == line).unwrap_or(0);
+        self.walk =
+            Some(Walk {
+                stops,
+                at,
+                msg: Some(msg),
+                tour: None,
+                intro: false,
+                done: false,
+                id: None,
+                list: false,
+                here: None,
+            });
+    }
+
+    /// Put the walk (or tour) away and take the highlight off the code with it.
+    fn end_walk(&mut self, cx: &mut Context<Self>) {
+        let Some(w) = self.walk.take() else { return };
+        // closing a tour means you're done with it for now: it doesn't come
+        // back next launch, but it stays in the list to be opened again
+        if let Some(id) = w.id.clone() {
+            if let Some(rec) = self.tours.iter_mut().find(|t| t.id == id) {
+                rec.at = w.at;
+                rec.closed = true;
+            }
+            self.save_tours();
+        }
+        self.sync_comment_gutters(cx);
+        cx.notify();
+    }
+
+    fn act_walk_next(&mut self, _: &WalkNext, window: &mut Window, cx: &mut Context<Self>) {
+        self.step_walk(1, window, cx);
+    }
+
+    fn act_walk_prev(&mut self, _: &WalkPrev, window: &mut Window, cx: &mut Context<Self>) {
+        self.step_walk(-1, window, cx);
+    }
+
+    /// Move along the walk and open what it lands on. Wraps, so the last ⌥] goes
+    /// back to the top of the answer rather than dead-ending.
+    fn step_walk(&mut self, dir: i32, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(w) = self.walk.as_mut() else { return };
+        let n = w.stops.len();
+        if n == 0 {
+            return;
+        }
+        // a tour restored from a previous session hasn't opened anything yet:
+        // the first press stands on where you left off instead of skipping it
+        if w.here.is_none() {
+            let stop = w.stops[w.at].clone();
+            self.open_walk_stop(&stop, window, cx);
+            return;
+        }
+        w.at = ((w.at as i32 + dir).rem_euclid(n as i32)) as usize;
+        let stop = w.stops[w.at].clone();
+        self.open_walk_stop(&stop, window, cx);
+        self.tour_touched();
+    }
+
+    /// A tour the agent posted to `/tour`. Stops whose file isn't in this
+    /// project are dropped rather than left to fail on arrival — a tour is only
+    /// worth anything if every press of ⌥] lands somewhere.
+    fn start_tour(&mut self, tour: rpc::Tour, cx: &mut Context<Self>) {
+        // no steps is how an agent puts a tour away; it is not a broken one
+        if tour.steps.is_empty() {
+            let had = self.walk.as_ref().is_some_and(|w| w.tour.is_some());
+            self.end_walk(cx);
+            if had {
+                self.show_flash("Tour closed", cx);
+            }
+            return;
+        }
+        let mut stops = Vec::new();
+        for st in &tour.steps {
+            if self.file_ref_target(&st.file, cx).is_none() {
+                continue;
+            }
+            stops.push(Stop {
+                path: st.file.clone(),
+                line: st.line,
+                end: st.end.max(st.line),
+                title: st.title.clone(),
+                group: st.group.clone(),
+                said: st.text.clone(),
+            });
+        }
+        if stops.is_empty() {
+            self.show_flash("That tour's files aren't in this project", cx);
+            return;
+        }
+        let dropped = tour.steps.len() - stops.len();
+        let n = stops.len();
+        let title = match tour.title.trim() {
+            "" => "Code tour".to_string(),
+            t => t.to_string(),
+        };
+        let rec = TourRec {
+            id: random_id(),
+            title: title.clone(),
+            at: 0,
+            made: now_secs(),
+            closed: false,
+            stops: stops.clone(),
+        };
+        self.walk = Some(Walk {
+            stops,
+            at: 0,
+            msg: None,
+            tour: Some(title),
+            intro: true,
+            done: false,
+            id: Some(rec.id.clone()),
+            list: false,
+            here: None,
+        });
+        // newest first, and the rest are put away: one tour is open at a time
+        for t in self.tours.iter_mut() {
+            t.closed = true;
+        }
+        self.tours.insert(0, rec);
+        self.tours.truncate(30);
+        self.save_tours();
+        // opening a file needs a Window, and this arrives on the poll where
+        // there isn't one; render has one and runs next
+        self.tour_jump = Some(0);
+        let note = if dropped > 0 { format!(" · {dropped} skipped") } else { String::new() };
+        self.show_flash(&format!("Tour: {n} steps{note}  ·  ⌥] / ⌥[ to step"), cx);
+        cx.notify();
+    }
+
+    /// Show the tour list in the left dock.
+    fn open_tours_pane(&mut self, cx: &mut Context<Self>) {
+        self.left_view = LeftView::Tours;
+        self.show_left = true;
+        cx.notify();
+    }
+
+    /// Every tour this workspace has been given: open one, start it over, or
+    /// throw it away. A tour is worth keeping — it costs the agent a turn to
+    /// build and it stays true until the code moves — so this is a shelf, not
+    /// a queue.
+    fn render_tours_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let width = px(self.tree_width);
+        let open_id = self.walk.as_ref().and_then(|w| w.id.clone());
+        let n = self.tours.len();
+        let mut list = div().flex().flex_col().min_h(px(0.)).id("tours-list").overflow_y_scroll();
+        for (i, t) in self.tours.iter().enumerate() {
+            let on = open_id.as_deref() == Some(t.id.as_str());
+            let id = t.id.clone();
+            let (restart_id, delete_id) = (id.clone(), id.clone());
+            let steps = t.stops.len();
+            let where_ = t
+                .stops
+                .get(t.at)
+                .map(|s| stop_label(s))
+                .unwrap_or_else(|| "nowhere yet".to_string());
+            let made = if t.made > 0 { todo::age(t.made) } else { String::new() };
+            let mut sub = format!("{steps} steps");
+            if t.at > 0 || on {
+                sub.push_str(&format!("  ·  on {}", t.at + 1));
+            }
+            if !made.is_empty() {
+                sub.push_str(&format!("  ·  {made}"));
+            }
+            let icon_btn = |id: &'static str,
+                            key: String,
+                            glyph: &'static str,
+                            hint: &'static str,
+                            restart: bool,
+                            cx: &mut Context<Self>| {
+                div()
+                    .id((id, i))
+                    .px_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .flex_shrink_0()
+                    .text_size(px(12.))
+                    .text_color(rgb(MUTED))
+                    .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(if restart { TEXT } else { GIT_DELETED })))
+                    .child(glyph)
+                    .tooltip(tip(hint))
+                    // the row behind it opens the tour: don't do both
+                    .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                        if restart {
+                            this.open_tour(key.clone(), true, cx);
+                        } else {
+                            this.delete_tour(key.clone(), cx);
+                        }
+                    }))
+            };
+            list = list.child(
+                div()
+                    .id(("tour-row", i))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .cursor_pointer()
+                    .when(on, |d| d.bg(rgba(TOUR_TINT)))
+                    .hover(|s| s.bg(rgb(HOVER)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .font_family(ICON_FONT)
+                                    .text_size(px(11.))
+                                    .text_color(rgb(if on { TOUR_MARK } else { MUTED }))
+                                    .child(IC_TOUR),
+                            )
+                            .child(
+                                div()
+                                    .flex_grow(1.0)
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(if on { TOUR_MARK } else { TEXT }))
+                                    .child(t.title.clone()),
+                            )
+                            .child(icon_btn("tour-restart", restart_id, "⟲", "Start it over", true, cx))
+                            .child(icon_btn("tour-del", delete_id, "✕", "Delete this tour", false, cx)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(rgb(MUTED))
+                            .child(sub),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .font_family("Menlo")
+                            .text_size(px(10.))
+                            .text_color(rgb(LINE_NUMBER))
+                            .child(where_),
+                    )
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                        this.open_tour(id.clone(), false, cx)
+                    })),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .w(width)
+            .h_full()
+            .bg(rgb(BG))
+            .child(
+                div()
+                    .h(px(32.))
+                    .px_3()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .text_size(px(12.))
+                    .text_color(rgb(MUTED))
+                    .child(if n == 0 { "CODE TOURS".to_string() } else { format!("CODE TOURS  ·  {n}") })
+                    .child(div().flex_grow(1.0))
+                    .child(self.collapse_left_btn(cx)),
+            )
+            .child(
+                div()
+                    .id("tours-ask")
+                    .mx_3()
+                    .mb_2()
+                    .py_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(TOUR_MARK))
+                    .cursor_pointer()
+                    .text_size(px(11.))
+                    .text_color(rgb(TOUR_MARK))
+                    .hover(|s| s.bg(rgba(TOUR_TINT)))
+                    .child("Ask the agent for a tour")
+                    .on_click(cx.listener(|this, _e, _w, cx| this.ask_for_tour(None, cx))),
+            )
+            .child(if self.tours.is_empty() {
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .child(
+                        "No tours yet. Ask for one here, from the agent pane, or by \
+                         right-clicking an answer — the agent posts the stops and you \
+                         step through them with ⌥] and ⌥[.",
+                    )
+                    .into_any_element()
+            } else {
+                list.into_any_element()
+            })
+    }
+
+    /// Write the library out. Called on anything that changes it: a tour
+    /// arriving, a step taken, one closed or deleted.
+    fn save_tours(&self) {
+        let Some(path) = tours_path(&self.root) else { return };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if self.tours.is_empty() {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        let _ = std::fs::write(path, tours_to_json(&self.tours));
+    }
+
+    /// Copy where you've got to back into the stored tour. The stop you're on
+    /// is part of a tour the way the scroll position is part of a book.
+    fn tour_touched(&mut self) {
+        let Some((id, at)) = self.walk.as_ref().and_then(|w| Some((w.id.clone()?, w.at))) else {
+            return;
+        };
+        let Some(rec) = self.tours.iter_mut().find(|t| t.id == id) else { return };
+        if rec.at == at && !rec.closed {
+            return; // nothing moved
+        }
+        rec.at = at;
+        rec.closed = false;
+        self.save_tours();
+    }
+
+    /// Open a stored tour. `restart` takes it from the top; otherwise it picks
+    /// up where it was left.
+    fn open_tour(&mut self, id: String, restart: bool, cx: &mut Context<Self>) {
+        let Some(rec) = self.tours.iter().find(|t| t.id == id) else {
+            self.show_flash("That tour is gone", cx);
+            return;
+        };
+        let n = rec.stops.len();
+        let walk = walk_from_rec(rec, restart);
+        let at = walk.at;
+        self.walk = Some(walk);
+        // only one tour is open at a time: the others are put away
+        for t in self.tours.iter_mut() {
+            t.closed = t.id != id;
+        }
+        if let Some(rec) = self.tours.iter_mut().find(|t| t.id == id) {
+            rec.at = at;
+        }
+        self.save_tours();
+        self.tour_jump = Some(at); // render has the Window to open a file with
+        self.show_flash(&format!("Tour: {n} steps  ·  ⌥] / ⌥[ to step"), cx);
+        cx.notify();
+    }
+
+    /// Drop a tour for good. The open one goes off screen with it.
+    fn delete_tour(&mut self, id: String, cx: &mut Context<Self>) {
+        let open_here = self.walk.as_ref().and_then(|w| w.id.clone()) == Some(id.clone());
+        self.tours.retain(|t| t.id != id);
+        if open_here {
+            self.walk = None;
+            self.sync_comment_gutters(cx);
+        }
+        self.save_tours();
+        self.show_flash("Tour deleted", cx);
+        cx.notify();
+    }
+
+
+    /// Send what's in the tour card's question box, with the stop it was asked
+    /// at. It goes as yours, not as TIDE's: you typed it.
+    fn ask_about_stop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let q = self.tour_ask.text.trim().to_string();
+        if q.is_empty() {
+            return;
+        }
+        let Some(w) = self.walk.as_ref() else { return };
+        let Some(stop) = w.stops.get(w.at).cloned() else { return };
+        let (tour, at, total) = (w.tour.clone().unwrap_or_default(), w.at + 1, w.stops.len());
+        let text = tour_question(&tour, at, total, &stop, &q);
+        self.tour_ask.clear();
+        self.agent_open = true;
+        self.send_agent_prompt_by(text, Some(q), Sender::You, cx);
+        self.agent_list.scroll_to_end();
+        // the answer lands in the pane; typing carries on in the editor
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    /// Keys in the tour card's question box: ↩ sends, esc leaves it.
+    fn tour_ask_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        match ks.key.as_str() {
+            "escape" => self.focus_active(window, cx),
+            "enter" => self.ask_about_stop(window, cx),
+            _ => {
+                if !Self::text_comes_via_input_handler(ks) {
+                    Self::field_input(&mut self.tour_ask, ks, cx, |_| true);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Stand on a numbered stop — what clicking a row in the step list does.
+    fn goto_walk_stop(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(w) = self.walk.as_mut() else { return };
+        let Some(stop) = w.stops.get(i).cloned() else { return };
+        w.at = i;
+        self.open_walk_stop(&stop, window, cx);
+        self.tour_touched(); // the stop you're on is part of the tour's state
+    }
+
+    fn open_walk_stop(&mut self, stop: &Stop, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(p) = self.file_ref_target(&stop.path, cx) else {
+            self.show_flash(&format!("Can't find {} in this project", stop.path), cx);
+            return;
+        };
+        self.open_file(p.clone(), window, cx);
+        // the lines this stop is about, lit up until the next step: a jump that
+        // only moves the caret leaves you hunting for what it meant
+        if let Some(w) = self.walk.as_mut() {
+            w.here = (stop.line > 0).then(|| (p.clone(), stop.line, stop.end.max(stop.line)));
+        }
+        self.sync_comment_gutters(cx); // the card's gap goes in before the scroll
+        if stop.line > 0 {
+            // the card is drawn under the span, so the scroll has to leave it
+            // room: without this a long stop puts its own text off the bottom
+            let turns: Vec<ReviewReply> = self
+                .review
+                .iter()
+                .find(|c| c.path == p && c.line == stop.line && c.end == stop.end.max(stop.line))
+                .map(|c| {
+                    let mut v = vec![ReviewReply { who: "you".into(), text: c.text.clone() }];
+                    v.extend(c.replies.iter().cloned());
+                    v
+                })
+                .unwrap_or_default();
+            let room = tour_gap_h(&stop.said) + tour_thread_h(&turns);
+            let (a, b) = (stop.line, stop.end.max(stop.line));
+            if let Some(tab) = self.tabs.get(self.active) {
+                tab.editor.update(cx, |e, cx| e.reveal_span(a, b, room, cx));
+            }
+        }
+        cx.notify();
+    }
+
+    /// The strip along the bottom of the editor while a walk or a tour is on:
+    /// where you are, what the agent said about this stop, and the arrows.
+    ///
+    /// A tour gets two more things than a walk: its own name, and a list of
+    /// every stop — the route you're being taken on, so you can see what is
+    /// coming and jump around in it rather than only stepping.
+    fn render_walk(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        // the card over the code is where the description belongs when the stop
+        // is on screen; this only carries it when it can't be
+        let carded = self.tour_card_at(cx).is_some();
+        let w = self.walk.as_ref()?;
+        let stop = w.stops.get(w.at)?;
+        let tour = w.tour.clone();
+        let accent = if tour.is_some() { TOUR_MARK } else { COMMENT_MARK };
+        // at the ends of the walk the arrow that would leave it is spent: it
+        // dims and stops answering, rather than wrapping round
+        let (back_off, fwd_off) = (w.intro, w.done);
+        let arrow = |id: &'static str,
+                     glyph: &'static str,
+                     hint: &'static str,
+                     dir: i32,
+                     spent: bool,
+                     cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .px_1p5()
+                .rounded_md()
+                .text_color(rgb(if spent { BORDER } else { MUTED }))
+                .when(!spent, |d| {
+                    d.cursor_pointer().hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                })
+                .child(glyph)
+                .when(!spent, |d| d.tooltip(tip(hint)))
+                .on_click(cx.listener(move |this, _e, window, cx| this.step_walk(dir, window, cx)))
+        };
+        // top row: the controls, what this stop is called, and where it is
+        let mut top = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .flex_shrink_0()
+            .h(px(22.))
+            .child(arrow("walk-prev", "‹", "Previous stop  (⌥[)", -1, back_off, cx))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(rgb(LINE_NUMBER))
+                    .child(format!("{}/{}", w.at + 1, w.stops.len())),
+            )
+            .child(arrow("walk-next", "›", "Next stop  (⌥])", 1, fwd_off, cx));
+        if let Some(name) = tour.clone().filter(|t| !t.trim().is_empty()) {
+            top = top.child(
+                div()
+                    .flex_shrink_0()
+                    .px_1p5()
+                    .rounded_md()
+                    .bg(rgba(TOUR_TINT))
+                    .text_color(rgb(TOUR_MARK))
+                    .child(name),
+            );
+        }
+        if !stop.title.trim().is_empty() {
+            top = top.child(
+                div()
+                    .id("walk-title")
+                    .flex_shrink_0()
+                    .max_w(px(420.))
+                    .truncate()
+                    .cursor_pointer()
+                    .text_color(rgb(TEXT))
+                    .hover(|s| s.text_color(rgb(accent)))
+                    .child(stop.title.clone())
+                    .tooltip(tip("Open this stop again"))
+                    .on_click(cx.listener(|this, _e, window, cx| {
+                        let at = this.walk.as_ref().map(|w| w.at).unwrap_or(0);
+                        this.goto_walk_stop(at, window, cx);
+                    })),
+            );
+        }
+        top = top
+            // the strip names where the stop is, so it may as well take you
+            // there: after scrolling away, this is the way back
+            .child(
+                div()
+                    .id("walk-where")
+                    .flex_shrink_0()
+                    .max_w(px(360.))
+                    .truncate()
+                    .cursor_pointer()
+                    .font_family("Menlo")
+                    .text_size(px(10.5))
+                    .text_color(rgb(accent))
+                    .hover(|s| s.text_color(rgb(TEXT)))
+                    .child(stop_label(stop))
+                    .tooltip(tip("Open this stop again"))
+                    .on_click(cx.listener(|this, _e, window, cx| {
+                        let at = this.walk.as_ref().map(|w| w.at).unwrap_or(0);
+                        this.goto_walk_stop(at, window, cx);
+                    })),
+            )
+            // the description, on the one line this strip is allowed to be. It
+            // is in full on the card when the stop is on screen; this is for
+            // when it isn't, and the strip must not change height either way.
+            .child({
+                let said = stop.said.trim().to_string();
+                let full = said.clone();
+                div()
+                    .id("walk-said")
+                    .flex_grow(1.0)
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_color(rgb(MUTED))
+                    .when(!carded && !said.is_empty(), |d| d.child(said))
+                    .when(!full.is_empty(), |d| {
+                        d.tooltip(move |_w, cx| {
+                            cx.new(|_| TooltipView { text: full.clone().into() }).into()
+                        })
+                    })
+            })
+            // the route at a glance: a tour is an argument with an order, and
+            // reading it needs seeing where this stop sits in it
+            .when(tour.is_some(), |d| {
+                let open = w.list;
+                d.child(
+                    div()
+                        .id("walk-list-toggle")
+                        .px_1p5()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .flex_shrink_0()
+                        .when(open, |d| d.bg(rgb(HOVER)))
+                        .text_color(rgb(if open { TEXT } else { MUTED }))
+                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                        .child(format!("☰ {} steps", w.stops.len()))
+                        .tooltip(tip("Every stop on the tour"))
+                        .on_click(cx.listener(|this, _e, _w, cx| {
+                            if let Some(w) = this.walk.as_mut() {
+                                w.list = !w.list;
+                            }
+                            cx.notify();
+                        })),
+                )
+            })
+            .when(w.msg.is_some(), |d| {
+                d.child(
+                    div()
+                        .id("walk-back")
+                        .px_1p5()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .flex_shrink_0()
+                        .text_color(rgb(MUTED))
+                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                        .child("the answer")
+                        .tooltip(tip("Back to where this was written"))
+                        .on_click(cx.listener(|this, _e, _w, cx| {
+                            if let Some(m) = this.walk.as_ref().and_then(|w| w.msg) {
+                                this.agent_list.scroll_to_reveal_item(m);
+                            }
+                            cx.notify();
+                        })),
+                )
+            })
+            .child(
+                div()
+                    .id("walk-close")
+                    .px_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .flex_shrink_0()
+                    .text_color(rgb(LINE_NUMBER))
+                    .hover(|s| s.text_color(rgb(GIT_DELETED)))
+                    .child("✕")
+                    .tooltip(tip(if tour.is_some() {
+                        "End the tour  (esc)"
+                    } else {
+                        "End the walk  (esc)"
+                    }))
+                    .on_click(cx.listener(|this, _e, _w, cx| this.end_walk(cx))),
+            );
+
+        let mut strip = div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .gap_1()
+            .py_1()
+            .px_3()
+            .bg(rgb(PANEL_BG))
+            .border_t_1()
+            .border_color(rgb(accent))
+            .text_size(px(11.))
+            .child(top);
+        if w.list {
+            let mut list = div()
+                .id("walk-list")
+                .flex()
+                .flex_col()
+                .w_full()
+                .max_h(px(168.))
+                .overflow_y_scroll()
+                .border_t_1()
+                .border_color(rgb(BORDER))
+                .pt_1();
+            for (i, s) in w.stops.iter().enumerate() {
+                let on = i == w.at;
+                let label = if s.title.trim().is_empty() {
+                    s.said.clone()
+                } else {
+                    s.title.clone()
+                };
+                list = list.child(
+                    div()
+                        .id(("walk-step", i))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .px_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .when(on, |d| d.bg(rgb(SELECTED_BG)))
+                        .hover(|st| st.bg(rgb(if on { SELECTED_BG } else { HOVER })))
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .w(px(18.))
+                                .text_color(rgb(if on { TOUR_MARK } else { LINE_NUMBER }))
+                                .child(format!("{}", i + 1)),
+                        )
+                        .child(
+                            div()
+                                .flex_grow(1.0)
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_color(rgb(if on { SEL_TEXT } else { TEXT }))
+                                .child(label),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .font_family("Menlo")
+                                .text_size(px(10.))
+                                .text_color(rgb(MUTED))
+                                .child(stop_label(s)),
+                        )
+                        .on_click(cx.listener(move |this, _e, window, cx| {
+                            this.goto_walk_stop(i, window, cx)
+                        })),
+                );
+            }
+            strip = strip.child(list);
+        }
+        Some(strip)
     }
 
     /// Open a file reference from the transcript at its line.
@@ -16961,10 +25204,12 @@ impl Storm {
 
     /// Send the next queued prompt, if any. Called when a turn ends.
     fn agent_next_queued(&mut self) {
-        if self.agent_queue.is_empty() {
+        // a queued prompt is not a running turn: it waits out the limit in the
+        // queue, where it stays visible, instead of being fired into an error
+        if self.agent_queue.is_empty() || self.usage_block().is_some() {
             return;
         }
-        let (text, label) = self.agent_queue.remove(0);
+        let Queued { text, label, imgs, by } = self.agent_queue.remove(0);
         if let Some(acp) = self.acp.clone() {
             let sent = if self.agent_briefed {
                 text.clone()
@@ -16972,9 +25217,13 @@ impl Storm {
                 self.agent_briefed = true;
                 format!("{}{text}", self.tide_briefing())
             };
-            acp.prompt(&sent);
-            self.agent_msgs
-                .push(AgentMsg::User { text: label.unwrap_or(text), imgs: Vec::new() });
+            let (wire, kept) = split_images(imgs);
+            acp.prompt_with(&sent, &wire);
+            self.agent_msgs.push(AgentMsg::User {
+                text: label.unwrap_or(text),
+                imgs: kept,
+                by,
+            });
             self.agent_turn_start = Some(std::time::Instant::now());
             self.acp_state = Some(AgentState::Working);
             self.agent_cur = None;
@@ -16984,13 +25233,156 @@ impl Storm {
         }
     }
 
-    /// The briefing, on screen: the same text every new session is handed
+    /// The tab strip at the top of the agent pane: the conversation, then a tab
+    /// per reviewer while one is working (and after, until you close it).
+    fn render_agent_tabs(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if self.reviewers.is_empty() {
+            return None;
+        }
+        let mut strip = div()
+            .h(px(26.))
+            .flex_shrink_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .bg(rgb(PANEL_BG))
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .text_size(px(11.))
+            .child(
+                div()
+                    .id("agent-tab-main")
+                    .px_2()
+                    .py(px(2.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(self.agent_tab == 0, |d| d.bg(rgb(SELECTED_BG)).text_color(rgb(SEL_TEXT)))
+                    .when(self.agent_tab != 0, |d| {
+                        d.text_color(rgb(MUTED)).hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                    })
+                    .child("Main")
+                    .on_click(cx.listener(|this, _e, _w, cx| {
+                        this.agent_tab = 0;
+                        cx.notify();
+                    })),
+            );
+        for (i, r) in self.reviewers.iter().enumerate() {
+            let tab = i + 1;
+            let on = self.agent_tab == tab;
+            // a reviewer still reading gets a dot in the state's colour
+            let color = if r.done { GIT_NEW } else { ACCENT };
+            strip = strip.child(
+                div()
+                    .id(("agent-tab", tab))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py(px(2.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(on, |d| d.bg(rgb(SELECTED_BG)).text_color(rgb(SEL_TEXT)))
+                    .when(!on, |d| {
+                        d.text_color(rgb(MUTED)).hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                    })
+                    .child(div().w(px(6.)).h(px(6.)).rounded_full().flex_shrink_0().bg(rgb(color)))
+                    .child(r.name)
+                    .child(
+                        div()
+                            .id(("agent-tab-close", tab))
+                            .px(px(2.))
+                            .text_size(px(10.))
+                            .text_color(rgb(LINE_NUMBER))
+                            .hover(|s| s.text_color(rgb(GIT_DELETED)))
+                            .child("✕")
+                            .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                if i < this.reviewers.len() {
+                                    // closing a reviewer that's still reading
+                                    // calls it off
+                                    this.reviewers.remove(i).acp.shutdown();
+                                }
+                                this.agent_tab = 0;
+                                cx.notify();
+                            })),
+                    )
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                        this.agent_tab = tab;
+                        cx.notify();
+                    })),
+            );
+        }
+        Some(strip)
+    }
+
+    /// One reviewer's session, in place of the conversation: what it has run and
+    /// what it has written, live.
+    fn render_reviewer_tab(&self, ix: usize) -> AnyElement {
+        let Some(r) = self.reviewers.get(ix) else { return div().into_any_element() };
+        let state = if r.done {
+            ("done", GIT_NEW)
+        } else if r.sent {
+            ("reading", ACCENT)
+        } else {
+            ("starting", MUTED)
+        };
+        let mut body = div()
+            .id(("reviewer-body", ix))
+            .flex_grow(1.0)
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(11.))
+                    .child(div().text_color(rgb(state.1)).child(state.0))
+                    .child(
+                        div()
+                            .text_color(rgb(LINE_NUMBER))
+                            .child(format!("{}s", r.started.elapsed().as_secs())),
+                    ),
+            );
+        // everything it has run, oldest first: the log is the progress bar
+        for line in &r.log {
+            body = body.child(
+                div()
+                    .truncate()
+                    .font_family("Menlo")
+                    .text_size(px(10.5))
+                    .text_color(rgb(LINE_NUMBER))
+                    .child(line.clone()),
+            );
+        }
+        if r.sent && !r.text.trim().is_empty() {
+            body = body.child(div().mt_2().child(md_text(r.text.trim(), 12.0, TEXT).min_w(px(0.))));
+        }
+        body.into_any_element()
+    }
+
+    /// How wide a picture in the transcript may be: the agent pane, less the
+    /// row's padding (12px a side) and the frame's border (1px a side).
+    fn shot_width(&self) -> f32 {
+        (self.term_width - 26.).max(80.)
+    }
+
+    /// The briefing, on screen: the same text every new session is handed    /// The briefing, on screen: the same text every new session is handed
     /// before your first prompt. Read-only, copyable, closed by clicking away.
     fn render_agent_brief(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         if !self.agent_brief_open {
             return None;
         }
-        let text = self.tide_briefing();
+        let text = self.agent_brief_text.clone();
         let copy = text.clone();
         Some(
             div()
@@ -17086,12 +25478,17 @@ impl Storm {
     }
 
     fn render_agent(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // The pane is open from startup, so nobody had to toggle it — start the
-        // adapter and resume the last session the first time it's actually drawn.
-        // Lazy on purpose: only the workspace you're looking at spawns an adapter.
+        // The pane is open from startup, so nobody had to toggle it. Normally the
+        // launch warm-up has already started this workspace's adapter; this
+        // catches the active one, which draws before the warm-up reaches it, and
+        // any workspace opened later.
         if self.acp.is_none() {
             self.ensure_acp(cx);
             self.autoresume_agent(cx);
+        }
+        // a tab whose reviewer is gone would leave the pane showing nothing
+        if self.agent_tab > self.reviewers.len() {
+            self.agent_tab = 0;
         }
         // header
         let header = div()
@@ -17138,6 +25535,15 @@ impl Storm {
                                 .text_color(rgb(if pct >= 80 { GIT_DELETED } else { LINE_NUMBER }))
                                 .child(format!("ctx {} / {} · {pct}%", usage::short(used), usage::short(size))),
                         )
+                        // the same track the PR pane uses, inverted: a full
+                        // window is the bad end, so it reddens as it fills
+                        .child(
+                            div().flex_shrink_0().w(px(40.)).child(progress_bar(
+                                pct as f32 / 100.0,
+                                4.0,
+                                progress_color(100usize.saturating_sub(pct as usize)),
+                            )),
+                        )
                     }),
             )
             .child(
@@ -17181,6 +25587,162 @@ impl Storm {
                                 })),
                         )
                     })
+                    // reviewers working in their own sessions, so a long read
+                    // doesn't look like nothing happening
+                    .when(!self.reviewers.is_empty(), |d| {
+                        let done = self.reviewers.iter().filter(|r| r.done).count();
+                        let n = self.reviewers.len();
+                        // while they read, the chip counts up; once they are
+                        // all done it says how long they took and stops. A
+                        // clock still running on finished work is noise.
+                        let running = done < n;
+                        let secs = if running {
+                            self.reviewers
+                                .iter()
+                                .filter(|r| !r.done)
+                                .map(|r| r.started.elapsed().as_secs())
+                                .max()
+                                .unwrap_or(0)
+                        } else {
+                            // longest run start to finish, since they go at once
+                            self.reviewers
+                                .iter()
+                                .filter_map(|r| {
+                                    r.finished.map(|f| f.duration_since(r.started).as_secs())
+                                })
+                                .max()
+                                .unwrap_or(0)
+                        };
+                        let label = if running {
+                            format!("reviewers {done}/{n}  ·  {}", human_secs(secs))
+                        } else {
+                            format!("reviewers {done}/{n}  ·  took {}", human_secs(secs))
+                        };
+                        let hint = if running {
+                            "Open the reviewer that's still reading"
+                        } else {
+                            "Both reviewers are done — open one to read it"
+                        };
+                        d.child(
+                            div()
+                                .id("reviewers-chip")
+                                .flex_shrink_0()
+                                .px_1p5()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .bg(rgb(if self.agent_tab > 0 { SELECTED_BG } else { HOVER }))
+                                .text_size(px(10.))
+                                // bright while they work, quiet once they are done
+                                .text_color(rgb(if running { COMMENT_MARK } else { MUTED }))
+                                .child(label)
+                                .tooltip(tip(hint))
+                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                    // the one still working, else the first
+                                    let ix = this
+                                        .reviewers
+                                        .iter()
+                                        .position(|r| !r.done)
+                                        .unwrap_or(0);
+                                    this.agent_tab = ix + 1;
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    // the answer to "did I already send those?", which is
+                    // otherwise a scroll back through the transcript
+                    .when_some(self.review_sent, |d, (when, count)| {
+                        let waiting = self
+                            .review
+                            .iter()
+                            .filter(|c| !c.draft && !c.sent && !c.resolved)
+                            .count();
+                        let ago = todo::age(when);
+                        let stamp = stamp_of(when);
+                        let tip_text = if waiting > 0 {
+                            format!(
+                                "{count} comment{} sent {stamp}\n{waiting} written since, not sent yet",
+                                if count == 1 { "" } else { "s" }
+                            )
+                        } else {
+                            format!(
+                                "{count} comment{} sent {stamp}\nnothing waiting",
+                                if count == 1 { "" } else { "s" }
+                            )
+                        };
+                        d.child(
+                            div()
+                                .id("review-sent")
+                                .flex_shrink_0()
+                                .px_1p5()
+                                .rounded_md()
+                                .text_size(px(10.))
+                                // amber while something written since hasn't gone
+                                .text_color(rgb(if waiting > 0 { FOLDER_ICON } else { MUTED }))
+                                .child(if waiting > 0 {
+                                    format!("sent {ago}  ·  {waiting} waiting")
+                                } else {
+                                    format!("sent {ago}")
+                                })
+                                .tooltip(move |_w, cx| {
+                                    cx.new(|_| TooltipView { text: tip_text.clone().into() }).into()
+                                }),
+                        )
+                    })
+                    // a phone on the same wifi, in this same session
+                    .when_some(self.remote_url.clone(), |d, url| {
+                        // one link for the whole window: the phone picks the
+                        // workspace once it is open
+                        d.child(
+                            div()
+                                .id("agent-remote")
+                                .flex_shrink_0()
+                                .px_1p5()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .text_size(px(10.))
+                                .text_color(rgb(MUTED))
+                                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                .child("phone")
+                                .tooltip({
+                                    let u = url.clone();
+                                    // the IP line only earns its place when it
+                                    // says something the first line doesn't
+                                    let ip = self
+                                        .remote_url_ip
+                                        .clone()
+                                        .filter(|i| *i != u)
+                                        .map(|i| format!("\n⌥click for {i}"))
+                                        .unwrap_or_default();
+                                    let reach = if self.remote_far {
+                                        "works anywhere your phone has the tailnet"
+                                    } else {
+                                        "same wifi only"
+                                    };
+                                    move |_w, cx| {
+                                        cx.new(|_| TooltipView {
+                                            text: format!(
+                                                "{u}{ip}\n\nclick to copy — every workspace is on it\n\
+                                                 bookmark it: the link is the same next launch\n\
+                                                 {reach}  ·  anyone holding it can type here"
+                                            )
+                                            .into(),
+                                        })
+                                        .into()
+                                    }
+                                })
+                                .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _w, cx| {
+                                    // ⌥click is the fallback: a phone that
+                                    // can't resolve `.local` still needs a way in
+                                    let link = if e.modifiers().alt {
+                                        this.remote_url_ip.clone().unwrap_or_else(|| url.clone())
+                                    } else {
+                                        url.clone()
+                                    };
+                                    cx.write_to_clipboard(ClipboardItem::new_string(link));
+                                    this.show_flash("Link copied — open it on your phone", cx);
+                                })),
+                        )
+                    })
                     // what TIDE says to the agent before your first word: not a
                     // secret, just hidden, so there's a way to read it
                     .child(
@@ -17198,6 +25760,9 @@ impl Storm {
                             .tooltip(tip("The instructions TIDE gives this agent"))
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 this.agent_brief_open = !this.agent_brief_open;
+                                if this.agent_brief_open {
+                                    this.agent_brief_text = this.tide_briefing();
+                                }
                                 cx.notify();
                             })),
                     )
@@ -17273,18 +25838,46 @@ impl Storm {
             })
             .flatten();
         let list = if count == 0 {
-            let starting = self.acp.as_ref().map(|a| !a.is_ready()).unwrap_or(false);
-            let hint = if starting {
-                "Starting agent…"
+            const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            // three states, and they are worth telling apart: the adapter is
+            // coming up, it is up and fetching the last session back, or there
+            // is nothing happening and the box is simply empty
+            // no adapter yet is the earliest part of starting, not idleness —
+            // read as idle it showed "ask Claude about this project" for a
+            // frame before the spinner, which is a lie about what's happening.
+            // A failed spawn puts a message in the transcript, so this branch
+            // isn't reached in that case.
+            let booting = self.acp.as_ref().map_or(true, |a| !a.is_ready());
+            let resuming = !booting && self.agent_autoresume;
+            let hint = if booting {
+                "Starting the agent…"
+            } else if resuming {
+                "Picking up where the last session left off…"
             } else {
                 "Ask Claude about this project. It can read and edit files in the working tree."
             };
+            let working = booting || resuming;
             div()
                 .flex_grow(1.0)
                 .min_h(px(0.))
                 .p_3()
+                .flex()
+                .flex_row()
+                .items_center()
+                // centred across the pane: a line of text pinned to the left
+                // edge of an empty column reads as a stray label
+                .justify_center()
+                .gap_2()
                 .text_size(px(12.))
                 .text_color(rgb(MUTED))
+                .when(working, |d| {
+                    d.child(
+                        div()
+                            .flex_shrink_0()
+                            .text_color(rgb(ACCENT))
+                            .child(SPIN[self.agent_spin % SPIN.len()]),
+                    )
+                })
                 .child(hint)
                 .into_any_element()
         } else {
@@ -17292,6 +25885,19 @@ impl Storm {
                 self.agent_list.clone(),
                 cx.processor(|this: &mut Self, ix: usize, window: &mut Window, cx: &mut Context<Self>| {
                     if let Some(m) = this.agent_msgs.get(ix) {
+                        // the closing summary, in its own card
+                        if matches!(m, AgentMsg::Reviewing) {
+                            let card = reviewing_card(&this.reviewers);
+                            return div().px_3().py_1().child(card).into_any_element();
+                        }
+                        if let AgentMsg::Summary { title, text } = m {
+                            let (title, text) = (title.clone(), text.clone());
+                            return div()
+                                .px_3()
+                                .py_1()
+                                .child(summary_card(&title, &text))
+                                .into_any_element();
+                        }
                         // agent prose is selectable, so it can be quoted back
                         if let AgentMsg::Agent(t) = m {
                             let t = t.clone();
@@ -17301,7 +25907,118 @@ impl Storm {
                                 .child(this.render_agent_md(ix, &t, window, cx))
                                 .into_any_element();
                         }
-                        return div().px_3().py_1().child(render_agent_msg(m, ix)).into_any_element();
+                        // a screenshot: right-click for copy / open, and no
+                        // hover preview — the picture is already full size
+                        if let AgentMsg::Shot { note, image, path, dims } = m {
+                            let (note, image, path, dims) =
+                                (note.clone(), image.clone(), path.clone(), *dims);
+                            let shot_w = this.shot_width();
+                            let (img_ctx, path_ctx) = (image.clone(), path.clone());
+                            return div()
+                                .id(("shot-row", ix))
+                                .px_3()
+                                .py_1()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_2()
+                                        .text_size(px(10.))
+                                        .text_color(rgb(MUTED))
+                                        .child(
+                                            div()
+                                                .font_family(ICON_FONT)
+                                                .text_size(px(10.))
+                                                .child(IC_BROWSER),
+                                        )
+                                        .child(div().flex_grow(1.0).truncate().child(
+                                            if note.is_empty() {
+                                                "screenshot".to_string()
+                                            } else {
+                                                note.clone()
+                                            },
+                                        )),
+                                )
+                                .child(
+                                    // the frame takes the pane's width and
+                                    // clips: without this it sizes to the
+                                    // picture, and a wide shot runs off the
+                                    // side of the transcript
+                                    div()
+                                        .w_full()
+                                        .min_w(px(0.))
+                                        .rounded_md()
+                                        .overflow_hidden()
+                                        .border_1()
+                                        .border_color(rgb(BORDER))
+                                        .child(shot_img(image.clone(), dims, shot_w)),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Right,
+                                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                                        this.ctx_shot = Some(img_ctx.clone());
+                                        this.tree_ctx_path = Some(path_ctx.clone());
+                                        this.tree_ctx_kind = CtxKind::Shot;
+                                        this.tree_ctx = Some((
+                                            f32::from(ev.position.x),
+                                            f32::from(ev.position.y),
+                                        ));
+                                        window.focus(&this.tree_ctx_focus, cx);
+                                        cx.notify();
+                                    }),
+                                )
+                                .into_any_element();
+                        }
+                        // your own words get the same treatment: select them,
+                        // right-click them, copy them
+                        if let AgentMsg::User { text, imgs, by } = m {
+                            let (text, imgs) = (text.clone(), imgs.clone());
+                            let tide = *by == Sender::Tide;
+                            return div()
+                                .px_3()
+                                .py_1()
+                                .flex()
+                                .flex_col()
+                                .w_full()
+                                .min_w(px(0.))
+                                .gap_1()
+                                .child(user_head(&text, ix, *by))
+                                .child(
+                                    div()
+                                        // a plain block sizes to its content, so
+                                        // a long line laid itself out past the
+                                        // bubble and got clipped. Flex + w_full
+                                        // + min_w(0) is what makes it wrap.
+                                        .flex()
+                                        .flex_col()
+                                        .w_full()
+                                        .min_w(px(0.))
+                                        .overflow_hidden()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        // TIDE's own messages are quieter and
+                                        // outlined; yours stay the solid blue
+                                        .when(tide, |d| {
+                                            d.bg(rgb(BG))
+                                                .border_1()
+                                                .border_color(rgb(USER_BUBBLE))
+                                                .text_color(rgb(TEXT))
+                                        })
+                                        .when(!tide, |d| {
+                                            d.bg(rgb(USER_BUBBLE)).text_color(rgb(SEL_TEXT))
+                                        })
+                                        .text_size(px(14.5))
+                                        .child(this.render_agent_md(ix, &text, window, cx)),
+                                )
+                                .children(user_images(&imgs, ix))
+                                .into_any_element();
+                        }
+                        return div().px_3().py_1().child(render_agent_msg(m, ix, this.shot_width())).into_any_element();
                     }
                     let after = ix - this.agent_msgs.len();
                     // the "thinking" row sits between the transcript and the queue
@@ -17335,7 +26052,11 @@ impl Storm {
                             .into_any_element();
                     }
                     let qi = after - usize::from(this.agent_busy);
-                    match this.agent_queue.get(qi).map(|(t, l)| l.clone().unwrap_or_else(|| t.clone())) {
+                    match this
+                        .agent_queue
+                        .get(qi)
+                        .map(|q| q.label.clone().unwrap_or_else(|| q.text.clone()))
+                    {
                         Some(text) => div()
                             .px_3()
                             .py_1()
@@ -17382,8 +26103,9 @@ impl Storm {
                                             .tooltip(tip("Move it back into the composer"))
                                             .on_click(cx.listener(move |this, _e, window, cx| {
                                                 if qi < this.agent_queue.len() {
-                                                    let (t, _) = this.agent_queue.remove(qi);
-                                                    this.agent_input.set(t);
+                                                    let q = this.agent_queue.remove(qi);
+                                                    this.agent_input.set(q.text);
+                                                    this.agent_imgs.extend(q.imgs);
                                                     window.focus(&this.agent_focus, cx);
                                                     cx.notify();
                                                 }
@@ -17448,6 +26170,7 @@ impl Storm {
         // the very bottom of the pane
         let rows = self.agent_input.text.split('\n').count().clamp(4, 14) as f32;
         let busy = self.agent_busy;
+        let blocked = self.usage_block();
         let pending_comments =
             self.review.iter().filter(|c| !c.draft && !c.sent && !c.resolved).count();
         // one box, full width: the text on top, controls along its bottom edge
@@ -17468,6 +26191,49 @@ impl Storm {
             .rounded_md()
             .flex()
             .flex_col()
+            // the plan window is spent. The box still takes what you type — the
+            // message is yours and shouldn't be lost — it just won't send until
+            // the window comes back or you say to send anyway
+            .when_some(blocked.clone(), |d, why| {
+                d.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .mb_1()
+                        .px_1p5()
+                        .py(px(2.))
+                        .rounded_md()
+                        .bg(rgba((GIT_MODIFIED << 8) | 0x1a))
+                        .text_size(px(10.5))
+                        .child(
+                            div()
+                                .flex_grow(1.0)
+                                .min_w(px(0.))
+                                .text_color(rgb(GIT_MODIFIED))
+                                .child(format!("{why}. Prompts are held.")),
+                        )
+                        .child(
+                            div()
+                                .id("usage-skip")
+                                .flex_shrink_0()
+                                .px_1()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_color(rgb(MUTED))
+                                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                .child("Send anyway")
+                                .tooltip(tip(
+                                    "Send regardless, until this window resets  ·  \
+                                     the next prompt may come back as a rate-limit error",
+                                ))
+                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                    this.skip_usage_block(cx);
+                                })),
+                        ),
+                )
+            })
             // pasted images waiting to go with the next message: a thumbnail
             // chip each, hover for a bigger look
             .when(!self.agent_imgs.is_empty(), |d| {
@@ -17549,9 +26315,16 @@ impl Storm {
                         }),
                     )
                     .child(if self.agent_input.text.is_empty() {
-                        div()
-                            .text_color(rgb(MUTED))
-                            .child(format!("Message the agent…{}", self.caret_if(focused)))
+                        // while the reviewers read, the box says why it won't
+                        // send rather than letting a message disappear
+                        let reading = self.reviewers.iter().any(|r| !r.done);
+                        div().text_color(rgb(MUTED)).child(if reading {
+                            format!("Waiting for the reviewers…{}", self.caret_if(focused))
+                        } else if blocked.is_some() {
+                            format!("Waiting for the plan window…{}", self.caret_if(focused))
+                        } else {
+                            format!("Message the agent…{}", self.caret_if(focused))
+                        })
                     } else {
                         // the ghost sits after the text, dimmed, like a shell's
                         // history suggestion — ⇥ takes it
@@ -17566,7 +26339,24 @@ impl Storm {
                             .child(
                                 div()
                                     .min_w(px(0.))
-                                    .child(self.agent_input.render(self.caret_if(focused), SELECTION)),
+                                    .child({
+                                        // clicking in the text puts the caret
+                                        // there; the field can't hear the mouse
+                                        // itself, so the workspace does it
+                                        let me = cx.entity().downgrade();
+                                        self.agent_input.render_clickable(
+                                            self.caret_if(focused),
+                                            SELECTION,
+                                            move |ix, _window, cx| {
+                                                me.update(cx, |this, cx| {
+                                                    this.agent_input.move_to(ix);
+                                                    this.recompute_agent_ghost();
+                                                    cx.notify();
+                                                })
+                                                .ok();
+                                            },
+                                        )
+                                    }),
                             )
                             .when_some(self.agent_ghost.clone(), |d, rest| {
                                 d.child(
@@ -17587,73 +26377,73 @@ impl Storm {
                             })
                     }),
             )
-            // bottom row inside the box: the key legend, and Stop while a turn runs
-            .child(
-                div()
-                    .h(px(20.))
-                    .flex_shrink_0()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_size(px(10.))
-                            .text_color(rgb(LINE_NUMBER))
-                            .child("↩ send  ·  @ reference  ·  ⌃J newline  ·  ⌃N new  ·  ⌘V paste image  ·  ⌥C comment  ·  ⌃C clear"),
-                    )
-                    .child(div().flex_grow(1.0))
-                    // pending review comments are usually written while reading an
-                    // answer right here — the send button belongs next to the box
-                    // you're already looking at, not only in the review pane
-                    .when(pending_comments > 0, |d| {
-                        d.child(
-                            div()
-                                .id("agent-send-comments")
-                                .flex_shrink_0()
-                                .mr_2()
-                                .px_1p5()
-                                .rounded_md()
-                                .cursor_pointer()
-                                .text_size(px(11.))
-                                .border_1()
-                                .border_color(rgb(COMMENT_MARK))
-                                .text_color(rgb(COMMENT_MARK))
-                                .hover(|s| s.bg(rgb(HOVER)))
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_1()
-                                // the codicon needs its own font family
-                                .child(div().font_family(ICON_FONT).text_size(px(10.)).child(IC_COMMENT))
-                                .child(format!(
-                                    "Send {pending_comments} comment{}",
-                                    if pending_comments == 1 { "" } else { "s" }
-                                ))
-                                .tooltip(tip("Send the pending review comments  (⌥↩)"))
-                                .on_click(cx.listener(|this, _e, window, cx| {
-                                    this.send_review(window, cx)
-                                })),
-                        )
-                    })
-                    .when(busy, |d| {
-                        d.child(
-                            div()
-                                .id("agent-stop")
-                                .flex_shrink_0()
-                                .px_1p5()
-                                .rounded_md()
-                                .cursor_pointer()
-                                .text_size(px(11.))
-                                .border_1()
-                                .border_color(rgb(GIT_DELETED))
-                                .text_color(rgb(GIT_DELETED))
-                                .hover(|s| s.bg(rgb(HOVER)))
-                                .child("■ Stop")
-                                .tooltip(tip("Interrupt the agent  (⌃C, which also clears the box)"))
-                                .on_click(cx.listener(|this, _e, _w, cx| this.interrupt_agent(cx))),
-                        )
-                    }),
-            );
+            // bottom row inside the box: Send comments, and Stop while a turn
+            // runs. The key legend that used to live here is gone — eight
+            // shortcuts under the box you type in, every hour of every day,
+            // long after you knew them. The keys are in the palette (⌘K).
+            // Nothing to show means no row at all, and 20px back for the text.
+            .when(pending_comments > 0 || busy, |col| {
+                col.child(
+                    div()
+                        .h(px(20.))
+                        .flex_shrink_0()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .child(div().flex_grow(1.0))
+                        // pending review comments are usually written while reading an
+                        // answer right here — the send button belongs next to the box
+                        // you're already looking at, not only in the review pane
+                        .when(pending_comments > 0, |d| {
+                            d.child(
+                                div()
+                                    .id("agent-send-comments")
+                                    .flex_shrink_0()
+                                    .mr_2()
+                                    .px_1p5()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_size(px(11.))
+                                    .border_1()
+                                    .border_color(rgb(COMMENT_MARK))
+                                    .text_color(rgb(COMMENT_MARK))
+                                    .hover(|s| s.bg(rgb(HOVER)))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    // the codicon needs its own font family
+                                    .child(div().font_family(ICON_FONT).text_size(px(10.)).child(IC_COMMENT))
+                                    .child(format!(
+                                        "Send {pending_comments} comment{}",
+                                        if pending_comments == 1 { "" } else { "s" }
+                                    ))
+                                    .tooltip(tip("Send the pending review comments  (⌥↩)"))
+                                    .on_click(cx.listener(|this, _e, window, cx| {
+                                        this.send_review(window, cx)
+                                    })),
+                            )
+                        })
+                        .when(busy, |d| {
+                            d.child(
+                                div()
+                                    .id("agent-stop")
+                                    .flex_shrink_0()
+                                    .px_1p5()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_size(px(11.))
+                                    .border_1()
+                                    .border_color(rgb(GIT_DELETED))
+                                    .text_color(rgb(GIT_DELETED))
+                                    .hover(|s| s.bg(rgb(HOVER)))
+                                    .child("■ Stop")
+                                    .tooltip(tip("Interrupt the agent  (⌃C, which also clears the box)"))
+                                    .on_click(cx.listener(|this, _e, _w, cx| this.interrupt_agent(cx))),
+                            )
+                        }),
+                )
+            });
 
         // the resume list replaces the transcript while it's open
         let picker = self.agent_picker.then(|| {
@@ -17719,14 +26509,23 @@ impl Storm {
             .key_context("Agent")
             .on_key_down(cx.listener(Self::agent_key))
             .relative()
+            // tabs first, then the header: a reviewer is a tab beside the
+            // conversation, not a popup over it
+            .children(self.render_agent_tabs(cx))
             .child(header)
-            // the pinned row only shows with the transcript, never over the picker
-            .children(if picker.is_some() { None } else { pinned_row })
-            .child(match picker {
-                Some(p) => p.into_any_element(),
-                None => list.into_any_element(),
+            // a reviewer's tab replaces the conversation and its composer —
+            // there's nothing to type at a session that isn't yours
+            .when(self.agent_tab > 0, |d| d.child(self.render_reviewer_tab(self.agent_tab - 1)))
+            .when(self.agent_tab == 0, |d| {
+                d
+                    // the pinned row only shows with the transcript, never over the picker
+                    .children(if picker.is_some() { None } else { pinned_row })
+                    .child(match picker {
+                        Some(p) => p.into_any_element(),
+                        None => list.into_any_element(),
+                    })
+                    .child(input)
             })
-            .child(input)
             .children(self.render_agent_brief(cx))
             // last child, so it paints over the transcript instead of under it
             .when(self.agent_jump_open, |d| {
@@ -17852,109 +26651,247 @@ fn tool_note(s: &str) -> String {
         .join("\n")
 }
 
-fn render_agent_msg(m: &AgentMsg, ix: usize) -> impl IntoElement {
+/// The "You" line above one of your messages, with the copy affordance. The
+/// transcript is often where the good version of a prompt ended up.
+fn user_head(text: &str, ix: usize, by: Sender) -> impl IntoElement {
+    let copy = text.to_string();
+    let tide = by == Sender::Tide;
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .text_size(px(10.))
+        .text_color(rgb(MUTED))
+        .child(
+            div()
+                .flex_grow(1.0)
+                .text_color(rgb(if tide { ACCENT } else { MUTED }))
+                // what TIDE sent on your behalf, and what you typed, are
+                // different things: a button's handoff isn't your sentence
+                .child(if tide { "TIDE" } else { "You" }),
+        )
+        .child(
+            div()
+                .id(("you-copy", ix))
+                .px_1()
+                .rounded_md()
+                .cursor_pointer()
+                .text_color(rgb(LINE_NUMBER))
+                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                .child("copy")
+                .on_click(move |_e, _w, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
+                }),
+        )
+}
+
+/// The pictures that went out with a message: the composer's chips, kept.
+/// The "reviewers are reading" card: who is reading, how long each has been at
+/// it, and the last thing each one did. Built from the live list every frame,
+/// so it never claims a reviewer is still working after it has finished.
+fn reviewing_card(reviewers: &[Reviewer]) -> Div {
+    let done = reviewers.iter().filter(|r| r.done).count();
+    let n = reviewers.len();
+    let mut card = div()
+        .w_full()
+        .min_w(px(0.))
+        .overflow_hidden()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .px_3()
+        .py_2()
+        .rounded_md()
+        .bg(rgba(COMMENT_TINT))
+        .border_l_2()
+        .border_color(rgb(COMMENT_MARK))
+        .child(
+            div()
+                .text_size(px(10.))
+                .text_color(rgb(COMMENT_MARK))
+                .child(format!("REVIEWERS READING  ·  {done}/{n} DONE")),
+        );
+    for r in reviewers {
+        let secs = match r.finished {
+            Some(f) => f.duration_since(r.started).as_secs(),
+            None => r.started.elapsed().as_secs(),
+        };
+        // the last line of its log is what it is doing right now
+        let doing = r.log.last().cloned().unwrap_or_else(|| "starting…".to_string());
+        card = card.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .text_size(px(11.))
+                .child(
+                    div()
+                        .size(px(6.))
+                        .flex_shrink_0()
+                        .rounded_full()
+                        .bg(rgb(if r.done { GIT_NEW } else { COMMENT_MARK })),
+                )
+                .child(div().flex_shrink_0().text_color(rgb(TEXT)).child(r.name))
+                .child(
+                    div()
+                        .flex_grow(1.0)
+                        .min_w(px(0.))
+                        .truncate()
+                        .text_color(rgb(MUTED))
+                        .child(if r.done { "done".to_string() } else { doing }),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(rgb(LINE_NUMBER))
+                        .child(human_secs(secs)),
+                ),
+        );
+    }
+    card
+}
+
+/// The agent's closing summary, as a card: a green rule down the side and a
+/// tinted ground, so the "what happened" of a long turn is findable at a glance
+/// instead of being the last paragraph of a wall.
+fn summary_card(title: &str, text: &str) -> Div {
+    let heading = if title.trim().is_empty() { "Summary" } else { title.trim() };
+    div()
+        .w_full()
+        .min_w(px(0.))
+        .overflow_hidden()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .pl_3()
+        .pr_3()
+        .py_2()
+        .rounded_md()
+        // `rgba`, not `rgb`: FREE_TINT carries its alpha in the low byte, and
+        // read as opaque it is a bright yellow-green that eats the text
+        .bg(rgba(FREE_TINT))
+        .border_l_2()
+        .border_color(rgb(GIT_NEW))
+        // what the card is about, so a transcript full of them can be scanned
+        .child(
+            div()
+                .text_size(px(10.))
+                .text_color(rgb(GIT_NEW))
+                .child(heading.to_uppercase()),
+        )
+        .child(md_doc(text))
+}
+
+/// A screenshot at a size worked out here rather than left to layout rules.
+///
+/// Both halves of that are learned the hard way. A transcript row sizes itself
+/// to its content, so a picture asking for its natural width makes the row that
+/// wide and any percentage inside resolves against the row instead of the pane
+/// — that is how a wide shot ran off the side. And `aspect_ratio` with a
+/// `max_width` sets the height from the width *before* the clamp, leaving a box
+/// taller than the picture with empty bands above and below it.
+///
+/// So: fit the picture's own pixels into `max_w` (the pane) and a 720px ceiling,
+/// keeping its shape, and give the element both numbers. The frame is then the
+/// picture, with nothing around it.
+fn shot_img(image: Arc<gpui::Image>, dims: Option<(f32, f32)>, max_w: f32) -> gpui::Img {
+    let img = gpui::img(image);
+    let Some((w, h)) = dims.filter(|(w, h)| *w > 0. && *h > 0.) else {
+        // no header to read: fall back to letting it size itself, capped
+        return img.max_w(px(max_w)).max_h(px(420.));
+    };
+    let (w, h) = shot_box(w, h, max_w, 720.);
+    img.w(px(w)).h(px(h))
+}
+
+/// The biggest `w`x`h` that fits inside `max_w` by `max_h` with its shape kept.
+/// Never enlarges: a small screenshot stays its own size rather than being
+/// blown up to fill the pane.
+fn shot_box(w: f32, h: f32, max_w: f32, max_h: f32) -> (f32, f32) {
+    let scale = (max_w / w).min(max_h / h).min(1.0);
+    ((w * scale).max(1.0), (h * scale).max(1.0))
+}
+
+fn user_images(imgs: &[SentImage], ix: usize) -> Option<impl IntoElement> {
+    if imgs.is_empty() {
+        return None;
+    }
+    let mut row = div().mt_1p5().flex().flex_row().flex_wrap().gap_2();
+    for (n, pi) in imgs.iter().enumerate() {
+        let kind = pi.mime.rsplit('/').next().unwrap_or("image").to_uppercase();
+        let kb = (pi.bytes as f32 / 1024.0).round() as usize;
+        let preview = pi.image.clone();
+        row = row.child(
+            div()
+                .id(("you-img", ix * 100 + n))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .pl_0p5()
+                .pr_1()
+                .rounded_md()
+                .bg(rgb(CURRENT_LINE))
+                .border_1()
+                .border_color(rgb(BORDER))
+                .text_size(px(10.))
+                .text_color(rgb(MUTED))
+                .child(gpui::img(pi.image.clone()).h(px(88.)).max_w(px(160.)).rounded_sm())
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(div().text_color(rgb(COMMENT_MARK)).child(pi.label.clone()))
+                        .child(format!("{kind}  ·  {kb} KB")),
+                )
+                .tooltip(move |_w, cx| cx.new(|_| ImagePreview { image: preview.clone() }).into()),
+        );
+    }
+    Some(row)
+}
+
+fn render_agent_msg(m: &AgentMsg, ix: usize, shot_w: f32) -> impl IntoElement {
     match m {
-        AgentMsg::User { text: t, imgs } => div()
+        // handled by the transcript itself, so it can be selected like an answer
+        AgentMsg::User { text, imgs, by } => div()
             .flex()
             .flex_col()
             .gap_1()
-            .child(div().text_size(px(10.)).text_color(rgb(MUTED)).child("You"))
+            .child(user_head(text, ix, *by))
             .child(
                 div()
                     .px_2()
                     .py_1()
                     .rounded_md()
-                    .bg(rgb(SELECTED_BG))
-                    // same size as the agent's prose (md_doc's body size)
-                    .text_size(px(14.5))
-                    .text_color(rgb(SEL_TEXT))
-                    // a URL you pasted is a link here too: underlined rather
-                    // than recoloured, since accent-on-selection is unreadable
-                    .child({
-                        let spans = url_spans(t);
-                        if spans.is_empty() {
-                            div().child(t.clone()).into_any_element()
-                        } else {
-                            let urls: Vec<String> =
-                                spans.iter().map(|r| t[r.clone()].to_string()).collect();
-                            let hl: Vec<(std::ops::Range<usize>, gpui::HighlightStyle)> = spans
-                                .iter()
-                                .map(|r| {
-                                    (
-                                        r.clone(),
-                                        gpui::HighlightStyle {
-                                            underline: Some(gpui::UnderlineStyle {
-                                                thickness: px(1.),
-                                                color: Some(rgb(SEL_TEXT).into()),
-                                                wavy: false,
-                                            }),
-                                            ..Default::default()
-                                        },
-                                    )
-                                })
-                                .collect();
-                            let styled = StyledText::new(t.clone()).with_highlights(hl);
-                            gpui::InteractiveText::new(("you-link", ix), styled)
-                                .on_click(spans, move |i, _w, _cx| {
-                                    if let Some(u) = urls.get(i) {
-                                        open_browser(u);
-                                    }
-                                })
-                                .into_any_element()
-                        }
+                    .when(*by == Sender::Tide, |d| {
+                        d.bg(rgb(BG)).border_1().border_color(rgb(USER_BUBBLE)).text_color(rgb(TEXT))
                     })
-                    // what went out with it: the same chips the composer showed
-                    // while you were writing, so `[Image #1]` still has a picture
-                    // attached to it after the fact
-                    .when(!imgs.is_empty(), |d| {
-                        let mut row = div().mt_1p5().flex().flex_row().flex_wrap().gap_2();
-                        for (n, pi) in imgs.iter().enumerate() {
-                            let kind = pi.mime.rsplit('/').next().unwrap_or("image").to_uppercase();
-                            let kb = (pi.bytes as f32 / 1024.0).round() as usize;
-                            let preview = pi.image.clone();
-                            row = row.child(
-                                div()
-                                    .id(("you-img", ix * 100 + n))
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_1()
-                                    .pl_0p5()
-                                    .pr_1()
-                                    .rounded_md()
-                                    .bg(rgb(CURRENT_LINE))
-                                    .border_1()
-                                    .border_color(rgb(BORDER))
-                                    .text_size(px(10.))
-                                    .text_color(rgb(MUTED))
-                                    .child(
-                                        gpui::img(pi.image.clone())
-                                            .h(px(88.))
-                                            .max_w(px(160.))
-                                            .rounded_sm(),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_col()
-                                            .child(
-                                                div()
-                                                    .text_color(rgb(COMMENT_MARK))
-                                                    .child(pi.label.clone()),
-                                            )
-                                            .child(format!("{kind}  ·  {kb} KB")),
-                                    )
-                                    .tooltip(move |_w, cx| {
-                                        cx.new(|_| ImagePreview { image: preview.clone() }).into()
-                                    }),
-                            );
-                        }
-                        d.child(row)
-                    }),
+                    .when(*by == Sender::You, |d| {
+                        d.bg(rgb(USER_BUBBLE)).text_color(rgb(SEL_TEXT))
+                    })
+                    .text_size(px(14.5))
+                    .child(text.clone()),
             )
+            .children(user_images(imgs, ix))
             .into_any_element(),
         // the model answers in markdown — headings, `code`, and bullets included
         AgentMsg::Agent(t) => md_doc(t).into_any_element(),
+        // drawn by the transcript itself (right-click menu, no hover preview)
+        AgentMsg::Summary { title, text } => summary_card(title, text).into_any_element(),
+        // drawn by the transcript itself, which has the live reviewer list
+        AgentMsg::Reviewing => div().into_any_element(),
+        AgentMsg::Shot { note, image, dims, .. } => div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .min_w(px(0.))
+            .overflow_hidden()
+            .gap_1()
+            .child(div().text_size(px(10.)).text_color(rgb(MUTED)).child(note.clone()))
+            .child(shot_img(image.clone(), *dims, shot_w))
+            .into_any_element(),
         AgentMsg::Thought(t) => div()
             .pl_2()
             .border_l_2()
@@ -17969,19 +26906,17 @@ fn render_agent_msg(m: &AgentMsg, ix: usize) -> impl IntoElement {
                 // a running call is the one thing here worth looking at
                 _ => ("●", ACCENT),
             };
-            // for a Bash call the title *is* the command, so it can be long and
-            // can carry newlines: the row shows the first line, the tooltip the
-            // whole of it
-            let mut head = title.lines().next().unwrap_or_default().to_string();
-            if title.lines().count() > 1 {
-                head.push_str(" …");
+            // for a Bash call the title *is* the command, so it is long and
+            // carries newlines. It wraps rather than ending in an ellipsis —
+            // half a command tells you nothing about what is running. Only a
+            // genuinely enormous one is cut, so a stray megabyte of here-doc
+            // can't push the rest of the transcript off screen.
+            const LONGEST: usize = 900;
+            let mut head = title.trim().to_string();
+            if head.chars().count() > LONGEST {
+                head = head.chars().take(LONGEST).collect::<String>() + " …";
             }
-            let secs = started.elapsed().as_secs();
-            let elapsed = if secs >= 60 {
-                format!("{}m {}s", secs / 60, secs % 60)
-            } else {
-                format!("{secs}s")
-            };
+            let elapsed = human_secs(started.elapsed().as_secs());
             // while it runs, `detail` says what the call is for; when it failed,
             // it's the error the model saw. On a call that worked it's noise.
             let note = detail
@@ -18006,7 +26941,9 @@ fn render_agent_msg(m: &AgentMsg, ix: usize) -> impl IntoElement {
                     div()
                         .flex()
                         .flex_row()
-                        .items_center()
+                        // the glyph sits against the command's first line, not
+                        // in the middle of a command three lines tall
+                        .items_start()
                         .gap_2()
                         .child(
                             div()
@@ -18021,17 +26958,10 @@ fn render_agent_msg(m: &AgentMsg, ix: usize) -> impl IntoElement {
                                 .id(("agent-tool", ix))
                                 .flex_grow(1.0)
                                 .min_w(px(0.))
-                                .truncate()
                                 .font_family("Menlo")
                                 .text_size(px(11.5))
                                 .text_color(rgb(if running { TEXT } else { MUTED }))
-                                .child(head)
-                                .tooltip({
-                                    let full = title.clone();
-                                    move |_w, cx| {
-                                        cx.new(|_| TooltipView { text: full.clone().into() }).into()
-                                    }
-                                }),
+                                .child(head),
                         )
                         // how long it has been going: the whole point of the row
                         // when a command takes minutes
@@ -18553,27 +27483,16 @@ impl Storm {
     /// The right-dock browser: an address bar + nav controls (gpui), with the
     /// embedded WebView floating over the region below the bar. Computes that
     /// region's rect from the current layout and (re)positions the WebView.
-    fn render_browser_dock(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The browser tab: an address bar and the page the agent's Chromium is
+    /// showing. Not an embedded engine — frames come off `agent-browser`'s
+    /// stream and are painted like any other picture, which is what lets a
+    /// dialog sit over them.
+    fn render_mirror(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let addr_h = 36.0_f32;
-        let dock_w = self.term_width;
-        // column sits just left of the 44px right activity bar
-        let region_x = self.win_width - 44.0 - dock_w;
-        let region_y = 44.0 + addr_h; // below topbar + address bar
-        let bottom = (if self.run_open { 260.0 } else { 0.0 })
-            + (if self.git_open { self.git_height + 4.0 } else { 0.0 });
-        let region_h = (self.win_height - region_y - bottom).max(0.0);
-        let region_w = dock_w;
+        let frame = self.mirror_frame.clone();
+        let live = self.mirror.as_ref().is_some_and(|m| m.connected());
 
-        // create the WebView on first open; afterwards just reposition + show it
-        if self.browser.is_none() {
-            let url = normalize_url(self.browser_url.text.trim());
-            self.browser = browser::Browser::new(window, &url, region_x, region_y, region_w, region_h);
-        } else if let Some(b) = &self.browser {
-            b.set_bounds(region_x, region_y, region_w, region_h);
-            b.set_visible(true);
-        }
-
-        let nav = |id: &'static str, glyph: &'static str, enabled: bool| {
+        let nav = |id: &'static str, glyph: &'static str| {
             div()
                 .id(id)
                 .flex()
@@ -18582,12 +27501,12 @@ impl Storm {
                 .size(px(22.))
                 .rounded_md()
                 .text_size(px(13.))
-                .text_color(rgb(if enabled { MUTED } else { LINE_NUMBER }))
-                .when(enabled, |d| d.cursor_pointer().hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT))))
+                .text_color(rgb(MUTED))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
                 .child(glyph)
         };
 
-        let focused = self.browser_focus.is_focused(window);
         let bar = div()
             .h(px(addr_h))
             .flex_shrink_0()
@@ -18599,14 +27518,23 @@ impl Storm {
             .bg(rgb(PANEL_BG))
             .border_b_1()
             .border_color(rgb(BORDER))
-            .child(nav("br-back", "‹", true).on_click(cx.listener(|this, _e, _w, _cx| {
-                if let Some(b) = &this.browser { b.back(); }
+            // green while the stream is live: a stale picture looks exactly
+            // like a live one
+            .child(
+                div()
+                    .size(px(6.))
+                    .rounded_full()
+                    .flex_shrink_0()
+                    .bg(rgb(if live { GIT_NEW } else { LINE_NUMBER })),
+            )
+            .child(nav("br-back", "‹").on_click(cx.listener(|this, _e, _w, _cx| {
+                this.mirror_cmd(&["back"]);
             })))
-            .child(nav("br-fwd", "›", true).on_click(cx.listener(|this, _e, _w, _cx| {
-                if let Some(b) = &this.browser { b.forward(); }
+            .child(nav("br-fwd", "›").on_click(cx.listener(|this, _e, _w, _cx| {
+                this.mirror_cmd(&["forward"]);
             })))
-            .child(nav("br-reload", "↻", true).on_click(cx.listener(|this, _e, _w, _cx| {
-                if let Some(b) = &this.browser { b.reload(); }
+            .child(nav("br-reload", "↻").on_click(cx.listener(|this, _e, _w, _cx| {
+                this.mirror_cmd(&["reload"]);
             })))
             .child(
                 div()
@@ -18616,7 +27544,7 @@ impl Storm {
                     .py(px(3.))
                     .bg(rgb(BG))
                     .border_1()
-                    .border_color(rgb(if focused { ACCENT } else { BORDER }))
+                    .border_color(rgb(BORDER))
                     .rounded_md()
                     .text_size(px(12.))
                     .text_color(rgb(TEXT))
@@ -18624,32 +27552,134 @@ impl Storm {
                     .on_key_down(cx.listener(Self::browser_key))
                     .child(self.browser_url.render(self.caret(), SELECTION)),
             )
-            .child(nav("br-ext", "⧉", true).on_click(cx.listener(|this, _e, _w, _cx| {
+            .child(nav("br-ext", "⧉").on_click(cx.listener(|this, _e, _w, _cx| {
                 open_browser(&normalize_url(this.browser_url.text.trim()));
-            })))
-            .child(nav("br-close", "✕", true).on_click(cx.listener(|this, _e, window, cx| {
-                this.toggle_browser(window, cx);
             })));
 
-        // the region below the bar is left empty — the native WebView floats over it
-        div()
-            .w(px(dock_w))
-            .h_full()
-            .flex_shrink_0()
-            .flex()
-            .flex_col()
-            .bg(rgb(BG))
-            .child(bar)
-            .child(div().flex_grow(1.0).min_h(px(0.)))
+        let waiting = self
+            .mirror
+            .as_ref()
+            .and_then(|m| m.error())
+            .unwrap_or_else(|| "Waiting for the browser…".to_string());
+        let page = div()
+            .id("mirror-page")
+            .track_focus(&self.mirror_focus)
+            .on_key_down(cx.listener(Self::mirror_key))
+            .flex_grow(1.0)
+            .min_h(px(0.))
+            .relative()
+            .overflow_hidden()
+            // where the page landed, measured rather than computed: the column
+            // moves with the tree, the docks and the window
+            .child(mirror_probe(cx.entity()))
+            .when(frame.is_none(), |d| {
+                d.flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .child(waiting)
+            })
+            .when_some(frame, |d, f| {
+                let ratio = if f.page_h > 0. { f.page_w / f.page_h } else { 16. / 9. };
+                d.child(gpui::img(f.image.clone()).w_full().aspect_ratio(ratio))
+            })
+            // a press focuses the page and goes through as a press, so the
+            // browser sees the same gesture you made
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                    window.focus(&this.mirror_focus, cx);
+                    let (x, y) = this.mirror_point(ev.position);
+                    if let Some(m) = this.mirror.as_ref() {
+                        m.mouse("mousePressed", x, y, ev.click_count as u32);
+                    }
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, ev: &MouseUpEvent, _w, _cx| {
+                    let (x, y) = this.mirror_point(ev.position);
+                    if let Some(m) = this.mirror.as_ref() {
+                        m.mouse("mouseReleased", x, y, ev.click_count as u32);
+                    }
+                }),
+            )
+            .on_scroll_wheel(cx.listener(move |this, ev: &gpui::ScrollWheelEvent, window, _cx| {
+                let (x, y) = this.mirror_point(ev.position);
+                let d = ev.delta.pixel_delta(window.line_height());
+                if let Some(m) = this.mirror.as_ref() {
+                    // the page scrolls the way the wheel turned, not the way
+                    // the trackpad's content-follows-finger delta reads
+                    m.wheel(x, y, -f32::from(d.x), -f32::from(d.y));
+                }
+            }));
+
+        div().flex().flex_col().flex_grow(1.0).min_h(px(0.)).bg(rgb(BG)).child(bar).child(page)
     }
 }
 
-/// The Webiny admin URL for a `wby-next{N}` project (`https://admin{N}.localhost`),
-/// or None for any other project.
-fn admin_url(root: &Path) -> Option<String> {
+/// Webiny's standalone server (`wdev`, one portless URL with admin on it and
+/// `/api` forwarded) only exists on `next`. Work aimed at the 6.4 or 6.5 release
+/// lines still runs the admin app on its own, so the branch decides which server
+/// TIDE starts and which host it watches.
+fn legacy_admin(branch: &str, target: Option<&str>) -> bool {
+    let old = |b: &str| b.starts_with("release/6.4") || b.starts_with("release/6.5");
+    old(branch) || target.is_some_and(old)
+}
+
+/// Where the local app is expected to serve for a `wby-next{N}` project, used
+/// until [`portless_url`] can say where it actually serves. The shell functions
+/// pick the name: `wdev` registers the whole project as `wby{N}`, and the older
+/// `admin` watch registers `admin{N}`. None for any other project.
+fn admin_url(root: &Path, legacy: bool) -> Option<String> {
     let name = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     let n = name.strip_prefix("wby-next")?;
-    (!n.is_empty() && n.chars().all(|c| c.is_ascii_digit())).then(|| format!("https://admin{n}.localhost"))
+    if n.is_empty() || !n.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(if legacy {
+        format!("https://admin{n}.localhost")
+    } else {
+        format!("https://wby{n}.localhost")
+    })
+}
+
+/// The host portless actually registered for this checkout.
+///
+/// `~/.portless/routes.json` lists every live route with the pid serving it, and
+/// that pid's working directory is the checkout it was started from, so the
+/// mapping is exact. Naming the host after the folder was always a guess, and it
+/// is wrong often enough to matter: `wby-next3` running the legacy `admin` watch
+/// serves on `admin3.localhost`, not `wby-next3.localhost`.
+///
+/// None when nothing is serving for this checkout, which is also the honest
+/// answer: there is no URL to open.
+fn portless_url(root: &Path) -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let raw = std::fs::read_to_string(Path::new(&home).join(".portless/routes.json")).ok()?;
+    let routes: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    routes.as_array()?.iter().find_map(|r| {
+        let host = r.get("hostname")?.as_str()?;
+        let pid = r.get("pid")?.as_u64()?;
+        // the server may run from a subdirectory of the checkout, so anything
+        // under the root counts as this workspace's
+        pid_cwd(pid)?.starts_with(root).then(|| format!("https://{host}"))
+    })
+}
+
+/// Working directory of a running process. `lsof -Fn` prints `n<path>` for the
+/// cwd descriptor; anything else (gone, not ours) is None.
+fn pid_cwd(pid: u64) -> Option<PathBuf> {
+    let out = Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix('n'))
+        .map(PathBuf::from)
 }
 
 /// Is the admin URL reachable? Any HTTP response (even 4xx/5xx) counts as up;
@@ -18662,20 +27692,20 @@ fn admin_reachable(url: &str) -> bool {
             let code = String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().unwrap_or(0);
             // Only a 2xx/3xx means the app is actually serving. The portless proxy
             // always answers on these hosts, with its own 404 ("No app registered
-            // for adminN.localhost") when nothing is running and 502 when the
-            // target crashed — both are "down", so any-response-is-up was wrong.
+            // for wbyN.localhost") when nothing is running, and 502 when the
+            // target crashed. Both are "down", so any-response-is-up was wrong.
             (200..400).contains(&code)
         })
         .unwrap_or(false)
 }
 
-/// Default browser URL for a project. `wby-next{N}` → `https://admin{N}.localhost`
-/// (Webiny multi-workspace convention); everything else → localhost:3000.
+/// Default browser URL for a project. `wby-next{N}` → `https://wby{N}.localhost`
+/// (what `wdev` serves); everything else → localhost:3000.
 fn default_browser_url(root: &Path) -> String {
     let name = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     if let Some(n) = name.strip_prefix("wby-next") {
         if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
-            return format!("https://admin{n}.localhost");
+            return format!("https://wby{n}.localhost");
         }
     }
     "http://localhost:3000".into()
@@ -18757,6 +27787,737 @@ fn activity_icon(
 }
 
 impl Storm {
+    /// The merge confirmation: what it is, where it goes, and every file it
+    /// would land. The point is that nothing here is a summary you have to
+    /// trust — the list is the diff's own file list, read fresh from GitHub.
+    /// One chip, in the shape the PR header already uses: small, tinted, and
+    /// readable at a glance in a dense row.
+    fn pr_chip(text: String, colour: u32) -> Div {
+        div()
+            .flex_shrink_0()
+            .px_1()
+            .rounded_sm()
+            .bg(rgba((colour << 8) | 0x22))
+            .text_size(px(10.))
+            .text_color(rgb(colour))
+            .child(text)
+    }
+
+    /// What the reviewers have said, if anything. Nothing requested reads as
+    /// nothing, which is the honest answer and keeps the row quiet.
+    fn pr_review_chip(review: &str) -> Option<Div> {
+        let (text, colour) = match review {
+            "APPROVED" => ("approved", GIT_NEW),
+            "CHANGES_REQUESTED" => ("changes", GIT_DELETED),
+            "REVIEW_REQUIRED" => ("review", MUTED),
+            _ => return None,
+        };
+        Some(Self::pr_chip(text.into(), colour))
+    }
+
+    /// The pull-request screen. Release PRs in boxes across the top, then every
+    /// open PR of yours as a row. Clicking one opens its body as a tab; ⌘click
+    /// goes to GitHub.
+    fn render_pr_screen(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let w = 1080.0_f32.min((self.win_width - 80.0).max(560.0));
+        let left = ((self.win_width - w) / 2.0).max(0.);
+        let max_h = (self.win_height - 150.0).max(320.0);
+        let (rel, mine) = self.pr_screen_rows();
+        let sel = self.prs_sel;
+        let loading = self.prs_loading;
+        let age = todo::age(self.prs_at);
+
+        let head = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .child(div().text_size(px(13.)).text_color(rgb(TEXT)).child("All pull requests"))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .child(format!("{} open", self.prs_mine.len())),
+            )
+            .when(loading, |d| {
+                d.child(div().text_size(px(10.)).text_color(rgb(ACCENT)).child("reading…"))
+            })
+            .when(!loading && !age.is_empty(), |d| {
+                d.child(div().text_size(px(10.)).text_color(rgb(LINE_NUMBER)).child(format!("read {age} ago")))
+            })
+            .child(div().flex_grow(1.0))
+            // the filter: no label, because a box you can type into next to a
+            // list is already a filter
+            .child(
+                div()
+                    .w(px(220.))
+                    .px_2()
+                    .py(px(2.))
+                    .bg(rgb(BG))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .rounded_md()
+                    .text_size(px(11.))
+                    .text_color(rgb(TEXT))
+                    .child(if self.prs_query.is_empty() {
+                        div()
+                            .text_color(rgb(LINE_NUMBER))
+                            .child(format!("filter{}", self.caret()))
+                            .into_any_element()
+                    } else {
+                        self.prs_query.render(self.caret(), SELECTION).into_any_element()
+                    }),
+            );
+
+        // the release boxes. Each is the same information as a row, stacked, so
+        // the eye reads "which release, how far along" without a second look
+        let mut boxes = div().flex().flex_row().gap_2().px_3().py_2();
+        for (i, r) in rel.iter().enumerate() {
+            let (checks_text, checks_colour) = r.checks.summary();
+            let number = r.number;
+            let url = r.url.clone();
+            let here = self.prs_where.get(&r.head).cloned();
+            boxes = boxes.child(
+                div()
+                    .id(("pr-release", number as usize))
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .px_2()
+                    .py_2()
+                    .bg(rgb(BG))
+                    .border_1()
+                    // the cursor runs through the boxes before the rows, so a
+                    // box has to be able to show it
+                    .border_color(rgb(if i == sel { ACCENT } else { BORDER }))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|s| s.border_color(rgb(ACCENT)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(rgb(TEXT))
+                                    .child(r.release_name().to_string()),
+                            )
+                            .child(pr_state_pill(r.state, 9.))
+                            .child(div().flex_grow(1.0))
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(LINE_NUMBER))
+                                    .child(format!("#{number}")),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .text_size(px(10.))
+                            .text_color(rgb(MUTED))
+                            .child("into")
+                            .child(branch_name_el(&r.base).text_size(px(10.))),
+                    )
+                    .when(r.checks.total() > 0, |d| {
+                        d.child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
+                                .text_size(px(10.))
+                                .text_color(rgb(checks_colour))
+                                .child(div().size(px(5.)).rounded_full().bg(rgb(checks_colour)))
+                                .child(checks_text),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .text_size(px(10.))
+                            .text_color(rgb(LINE_NUMBER))
+                            .child(format!("@{}", r.author))
+                            .when_some(here, |d, folder| {
+                                d.child(Self::pr_chip(folder, FOLDER_ICON))
+                            })
+                            .child(div().flex_grow(1.0))
+                            // cutting a beta is a comment on the release PR;
+                            // the pipeline is watching for it
+                            .child({
+                                let busy = self.pr_cmd_posting == Some("/beta");
+                                div()
+                                    .id(("prs-beta", i))
+                                    .flex_shrink_0()
+                                    .px_1p5()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(rgb(if busy { ACCENT } else { BORDER }))
+                                    .text_size(px(10.))
+                                    .font_family("Menlo")
+                                    .text_color(rgb(if busy { ACCENT } else { MUTED }))
+                                    .when(!busy, |d| {
+                                        d.cursor_pointer()
+                                            .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                    })
+                                    .child(if busy { "posting…" } else { "/beta" })
+                                    .tooltip(tip(
+                                        "Comment /beta on this release PR, which cuts a beta  (⌘B)",
+                                    ))
+                                    // the box behind it opens the PR
+                                    .on_mouse_down(MouseButton::Left, |_e, _w, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                                        this.prs_sel = i;
+                                        this.prs_box = i;
+                                        this.post_pr_command(number, "/beta", cx)
+                                    }))
+                            }),
+                    )
+                    .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
+                        let github = e.modifiers().platform;
+                        this.prs_sel = i;
+                        if github {
+                            open_browser(&url);
+                            this.prs_open = false;
+                            this.focus_active(window, cx);
+                        } else {
+                            this.prs_open = false;
+                            this.focus_active(window, cx);
+                            this.open_pr_number(Some(number), cx);
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+
+        let mut list = div()
+            .id("pr-screen-list")
+            .flex()
+            .flex_col()
+            .max_h(px(max_h))
+            .overflow_y_scroll()
+            .px_1()
+            .pb_1();
+        if mine.is_empty() {
+            list = list.child(
+                div().px_3().py_3().text_size(px(11.)).text_color(rgb(LINE_NUMBER)).child(
+                    if loading { "Reading…" } else { "Nothing open." },
+                ),
+            );
+        }
+        for (i, r) in mine.iter().enumerate() {
+            let ix = rel.len() + i; // the boxes come first in the cursor's order
+            let on = ix == sel;
+            let (checks_text, checks_colour) = r.checks.summary();
+            let (number, url) = (r.number, r.url.clone());
+            let here = self.prs_where.get(&r.head).cloned();
+            let conflicts = r.mergeable == "CONFLICTING";
+            let age = todo::age(r.updated);
+            list = list.child(
+                div()
+                    .id(("pr-row", number as usize))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1p5()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(on, |d| d.bg(rgb(SELECTED_BG)))
+                    .when(!on, |d| d.hover(|s| s.bg(rgb(HOVER))))
+                    .child(pr_state_pill(r.state, 9.).flex_shrink_0())
+                    // the title takes the room, and gives it back to the chips
+                    .child(
+                        div()
+                            .flex_grow(1.0)
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(12.5))
+                            .text_color(rgb(if on { SEL_TEXT } else { TEXT }))
+                            .child(r.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(11.))
+                            .text_color(rgb(MUTED))
+                            .child(format!("#{number}")),
+                    )
+                    .child(branch_name_el(&r.base).text_size(px(10.)).flex_shrink_0())
+                    .when(conflicts, |d| d.child(Self::pr_chip("conflicts".into(), GIT_DELETED)))
+                    .children(Self::pr_review_chip(&r.review))
+                    .when(r.checks.total() > 0, |d| {
+                        d.child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
+                                .flex_shrink_0()
+                                .text_size(px(10.))
+                                .text_color(rgb(checks_colour))
+                                .child(div().size(px(5.)).rounded_full().bg(rgb(checks_colour)))
+                                .child(checks_text),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .flex_shrink_0()
+                            .text_size(px(10.))
+                            .child(div().text_color(rgb(MUTED)).child(format!(
+                                "{} file{}",
+                                r.files,
+                                if r.files == 1 { "" } else { "s" }
+                            )))
+                            .child(div().text_color(rgb(GIT_NEW)).child(format!("+{}", r.added)))
+                            .child(
+                                div().text_color(rgb(GIT_DELETED)).child(format!("−{}", r.removed)),
+                            ),
+                    )
+                    // the thing the browser can't tell you: it's already checked
+                    // out next door
+                    .when_some(here, |d, folder| d.child(Self::pr_chip(folder, FOLDER_ICON)))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .w(px(30.))
+                            .text_size(px(10.))
+                            .text_color(rgb(LINE_NUMBER))
+                            .child(age),
+                    )
+                    .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
+                        let github = e.modifiers().platform;
+                        this.prs_sel = ix;
+                        this.prs_open = false;
+                        this.focus_active(window, cx);
+                        if github {
+                            open_browser(&url);
+                        } else {
+                            this.open_pr_number(Some(number), cx);
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+
+        let foot = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .px_3()
+            .py_1p5()
+            .border_t_1()
+            .border_color(rgb(BORDER))
+            .text_size(px(10.))
+            .text_color(rgb(LINE_NUMBER))
+            .child("⌘B /beta  ·  ↩ open the body  ·  ⌘↩ open on GitHub  ·  ⌘R re-read  ·  esc close");
+
+        div()
+            .absolute()
+            .top(px(70.))
+            .left(px(left))
+            .w(px(w))
+            .bg(rgb(PANEL_BG))
+            .border_1()
+            .border_color(rgb(ACCENT))
+            .rounded_md()
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .track_focus(&self.prs_focus)
+            .on_key_down(cx.listener(Self::pr_screen_key))
+            .on_scroll_wheel(|_e, _w, cx| cx.stop_propagation())
+            .child(head)
+            .when(!rel.is_empty(), |d| {
+                d.child(
+                    div()
+                        .px_3()
+                        .pt_2()
+                        .text_size(px(10.))
+                        .text_color(rgb(MUTED))
+                        .child("Releases"),
+                )
+                .child(boxes)
+            })
+            .child(
+                div()
+                    .px_3()
+                    .pt_1()
+                    .pb_1()
+                    .text_size(px(10.))
+                    .text_color(rgb(MUTED))
+                    .child("Yours"),
+            )
+            .child(list)
+            .child(foot)
+    }
+
+    fn render_merge_confirm(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(c) = self.merge_confirm.as_ref() else {
+            return div().into_any_element();
+        };
+        let (pr, files) = (&c.doc, &c.files);
+        let w = 720.0_f32;
+        let left = ((self.win_width - w) / 2.0).max(0.);
+        let (checks_text, checks_colour) = pr.checks.summary();
+        let verb = "Merge";
+        let merging = c.merging;
+
+        // the header's own line, so the dialog says the same things in the same
+        // shapes rather than in new words
+        let head = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .child(
+                div()
+                    .px_1p5()
+                    .py(px(1.))
+                    .rounded_md()
+                    .bg(rgb(pr.state.color()))
+                    .text_size(px(11.))
+                    .text_color(rgb(SEL_TEXT))
+                    .child(pr.state.label()),
+            )
+            .child(branch_name_el(&pr.base).text_size(px(11.)))
+            .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child("←"))
+            .child(branch_name_el(&pr.head).text_size(px(11.)))
+            .when(pr.checks.total() > 0, |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .text_size(px(11.))
+                        .text_color(rgb(checks_colour))
+                        .child(div().size(px(6.)).rounded_full().bg(rgb(checks_colour)))
+                        .child(checks_text),
+                )
+            })
+            .child(div().flex_grow(1.0))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .child(format!("#{}", pr.number)),
+            );
+
+        let counts = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1p5()
+            .text_size(px(11.))
+            .child(div().text_color(rgb(TEXT)).child(pr.title.clone()).min_w(px(0.)).truncate())
+            .child(div().flex_grow(1.0))
+            .child(div().flex_shrink_0().text_color(rgb(MUTED)).child(format!(
+                "{} file{}",
+                pr.files,
+                if pr.files == 1 { "" } else { "s" }
+            )))
+            .child(div().flex_shrink_0().text_color(rgb(GIT_NEW)).child(format!("+{}", pr.added)))
+            .child(
+                div().flex_shrink_0().text_color(rgb(GIT_DELETED)).child(format!("−{}", pr.removed)),
+            );
+
+        let mut list = div()
+            .id("merge-files")
+            .flex()
+            .flex_col()
+            .max_h(px(420.))
+            .overflow_y_scroll()
+            .px_1()
+            .py_1();
+        if files.is_empty() {
+            list = list.child(
+                div()
+                    .px_2()
+                    .py_2()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .child("Reading the file list…"),
+            );
+        }
+        // drawn the way the project tree draws it: chevron, folder glyph, name,
+        // one row height, one indent step. A folder folds away with a click.
+        let collapsed = c.collapsed.clone();
+        for (ix, row) in merge_tree_rows(files).into_iter().enumerate() {
+            // inside a folded folder: nothing to draw
+            if collapsed.iter().any(|d| row.path.starts_with(&format!("{d}/"))) {
+                continue;
+            }
+            let is_dir = row.file.is_none();
+            let folded = is_dir && collapsed.contains(&row.path);
+            let key = row.path.clone();
+            let mut line = div()
+                .id(("merge-row", ix))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .h(px(22.))
+                .pl(px(8. + row.depth as f32 * 14.))
+                .pr_2()
+                // the project tree's rows take the app's own size; this matches
+                // it rather than inventing a smaller one for a dialog
+                .text_size(px(14.))
+                .child(
+                    div()
+                        .w(px(12.))
+                        .flex_shrink_0()
+                        .flex()
+                        .justify_center()
+                        .text_size(px(13.))
+                        .text_color(rgb(DIR))
+                        .child(if !is_dir {
+                            ""
+                        } else if folded {
+                            "▸"
+                        } else {
+                            "▾"
+                        }),
+                );
+            line = match row.file {
+                None => line
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(HOVER)))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .font_family(ICON_FONT)
+                            .text_size(px(13.))
+                            .text_color(rgb(FOLDER_ICON))
+                            .child(IC_FOLDER),
+                    )
+                    .child(div().text_color(rgb(DIR)).child(row.name))
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                        if let Some(c) = this.merge_confirm.as_mut() {
+                            if !c.collapsed.remove(&key) {
+                                c.collapsed.insert(key.clone());
+                            }
+                            cx.notify();
+                        }
+                    })),
+                Some(f) => {
+                    // the file-type badge and the status colour the PR pane uses,
+                    // so the same file looks the same in both trees
+                    let (badge, badge_colour) = ext_badge(Path::new(&f.path));
+                    line.child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(9.))
+                            .text_color(rgb(badge_colour))
+                            .child(badge),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_color(rgb(f.colour()))
+                            .child(row.name),
+                    )
+                    .child(div().flex_grow(1.0))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(12.))
+                            .text_color(rgb(GIT_NEW))
+                            .child(format!("+{}", f.added)),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .w(px(44.))
+                            .text_size(px(12.))
+                            .text_color(rgb(GIT_DELETED))
+                            .child(format!("−{}", f.removed)),
+                    )
+                }
+            };
+            list = list.child(line);
+        }
+
+        // the tick is only a question worth asking when there is an agent in
+        // this workspace to tell
+        let tell = self.merge_confirm.as_ref().is_some_and(|c| c.tell);
+        let has_agent = self.acp.is_some();
+        let hint = if has_agent {
+            "squash · bypasses the review requirement · ↩ merge · ⌥↩ merge quietly · esc cancel"
+        } else {
+            "squash · bypasses the review requirement · ↩ merge · esc cancel"
+        };
+        let buttons = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .border_t_1()
+            .border_color(rgb(BORDER))
+            .child(div().text_size(px(10.)).text_color(rgb(LINE_NUMBER)).child(hint))
+            .child(div().flex_grow(1.0))
+            .when(has_agent, |d| {
+                d.child(
+                    div()
+                        .id("merge-tell")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .mr_2()
+                        .when(!merging, |d| d.cursor_pointer())
+                        .child(check_box(tell))
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(if tell { TEXT } else { MUTED }))
+                                .child("Tell the agent"),
+                        )
+                        .on_click(cx.listener(|this, _e, _w, cx| {
+                            let Some(c) = this.merge_confirm.as_mut() else { return };
+                            if c.merging {
+                                return; // the choice is already on its way
+                            }
+                            c.tell = !c.tell;
+                            cx.notify();
+                        })),
+                )
+            })
+            .child(
+                div()
+                    .id("merge-cancel")
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_size(px(11.))
+                    .text_color(rgb(if merging { LINE_NUMBER } else { MUTED }))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .when(!merging, |d| {
+                        d.cursor_pointer().hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                    })
+                    .child("Cancel")
+                    .on_click(cx.listener(|this, _e, window, cx| {
+                        if this.merge_confirm.as_ref().is_some_and(|c| c.merging) {
+                            return;
+                        }
+                        this.merge_confirm = None;
+                        this.focus_active(window, cx);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .id("merge-go")
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_size(px(11.))
+                    // dimmed and unclickable while GitHub is deciding
+                    .bg(rgb(if merging { HOVER } else { ACCENT }))
+                    .text_color(rgb(if merging { MUTED } else { SEL_TEXT }))
+                    .when(!merging, |d| d.cursor_pointer().hover(|s| s.opacity(0.9)))
+                    .child(if merging { "Merging…" } else { verb })
+                    .on_click(cx.listener(|this, _e, window, cx| {
+                        this.do_confirmed_merge(window, cx)
+                    })),
+            );
+
+        div()
+            .absolute()
+            .top(px(90.))
+            .left(px(left))
+            .w(px(w))
+            .bg(rgb(PANEL_BG))
+            .border_1()
+            .border_color(rgb(ACCENT))
+            .rounded_md()
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .track_focus(&self.merge_focus)
+            .on_key_down(cx.listener(Self::merge_confirm_key))
+            // the wheel stops here: without this the editor underneath scrolls
+            // along with the list, since both are under the pointer
+            .on_scroll_wheel(|_e, _w, cx| cx.stop_propagation())
+            .child(head)
+            .child(counts)
+            .child(list)
+            .child(buttons)
+            .into_any_element()
+    }
+
+    fn render_prnum(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let w = 320.0_f32;
+        let left = ((self.win_width - w) / 2.0).max(0.);
+        div()
+            .absolute()
+            .top(px(120.))
+            .left(px(left))
+            .w(px(w))
+            .bg(rgb(PANEL_BG))
+            .border_1()
+            .border_color(rgb(ACCENT))
+            .rounded_md()
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .track_focus(&self.prnum_focus)
+            .on_key_down(cx.listener(Self::prnum_key))
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .child("Open pull request  [number or link]"),
+            )
+            .child(
+                div()
+                    .mx_3()
+                    .mb_3()
+                    .px_2()
+                    .py_1()
+                    .bg(rgb(BG))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .rounded_md()
+                    .text_color(rgb(TEXT))
+                    .child(self.prnum_query.render(self.caret(), SELECTION)),
+            )
+    }
+
     fn render_goto(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let w = 320.0_f32;
         let left = ((self.win_width - w) / 2.0).max(0.);
@@ -18795,6 +28556,686 @@ impl Storm {
                     .text_color(rgb(TEXT))
                     .child(self.goto_query.render(self.caret(), SELECTION)),
             )
+    }
+
+    /// The "new task" form: category, description, status, and the two optional
+    /// fields. Everything but the description can be left alone, which is what
+    /// keeps a thought cheap to file.
+    fn render_todo(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        // wide: the details field is where an agent's reasoning lands, and a
+        // narrow column turns a paragraph into a wall
+        let w = 840.0_f32.min((self.win_width - 80.0).max(420.0));
+        let left = ((self.win_width - w) / 2.0).max(0.);
+        let editing = self.todo_edit.is_some();
+        // one row of the form: a right-aligned label, then the control
+        // a row whose label carries a raw/md switch (only Details has one)
+        let md_on = self.todo_details_md;
+        let has_details = !self.todo_details.text.trim().is_empty();
+        let row = |label: &'static str, control: AnyElement| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .px_4()
+                .py_1p5()
+                .child(
+                    div()
+                        .w(px(84.))
+                        .flex_shrink_0()
+                        .text_size(px(11.))
+                        .text_color(rgb(MUTED))
+                        .flex()
+                        .justify_end()
+                        .child(label),
+                )
+                .child(div().flex_grow(1.0).min_w(px(0.)).child(control))
+        };
+        // the same row, with a raw/md switch tucked under its label
+        let row_with_toggle = |label: &'static str, control: AnyElement, cx: &mut Context<Self>| {
+            div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap_3()
+                .px_4()
+                .py_1p5()
+                .child(
+                    div()
+                        .w(px(84.))
+                        .flex_shrink_0()
+                        .flex()
+                        .flex_col()
+                        .items_end()
+                        .gap(px(2.))
+                        .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(label))
+                        .when(has_details, |d| {
+                            d.child(
+                                div()
+                                    .id("todo-details-toggle")
+                                    .px_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_size(px(9.))
+                                    .text_color(rgb(if md_on { COMMENT_MARK } else { LINE_NUMBER }))
+                                    .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                    .child(if md_on { "md" } else { "raw" })
+                                    .tooltip(tip("Rendered markdown, or the raw text"))
+                                    .on_click(cx.listener(|this, _e, window, cx| {
+                                        this.todo_details_md = !this.todo_details_md;
+                                        if !this.todo_details_md {
+                                            this.todo_field = 1;
+                                            window.focus(&this.todo_focus, cx);
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                        }),
+                )
+                .child(div().flex_grow(1.0).min_w(px(0.)).child(control))
+        };
+        // a text field, boxed, focused-looking when the typing goes to it, and
+        // clickable: ⇥ is for the keyboard, but a form you can't click into
+        // isn't a form
+        let input = |f: &Field,
+                     placeholder: &'static str,
+                     idx: usize,
+                     caret: &'static str,
+                     cx: &mut Context<Self>| {
+            let on = idx == self.todo_field;
+            div()
+                .id(("todo-input", idx))
+                .px_2()
+                .py_1()
+                .bg(rgb(BG))
+                .border_1()
+                .border_color(rgb(if on { ACCENT } else { BORDER }))
+                .rounded_md()
+                .cursor(CursorStyle::IBeam)
+                .text_size(px(12.5))
+                .text_color(rgb(TEXT))
+                .child(if f.is_empty() {
+                    div()
+                        .text_color(rgb(LINE_NUMBER))
+                        .child(format!("{placeholder}{}", if on { caret } else { "" }))
+                        .into_any_element()
+                } else {
+                    f.render(if on { caret } else { "" }, SELECTION).into_any_element()
+                })
+                .on_click(cx.listener(move |this, _e, window, cx| {
+                    this.todo_field = idx;
+                    window.focus(&this.todo_focus, cx);
+                    cx.notify();
+                }))
+                .into_any_element()
+        };
+        let caret = self.caret();
+        // category chips, the same set (and look) the workspace title uses
+        let mut cats = div().flex().flex_row().flex_wrap().gap_1();
+        for (i, (key, emoji, label)) in TITLE_TYPES.iter().enumerate() {
+            let on = self.todo_cat == Some(i);
+            let tip_text: SharedString = format!("{key} — {label}").into();
+            cats = cats.child(
+                div()
+                    .id(("todo-cat", i))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .px_1p5()
+                    .py(px(2.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(rgb(if on { SELECTED_BG } else { BG }))
+                    .border_1()
+                    .border_color(rgb(if on { ACCENT } else { BORDER }))
+                    .text_size(px(10.))
+                    .text_color(rgb(if on { SEL_TEXT } else { MUTED }))
+                    .child(div().text_size(px(11.)).child(*emoji))
+                    .child(*key)
+                    .tooltip(move |_w, cx| cx.new(|_| TooltipView { text: tip_text.clone() }).into())
+                    .on_click(cx.listener(move |this, _e, window, cx| {
+                        this.todo_cat = (this.todo_cat != Some(i)).then_some(i);
+                        window.focus(&this.todo_focus, cx);
+                        cx.notify();
+                    })),
+            );
+        }
+        // status chips, in the form's own order
+        let mut stats = div().flex().flex_row().gap_1();
+        for (i, st) in todo::Status::ALL.iter().enumerate() {
+            let on = i == self.todo_status;
+            let color = todo_color(*st);
+            stats = stats.child(
+                div()
+                    .id(("todo-status", i))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py(px(2.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(rgb(if on { SELECTED_BG } else { BG }))
+                    .border_1()
+                    .border_color(rgb(if on { color } else { BORDER }))
+                    .text_size(px(11.))
+                    .text_color(rgb(if on { SEL_TEXT } else { MUTED }))
+                    .child(div().w(px(7.)).h(px(7.)).rounded_full().flex_shrink_0().bg(rgb(color)))
+                    .child(st.label())
+                    .on_click(cx.listener(move |this, _e, window, cx| {
+                        this.todo_status = i;
+                        window.focus(&this.todo_focus, cx);
+                        cx.notify();
+                    })),
+            );
+        }
+        div()
+            .absolute()
+            .top(px(90.))
+            .left(px(left))
+            .w(px(w))
+            .bg(rgb(PANEL_BG))
+            .border_1()
+            .border_color(rgb(ACCENT))
+            .rounded_md()
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .track_focus(&self.todo_focus)
+            .on_key_down(cx.listener(Self::todo_key))
+            // dictation and IME arrive through `insertText:`, not as keys
+            .child(input_sink(self.todo_focus.clone(), cx.entity()))
+            .child(
+                div()
+                    .px_4()
+                    .pt_3()
+                    .pb_1()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .child(if editing { "Edit task" } else { "New task" }),
+            )
+            .child(row("Category", cats.into_any_element()))
+            .child(row(
+                "Description",
+                input(&self.todo_desc, "e.g., broken header alignment", 0, caret, cx),
+            ))
+            // the long half: context, what was decided, what to watch out for.
+            // ↩ writes a line here; ⌘↩ still files the task. A task you opened
+            // shows it rendered — the agent writes markdown in here — and one
+            // click puts the raw text back under the caret.
+            .child(row_with_toggle("Details", {
+                if self.todo_details_md {
+                    div()
+                        .id("todo-details-md")
+                        .px_2()
+                        .py_1()
+                        .bg(rgb(BG))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|s| s.border_color(rgb(ACCENT)))
+                        .child(md_text(&self.todo_details.text, 12.5, TEXT))
+                        .tooltip(tip("Click to edit the raw text"))
+                        .on_click(cx.listener(|this, _e, window, cx| {
+                            this.todo_details_md = false;
+                            this.todo_field = 1;
+                            window.focus(&this.todo_focus, cx);
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                } else {
+                    input(&self.todo_details, "anything worth remembering (optional)", 1, caret, cx)
+                }
+            }, cx))
+            .child(row("Status", stats.into_any_element()))
+            .child(row("Link", input(&self.todo_link, "https://… (optional)", 2, caret, cx)))
+            .child(row(
+                "Scope",
+                input(&self.todo_scope, "e.g., cli, sdk, admin (optional)", 3, caret, cx),
+            ))
+            .child(row(
+                "Client",
+                input(&self.todo_client, "e.g., Acme (optional)", 4, caret, cx),
+            ))
+            // what this belongs with: a batch filed out of one piece of work
+            // reads as a block in the list
+            .child(row(
+                "Group",
+                input(&self.todo_group, "e.g., license gated flags (optional)", 5, caret, cx),
+            ))
+            .child(
+                div()
+                    .mt_2()
+                    .px_4()
+                    .py_2()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .border_t_1()
+                    .border_color(rgb(BORDER))
+                    .text_size(px(10.))
+                    .text_color(rgb(LINE_NUMBER))
+                    .child(div().flex_grow(1.0).child("⇥ next field  ·  `fix:` picks a category  ·  ⌃←→ status  ·  esc cancel"))
+                    .child(
+                        div()
+                            .id("todo-create")
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .bg(rgb(SELECTED_BG))
+                            .border_1()
+                            .border_color(rgb(ACCENT))
+                            .text_size(px(11.))
+                            .text_color(rgb(SEL_TEXT))
+                            .child(if editing { "Save  ⌘↩" } else { "Create task  ⌘↩" })
+                            .on_click(cx.listener(|this, _e, window, cx| this.commit_todo(window, cx))),
+                    ),
+            )
+    }
+
+    fn todo_filter_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        if ks.key == "escape" {
+            // esc clears what you typed, or hands focus back when it's empty
+            if self.todo_filter.is_empty() {
+                self.focus_active(window, cx);
+            } else {
+                self.todo_filter.clear();
+            }
+        } else if !Self::text_comes_via_input_handler(ks) {
+            Self::field_input(&mut self.todo_filter, ks, cx, |_| true);
+        }
+        cx.notify();
+    }
+
+    /// The list, in the left bar. Rows walk todo → in progress → done on click,
+    /// the icon opens the line in the form, and ✕ drops it.
+    fn render_todo_pane(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let width = px(self.tree_width);
+        let filter_focused = self.todo_filter_focus.is_focused(window);
+        let here = self.folder_name();
+        let scope = self.todo_here_only.then_some(here.as_str());
+        let groups = todo::grouped(&self.todos, &self.todo_filter.text, scope);
+        let open_n = todo::open_count(&self.todos);
+        let done_n = self.todos.len() - open_n;
+        let empty = groups.is_empty();
+        let mut list = div().id("todo-pane-list").flex().flex_col().min_h(px(0.)).overflow_y_scroll();
+        for (name, rows) in groups {
+            // a batch filed out of one piece of work reads as a block; loose
+            // lines come last, under no heading at all
+            if !name.is_empty() {
+                let open_here = rows.iter().filter(|&&i| !self.todos[i].done()).count();
+                list = list.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .pt_2()
+                        .pb_1()
+                        .text_size(px(10.))
+                        .text_color(rgb(COMMENT_MARK))
+                        .child(div().flex_grow(1.0).truncate().child(name.clone()))
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_color(rgb(LINE_NUMBER))
+                                .child(format!("{open_here}/{}", rows.len())),
+                        ),
+                );
+            }
+            list = self.todo_rows(list, &rows, cx);
+        }
+        div()
+            .flex()
+            .flex_col()
+            .w(width)
+            .h_full()
+            .bg(rgb(BG))
+            .child(self.todo_pane_header(open_n, done_n, cx))
+            // type to narrow: text, details, scope, client, group, workspace
+            .child(
+                div()
+                    .h(px(28.))
+                    .px_3()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .relative()
+                    .child(input_sink(self.todo_filter_focus.clone(), cx.entity()))
+                    .track_focus(&self.todo_filter_focus)
+                    .on_key_down(cx.listener(Self::todo_filter_key))
+                    .id("todo-filter")
+                    .cursor(CursorStyle::IBeam)
+                    .on_click(cx.listener(|this, _e, window, cx| {
+                        window.focus(&this.todo_filter_focus, cx);
+                        cx.notify();
+                    }))
+                    .child(div().font_family(ICON_FONT).text_size(px(11.)).text_color(rgb(MUTED)).child(IC_SEARCH))
+                    .child(if self.todo_filter.is_empty() {
+                        div()
+                            .flex_grow(1.0)
+                            .text_size(px(12.))
+                            .text_color(rgb(MUTED))
+                            .child(format!("Filter tasks…{}", self.caret_if(filter_focused)))
+                    } else {
+                        div()
+                            .flex_grow(1.0)
+                            .text_size(px(12.))
+                            .text_color(rgb(TEXT))
+                            .child(self.todo_filter.render(self.caret_if(filter_focused), SELECTION))
+                    })
+                    .when(!self.todo_filter.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .id("todo-filter-clear")
+                                .px_1()
+                                .text_size(px(11.))
+                                .text_color(rgb(MUTED))
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(rgb(TEXT)))
+                                .child("✕")
+                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                    this.todo_filter.clear();
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
+            // which project's list: this one, or everything
+            .child({
+                let chip = |id: &'static str, label: String, on: bool, here_only: bool, cx: &mut Context<Self>| {
+                    div()
+                        .id(id)
+                        .px_2()
+                        .py(px(1.))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_size(px(10.))
+                        // the unselected one used to be BG on BG with a border
+                        // that barely shows: it read as absent, and the pair
+                        // looked like it jumped when the selection moved. Both
+                        // are slabs now, and only the colour changes.
+                        .bg(rgb(if on { SELECTED_BG } else { PANEL_BG }))
+                        .border_1()
+                        .border_color(rgb(if on { ACCENT } else { BORDER }))
+                        .text_color(rgb(if on { SEL_TEXT } else { MUTED }))
+                        .when(!on, |d| d.hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT))))
+                        .child(label)
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            this.todo_here_only = here_only;
+                            cx.notify();
+                        }))
+                };
+                let all_n = self.todos.len();
+                let here_n = todo::view(&self.todos, "", Some(here.as_str())).len();
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .h(px(26.))
+                    .px_3()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .child(chip("todo-here", format!("{here}  {here_n}"), self.todo_here_only, true, cx))
+                    .child(chip("todo-all", format!("All  {all_n}"), !self.todo_here_only, false, cx))
+            })
+            .child(if empty {
+                div()
+                    .flex_grow(1.0)
+                    .px_3()
+                    .py_2()
+                    .text_size(px(12.))
+                    .text_color(rgb(MUTED))
+                    .child(if !self.todo_filter.is_empty() {
+                        "Nothing matches that filter.".to_string()
+                    } else if self.todo_here_only {
+                        format!("Nothing written in {here}. ⌘⇧L writes one down, or see All.")
+                    } else {
+                        "Nothing on the list. ⌘⇧L writes one down.".to_string()
+                    })
+                    .into_any_element()
+            } else {
+                list.flex_grow(1.0).into_any_element()
+            })
+    }
+
+    /// The rows of one group.
+    fn todo_rows(
+        &self,
+        mut list: gpui::Stateful<Div>,
+        rows: &[usize],
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        for &i in rows {
+            let t = self.todos[i].clone();
+            let (id_click, id_edit) = (t.id.clone(), t.id.clone());
+            let (id_start, id_del) = (t.id.clone(), t.id.clone());
+            let color = todo_color(t.status);
+            let emoji = TITLE_TYPES
+                .iter()
+                .find(|(k, _, _)| *k == t.category)
+                .map(|(_, e, _)| *e)
+                .unwrap_or("");
+            let link = t.link.clone();
+            list = list.child(
+                div()
+                    .id(("todo-pane-row", i))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .px_3()
+                    .py_1p5()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(HOVER)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_start()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id(("todo-pane-dot", i))
+                                    .mt(px(1.))
+                                    .p(px(3.))
+                                    .rounded_full()
+                                    .flex_shrink_0()
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(HOVER)))
+                                    .child(
+                                        div().w(px(7.)).h(px(7.)).rounded_full().bg(rgb(color)),
+                                    )
+                                    .tooltip(tip("Todo → in progress → done"))
+                                    .on_mouse_down(MouseButton::Left, |_e, _w, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                                        todo::advance(&mut this.todos, &id_click);
+                                        this.save_todos();
+                                        cx.notify();
+                                    })),
+                            )
+                            .when(!emoji.is_empty(), |d| {
+                                d.child(div().flex_shrink_0().text_size(px(11.)).child(emoji))
+                            })
+                            .child(
+                                div()
+                                    .flex_grow(1.0)
+                                    .min_w(px(0.))
+                                    .text_size(px(12.))
+                                    .text_color(rgb(if t.done() { LINE_NUMBER } else { TEXT }))
+                                    .child(t.text.clone()),
+                            )
+                            .child(
+                                div()
+                                    .id(("todo-pane-start", i))
+                                    .flex_shrink_0()
+                                    .px_1()
+                                    .rounded_md()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(LINE_NUMBER))
+                                    .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(GIT_NEW)))
+                                    .child("▶")
+                                    .tooltip(tip("Hand this to the agent, and mark it in progress"))
+                                    .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
+                                    .on_click(cx.listener(move |this, _e, window, cx| {
+                                        this.start_todo(&id_start, window, cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id(("todo-pane-del", i))
+                                    .flex_shrink_0()
+                                    .px_1()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(LINE_NUMBER))
+                                    .hover(|s| s.text_color(rgb(GIT_DELETED)))
+                                    .child("✕")
+                                    .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
+                                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                                        todo::remove(&mut this.todos, &id_del);
+                                        this.save_todos();
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    // the details, clipped to one line: enough to know whether
+                    // to open it, never enough to crowd the list
+                    .when(!t.details.is_empty(), |d| {
+                        let first = t.details.lines().next().unwrap_or_default().to_string();
+                        let more = t.details.lines().count() > 1;
+                        d.child(
+                            div()
+                                .pl(px(15.))
+                                .truncate()
+                                .text_size(px(10.5))
+                                .text_color(rgb(MUTED))
+                                .child(if more { format!("{first} …") } else { first }),
+                        )
+                    })
+                    // the trimmings: where it was written, its scope, its age,
+                    // and the link if it has one
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1p5()
+                            .pl(px(15.))
+                            .text_size(px(9.))
+                            .text_color(rgb(LINE_NUMBER))
+                            .when(!t.scope.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .px_1()
+                                        .rounded_md()
+                                        .bg(rgb(HOVER))
+                                        .text_color(rgb(COMMENT_MARK))
+                                        .child(t.scope.clone()),
+                                )
+                            })
+                            .when(!t.client.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .px_1()
+                                        .rounded_md()
+                                        .bg(rgb(HOVER))
+                                        .text_color(rgb(FOLDER_ICON))
+                                        .child(t.client.clone()),
+                                )
+                            })
+                            .when(!t.origin.is_empty(), |d| {
+                                // provenance, not a label you chose: dim, and
+                                // last before the age
+                                d.child(div().child(t.origin.clone()))
+                            })
+                            .child(todo::age(t.created))
+                            .when(!link.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .id(("todo-pane-link", i))
+                                        .px_1()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .text_color(rgb(ACCENT))
+                                        .hover(|s| s.bg(rgb(HOVER)))
+                                        .child("link")
+                                        .on_mouse_down(MouseButton::Left, |_e, _w, cx| {
+                                            cx.stop_propagation()
+                                        })
+                                        .on_click(cx.listener(move |_t, _e, _w, _cx| {
+                                            open_browser(&link);
+                                        })),
+                                )
+                            }),
+                    )
+                    // the row opens the task; the dot is what moves it along
+                    .on_click(cx.listener(move |this, _e, window, cx| {
+                        this.edit_todo(&id_edit, window, cx);
+                    })),
+            );
+        }
+        list
+    }
+
+    /// The pane's own header: the count, "+ new", and a way to drop what's done.
+    fn todo_pane_header(&self, open_n: usize, done_n: usize, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+                    .h(px(32.))
+                    .px_3()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(12.))
+                    .text_color(rgb(MUTED))
+                    .child(div().flex_grow(1.0).child(format!("TODO  ·  {open_n} open")))
+                    .child(
+                        div()
+                            .id("todo-pane-new")
+                            .px_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_color(rgb(COMMENT_MARK))
+                            .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                            .child("+ new")
+                            .tooltip(tip("New task  (⌘⇧L)"))
+                            .on_click(cx.listener(|this, _e, window, cx| this.open_todo(window, cx))),
+                    )
+                    .when(done_n > 0, |d| {
+                        d.child(
+                            div()
+                                .id("todo-pane-clear")
+                                .px_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .text_size(px(11.))
+                                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                .child(format!("clear {done_n}"))
+                                .tooltip(tip("Drop everything already done"))
+                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                    let n = todo::clear_done(&mut this.todos);
+                                    this.save_todos();
+                                    this.show_flash(&format!("Cleared {n} done"), cx);
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .child(self.collapse_left_btn(cx))
     }
 
     fn render_finder(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -18927,6 +29368,12 @@ impl Storm {
     /// sidebar (same as toggling its activity-bar icon off).
     /// Header button that copies all given file paths (repo-relative, one per
     /// line) to the clipboard — handy to paste a changed-file list into an LLM.
+    /// The PR's changed paths that live under `under`, repo-relative. A file
+    /// path answers with itself, so one menu item works on either kind of row.
+    fn changed_paths_under(&self, under: &Path) -> Vec<String> {
+        self.pr_shown_files.iter().filter(|p| p.starts_with(under)).map(|p| self.rel(p)).collect()
+    }
+
     fn copy_paths_btn(&self, id: &'static str, paths: Vec<PathBuf>, cx: &mut Context<Self>) -> impl IntoElement {
         let n = paths.len();
         div()
@@ -18945,6 +29392,46 @@ impl Storm {
                 cx.write_to_clipboard(ClipboardItem::new_string(list));
                 this.show_flash(&format!("Copied {n} paths"), cx);
             }))
+    }
+
+    /// Header button that asks the running agent what the files now in the tree
+    /// changed. The copy button next to it exists because the answer to "what
+    /// is in this PR" used to be paste-the-list-and-ask by hand; this is that,
+    /// without the round trip through the clipboard.
+    ///
+    /// It sends the filtered set, not the whole PR: filtering to `packages/api`
+    /// and asking is how you read a 119-file change one area at a time.
+    fn ask_changed_btn(&self, id: &'static str, paths: Vec<PathBuf>, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id(id)
+            .px_1()
+            .flex_shrink_0()
+            .font_family(ICON_FONT)
+            .text_size(px(12.))
+            .text_color(rgb(MUTED))
+            .hover(|s| s.text_color(rgb(TEXT)))
+            .cursor_pointer()
+            .child(IC_AGENT)
+            .tooltip(tip("Ask the agent what changed"))
+            .on_click(cx.listener(move |this, _e, _w, cx| this.ask_agent_changed(paths.clone(), cx)))
+    }
+
+    /// Put the question in the agent's thread and show it going: the pane is
+    /// where the answer lands, and a prompt sent to a pane you can't see reads
+    /// as a button that did nothing.
+    fn ask_agent_changed(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let list: Vec<String> = paths.iter().map(|p| self.rel(p)).collect();
+        if list.is_empty() {
+            self.show_flash("Nothing in the tree to ask about", cx);
+            return;
+        }
+        let all = list.len() == self.pr_files.len();
+        let text = ask_changed_note(&list, &self.pr_base, all);
+        let label = ask_changed_label(&list);
+        self.agent_open = true;
+        self.send_agent_prompt_as(text, Some(label), cx);
+        self.agent_list.scroll_to_end();
+        cx.notify();
     }
 
     /// "collapse all" / "expand all" for a file tree pane.
@@ -19148,11 +29635,19 @@ impl Storm {
         // tab bar
         col = col.child(self.render_tabs(cx));
 
+        // the browser tab has no file, no breadcrumb and no editor: it is the
+        // address bar and the page, and nothing else belongs above it
+        if self.tabs.get(self.active).is_some_and(|t| t.browser) {
+            let page = self.render_mirror(cx);
+            return col.child(page);
+        }
         if has_tabs {
             // breadcrumb bar above the file (Zed-style): rel path + copy button
             let path = self.tabs[self.active].path.clone();
             let scratch = self.tabs[self.active].scratch;
-            let rel = if scratch {
+            let rel = if let Some(label) = self.tabs[self.active].label.clone() {
+                label // a PR's title, in full — the tab bar's copy is the cut one
+            } else if scratch {
                 path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
             } else {
                 self.rel(&path)
@@ -19230,10 +29725,22 @@ impl Storm {
                     )
                 });
             col = col.child(crumb);
+            // a fetched PR body: its state, branches, author and link are
+            // chrome, not prose — drawn here so `open` can be the colour it
+            // means rather than a word in a sentence
+            // a fetched PR body: the title and what it is, drawn as the head of
+            // the document rather than as a bar above it
+            if let Some(pr) = self.tabs[self.active].pr.clone() {
+                col = col.child(self.render_pr_header(&pr, cx));
+            }
             let tab = &self.tabs[self.active];
             if tab.preview && is_markdown(&tab.path) {
                 // rendered view reads the buffer, so unsaved edits show up too
                 let body = tab.editor.read(cx).text();
+                let source = body.clone();
+                // the document's folder, so `./shot.png` in a local file works
+                let base = tab.path.parent().map(|p| p.to_path_buf());
+                self.prefetch_md_images(&body, base, cx);
                 col = col.child(
                     div()
                         .id("md-preview")
@@ -19241,8 +29748,66 @@ impl Storm {
                         .min_h(px(0.))
                         .overflow_y_scroll()
                         .bg(rgb(BG))
-                        .child(md_doc(&body).px_4().py_3()),
+                        // the tab's shortcuts live on the `Editor` context, and
+                        // the editor itself isn't on screen in this mode
+                        .track_focus(&self.md_focus)
+                        // both: everything a file tab answers to (⌘W, ⌘S, ⌘C)
+                        // plus the formatting the rendered view adds
+                        .key_context({
+                            let mut k = gpui::KeyContext::default();
+                            k.add("Editor");
+                            k.add("MdPreview");
+                            k
+                        })
+                        .on_action(cx.listener(|this, _: &MdFind, w, cx| this.md_find_open_now(w, cx)))
+                        // the Editor entity isn't on screen in this mode, so
+                        // ⌘C has no handler unless this view provides one
+                        .on_action({
+                            let source = body.clone();
+                            cx.listener(move |this, _: &Copy, _w, cx| {
+                                let Some(text) = this.md_selection(&source) else { return };
+                                let n = text.chars().count();
+                                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                                this.show_flash(&format!("Copied {n} characters"), cx);
+                            })
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _e, window, cx| {
+                                window.focus(&this.md_focus, cx);
+                                cx.notify();
+                            }),
+                        )
+                        // right-click → copy the markdown it was rendered from
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                                this.md_source = source.clone();
+                                this.tree_ctx =
+                                    Some((f32::from(ev.position.x), f32::from(ev.position.y)));
+                                this.tree_ctx_kind = CtxKind::MdPreview;
+                                window.focus(&this.tree_ctx_focus, cx);
+                                cx.notify();
+                            }),
+                        )
+                        // the editor column: the window less the two side
+                        // panes, less this view's own padding
+                        .track_scroll(&self.md_scroll)
+                        .children(self.md_find_open.then(|| self.render_md_find(cx)))
+                        .child(
+                            self.md_doc_sel(
+                                &body,
+                                (self.win_width - self.tree_width - self.term_width - 70.0)
+                                    .max(240.0),
+                                cx,
+                            )
+                            .px_4()
+                            .py_3(),
+                        ),
                 );
+            } else if is_image_file(&tab.path) {
+                let path = tab.path.clone();
+                col = col.child(self.render_image_tab(&path, cx));
             } else {
                 let editor = tab.editor.clone();
                 col = col.child(div().flex_grow(1.0).min_h(px(0.)).child(editor));
@@ -19252,6 +29817,286 @@ impl Storm {
         }
 
         col
+    }
+
+    /// The band above a fetched pull-request body: what it is, where it goes,
+    /// who wrote it, and a way out to GitHub.
+    /// The top of a fetched pull-request body: its title, then what it is,
+    /// where it goes and who wrote it. Drawn on the document's own background
+    /// with the document's own margin, so it reads as the head of what you're
+    /// reading rather than as another bar of chrome above it.
+    fn render_pr_header(&self, pr: &PrDoc, cx: &mut Context<Self>) -> impl IntoElement {
+        // the same chip the topbar and the status card use, so a branch looks
+        // like a branch wherever it is named
+        let branch = |name: String| branch_name_el(&name).text_size(px(11.));
+        let url = pr.url.clone();
+        let syncing = self.pr_syncing.contains(&pr.number);
+        // nothing read yet: say that instead of showing a state, branches and
+        // counts that are all placeholders
+        if pr.loading {
+            return div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .flex_shrink_0()
+                .bg(rgb(BG))
+                .px_4()
+                .pt_3()
+                .text_size(px(12.))
+                .text_color(rgb(MUTED))
+                // no spinner: the only ticker in this view belongs to the
+                // agent, and one that doesn't turn looks broken
+                .child(div().size(px(6.)).rounded_full().bg(rgb(ACCENT)))
+                .child(format!("Reading #{} from GitHub…", pr.number));
+        }
+        let meta = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            // re-reading behind a body you are already looking at
+            .when(syncing, |d| {
+                d.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(10.))
+                        .text_color(rgb(ACCENT))
+                        .child("syncing…"),
+                )
+            })
+            .child(
+                div()
+                    .px_1p5()
+                    .py(px(1.))
+                    .rounded_md()
+                    .bg(rgb(pr.state.color()))
+                    .text_size(px(11.))
+                    .text_color(rgb(SEL_TEXT))
+                    .child(pr.state.label()),
+            )
+            .child(branch(pr.base.clone()))
+            .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child("←"))
+            .child(branch(pr.head.clone()))
+            .when(!pr.author.is_empty(), |d| {
+                d.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(MUTED))
+                        .child(format!("@{}", pr.author)),
+                )
+            })
+            // how big it is, the way a diff reports itself
+            .when(pr.files > 0, |d| {
+                let (files, added, removed) = (pr.files, pr.added, pr.removed);
+                d.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .text_size(px(11.))
+                        .child(
+                            div()
+                                .text_color(rgb(MUTED))
+                                .child(format!("{files} file{}", if files == 1 { "" } else { "s" })),
+                        )
+                        .child(div().text_color(rgb(GIT_NEW)).child(format!("+{added}")))
+                        .child(div().text_color(rgb(GIT_DELETED)).child(format!("−{removed}"))),
+                )
+            })
+            // what CI makes of it: the count that matters, in the colour that
+            // matters, with the names of whatever isn't green on hover
+            .when(pr.checks.total() > 0, |d| {
+                let (text, colour) = pr.checks.summary();
+                let names = pr.checks.notable.clone();
+                let checks_url = format!("{}/checks", pr.url);
+                let tip_text = if names.is_empty() {
+                    "Every check passed  ·  click to open them on GitHub".to_string()
+                } else {
+                    format!(
+                        "{}\n\nclick to open them on GitHub",
+                        names.iter().take(8).cloned().collect::<Vec<_>>().join("\n")
+                    )
+                };
+                d.child(
+                    div()
+                        .id("pr-doc-checks")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .px_1p5()
+                        .py(px(1.))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_size(px(11.))
+                        .text_color(rgb(colour))
+                        .hover(|s| s.bg(rgb(HOVER)))
+                        .child(div().size(px(6.)).rounded_full().bg(rgb(colour)))
+                        .child(text)
+                        .tooltip(move |_w, cx| {
+                            cx.new(|_| TooltipView { text: tip_text.clone().into() }).into()
+                        })
+                        .on_click(cx.listener(move |_this, _e, _w, _cx| {
+                            let _ = Command::new("open").arg(&checks_url).spawn();
+                        })),
+                )
+            })
+            .child(div().flex_grow(1.0))
+            // the repo's own CI commands: a comment is all they are
+            .when(pr.state == PrState::Open || pr.state == PrState::Draft, |d| {
+                let number = pr.number;
+                let posting = self.pr_cmd_posting;
+                d.children(["/e2e", "/vitest"].map(|cmd| {
+                    let busy = posting == Some(cmd);
+                    let idle = posting.is_none();
+                    div()
+                        .id(cmd)
+                        .px_1p5()
+                        .py(px(1.))
+                        .rounded_md()
+                        .text_size(px(11.))
+                        .font_family("Menlo")
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .text_color(rgb(if busy {
+                            ACCENT
+                        } else if idle {
+                            MUTED
+                        } else {
+                            LINE_NUMBER
+                        }))
+                        .when(idle, |d| {
+                            d.cursor_pointer().hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                        })
+                        .child(cmd)
+                        .tooltip(tip(if cmd == "/e2e" {
+                            "Comment /e2e on the pull request, which starts the e2e run"
+                        } else {
+                            "Comment /vitest on the pull request, which starts the unit tests"
+                        }))
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            this.post_pr_command(number, cmd, cx)
+                        }))
+                }))
+            })
+            // merging is not undoable, so the first click only arms it
+            .when(pr.state == PrState::Open || pr.state == PrState::Draft, |d| {
+                let busy = self.pr_merging == Some(pr.number);
+                let label = if busy { "Merging…" } else { "Merge" };
+                let number = pr.number;
+                d.child(
+                    div()
+                        .id("pr-doc-merge")
+                        .px_1p5()
+                        .py(px(1.))
+                        .rounded_md()
+                        .text_size(px(11.))
+                        .border_1()
+                        // while GitHub is merging there is nothing to click, so
+                        // it stops looking clickable: dimmed, no pointer, no
+                        // hover — the early return below is then a backstop
+                        // rather than the only thing saying no
+                        .border_color(rgb(if busy { BG } else { BORDER }))
+                        .text_color(rgb(if busy { LINE_NUMBER } else { MUTED }))
+                        .when(!busy, |d| {
+                            d.cursor_pointer().hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                        })
+                        .child(label)
+                        .tooltip(tip(
+                            "Squash-merges this pull request, bypassing the review requirement",
+                        ))
+                        .on_click(cx.listener(move |this, _e, window, cx| {
+                            if this.pr_merging.is_some() {
+                                return; // GitHub is already working on it
+                            }
+                            this.open_merge_confirm(number, window, cx);
+                        })),
+                )
+            })
+            .child(
+                div()
+                    .id("pr-doc-open")
+                    .px_1p5()
+                    .py(px(1.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_size(px(11.))
+                    .text_color(rgb(ACCENT))
+                    .hover(|s| s.bg(rgb(HOVER)))
+                    .child(format!("#{}  ↗", pr.number))
+                    .tooltip(tip("Open this pull request on GitHub"))
+                    .on_click(cx.listener(move |_this, _e, _w, _cx| {
+                        let _ = Command::new("open").arg(&url).spawn();
+                    })),
+            );
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .flex_shrink_0()
+            .bg(rgb(BG))
+            // the same margin the rendered markdown uses, so the title below
+            // lines up with the body below it
+            .px_4()
+            .pt_3()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    // top, not baseline: a title that wraps has its last line's
+                    // baseline at the bottom, which is where the number ended up
+                    .items_start()
+                    .gap_2()
+                    .text_size(px(21.))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    // the number leads: with several PR tabs open it is what
+                    // tells them apart, and a long title would push it off the
+                    // end if it trailed
+                    .child(div().flex_shrink_0().text_color(rgb(MUTED)).child(format!("#{}", pr.number)))
+                    .child(div().min_w(px(0.)).text_color(rgb(TEXT)).child(pr.title.clone())),
+            )
+            .child(meta)
+            // what the squash landed as. GitHub writes this message from the
+            // repo's own setting, and the merge itself tells you nothing about
+            // it — so it is shown here, and a click takes the whole thing.
+            .when_some(self.pr_merged_as.clone(), |d, (sha, message)| {
+                let subject = message.lines().next().unwrap_or("").to_string();
+                let full = message.clone();
+                d.child(
+                    div()
+                        .id("pr-merged-as")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .cursor_pointer()
+                        .text_size(px(11.))
+                        .text_color(rgb(MUTED))
+                        .hover(|s| s.text_color(rgb(TEXT)))
+                        .child(
+                            div()
+                                .px_1()
+                                .rounded_md()
+                                .bg(rgb(HOVER))
+                                .font_family("Menlo")
+                                .child(sha.clone()),
+                        )
+                        .child(div().min_w(px(0.)).truncate().child(subject))
+                        .tooltip(move |_w, cx| {
+                            cx.new(|_| TooltipView {
+                                text: format!("{full}\n\nclick to copy").into(),
+                            })
+                            .into()
+                        })
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(message.clone()));
+                            this.show_flash("Merge commit message copied", cx);
+                        })),
+                )
+            })
     }
 
     /// Empty-pane dashboard: a snapshot of the current work — branch, PR (with
@@ -19272,7 +30117,11 @@ impl Storm {
         };
 
         let mut card = div()
-            .w(px(460.))
+            // as wide as it can be, up to 460 — not 460 regardless. In a narrow
+            // centre column a fixed width ran out under the agent pane.
+            .w_full()
+            .max_w(px(460.))
+            .min_w(px(0.))
             .flex()
             .flex_col()
             .gap_3()
@@ -19400,7 +30249,7 @@ impl Storm {
 
         // admin (wby-next* only): clickable host + the same ▶ the topbar has.
         // The button's colour already says up/down, so no separate dot.
-        if let Some(url) = admin_url(&self.root) {
+        if let Some(url) = self.app_url() {
             let host = url.trim_start_matches("https://").trim_start_matches("http://").to_string();
             let open = url.clone();
             card = card.child(
@@ -19503,16 +30352,24 @@ impl Storm {
             .w_full()
             .h_full()
             .min_h(px(0.))
+            .min_w(px(0.))
             .flex()
             .flex_row()
             .items_center()
             .justify_center()
+            .overflow_hidden()
+            // room either side, so the card never sits against the pane edges
+            .px_4()
             .child(card)
     }
 
     fn render_tabs(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut bar = div()
             .h(px(34.))
+            // a fixed height is only fixed if it can't be squeezed: without
+            // this, anything tall below it in the column — a PR header, say —
+            // takes its height back out of the tabs
+            .flex_shrink_0()
             .flex()
             .flex_row()
             .items_center()
@@ -19523,15 +30380,26 @@ impl Storm {
 
         for (ix, tab) in self.tabs.iter().enumerate() {
             let active = ix == self.active;
-            let dirty = tab.editor.read(cx).is_dirty();
+            let browser = tab.browser;
+            let dirty = !browser && tab.editor.read(cx).is_dirty();
+            // a PR tab is its title; a file tab is its filename. A title can be
+            // a sentence, so it is cut to something a tab bar can hold.
             let name = tab
-                .path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
+                .label
+                .clone()
+                .map(|t| {
+                    const ROOM: usize = 34;
+                    if t.chars().count() > ROOM {
+                        t.chars().take(ROOM).collect::<String>() + "…"
+                    } else {
+                        t
+                    }
+                })
+                .or_else(|| tab.path.file_name().map(|n| n.to_string_lossy().to_string()))
                 .unwrap_or_default();
             // color the filename by its git status (added/modified/deleted),
             // falling back to the normal active/inactive text colors
-            let label_color = match self.git_status.get(&tab.path) {
+            let label_color = match (!browser).then(|| self.git_status.get(&tab.path)).flatten() {
                 Some(GitState::New) => GIT_NEW,
                 Some(GitState::Modified) => GIT_MODIFIED,
                 Some(GitState::Deleted) => GIT_DELETED,
@@ -19550,6 +30418,15 @@ impl Storm {
                 .border_color(rgb(BORDER))
                 .when(active, |d| d.bg(rgb(BG)))
                 .when(!active, |d| d.hover(|s| s.bg(rgb(HOVER))))
+                .when(browser, |d| {
+                    d.child(
+                        div()
+                            .font_family(ICON_FONT)
+                            .text_size(px(11.))
+                            .text_color(rgb(if active { TEXT } else { MUTED }))
+                            .child(IC_BROWSER),
+                    )
+                })
                 .child(
                     // label — click switches tab
                     div()
@@ -19622,15 +30499,16 @@ struct Workspace {
     /// The switcher was opened from a child view, which has no window handle —
     /// the next render claims focus for it.
     switcher_focus_pending: bool,
-    /// Project the mouse is over while the ⌥Tab switcher is up: releasing ⌥
-    /// commits this rather than the keyboard selection.
-    switcher_hover: Option<usize>,
     // blinking caret for the switcher's filter input
     caret_on: bool,
     switcher_scroll: ScrollHandle, // the row list scrolls when it outgrows the panel
     /// Project indices whose agent is mid-turn when ⌘Q was pressed; `Some` shows
     /// the "are you sure" panel instead of quitting.
     quit_busy: Option<Vec<usize>>,
+    /// One listener for the whole window, so a phone on the same network can
+    /// read any workspace. Always on: it costs a bound socket, and the work of
+    /// building a transcript only happens while a phone is actually polling.
+    remote: Option<rpc::RemoteHub>,
     quit_focus: FocusHandle,
 }
 
@@ -19647,16 +30525,20 @@ impl Workspace {
             switcher_query: Field::default(),
             switcher_quick: false,
             switcher_focus_pending: false,
-            switcher_hover: None,
             caret_on: true,
             switcher_scroll: ScrollHandle::new(),
             quit_busy: None,
+            remote: None,
             quit_focus: cx.focus_handle(),
         };
         // open every passed root as its own workspace
         for root in roots {
             ws.add_project(root, cx);
         }
+        // the phone's way in. Its own token, kept on disk, so the link survives
+        // a restart and a bookmark on the phone keeps working.
+        ws.remote = remote_token().and_then(rpc::RemoteHub::start);
+        ws.start_remote_poll(cx);
         // start on the first workspace that isn't parked; a paused one is only
         // the landing spot when every workspace is paused
         ws.active = ws
@@ -19664,6 +30546,45 @@ impl Workspace {
             .iter()
             .position(|p| !p.read(cx).ws_paused)
             .unwrap_or(0);
+        // Every workspace's agent comes up at launch, not when you first look at
+        // it. Resuming a session takes long enough that arriving at a workspace
+        // and waiting for it is its own chore — the old way meant ⌥Tabbing round
+        // the ring on startup just to wake them.
+        //
+        // Staggered, because each one is a node process and starting eight at
+        // once makes launch stutter for no gain: they only have to be ready
+        // before you get there.
+        cx.spawn(async move |this, cx| {
+            let Ok(count) = this.update(cx, |this, _| this.projects.len()) else { return };
+            for ix in 0..count {
+                let started = this.update(cx, |this, cx| {
+                    let Some(project) = this.projects.get(ix).cloned() else { return false };
+                    project.update(cx, |storm, cx| {
+                        if storm.acp.is_some() {
+                            return false; // the active one woke itself on render
+                        }
+                        // a parked workspace is one you are not working in:
+                        // starting its agent spends a process and a session
+                        // resume on work you have put down. It still wakes on
+                        // its own when you ⌥Tab back to it.
+                        if storm.ws_paused {
+                            return false;
+                        }
+                        storm.ensure_acp(cx);
+                        storm.autoresume_agent(cx);
+                        true
+                    })
+                });
+                match started {
+                    Ok(true) => {
+                        cx.background_executor().timer(Duration::from_millis(1200)).await
+                    }
+                    Ok(false) => continue,
+                    Err(_) => return,
+                }
+            }
+        })
+        .detach();
         // Slow repaint so per-project topbar state (branch names, attention dots)
         // pushed up from the child views stays current.
         cx.spawn(async move |this, cx| loop {
@@ -19712,6 +30633,23 @@ impl Workspace {
                     this.focus_pending = true;
                     cx.notify();
                 }
+            }
+            ProjectNav::HandOff { to, text, send } => {
+                let (to, send) = (*to, *send);
+                let Some(p) = this.projects.get(to).cloned() else { return };
+                let text = text.clone();
+                p.update(cx, |s, cx| {
+                    s.agent_open = true;
+                    if send {
+                        s.send_agent_prompt_by(text, None, Sender::You, cx);
+                    } else {
+                        s.agent_input.insert_text(&text);
+                        s.agent_focus_pending = true;
+                    }
+                });
+                this.active = to;
+                this.focus_pending = true;
+                cx.notify();
             }
             ProjectNav::Switcher => this.open_switcher(cx),
             ProjectNav::Open => this.open_project(cx),
@@ -19786,11 +30724,9 @@ impl Workspace {
         if self.projects.len() <= 1 {
             return;
         }
-        self.switcher_hover = None;
         if !self.switcher_open {
             self.switcher_open = true;
             self.switcher_query.clear();
-            self.switcher_hover = None; // stale hover from a previous open
             self.switcher_quick = true;
             window.focus(&self.switcher_focus, cx);
             // quick-switch only walks unpaused workspaces; start from the one
@@ -19815,15 +30751,12 @@ impl Workspace {
     fn switcher_modifiers(&mut self, ev: &ModifiersChangedEvent, _w: &mut Window, cx: &mut Context<Self>) {
         if self.switcher_open && self.switcher_quick && !ev.modifiers.alt {
             let filtered = self.switcher_matches(cx);
-            // the row under the cursor wins: if you went looking with the mouse,
-            // that's the one you meant, not wherever ⌥Tab left the selection
-            let target = self
-                .switcher_hover
-                .filter(|i| filtered.contains(i))
-                .or_else(|| filtered.get(self.switcher_sel).copied());
+            // whatever ⌥Tab landed on, and only that. Letting the row under the
+            // cursor win meant a pointer parked anywhere over the list hijacked
+            // the switch you were making with the keyboard.
+            let target = filtered.get(self.switcher_sel).copied();
             self.switcher_open = false;
             self.switcher_quick = false;
-            self.switcher_hover = None;
             if let Some(pi) = target {
                 self.switch_to(pi, cx);
             }
@@ -19849,7 +30782,6 @@ impl Workspace {
         self.switcher_quick = false;
         self.switcher_query.clear();
         self.switcher_sel = self.active;
-        self.switcher_hover = None;
         self.switcher_scroll.scroll_to_item(self.switcher_sel);
         window.focus(&self.switcher_focus, cx);
         cx.notify();
@@ -19876,7 +30808,7 @@ impl Workspace {
     /// Project indices matching the type-to-filter query (name or branch).
     fn switcher_matches(&self, cx: &App) -> Vec<usize> {
         let q = self.switcher_query.text.to_lowercase();
-        (0..self.projects.len())
+        let mut out: Vec<usize> = (0..self.projects.len())
             .filter(|&i| {
                 // ⌥Tab's rotation excludes paused workspaces entirely; ⌘E lists
                 // them (marked, and skipped by ↑↓) so they can be resumed
@@ -19892,13 +30824,22 @@ impl Workspace {
                     || s.folder_name().to_lowercase().contains(&q)
                     || s.branch.to_lowercase().contains(&q)
             })
-            .collect()
+            .collect::<Vec<_>>();
+        // free ones last, order otherwise untouched (a stable sort)
+        out.sort_by_key(|&i| self.ws_is_free(i, cx));
+        out
+    }
+
+    /// True when nobody is on this workspace: it's a slot to claim, not work in
+    /// progress. Free ones sort to the end of the switcher — they're what you
+    /// scan for when you want somewhere to start, and clutter otherwise.
+    fn ws_is_free(&self, i: usize, cx: &App) -> bool {
+        self.projects[i].read(cx).agent_rollup().is_some_and(|(s, _)| s.is_idle())
     }
 
     fn switcher_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let key = ev.keystroke.key.as_str();
         // typing or arrowing means the keyboard is choosing again
-        self.switcher_hover = None;
         let filtered = self.switcher_matches(cx);
         match key {
             "escape" => {
@@ -20213,6 +31154,90 @@ impl Workspace {
     }
 }
 
+impl Workspace {
+    /// Feed the phone and take what it types. Twice a second while someone is
+    /// looking, once every three seconds when nobody is — the snapshot is only
+    /// built when there is something to build it for.
+    fn start_remote_poll(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            let watched = this
+                .update(cx, |this, cx| {
+                    let Some(hub) = this.remote.as_ref() else { return None };
+                    // anything typed on the phone goes to the workspace it was
+                    // typed in, as if it had been typed in that pane
+                    for said in hub.drain_said() {
+                        if let Some(p) = this.projects.get(said.ws).cloned() {
+                            p.update(cx, |storm, cx| {
+                                // the pictures go on first, so the tokens they
+                                // add are part of the message that carries them
+                                let mut text = said.text;
+                                for (mime, b64) in said.imgs {
+                                    if let Some(label) = storm.attach_remote_image(&mime, &b64) {
+                                        text = format!("[{label}] {text}");
+                                    }
+                                }
+                                storm.send_agent_prompt_by(text, None, Sender::You, cx)
+                            });
+                        }
+                    }
+                    let watched = hub.watched();
+                    if watched {
+                        let wanted = hub.wanted().min(this.projects.len().saturating_sub(1));
+                        let wss: Vec<serde_json::Value> = this
+                            .projects
+                            .iter()
+                            .map(|p| {
+                                let s = p.read(cx);
+                                serde_json::json!({
+                                    "n": s.ws_title.clone().unwrap_or_else(|| s.folder_name()),
+                                    "busy": s.agent_busy,
+                                    // parked or marked idle on the desktop: the
+                                    // phone hides these behind the All toggle
+                                    "off": s.ws_paused || s.ws_idle,
+                                })
+                            })
+                            .collect();
+                        // only the open one's transcript is serialised; the rest
+                        // are two fields each
+                        let mut snap = this
+                            .projects
+                            .get(wanted)
+                            .map(|p| p.read(cx).thread_json())
+                            .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        // the pictures that transcript points at, uploaded once
+                        // each — `has_img` first, so an unchanged transcript
+                        // doesn't clone megabytes twice a second
+                        if let Some(p) = this.projects.get(wanted) {
+                            for (id, mime, img) in p.read(cx).thread_images() {
+                                if !hub.has_img(id) {
+                                    hub.put_img(id, mime, img.bytes.clone());
+                                }
+                            }
+                        }
+                        snap["wss"] = serde_json::Value::Array(wss);
+                        // where the desktop is looking, so a phone opening for
+                        // the first time lands on the session you were just in
+                        snap["active"] = serde_json::json!(this.active);
+                        hub.publish(snap.to_string());
+                    }
+                    Some(watched)
+                })
+                .ok()
+                .flatten();
+            let wait = match watched {
+                Some(true) => 500,
+                // a phone that just opened the page waits this long before the
+                // first snapshot has anything in it, so it is a second, not three
+                Some(false) => 1000,
+                None => break, // no hub, or the window is gone
+            };
+            cx.background_executor().timer(Duration::from_millis(wait)).await;
+        })
+        .detach();
+    }
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.active;
@@ -20237,20 +31262,19 @@ impl Render for Workspace {
             .iter()
             .map(|p| p.read(cx).agent_rollup().map(|(s, _)| s))
             .collect();
+        let remote_url = self.remote.as_ref().and_then(|h| h.url());
+        let remote_url_ip = self.remote.as_ref().and_then(|h| h.url_ip());
+        let remote_far = self.remote.as_ref().is_some_and(|h| h.is_far());
         self.projects[active].update(cx, |s, _| {
             s.ws_names = names;
             s.ws_roots = roots;
             s.ws_branches = branches;
             s.ws_states = states;
+            s.remote_url = remote_url;
+            s.remote_url_ip = remote_url_ip;
+            s.remote_far = remote_far;
             s.ws_active = active;
         });
-        // hide every background project's native WebView so it doesn't float
-        // over the active workspace (the active one re-shows its own on render)
-        for (i, p) in self.projects.iter().enumerate() {
-            if i != active {
-                p.update(cx, |s, _| s.park_browser());
-            }
-        }
         // focus the active project after a switch (render has the Window)
         if self.focus_pending {
             self.focus_pending = false;
@@ -20303,6 +31327,7 @@ impl Render for Workspace {
             let max_h = (f32::from(win.height) - top - 56.0).max(200.0);
             // vertical list, one full-width row per matching project
             let mut grid = div().flex().flex_col().gap_1().px_2().pb_2();
+            let mut free_seen = false;
             for (pos, &i) in filtered.iter().enumerate() {
                 let paused = self.projects[i].read(cx).ws_paused;
                 let client = self.projects[i].read(cx).ws_client.clone();
@@ -20330,18 +31355,20 @@ impl Render for Workspace {
                     _ => String::new(),
                 };
                 let free = agent.as_ref().is_some_and(|(s, _)| s.is_idle());
+                // free workspaces sit together at the end; a rule marks where
+                // "what's in flight" stops and "what's available" starts
+                if free && !free_seen {
+                    free_seen = true;
+                    if pos > 0 {
+                        grid = grid.child(div().h(px(1.)).my_1().mx_2().bg(rgb(BORDER)));
+                    }
+                }
                 let label_drag = name.clone();
                 grid = grid.child(
                     div()
                         .id(("ws-switch", i))
                         .relative()
                         .w_full()
-                        .on_mouse_move(cx.listener(move |this, _e: &MouseMoveEvent, _w, cx| {
-                            if this.switcher_hover != Some(i) {
-                                this.switcher_hover = Some(i);
-                                cx.notify();
-                            }
-                        }))
                         // min, not fixed: a row with an agent-state line is taller,
                         // and a fixed height clipped it into the row below
                         .min_h(px(64.))
@@ -20842,15 +31869,17 @@ impl DiffWindow {
         let (list, counts) = self
             .storm
             .read_with(cx, |s, _| {
+                // a resolved thread is filed away: it has left the editor's
+                // gutter and every count, so it has no business here either
                 let list = s
                     .review
                     .iter()
-                    .filter(|c| c.path == path)
+                    .filter(|c| c.path == path && !c.resolved)
                     .map(|c| (c.end, c.text.clone()))
                     .collect::<Vec<_>>();
                 // counts for every file, so the sidebar can mark them
                 let mut counts: HashMap<PathBuf, usize> = HashMap::new();
-                for c in &s.review {
+                for c in s.review.iter().filter(|c| !c.resolved) {
                     *counts.entry(c.path.clone()).or_insert(0) += 1;
                 }
                 (list, counts)
@@ -20890,7 +31919,7 @@ impl DiffWindow {
             .read_with(cx, |s, _| {
                 s.review
                     .iter()
-                    .find(|c| c.path == path && c.end == line)
+                    .find(|c| c.path == path && c.end == line && !c.resolved)
                     .map(|c| c.replies.clone())
                     .unwrap_or_default()
             })
@@ -20933,7 +31962,10 @@ impl DiffWindow {
         let has_note = self.comments.iter().any(|(l, _)| *l == self.rc_line);
         div()
             .min_h(px(rc_box_h(&self.rc_query.text, &replies)))
-            .w_full()
+            // no `w_full` here: a full-width box *plus* side margins is wider
+            // than what holds it, which is how the buttons ended up outside the
+            // pane. Stretching to the column and insetting by the margin is the
+            // same look, contained.
             .mx(px(RC_BOX_PAD))
             .my(px(RC_BOX_PAD))
             .px_2()
@@ -21109,10 +32141,21 @@ impl DiffWindow {
         // while filtering, ignore collapse state so every match is visible
         fn walk(node: &Node, depth: usize, prefix: &Path, collapsed: &HashSet<PathBuf>, filtering: bool, out: &mut Vec<DiffTreeRow>) {
             for (name, child) in &node.dirs {
-                let path = prefix.join(name);
-                out.push(DiffTreeRow { depth, label: name.clone(), dir: Some(path.clone()), file_idx: None });
+                // absorb a chain of single directories into one row, the way the
+                // project tree and the Changes pane do: `src/features/debugger`
+                // is one line, not three
+                let mut label = name.clone();
+                let mut path = prefix.join(name);
+                let mut cur = child;
+                while cur.files.is_empty() && cur.dirs.len() == 1 {
+                    let (cn, cc) = cur.dirs.iter().next().unwrap();
+                    label = format!("{label}/{cn}");
+                    path = path.join(cn);
+                    cur = cc;
+                }
+                out.push(DiffTreeRow { depth, label, dir: Some(path.clone()), file_idx: None });
                 if filtering || !collapsed.contains(&path) {
-                    walk(child, depth + 1, &path, collapsed, filtering, out);
+                    walk(cur, depth + 1, &path, collapsed, filtering, out);
                 }
             }
             for (name, idx) in &node.files {
@@ -21718,9 +32761,18 @@ impl Render for DiffWindow {
         let split = self.pane_split;
         // visible width of each pane: comment widgets are sized to this so they
         // stay fully on screen instead of extending into the scrollable width
+        // One set of widths for both the panes and the widgets inside them. They
+        // used to be worked out twice, and the second copy still assumed a 260px
+        // sidebar after it became resizable — so with the sidebar dragged wider
+        // the panes were sized for a window that didn't exist, and the comment
+        // box went off the right edge with them.
+        let win_w = f32::from(window.viewport_size().width);
         let sidebar = if self.files.len() > 1 { self.sidebar_w + 4.0 } else { 0.0 };
-        let area_w = (f32::from(window.viewport_size().width) - sidebar - 4.0).max(120.0);
-        let (left_vis, right_vis) = (area_w * split - 10.0, area_w * (1.0 - split) - 10.0);
+        let avail = (win_w - sidebar - 4.0).max(2.0); // minus the 4px divider
+        let lw = (avail * split).max(1.0);
+        let rw = (avail - lw).max(1.0);
+        // the widgets stop short of the scrollbar rather than under it
+        let (left_vis, right_vis) = (lw - 10.0, rw - 10.0);
         // the inline comment box lives in the right pane, under its row
         let comment_box = self
             .rc_open
@@ -21729,8 +32781,11 @@ impl Render for DiffWindow {
                 let focused = self.rc_focus.is_focused(window);
                 (self.rc_row, rc_gap_h(&self.rc_query.text, &replies), self.render_diff_comment_box(focused, cx))
             });
-        let left_pane = diff_pane(&self.rows, DiffSide::Left, &self.left_scroll, self.char_w, self.sel.as_ref(), &self.left_styles, &self.matches, self.cur_match, self.caret, self.caret_on, &[], None, left_vis.max(120.0));
-        let right_pane = diff_pane(&self.rows, DiffSide::Right, &self.right_scroll, self.char_w, self.sel.as_ref(), &self.right_styles, &self.matches, self.cur_match, self.caret, self.caret_on, &self.comments, comment_box, right_vis.max(120.0));
+        // a double-clicked identifier is marked on both sides, so the same name
+        // is findable across the diff rather than only where you clicked
+        let word = diff_selected_word(&self.rows, self.sel.as_ref());
+        let left_pane = diff_pane(&self.rows, DiffSide::Left, &self.left_scroll, self.char_w, self.sel.as_ref(), &self.left_styles, &self.matches, self.cur_match, self.caret, self.caret_on, &[], None, left_vis.max(120.0), word.as_deref());
+        let right_pane = diff_pane(&self.rows, DiffSide::Right, &self.right_scroll, self.char_w, self.sel.as_ref(), &self.right_styles, &self.matches, self.cur_match, self.caret, self.caret_on, &self.comments, comment_box, right_vis.max(120.0), word.as_deref());
         let divider = div()
             .w(px(4.))
             .h_full()
@@ -21746,12 +32801,7 @@ impl Render for DiffWindow {
                 }),
             );
         // explicit pixel widths (flex_grow split was unreliable — a pane's content
-        // min-width leaked through and skewed the ratio). Compute from the window:
-        let win_w = f32::from(window.viewport_size().width);
-        let sidebar_w = if self.files.len() > 1 { 260.0 } else { 0.0 };
-        let avail = (win_w - sidebar_w - 4.0).max(2.0); // minus the 4px divider
-        let lw = (avail * split).max(1.0);
-        let rw = (avail - lw).max(1.0);
+        // min-width leaked through and skewed the ratio); `lw`/`rw` above.
         let body = div()
             .flex()
             .flex_row()
@@ -21877,21 +32927,13 @@ impl Render for DiffWindow {
                             .child(format!("{viewed_count}/{total} viewed"))
                             .child(format!("{pct}%")),
                     )
-                    .child({
-                        let bar_w = 236.0_f32; // ~sidebar width minus padding
-                        div()
-                            .w(px(bar_w))
-                            .h(px(4.))
-                            .rounded_sm()
-                            .bg(rgb(HOVER))
-                            .child(
-                                div()
-                                    .w(px(bar_w * pct as f32 / 100.0))
-                                    .h_full()
-                                    .rounded_sm()
-                                    .bg(rgb(GIT_NEW)),
-                            )
-                    })
+                    .child(
+                        // full width of the window: the bar is about the whole
+                        // review, not about the sidebar it used to live in.
+                        // Same red → yellow → green ramp as the PR pane's, so
+                        // the colour means the same thing in both places.
+                        segmented_bar(pct, progress_color(pct), 8.),
+                    )
             });
             for (ri, row) in self.tree_rows().into_iter().enumerate() {
                 let indent = 8.0 + row.depth as f32 * 14.0;
@@ -22022,7 +33064,7 @@ impl Render for DiffWindow {
                             div()
                                 .flex_grow(1.0)
                                 .truncate()
-                                .text_size(px(13.))
+                                .text_size(px(14.)) // the project tree's size
                                 // colour file names by git status, like the trees
                                 // in the main window
                                 .text_color(rgb(if sel {
@@ -22030,10 +33072,14 @@ impl Render for DiffWindow {
                                 } else if is_dir {
                                     DIR
                                 } else {
+                                    // the PR pane's mapping, not the main
+                                    // window's: these two trees sit side by
+                                    // side over the same review, and a file
+                                    // that reads deleted-grey in one and
+                                    // deleted-red in the other reads as two
+                                    // different facts
                                     match row.file_idx.and_then(|i| self.files.get(i)).and_then(|p| self.states.get(p)) {
-                                        Some(GitState::New) => GIT_NEW,
-                                        Some(GitState::Modified) => GIT_MODIFIED,
-                                        Some(GitState::Deleted) => GIT_DELETED,
+                                        Some(state) => pr_status_color(*state),
                                         None => TEXT,
                                     }
                                 }))
@@ -22071,14 +33117,14 @@ impl Render for DiffWindow {
                 .h_full()
                 .flex()
                 .flex_col()
-                .bg(rgb(PANEL_BG))
+                // same ground as the project tree in the main window
+                .bg(rgb(BG))
                 .border_r_1()
                 .border_color(rgb(BORDER))
                 .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
                 .child(filter_row)
                 .children(chips)
-                .child(list)
-                .children(progress);
+                .child(list);
             // draggable edge between the sidebar and the two diff panes
             let sidebar_divider = div()
                 .w(px(4.))
@@ -22104,7 +33150,7 @@ impl Render for DiffWindow {
                 .child(sidebar)
                 .child(sidebar_divider)
                 .child(body);
-            col.child(content)
+            col.child(content).children(progress)
         } else {
             col.child(body)
         }
@@ -22348,6 +33394,24 @@ fn resolve_arg(arg: &str) -> Vec<PathBuf> {
     hits
 }
 
+/// Put TIDE's own icon in the dock. Run from a terminal, a Rust binary has no
+/// bundle and therefore no icon, so it shows up as the generic one; AppKit will
+/// take an image for the running app at any point after launch.
+#[cfg(target_os = "macos")]
+fn set_dock_icon() {
+    use objc2::ClassType;
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::{MainThreadMarker, NSData};
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let data = NSData::with_bytes(include_bytes!("../assets/tide-512.png"));
+    let Some(img) = NSImage::initWithData(NSImage::alloc(), &data) else { return };
+    // safe enough: a main-thread call on the shared app with an image we own
+    unsafe { NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&img)) };
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_dock_icon() {}
+
 fn main() {
     // Each CLI arg is a project root (globs allowed) opened as its own
     // workspace. With no args, reopen last session's workspaces; if there is no
@@ -22371,6 +33435,7 @@ fn main() {
     };
 
     application().run(move |cx: &mut App| {
+        set_dock_icon();
         // bundle the Codicon icon font + Inter (UI font)
         cx.text_system()
             .add_fonts(vec![
@@ -22453,6 +33518,11 @@ fn main() {
             // the commit pane is a palette command now — ⌘K opens the palette
             KeyBinding::new("cmd-shift-k", PushDialog, None),
             KeyBinding::new("cmd-shift-t", SetWsTitle, None),
+            KeyBinding::new("cmd-shift-l", TodoList, None),
+            KeyBinding::new("cmd-shift-p", PrScreen, None),
+            // walking an answer's file references: next / previous stop
+            KeyBinding::new("alt-]", WalkNext, None),
+            KeyBinding::new("alt-[", WalkPrev, None),
             // find in files (global)
             KeyBinding::new("cmd-shift-f", FindInFiles, None),
             // git branches/actions popup (global)
@@ -22480,9 +33550,18 @@ fn main() {
             KeyBinding::new("alt-c", QuoteAgentSel, Some("Agent")),
             KeyBinding::new("alt-shift-c", ShowComments, None),
             KeyBinding::new("alt-enter", SendComments, None),
+            // what you typed, or what you selected in an answer, handed to
+            // another workspace's agent
+            KeyBinding::new("alt-shift-enter", SendElsewhere, None),
             KeyBinding::new("cmd-f12", SendComments, None),
             KeyBinding::new("cmd-q", QuitApp, None),
             KeyBinding::new("cmd-shift-v", ToggleMdPreview, None),
+            // the rendered markdown view edits the source behind it. Listed
+            // after the Editor bindings: ⌘B is go-to-definition in a file, and
+            // the later binding is the one that wins where both contexts match
+            // ⌘F in a file is the editor's own search, which isn't on screen
+            // in the rendered view; this is the same thing over the document
+            KeyBinding::new("cmd-f", MdFind, Some("MdPreview")),
             // refresh PR status + admin health (topbar chip and status screen)
             KeyBinding::new("cmd-r", RefreshPr, None),
             // diff (opens in its own window)
@@ -22535,6 +33614,40 @@ mod short_cmd_tests {
         let out = short_cmd("yarn webiny watch api website admin graphql headless-cms file-manager");
         assert!(out.chars().count() <= 38, "{out}");
         assert!(out.ends_with('…'), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod md_flatten_tests {
+    use super::*;
+
+    /// Emphasis nests: a code span inside bold is still code. The flattener used
+    /// to push the bold run's text verbatim, so the backticks ended up on screen
+    /// around the very file paths they were marking.
+    #[test]
+    fn code_inside_bold_keeps_no_backticks() {
+        let rows = md_prepare("Yes — **all four are under `packages/api-aco`**, three in `src`.");
+        let row = &rows[0];
+        assert!(!row.text.contains('`'), "backticks reached the screen: {}", row.text);
+        assert_eq!(row.text.as_ref(), "Yes — all four are under packages/api-aco, three in src.");
+        // both code spans are monospaced, the one inside the bold included
+        let mono: Vec<&str> = row.mono.iter().map(|r| &row.text[r.clone()]).collect();
+        assert_eq!(mono, ["packages/api-aco", "src"]);
+        // and the bold still reads as bold, over its own text
+        assert!(row
+            .highlights
+            .iter()
+            .any(|(r, h)| h.font_weight == Some(gpui::FontWeight::BOLD)
+                && row.text[r.clone()].contains("all four are under")));
+    }
+
+    /// The same for italics, and for emphasis with nothing nested in it.
+    #[test]
+    fn plain_emphasis_still_works() {
+        let rows = md_prepare("a *slanted* word and **a loud one**");
+        let row = &rows[0];
+        assert_eq!(row.text.as_ref(), "a slanted word and a loud one");
+        assert!(row.highlights.iter().any(|(_, h)| h.font_style == Some(gpui::FontStyle::Italic)));
     }
 }
 
@@ -22609,6 +33722,198 @@ mod file_ref_tests {
         let refs = file_refs("in Icon.tsx.");
         assert_eq!(refs[0].path, "Icon.tsx");
     }
+    /// Models write ranges, and half the time with an en dash. Both halves are
+    /// part of the reference, and the walk uses them to show the whole span.
+    #[test]
+    fn a_line_range_is_one_reference() {
+        let refs = file_refs("see UpdateFolderWithFolderLevelPermissions.ts:43-51 for the check");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].line, 43);
+        assert_eq!(refs[0].end, 51);
+        let text = "see UpdateFolderWithFolderLevelPermissions.ts:43-51 for the check";
+        assert_eq!(&text[refs[0].range.clone()], "UpdateFolderWithFolderLevelPermissions.ts:43-51");
+        // en dash, em dash, and a backwards range that stays sane
+        assert_eq!(file_refs("CanAccessFolder.ts:13–19")[0].end, 19);
+        assert_eq!(file_refs("GetFlpWithCodeFlps.ts:14—16")[0].end, 16);
+        assert_eq!(file_refs("Foo.ts:51-43")[0].end, 51, "never before the first line");
+        // a plain reference ends where it always did
+        let one = file_refs("Icon.tsx:14");
+        assert_eq!((one[0].line, one[0].end), (14, 14));
+        assert_eq!(file_refs("Icon.tsx")[0].end, 0, "no line, no range");
+    }
+
+}
+
+#[cfg(test)]
+mod img_id_tests {
+    use super::*;
+
+    /// The phone fetches pictures by gpui's content hash, which is a full u64.
+    ///
+    /// Sent as a JSON number it comes back from `JSON.parse` as a double, and
+    /// every id past 2^53 arrives rounded — the phone then asks `/img` for a
+    /// picture that was never there and draws a broken image. A real id out of
+    /// a live transcript is the case to pin, because a small one in a test
+    /// passes happily.
+    #[test]
+    fn a_real_image_id_survives_the_trip() {
+        let id = 13_116_841_340_227_802_995u64;
+        assert!(id > (1u64 << 53), "the whole point is that it doesn't fit a double");
+        let v = serde_json::json!({ "imgs": [img_id(id)] });
+        let out = v["imgs"][0].as_str().expect("a string, not a number");
+        assert_eq!(out, "13116841340227802995");
+        // and `/img` turns it back into the same id, exactly
+        assert_eq!(out.parse::<u64>().unwrap(), id);
+        // what a double would have done to it
+        assert_ne!(id as f64 as u64, id);
+    }
+}
+
+#[cfg(test)]
+mod usage_block_tests {
+    use super::*;
+
+    fn limits(five: Option<f32>, week: Option<f32>) -> usage::Limits {
+        let w = |pct: f32| usage::Window { pct, resets_at: 0 };
+        usage::Limits { five_hour: five.map(w), seven_day: week.map(w), seen: 0 }
+    }
+
+    /// Under 100% nothing is held, and a reading that never arrived holds
+    /// nothing either — an unknown window is not a full one.
+    #[test]
+    fn room_left_blocks_nothing() {
+        assert!(usage_block_text(&usage_spent(None)).is_none());
+        assert!(usage_block_text(&usage_spent(Some(&limits(Some(99.4), Some(0.0))))).is_none());
+        assert!(usage_block_text(&usage_spent(Some(&limits(None, None)))).is_none());
+    }
+
+    /// At 100% the message names the window that's spent, because "which one"
+    /// decides whether the wait is hours or days.
+    #[test]
+    fn a_spent_window_says_which() {
+        let session = usage_block_text(&usage_spent(Some(&limits(Some(100.0), Some(12.0)))));
+        assert_eq!(session.as_deref(), Some("The 5-hour session window is at 100%"));
+        let weekly = usage_block_text(&usage_spent(Some(&limits(Some(3.0), Some(100.0)))));
+        assert_eq!(weekly.as_deref(), Some("The weekly window is at 100%"));
+        let both = usage_block_text(&usage_spent(Some(&limits(Some(100.0), Some(100.0)))));
+        assert_eq!(both.as_deref(), Some("Both plan windows are at 100%"));
+    }
+
+    /// The reading is clamped on the way in, so "over" still reads as spent.
+    #[test]
+    fn a_clamped_reading_still_counts() {
+        let l = usage::parse_limits(
+            r#"{"rate_limits":{"five_hour":{"used_percentage":140,"resets_at":0}}}"#,
+            0,
+        )
+        .expect("limits");
+        assert_eq!(l.five_hour.as_ref().map(|w| w.pct), Some(100.0));
+        assert!(usage_block_text(&usage_spent(Some(&l))).is_some());
+    }
+
+    /// The soonest window back is the one quoted: that's the wait that ends.
+    #[test]
+    fn the_nearer_reset_is_the_one_quoted() {
+        let soon = now_secs() as i64 + 2 * 3600 + 60;
+        let later = now_secs() as i64 + 48 * 3600;
+        let spent = [("The 5-hour session window", soon), ("The weekly window", later)];
+        let text = usage_block_text(&spent).expect("blocked");
+        assert!(text.contains("2h"), "{text}");
+        // and the skip is keyed to the last one back, so one click covers both
+        assert_eq!(spent.iter().map(|(_, r)| *r).max(), Some(later));
+    }
+}
+
+#[cfg(test)]
+mod pr_screen_tests {
+    use super::*;
+
+    /// The dates GitHub answers with, against values from `date -u -j -f`.
+    #[test]
+    fn github_timestamps_parse() {
+        assert_eq!(iso_secs("1970-01-01T00:00:00Z"), 0);
+        assert_eq!(iso_secs("2026-10-09T07:21:04Z"), 1_791_530_464);
+        // a leap day, because the civil-calendar arithmetic is where this breaks
+        assert_eq!(iso_secs("2024-02-29T12:00:00Z"), 1_709_208_000);
+        assert_eq!(iso_secs(""), 0);
+        assert_eq!(iso_secs("not a date"), 0);
+    }
+
+    fn row(head: &str) -> PrRow {
+        pr_row_from(&serde_json::json!({
+            "number": 5760,
+            "title": "Release 6.5.0",
+            "headRefName": head,
+            "baseRefName": "next",
+            "author": { "login": "adrians5j" },
+            "state": "OPEN",
+            "additions": 12,
+            "deletions": 3,
+            "changedFiles": 2,
+            "mergeable": "CONFLICTING",
+            "reviewDecision": "REVIEW_REQUIRED",
+            "updatedAt": "2026-10-09T07:21:04Z",
+        }))
+        .expect("a row")
+    }
+
+    /// Release PRs head the screen in their own boxes, so they have to be
+    /// recognisable from the head branch alone — that's all `gh` gives.
+    #[test]
+    fn release_branches_are_their_own_thing() {
+        let r = row("release/6.5.0");
+        assert!(r.is_release());
+        assert_eq!(r.release_name(), "6.5.0");
+        assert!(!row("adrian/fix-thing").is_release());
+    }
+
+    /// Everything the row shows comes out of one `gh pr list`.
+    #[test]
+    fn a_row_carries_what_the_screen_draws() {
+        let r = row("release/6.5.0");
+        assert_eq!((r.number, r.files, r.added, r.removed), (5760, 2, 12, 3));
+        assert_eq!(r.mergeable, "CONFLICTING");
+        assert_eq!(r.author, "adrians5j");
+        assert_eq!(r.state, PrState::Open);
+        // the filter matches the number, the title and either branch
+        let hay = r.haystack();
+        for needle in ["5760", "release 6.5.0", "next", "adrians5j"] {
+            assert!(hay.contains(needle), "{needle} not in {hay}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod legacy_admin_tests {
+    use super::*;
+
+    /// `wdev` is a `next` thing. Work aimed at 6.4 or 6.5 has to run the old
+    /// admin watch, whether that shows in the branch or only in its PR base.
+    #[test]
+    fn release_lines_keep_the_old_admin() {
+        assert!(legacy_admin("release/6.4.x", None));
+        assert!(legacy_admin("adrian/fix-thing", Some("release/6.5.x")));
+        assert!(legacy_admin("release/6.5.0", None));
+    }
+
+    #[test]
+    fn everything_else_gets_the_standalone_server() {
+        assert!(!legacy_admin("next", None));
+        assert!(!legacy_admin("adrian/fix-thing", Some("next")));
+        // 6.6 onwards has it
+        assert!(!legacy_admin("release/6.6.x", None));
+        assert!(!legacy_admin("adrian/fix-thing", None));
+    }
+
+    #[test]
+    fn the_url_follows_the_branch() {
+        let root = Path::new("/Users/adrian/dev/wby-next6");
+        assert_eq!(admin_url(root, false).unwrap(), "https://wby6.localhost");
+        // the old admin watch registers the folder, not an `admin{N}` host:
+        // the `admin` shell function registers wby-next6 as `admin6`
+        assert_eq!(admin_url(root, true).unwrap(), "https://admin6.localhost");
+        assert_eq!(admin_url(Path::new("/Users/adrian/dev/tide"), false), None);
+    }
 }
 
 #[cfg(test)]
@@ -22629,12 +33934,504 @@ mod session_title_tests {
     }
 
     #[test]
+    fn a_replayed_first_turn_sheds_the_briefing() {
+        // the real thing, so the marker the strip looks for stays in step with
+        // the briefing's last line
+        let sent = format!("{}what broke in the date parser?", Storm::tide_briefing_body());
+        assert_eq!(strip_briefing(&sent), "what broke in the date parser?");
+        // every later turn is yours alone and is left as it is
+        assert_eq!(strip_briefing("push it"), "push it");
+        // a turn that carried nothing but the briefing has nothing to show
+        assert_eq!(strip_briefing(&Storm::tide_briefing_body()), "");
+    }
+
+    #[test]
     fn a_real_title_keeps_its_first_line_clipped() {
         assert_eq!(session_title("Fix the SQL date bug\nand more"), Some("Fix the SQL date bug".into()));
         let long = "x".repeat(200);
         let out = session_title(&long).unwrap();
         assert_eq!(out.chars().count(), 71, "70 chars plus the ellipsis");
         assert!(out.ends_with('…'));
+    }
+}
+
+#[cfg(test)]
+mod image_size_tests {
+    use super::*;
+
+    #[test]
+    fn png_dimensions_come_out_of_the_ihdr() {
+        let mut b = b"\x89PNG\r\n\x1a\n".to_vec();
+        b.extend_from_slice(&[0, 0, 0, 13]); // chunk length
+        b.extend_from_slice(b"IHDR");
+        b.extend_from_slice(&1456u32.to_be_bytes());
+        b.extend_from_slice(&816u32.to_be_bytes());
+        assert_eq!(image_size(&b), Some((1456, 816)));
+        assert_eq!(image_size(&b).map(|(w, h)| w as f32 / h as f32), Some(1456.0 / 816.0));
+    }
+
+    #[test]
+    fn gif_reads_little_endian() {
+        let mut b = b"GIF89a".to_vec();
+        b.extend_from_slice(&200u16.to_le_bytes());
+        b.extend_from_slice(&100u16.to_le_bytes());
+        assert_eq!(image_size(&b), Some((200, 100)));
+    }
+
+    #[test]
+    fn jpeg_walks_to_the_start_of_frame() {
+        let mut b = vec![0xFF, 0xD8];
+        // a segment to skip over: marker, length (including the two length bytes)
+        b.extend_from_slice(&[0xFF, 0xE0, 0x00, 0x06, 1, 2, 3, 4]);
+        // SOF0: length, precision, height, width
+        b.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x11, 0x08]);
+        b.extend_from_slice(&600u16.to_be_bytes());
+        b.extend_from_slice(&800u16.to_be_bytes());
+        assert_eq!(image_size(&b), Some((800, 600)));
+        // a table, not a frame: walked past, not read as dimensions
+        let mut c = vec![0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x04, 0, 0];
+        c.extend_from_slice(&[0xFF, 0xC2, 0x00, 0x11, 0x08]);
+        c.extend_from_slice(&50u16.to_be_bytes());
+        c.extend_from_slice(&70u16.to_be_bytes());
+        assert_eq!(image_size(&c), Some((70, 50)));
+    }
+
+    #[test]
+    fn anything_else_has_no_shape_to_report() {
+        assert_eq!(image_size(b"not an image at all"), None);
+        assert_eq!(image_size(b"\x89PNG\r\n\x1a\n"), None); // truncated header
+        // a zero dimension has no shape to fit
+        let mut b = b"GIF89a".to_vec();
+        b.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(image_size(&b), Some((0, 0)));
+    }
+}
+
+#[cfg(test)]
+mod base_sync_tests {
+    use super::*;
+
+    #[test]
+    fn conflicted_paths_stop_at_the_prose() {
+        // git prints the tree it wrote, the conflicted paths, then a blank line
+        // and its running commentary — only the middle part is the answer
+        let out = "14f1750f1f2b9596ee7d713c5df5ac6cb11ff698\n                   packages/api/src/index.ts\n                   packages/ui/src/Form.tsx\n                   \n                   Auto-merging packages/api/src/index.ts\n                   CONFLICT (content): Merge conflict in packages/api/src/index.ts\n";
+        assert_eq!(
+            merge_tree_conflicts(out),
+            vec!["packages/api/src/index.ts", "packages/ui/src/Form.tsx"]
+        );
+    }
+
+    #[test]
+    fn a_clean_merge_names_no_files() {
+        assert_eq!(merge_tree_conflicts("14f1750\n"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn level_with_the_base_shows_nothing() {
+        let s = BaseSync {
+            base: "origin/next".into(),
+            behind: 0,
+            conflicts: Vec::new(),
+            gh_conflict: false,
+            unpushed: 0,
+        };
+        assert!(s.clean());
+        assert_eq!(s.short(), "next");
+        // behind but mergeable is still worth a chip
+        assert!(!BaseSync { behind: 3, ..s.clone() }.clean());
+        assert!(!BaseSync { conflicts: vec!["a.ts".into()], ..s.clone() }.clean());
+        // and so is GitHub disagreeing with a locally clean tree — that is the
+        // merge that was done here and never pushed
+        assert!(!BaseSync { gh_conflict: true, unpushed: 1, ..s }.clean());
+    }
+}
+
+#[cfg(test)]
+mod shot_box_tests {
+    use super::*;
+
+    #[test]
+    fn a_wide_shot_is_fitted_to_the_pane() {
+        // 1280x800 in a 900px pane: the width decides, and the height follows
+        let (w, h) = shot_box(1280., 800., 900., 720.);
+        assert_eq!(w, 900.);
+        assert!((h - 562.5).abs() < 0.01, "{h}");
+        assert!((w / h - 1280. / 800.).abs() < 1e-4, "the shape survives");
+    }
+
+    #[test]
+    fn a_tall_shot_is_fitted_to_the_ceiling() {
+        // a full-page capture: the height decides, so it narrows rather than
+        // filling the pane and running off the bottom
+        let (w, h) = shot_box(1280., 4000., 900., 720.);
+        assert_eq!(h, 720.);
+        assert!((w - 230.4).abs() < 0.01, "{w}");
+        assert!(w < 900., "narrower than the pane, as a tall picture must be");
+    }
+
+    #[test]
+    fn a_small_shot_is_left_alone() {
+        // never enlarged: a 300px screenshot in a 900px pane stays 300px
+        assert_eq!(shot_box(300., 200., 900., 720.), (300., 200.));
+    }
+
+    #[test]
+    fn nothing_comes_out_at_zero() {
+        let (w, h) = shot_box(1., 4000., 900., 720.);
+        assert!(w >= 1.0 && h >= 1.0, "{w}x{h}");
+    }
+}
+
+#[cfg(test)]
+mod duration_tests {
+    use super::*;
+
+    #[test]
+    fn a_duration_reads_as_one() {
+        assert_eq!(human_secs(0), "0s");
+        assert_eq!(human_secs(59), "59s");
+        assert_eq!(human_secs(60), "1m 0s");
+        assert_eq!(human_secs(95), "1m 35s");
+        assert_eq!(human_secs(3599), "59m 59s");
+        // the one that started this: 10078s told you nothing
+        assert_eq!(human_secs(10_078), "2h 47m");
+        assert_eq!(human_secs(86_400), "24h 0m");
+    }
+}
+
+#[cfg(test)]
+mod progress_bar_tests {
+    use super::*;
+
+    fn lit(pct: usize) -> Vec<f32> {
+        (0..BAR_CELLS).map(|c| cell_fill(pct, c)).collect()
+    }
+
+    #[test]
+    fn a_tenth_lights_exactly_one_cell() {
+        assert_eq!(lit(30), vec![1., 1., 1., 0., 0., 0., 0., 0., 0., 0.]);
+        assert_eq!(lit(0), vec![0.; BAR_CELLS]);
+        assert_eq!(lit(100), vec![1.; BAR_CELLS]);
+    }
+
+    #[test]
+    fn the_cell_in_progress_shows_the_remainder() {
+        // 35% is three full cells and the fourth half lit — the part that keeps
+        // the bar moving between tenths instead of jumping
+        let bar = lit(35);
+        assert_eq!(&bar[..3], &[1., 1., 1.]);
+        assert!((bar[3] - 0.5).abs() < 1e-5, "{bar:?}");
+        assert_eq!(&bar[4..], &[0.; 6]);
+    }
+
+    #[test]
+    fn nothing_overflows_its_cell() {
+        // a percentage past the end can't light more than the bar has
+        for pct in [0, 1, 37, 99, 100, 250] {
+            for (cell, fill) in lit(pct).into_iter().enumerate() {
+                assert!((0.0..=1.0).contains(&fill), "cell {cell} at {pct}%: {fill}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod word_highlight_tests {
+    use super::*;
+
+    #[test]
+    fn whole_words_only() {
+        let line = "    RuntimeTenant, Tenant, tenant, RuntimeTenant.Interface";
+        let hits = word_cols(line, "Tenant");
+        // "RuntimeTenant" twice and lowercase "tenant" are not matches
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        let (s, e) = hits[0];
+        assert_eq!(line.chars().skip(s).take(e - s).collect::<String>(), "Tenant");
+    }
+
+    #[test]
+    fn a_word_touching_punctuation_still_counts() {
+        // the common case: an identifier followed by a dot, comma or paren
+        assert_eq!(word_cols("this.runtimeTenant.assign(x)", "runtimeTenant"), vec![(5, 18)]);
+        assert_eq!(word_cols("[Tenant]", "Tenant"), vec![(1, 7)]);
+        assert_eq!(word_cols("Tenant", "Tenant"), vec![(0, 6)]);
+    }
+
+    #[test]
+    fn every_occurrence_on_the_line() {
+        assert_eq!(word_cols("a, a, ab, a", "a"), vec![(0, 1), (3, 4), (10, 11)]);
+    }
+
+    #[test]
+    fn nothing_to_match_is_no_match() {
+        assert!(word_cols("anything", "").is_empty());
+        assert!(word_cols("ab", "abcdef").is_empty(), "longer than the line");
+        assert!(word_cols("", "x").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod pr_file_tests {
+    use super::*;
+
+    fn at(path: &str) -> PrFile {
+        PrFile { path: path.into(), added: 1, removed: 0, change: "MODIFIED".into() }
+    }
+
+    fn shape(files: &[PrFile]) -> Vec<String> {
+        merge_tree_rows(files)
+            .iter()
+            .map(|r| format!("{}{}{}", "  ".repeat(r.depth), r.name, if r.file.is_some() { "" } else { "/" }))
+            .collect()
+    }
+
+    #[test]
+    fn files_nest_under_their_folders() {
+        let files = vec![at("packages/api/src/a.ts"), at("packages/api/src/b.ts")];
+        assert_eq!(
+            shape(&files),
+            vec!["packages/", "  api/", "    src/", "      a.ts", "      b.ts"]
+        );
+    }
+
+    #[test]
+    fn a_shared_parent_is_opened_once() {
+        // the second file only enters the folders the first one left
+        let files = vec![at("a/one/x.ts"), at("a/two/y.ts")];
+        assert_eq!(shape(&files), vec!["a/", "  one/", "    x.ts", "  two/", "    y.ts"]);
+    }
+
+    #[test]
+    fn a_folder_row_carries_the_path_it_folds_by() {
+        let rows = merge_tree_rows(&[at("packages/api/src/a.ts")]);
+        let dirs: Vec<&str> =
+            rows.iter().filter(|r| r.file.is_none()).map(|r| r.path.as_str()).collect();
+        assert_eq!(dirs, vec!["packages", "packages/api", "packages/api/src"]);
+        // folding "packages/api" has to hide the file under it, which is what
+        // the prefix test in the dialog relies on
+        assert!(rows.last().unwrap().path.starts_with("packages/api/"));
+        // and must not hide a sibling whose name merely starts the same way
+        let wider = merge_tree_rows(&[at("packages/api/a.ts"), at("packages/api-core/b.ts")]);
+        let other = wider.iter().find(|r| r.name == "b.ts").unwrap();
+        assert!(!other.path.starts_with("packages/api/"), "{}", other.path);
+    }
+
+    #[test]
+    fn a_root_file_has_no_folder_row() {
+        assert_eq!(shape(&[at("README.md")]), vec!["README.md"]);
+        // and a root file after a nested one closes the folders behind it
+        let files = vec![at("src/a.ts"), at("README.md")];
+        assert_eq!(shape(&files), vec!["src/", "  a.ts", "README.md"]);
+    }
+
+    fn file(change: &str) -> PrFile {
+        PrFile { path: "a.ts".into(), added: 1, removed: 0, change: change.into() }
+    }
+
+    #[test]
+    fn a_change_gets_the_colour_the_tree_uses() {
+        assert_eq!(file("ADDED").colour(), GIT_NEW);
+        assert_eq!(file("REMOVED").colour(), GIT_DELETED);
+        assert_eq!(file("RENAMED").colour(), FOLDER_ICON);
+        assert_eq!(file("MODIFIED").colour(), GIT_MODIFIED);
+        // anything GitHub invents later reads as a modification rather than
+        // showing nothing
+        assert_eq!(file("COPIED").colour(), GIT_MODIFIED);
+    }
+}
+
+#[cfg(test)]
+mod pr_checks_tests {
+    use super::*;
+
+    fn rollup(items: serde_json::Value) -> PrChecks {
+        pr_checks(&serde_json::json!({ "statusCheckRollup": items }))
+    }
+
+    #[test]
+    fn a_finished_run_counts_by_its_conclusion() {
+        let c = rollup(serde_json::json!([
+            { "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS" },
+            { "name": "lint", "status": "COMPLETED", "conclusion": "SKIPPED" },
+            { "name": "tests", "status": "COMPLETED", "conclusion": "FAILURE" },
+        ]));
+        assert_eq!((c.passed, c.failed, c.running), (2, 1, 0));
+        assert_eq!(c.notable, vec!["tests"], "only what isn't green is worth naming");
+        assert_eq!(c.summary().0, "1 of 3 checks failing");
+    }
+
+    #[test]
+    fn anything_unfinished_is_running_not_passing() {
+        let c = rollup(serde_json::json!([
+            { "name": "build", "status": "IN_PROGRESS" },
+            { "name": "e2e", "status": "QUEUED" },
+            { "name": "ok", "status": "COMPLETED", "conclusion": "SUCCESS" },
+        ]));
+        assert_eq!((c.passed, c.failed, c.running), (1, 0, 2));
+        assert_eq!(c.summary().0, "2 of 3 checks running");
+    }
+
+    #[test]
+    fn a_status_context_reports_state_instead_of_conclusion() {
+        // the older API shape, which has no `status` field at all
+        let c = rollup(serde_json::json!([
+            { "context": "ci/circleci", "state": "SUCCESS" },
+            { "context": "slop-cop", "state": "ERROR" },
+        ]));
+        assert_eq!((c.passed, c.failed), (1, 1));
+        assert_eq!(c.notable, vec!["slop-cop"]);
+    }
+
+    #[test]
+    fn failures_are_named_before_the_ones_still_running() {
+        let c = rollup(serde_json::json!([
+            { "name": "slow", "status": "IN_PROGRESS" },
+            { "name": "broken", "status": "COMPLETED", "conclusion": "FAILURE" },
+        ]));
+        assert_eq!(c.notable, vec!["broken", "slow"]);
+    }
+
+    #[test]
+    fn no_checks_at_all_is_not_a_pass() {
+        let c = pr_checks(&serde_json::json!({}));
+        assert_eq!(c.total(), 0, "nothing to report, so the chip stays away");
+        assert_eq!(rollup(serde_json::json!([])).total(), 0);
+        // and a green run reads as green
+        let all_good = rollup(serde_json::json!([
+            { "name": "one", "status": "COMPLETED", "conclusion": "SUCCESS" }
+        ]));
+        assert_eq!(all_good.summary().0, "1 check passed");
+    }
+}
+
+#[cfg(test)]
+mod pr_body_tests {
+    use super::*;
+
+    fn payload(body: &str) -> serde_json::Value {
+        serde_json::json!({
+            "number": 5824,
+            "title": "Merge 6.5.0 into next",
+            "body": body,
+            "url": "https://github.com/webiny/webiny-js/pull/5824",
+            "state": "OPEN",
+            "isDraft": false,
+            "baseRefName": "next",
+            "headRefName": "claude/cherry-pick-650-clean",
+            "author": { "login": "adrians5j" },
+            "changedFiles": 17,
+            "additions": 340,
+            "deletions": 120
+        })
+    }
+
+    #[test]
+    fn the_body_becomes_a_markdown_document() {
+        let (name, doc, meta) = pr_body_from(&payload("## What\n\nCherry-picks.")).unwrap();
+        // `.md`, so the tab renders it instead of showing the source
+        assert_eq!(name, "PR #5824.md");
+        // the document is the body someone wrote, and nothing else: the title,
+        // state, branches, author and link all belong to the header, which can
+        // colour and shape them in ways markdown can't
+        assert_eq!(doc.trim(), "## What\n\nCherry-picks.");
+        assert_eq!(meta.title, "Merge 6.5.0 into next");
+        assert!(!doc.contains("github.com"), "the link is a button, not a line");
+        assert!(!doc.contains("adrians5j"), "the author is a chip, not a line");
+        assert_eq!(meta.state, PrState::Open);
+        assert_eq!(meta.base, "next");
+        assert_eq!(meta.head, "claude/cherry-pick-650-clean");
+        assert_eq!(meta.author, "adrians5j");
+        assert_eq!(meta.number, 5824);
+        assert_eq!((meta.files, meta.added, meta.removed), (17, 340, 120));
+        assert_eq!(meta.url, "https://github.com/webiny/webiny-js/pull/5824");
+    }
+
+    #[test]
+    fn a_draft_reads_as_draft_rather_than_open() {
+        let mut v = payload("x");
+        v["isDraft"] = serde_json::json!(true);
+        assert_eq!(pr_body_from(&v).unwrap().2.state, PrState::Draft);
+        // and a merged one keeps its own colour
+        let mut merged = payload("x");
+        merged["state"] = serde_json::json!("MERGED");
+        assert_eq!(pr_body_from(&merged).unwrap().2.state, PrState::Merged);
+    }
+
+    #[test]
+    fn an_empty_body_says_so_instead_of_showing_nothing() {
+        let (_, doc, _) = pr_body_from(&payload("   ")).unwrap();
+        assert!(doc.contains("*No description.*"));
+        // and a payload that isn't a PR at all yields no document
+        assert!(pr_body_from(&serde_json::json!({})).is_none());
+    }
+}
+
+#[cfg(test)]
+mod pr_ref_tests {
+    use super::*;
+
+    fn refs(t: &str) -> Vec<(String, u64, String)> {
+        pr_refs(t).into_iter().map(|(r, repo, n)| (t[r].to_string(), n, repo)).collect()
+    }
+
+    #[test]
+    fn a_hash_number_is_a_pull_request() {
+        assert_eq!(refs("fixed in #5619"), vec![("#5619".into(), 5619, String::new())]);
+        // several on a line, brackets and all
+        let many = refs("The 6.4.10, 6.4.11 and 6.4.12 fixes (#5669, #5696, #5787)");
+        assert_eq!(many.len(), 3);
+        assert_eq!(many[0].1, 5669);
+        assert_eq!(many[2].0, "#5787");
+    }
+
+    #[test]
+    fn another_repos_number_carries_its_repo() {
+        let r = refs("see webiny/webiny-js#5619 for that");
+        assert_eq!(r, vec![("webiny/webiny-js#5619".into(), 5619, "webiny/webiny-js".into())]);
+    }
+
+    #[test]
+    fn tides_own_tokens_are_not_pull_requests() {
+        // the composer's attachment tokens carry their own numbering
+        assert!(refs("what abt [Pasted text #2 +12 lines] ?").is_empty());
+        assert!(refs("see [Image #1]").is_empty());
+        // but a reference after a closed token still counts
+        let after = refs("[Image #1] relates to #5844");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].1, 5844);
+        // and a plain bracket isn't a token
+        assert_eq!(refs("[see #5844]").len(), 1);
+    }
+
+    #[test]
+    fn colours_and_words_are_not_pull_requests() {
+        // six digits is a hex colour, and the cap keeps it out
+        assert!(refs("background #112233 on the card").is_empty());
+        assert!(refs("#2b2d30 is the panel").is_empty(), "letters aren't a number at all");
+        // glued to a word, so not a reference
+        assert!(refs("abc#12").is_empty());
+        assert!(refs("issue#5619").is_empty());
+        // a heading marker and a bare hash have nothing to point at
+        assert!(refs("# Heading").is_empty());
+        assert!(refs("#0").is_empty(), "there is no PR zero");
+    }
+
+    #[test]
+    fn a_link_needs_somewhere_to_point() {
+        let base = Some("https://github.com/webiny/webiny-js");
+        let links = pr_links("fixed in #5619", base);
+        assert!(matches!(
+            &links[0].1,
+            LinkTarget::Url(u) if u == "https://github.com/webiny/webiny-js/pull/5619"
+        ));
+        // no origin to resolve against: a bare number stays plain text
+        assert!(pr_links("fixed in #5619", None).is_empty());
+        // one that names its own repo doesn't need ours
+        assert!(matches!(
+            &pr_links("see other/repo#42 there", None)[0].1,
+            LinkTarget::Url(u) if u == "https://github.com/other/repo/pull/42"
+        ));
     }
 }
 
@@ -22952,3 +34749,850 @@ mod review_persist_tests {
         assert_eq!(out[0].end, 2); // end defaults to line
     }
 }
+
+
+
+
+
+#[cfg(test)]
+mod md_image_tests {
+    use super::*;
+
+    /// `![alt](src)` becomes a picture, not the literal text it used to render
+    /// as. A PR body's screenshot section is the case that matters.
+    #[test]
+    fn an_image_line_parses_as_an_image() {
+        let body = "Before, with an override pointing at a dead localhost:3000:\n\n\
+                    ![before](https://raw.githubusercontent.com/webiny/webiny-js/abc123/.github/pr-assets/5966/before-override.png)\n";
+        let rows = md_prepare(body);
+        let imgs: Vec<_> = rows.iter().flat_map(|r| r.images.clone()).collect();
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].0, "before");
+        assert!(imgs[0].1.ends_with("before-override.png"), "{}", imgs[0].1);
+        // and the markup is gone from the text rather than printed
+        let text: String = rows.iter().map(|r| r.text.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(!text.contains("!["), "the literal markup survived: {text}");
+        assert!(!text.contains("raw.githubusercontent"), "the url survived: {text}");
+    }
+
+    /// A `*` inside a URL must not start a run of italics, and a title after
+    /// the URL is not part of it.
+    #[test]
+    fn awkward_image_markup() {
+        let one = md_prepare("![a *b* c](http://x/y_*_z.png \"a title\")");
+        let imgs: Vec<_> = one.iter().flat_map(|r| r.images.clone()).collect();
+        assert_eq!(imgs[0].1, "http://x/y_*_z.png");
+        // a link is not an image: no leading `!`, so it stays text
+        let link = md_prepare("[not an image](http://x/y.png)");
+        assert!(link.iter().all(|r| r.images.is_empty()));
+    }
+
+    /// The format comes from the bytes. An extension is a guess.
+    #[test]
+    fn formats_are_sniffed_not_assumed() {
+        assert_eq!(img_format(b"\x89PNG\r\n\x1a\n...."), Some(gpui::ImageFormat::Png));
+        assert_eq!(img_format(&[0xff, 0xd8, 0xff, 0xe0]), Some(gpui::ImageFormat::Jpeg));
+        assert_eq!(img_format(b"GIF89a"), Some(gpui::ImageFormat::Gif));
+        assert_eq!(img_format(b"RIFF\0\0\0\0WEBP"), Some(gpui::ImageFormat::Webp));
+        assert_eq!(img_format(b"<html>"), None);
+        assert_eq!(img_format(b""), None);
+    }
+
+    /// A local picture beside the document, which is how a scratch note refers
+    /// to one. Nothing touches the network.
+    #[test]
+    fn a_relative_path_resolves_against_the_document() {
+        let dir = std::env::temp_dir().join(format!("tide-md-img-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("shot.png");
+        // a 1x1 PNG
+        std::fs::write(&png, [
+            0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,0,0,0,0x0d,0x49,0x48,0x44,0x52,
+            0,0,0,1,0,0,0,1,8,2,0,0,0,0x90,0x77,0x53,0xde,
+        ]).unwrap();
+        assert!(matches!(md_img_load("./shot.png", Some(&dir)), MdImg::Ready(..)));
+        assert!(matches!(md_img_load("shot.png", Some(&dir)), MdImg::Ready(..)));
+        assert!(matches!(md_img_load("nope.png", Some(&dir)), MdImg::Failed));
+        // not an image at all
+        std::fs::write(dir.join("a.png"), b"<!doctype html>").unwrap();
+        assert!(matches!(md_img_load("a.png", Some(&dir)), MdImg::Failed));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+
+#[cfg(test)]
+mod md_selection_tests {
+    use super::*;
+
+    /// Byte offsets come back from the text layout and can land mid-character.
+    /// Slicing a String there panics, and a PR body full of `→` and `—` is
+    /// exactly where that would happen.
+    #[test]
+    fn a_selection_never_splits_a_character() {
+        let text = "héllo wörld → done\nsecond line";
+        let rows = md_prepare(text);
+        let first = rows.iter().find(|r| !r.text.is_empty()).expect("a row");
+        let len = first.text.len();
+        // every offset, including the ones inside multi-byte characters
+        for a in 0..=len {
+            for b in 0..=len {
+                let t = first.text.as_ref();
+                let clamp = |x: usize| {
+                    let x = x.min(t.len());
+                    (0..=x).rev().find(|&i| t.is_char_boundary(i)).unwrap_or(0)
+                };
+                let (lo, hi) = (clamp(a.min(b)), clamp(a.max(b)));
+                let _ = &t[lo..hi]; // must not panic
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod md_map_tests {
+    use super::*;
+
+
+    /// And back the other way, which is how the caret is drawn.
+    #[test]
+    fn a_source_offset_finds_its_place_on_screen() {
+        let doc = "# Title\n\nsome **bold** text\n";
+        let rows = md_prepare(doc);
+        let p = rows.iter().position(|r| r.text.contains("some")).expect("the paragraph");
+        let (row, flat) = md_src_to_rc(&rows, doc.find("bold").unwrap()).expect("mapped");
+        assert_eq!(row, p);
+        assert_eq!(&rows[p].text[flat..flat + 4], "bold");
+        // a position inside the markers is not on screen at all
+        let stars = doc.find("**").unwrap();
+        let hit = md_src_to_rc(&rows, stars + 1);
+        assert!(hit.is_none() || hit.unwrap().0 == p);
+        // the heading's text maps back into the heading row
+        assert_eq!(md_src_to_rc(&rows, 2).map(|(r, _)| r), Some(0));
+    }
+
+}
+
+#[cfg(test)]
+mod md_select_tests {
+    use super::*;
+
+    /// Double-click takes the word under the pointer, from either end of it
+    /// and from the middle, and nothing when the pointer is on a space.
+    #[test]
+    fn a_word_is_what_surrounds_the_click() {
+        let t = "the quick brown-fox jumps";
+        assert_eq!(&t[word_at(t, 4)], "quick");
+        assert_eq!(&t[word_at(t, 6)], "quick");
+        assert_eq!(&t[word_at(t, 9)], "quick", "the far edge still belongs to it");
+        assert_eq!(&t[word_at(t, 12)], "brown-fox", "a hyphen reads as part of a word");
+        // the boundary between a word and the space after it belongs to the
+        // word: clicking the right half of "e" lands there, and taking "the"
+        // is what every other editor does with it
+        assert_eq!(&t[word_at(t, 3)], "the");
+        // in the middle of a run of spaces there is no word to take
+        assert_eq!(&"a  b"[word_at("a  b", 2)], "");
+        assert_eq!(&t[word_at(t, t.len())], "jumps");
+        // multi-byte text must not split a character
+        let u = "héllo wörld";
+        assert_eq!(&u[word_at(u, 2)], "héllo");
+        assert_eq!(&u[word_at(u, 9)], "wörld");
+    }
+
+}
+
+#[cfg(test)]
+mod pr_body_check_tests {
+    use super::*;
+
+    /// The ask compares against the PR's own base, not whatever `main` is, and
+    /// a plain click asks rather than rewrites.
+    #[test]
+    fn it_asks_about_the_right_branch() {
+        let q = pr_body_check(6001, "release/6.5.0", false);
+        assert!(q.contains("Is #6001's description still true?"), "{q}");
+        assert!(q.contains("gh pr view 6001 --json title,body"), "{q}");
+        assert!(q.contains("git log release/6.5.0..HEAD --oneline"), "{q}");
+        assert!(q.contains("git diff release/6.5.0...HEAD --stat"), "{q}");
+        assert!(q.contains("Don't edit anything"), "{q}");
+        assert!(!q.contains("gh pr edit"), "a question is not a rewrite: {q}");
+    }
+
+    /// The PR's own tour: the schema and the rules of any tour, plus where to
+    /// read the change from and what order to put it in.
+    #[test]
+    fn a_pr_tour_is_built_from_the_change() {
+        let q = pr_tour_request(6080, "next");
+        // it is a tour, so it still carries the shape an answer has to take
+        assert!(q.contains("$TIDE_RPC/tour"), "{q}");
+        assert!(q.contains("\"steps\""), "{q}");
+        // and it is this PR's
+        assert!(q.contains("of #6080 — what it changes"), "{q}");
+        assert!(q.contains("gh pr diff 6080"), "{q}");
+        assert!(q.contains("against `next`"), "{q}");
+        assert!(q.contains("the entry point first"), "{q}");
+        assert!(q.contains("version bumps"), "{q}");
+        // no base read yet: still a usable ask
+        assert!(pr_tour_request(42, "  ").contains("against its base"));
+    }
+
+    /// ⌥click asks for the rewrite too, and for the refresh that makes TIDE
+    /// show it without a reload.
+    #[test]
+    fn the_update_variant_asks_for_the_rewrite() {
+        let q = pr_body_check(6001, "next", true);
+        assert!(q.contains("gh pr edit"), "{q}");
+        assert!(q.contains("/refresh"), "{q}");
+        assert!(!q.contains("Don't edit anything"), "{q}");
+    }
+
+    /// No base read yet: still a usable question, minus commands with a hole
+    /// where the branch should be.
+    #[test]
+    fn without_a_base_it_still_reads() {
+        let q = pr_body_check(42, "  ", false);
+        assert!(q.contains("git log the base branch..HEAD") || q.contains("the base branch"), "{q}");
+        assert!(!q.contains(".. HEAD"), "{q}");
+    }
+}
+
+#[cfg(test)]
+mod image_tab_tests {
+    use super::*;
+
+    /// A picture opens as a picture. Everything else, SVG included, is text —
+    /// which is what you want to see for an SVG anyway.
+    #[test]
+    fn only_what_can_be_decoded_opens_as_a_picture() {
+        for p in ["a/shot.png", "a/SHOT.PNG", "x.jpg", "x.jpeg", "x.gif", "x.webp"] {
+            assert!(is_image_file(Path::new(p)), "{p}");
+        }
+        for p in ["logo.svg", "notes.md", "x.ico", "x.bmp", "Makefile", "x.png.txt"] {
+            assert!(!is_image_file(Path::new(p)), "{p}");
+        }
+    }
+
+    /// The key carries the mtime: retaking a screenshot under an open tab has
+    /// to show the new one, and the cache is keyed by string.
+    #[test]
+    fn the_key_moves_when_the_file_does() {
+        let dir = std::env::temp_dir().join(format!("tide-img-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("shot.png");
+        std::fs::write(&p, b"one").unwrap();
+        let first = image_key(&p);
+        assert!(first.starts_with(&p.to_string_lossy().to_string()));
+        // a file that isn't there still gets a key rather than panicking
+        assert!(image_key(&dir.join("gone.png")).ends_with("#0"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sizes_read_at_a_glance() {
+        assert_eq!(size_label(940), "940 B");
+        assert_eq!(size_label(254_000), "248 KB");
+        assert_eq!(size_label(3_565_158), "3.4 MB");
+    }
+}
+
+#[cfg(test)]
+mod briefing_tests {
+    use super::*;
+
+    /// The briefing is one long escaped string literal; a stray `\` turns a
+    /// curl line into something an agent will run and watch fail. These are
+    /// the pieces that have to survive the escaping intact.
+    #[test]
+    fn the_content_planner_lines_survive_the_escaping() {
+        let b = Storm::tide_briefing_body();
+        if std::env::var("SHOW_BRIEF").is_ok() {
+            let i = b.find("Insert this into content planner").unwrap();
+            let j = b[i..].find("Open the pull request").unwrap();
+            println!("{}", &b[i - 1..i + j]);
+        }
+        assert!(b.contains("curl -s -X POST localhost:47400/events"), "the endpoint");
+        assert!(b.contains("\"type\":\"post.drafted\""), "the event type");
+        assert!(b.contains("\"id\":\"cp:webiny:2026-11-03-rules-tab\""), "the id shape");
+        assert!(b.contains("A new id adds another post"), "a day holds several now");
+        assert!(b.contains("`content` — not `data`"), "the attachment trap");
+        assert!(b.contains("curl -s localhost:47400/consumers"), "the check");
+        // and the line about how to write, which is easy to lose in an edit
+        assert!(b.contains("Write plainly."), "the plain-language rule");
+        // and no line of it ran into the next one
+        assert!(!b.contains("post.drafted\",         "), "{b}");
+    }
+}
+
+#[cfg(test)]
+mod tour_group_tests {
+    use super::*;
+
+    fn stop_g(path: &str, group: &str) -> Stop {
+        Stop {
+            path: path.into(),
+            line: 1,
+            end: 1,
+            title: "t".into(),
+            group: group.into(),
+            said: String::new(),
+        }
+    }
+
+    /// A node takes the section of the stop it starts with, so the map can
+    /// head each stretch where it begins.
+    #[test]
+    fn a_visit_belongs_to_a_section() {
+        let stops = vec![
+            stop_g("aws/a.ts", "The AWS side"),
+            stop_g("aws/b.ts", "The AWS side"),
+            stop_g("standalone/c.ts", "Standalone"),
+            stop_g("standalone/c.ts", "Standalone"),
+            stop_g("shared/d.ts", ""),
+        ];
+        let nodes = tour_nodes(&stops);
+        assert_eq!(nodes.len(), 4);
+        assert_eq!(nodes[0].group, "The AWS side");
+        assert_eq!(nodes[1].group, "The AWS side");
+        assert_eq!(nodes[2].group, "Standalone");
+        assert_eq!(nodes[3].group, "", "a tour may group only part of itself");
+        // the heading is drawn where the section changes, which is nodes 0 and 2
+        let mut heads = Vec::new();
+        let mut section = String::new();
+        for (i, n) in nodes.iter().enumerate() {
+            if !n.group.trim().is_empty() && n.group != section {
+                section = n.group.clone();
+                heads.push(i);
+            }
+        }
+        assert_eq!(heads, vec![0, 2]);
+    }
+
+    /// The note the clarify button writes has to read as something you would
+    /// have typed: an instruction, not a shrug.
+    #[test]
+    fn clarify_asks_for_something() {
+        assert!(CLARIFY_NOTE.contains("isn't clear"));
+        assert!(CLARIFY_NOTE.contains("plainer terms"));
+        assert!(!CLARIFY_NOTE.contains("  "), "no double spaces from the line continuations");
+    }
+}
+
+#[cfg(test)]
+mod tour_end_tests {
+    use super::*;
+
+    fn walk_of(n: usize) -> Walk {
+        Walk {
+            stops: (0..n)
+                .map(|i| Stop {
+                    path: format!("src/f{i}.ts"),
+                    line: 1,
+                    end: 2,
+                    title: format!("step {i}"),
+                    group: String::new(),
+                    said: String::new(),
+                })
+                .collect(),
+            at: 0,
+            msg: None,
+            tour: Some("A tour".into()),
+            id: Some("t1".into()),
+            intro: false,
+            done: false,
+            list: true,
+            here: None,
+        }
+    }
+
+    /// The walk has two ends, and neither of them wraps round to the other.
+    #[test]
+    fn the_ends_are_ends() {
+        let mut w = walk_of(3);
+        w.intro = true;
+        // ‹ at the start is spent; › leaves the card for the first stop
+        assert!(w.intro && !w.done);
+        w.intro = false;
+        w.at = 2;
+        // › past the last stop lands on the end card, not back at stop 1
+        w.done = true;
+        assert_eq!(w.at, 2, "the cursor stays on the last stop behind the card");
+        // and at either end no file node holds the highlight: the bookend does
+        for (intro, done) in [(true, false), (false, true)] {
+            let here = (!done && !intro)
+                .then(|| tour_nodes(&w.stops).iter().position(|n| n.steps.contains(&w.at)))
+                .flatten();
+            assert!(here.is_none(), "intro={intro} done={done}");
+        }
+    }
+
+    /// The map draws a node per file and then the end of the route, so the
+    /// walk has somewhere to finish rather than stopping mid-column.
+    #[test]
+    fn the_route_has_an_end() {
+        let w = walk_of(3);
+        assert_eq!(tour_nodes(&w.stops).len(), 3, "three files");
+        // the end is not a file: it is drawn after the nodes, and `done` is
+        // what lights it
+        assert!(!w.done);
+        let mut w = w;
+        w.done = true;
+        // and once done, no file node is the current one
+        let here = (!w.done)
+            .then(|| tour_nodes(&w.stops).iter().position(|n| n.steps.contains(&w.at)))
+            .flatten();
+        assert!(here.is_none(), "the end node holds the highlight instead");
+    }
+}
+
+#[cfg(test)]
+mod tour_thread_tests {
+    use super::*;
+
+    fn turn(who: &str, text: &str) -> ReviewReply {
+        ReviewReply { who: who.into(), text: text.into() }
+    }
+
+    /// The editor parts its lines for the card, and the thread is part of the
+    /// card: without this the conversation would be drawn over the code.
+    #[test]
+    fn a_thread_claims_its_own_room() {
+        assert_eq!(tour_thread_h(&[]), 0.0, "no thread, no gap");
+        let one = tour_thread_h(&[turn("you", "why not await it?")]);
+        assert!(one > 0.0);
+        let two = tour_thread_h(&[turn("you", "why not await it?"), turn("agent", "because…")]);
+        assert!(two > one, "a reply takes more room than the note alone");
+        // a long answer stops pushing the file apart and scrolls instead
+        let wall = turn("agent", &"x".repeat(TOUR_CARD_COLS * 40));
+        let capped = tour_thread_h(&[wall.clone(), wall.clone(), wall]);
+        assert!(capped <= 11.0 * TOUR_LINE_H + 10.0, "capped at the scroll point");
+    }
+}
+
+#[cfg(test)]
+mod tour_map_tests {
+    use super::*;
+
+    fn stop_in(path: &str, title: &str) -> Stop {
+        Stop {
+            path: path.into(),
+            line: 1,
+            end: 1,
+            title: title.into(),
+            group: String::new(),
+            said: String::new(),
+        }
+    }
+
+    /// The map follows the walk: a node per visit, so the arrows point at the
+    /// stop that actually comes next, and a file the tour returns to shows up
+    /// again where it is returned to.
+    #[test]
+    fn the_map_is_the_route_not_the_file_list() {
+        let stops = vec![
+            stop_in("src/a.ts", "one"),
+            stop_in("src/a.ts", "two"),
+            stop_in("pkg/deep/b.ts", "three"),
+            stop_in("src/a.ts", "four"),
+            stop_in("src/c.ts", "five"),
+        ];
+        let nodes = tour_nodes(&stops);
+        assert_eq!(nodes.len(), 4, "a.ts is visited twice, so it is two nodes");
+        assert_eq!(nodes[0].file, "a.ts");
+        assert_eq!(nodes[0].dir, "src");
+        assert_eq!(nodes[0].steps, vec![0, 1], "the run it spends there");
+        assert!(!nodes[0].repeat, "the first visit is not a return");
+        assert_eq!(nodes[1].file, "b.ts");
+        assert_eq!(nodes[1].steps, vec![2]);
+        assert_eq!(nodes[2].file, "a.ts");
+        assert_eq!(nodes[2].steps, vec![3]);
+        assert!(nodes[2].repeat, "coming back is marked");
+        assert_eq!(nodes[3].file, "c.ts");
+        assert!(!nodes[3].repeat);
+        // every stop lands in exactly one node, so the highlight is never
+        // ambiguous
+        for i in 0..stops.len() {
+            assert_eq!(nodes.iter().filter(|n| n.steps.contains(&i)).count(), 1, "stop {i}");
+        }
+    }
+
+    /// A file with no folder, and one with a long one: the label has to fit a
+    /// 300px column either way.
+    #[test]
+    fn the_folder_is_cut_to_its_tail() {
+        assert_eq!(dir_tail("", 2), "");
+        assert_eq!(dir_tail("src", 2), "src");
+        assert_eq!(dir_tail("src/api", 2), "src/api");
+        assert_eq!(
+            dir_tail("packages/background-tasks/src/api/features/TaskService", 2),
+            "…/features/TaskService"
+        );
+        let nodes = tour_nodes(&[stop_in("README.md", "x")]);
+        assert_eq!(nodes[0].file, "README.md");
+        assert_eq!(nodes[0].dir, "");
+    }
+}
+
+#[cfg(test)]
+mod code_tour_tests {
+    use super::*;
+
+    fn stop(path: &str, line: usize, end: usize, title: &str) -> Stop {
+        Stop {
+            path: path.into(),
+            line,
+            end,
+            title: title.into(),
+            group: String::new(),
+            said: "because".into(),
+        }
+    }
+
+    /// The strip and the step list both say where a stop is, and a range says
+    /// so rather than pretending to be one line.
+    #[test]
+    fn a_stop_says_where_it_is() {
+        assert_eq!(stop_label(&stop("src/a.ts", 67, 72, "t")), "src/a.ts:67-72");
+        assert_eq!(stop_label(&stop("src/a.ts", 67, 67, "t")), "src/a.ts:67");
+        assert_eq!(stop_label(&stop("src/a.ts", 0, 0, "t")), "src/a.ts");
+    }
+
+    fn rec(id: &str, title: &str, at: usize, closed: bool) -> TourRec {
+        TourRec {
+            id: id.into(),
+            title: title.into(),
+            at,
+            made: 1_760_000_000,
+            closed,
+            stops: vec![stop("src/a.ts", 67, 72, "trigger()"), stop("src/b.ts", 12, 12, "loop")],
+        }
+    }
+
+    /// Tours survive a restart: the stops, their prose, where you had got to,
+    /// and which one was open.
+    #[test]
+    fn the_library_round_trips_through_json() {
+        let list = vec![rec("t1", "Task dispatch", 1, false), rec("t2", "Uploads", 0, true)];
+        let back = tours_from_json(&tours_to_json(&list));
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].id, "t1");
+        assert_eq!(back[0].title, "Task dispatch");
+        assert_eq!(back[0].at, 1);
+        assert_eq!(back[0].made, 1_760_000_000);
+        assert!(!back[0].closed);
+        assert!(back[1].closed, "the one you put away stays put away");
+        assert_eq!(stop_label(&back[0].stops[0]), "src/a.ts:67-72");
+        assert_eq!(back[0].stops[1].said, "because");
+        // a tour comes back pointing at nothing, so a restart opens no file on
+        // its own, and `at` can't dangle past a shortened tour
+        let w = walk_from_rec(&back[0], false);
+        assert_eq!(w.at, 1);
+        assert!(w.here.is_none());
+        assert!(w.list, "a tour comes back with its map up, the way it arrives");
+        assert_eq!(w.id.as_deref(), Some("t1"));
+        assert_eq!(walk_from_rec(&back[0], true).at, 0, "restart goes back to the top");
+        let mut short = back[0].clone();
+        short.stops.truncate(1);
+        assert_eq!(walk_from_rec(&short, false).at, 0);
+    }
+
+    /// The file the first version wrote held one tour with no list around it.
+    /// It still loads, and gets an id so the list can act on it.
+    #[test]
+    fn a_single_tour_file_still_loads() {
+        let old = "{\"title\":\"Task dispatch\",\"at\":1,\"closed\":true,\"steps\":[\
+            {\"file\":\"src/a.ts\",\"line\":67,\"end\":72,\"title\":\"trigger()\",\"text\":\"saves it\"}]}";
+        let back = tours_from_json(old);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].title, "Task dispatch");
+        assert!(back[0].closed);
+        assert_eq!(back[0].at, 0, "one stop left, so `at` clamps to it");
+        assert!(!back[0].id.is_empty());
+        // nothing to walk is no tour
+        assert!(tours_from_json("{\"tours\":[{\"title\":\"x\",\"steps\":[]}]}").is_empty());
+        assert!(tours_from_json("not json").is_empty());
+    }
+
+
+
+    /// The ask carries the shape the answer has to come back in, and says what
+    /// the tour is about when there is something to say.
+    #[test]
+    fn the_ask_names_its_subject_and_the_route_back() {
+        let general = tour_request(None, None);
+        assert!(general.contains("of what we have been talking about"), "{general}");
+        assert!(general.contains("$TIDE_RPC/tour"), "{general}");
+        assert!(general.contains("\"steps\""), "{general}");
+        let about = tour_request(Some("src/a.ts:39 and what I asked about it"), None);
+        assert!(about.contains("of src/a.ts:39 and what I asked about it"), "{about}");
+        // an empty subject is the general ask, not "of "
+        assert!(tour_request(Some("  "), None).contains("of what we have been talking about"));
+        // an answer rides along, and names itself as the subject
+        let from = tour_request(None, Some("1. it starts at src/a.ts:12"));
+        assert!(from.contains("of the answer at the end of this message"), "{from}");
+        assert!(from.contains("--- the answer ---\n1. it starts at src/a.ts:12"), "{from}");
+        assert!(tour_request(None, Some("   ")).contains("of what we have been talking about"));
+    }
+}
+
+#[cfg(test)]
+mod ask_changed_tests {
+    use super::*;
+
+    /// One file is named; a pile of them is counted. The thread shows this, not
+    /// the list.
+    #[test]
+    fn label_names_one_file_and_counts_many() {
+        assert_eq!(ask_changed_label(&["src/main.rs".into()]), "What changed in src/main.rs?");
+        assert_eq!(
+            ask_changed_label(&["a.ts".into(), "b.ts".into()]),
+            "What changed in these 2 files?"
+        );
+    }
+
+    /// The paths go in as a list and the base comes with a runnable diff
+    /// command, so the agent doesn't have to guess which base the panel means.
+    #[test]
+    fn note_lists_paths_and_names_the_base() {
+        let note = ask_changed_note(&["a.ts".into(), "b/c.ts".into()], "next", true);
+        assert!(note.contains("- a.ts\n- b/c.ts\n"), "{note}");
+        assert!(note.contains("against `next`"), "{note}");
+        assert!(note.contains("git diff next...HEAD -- <paths>"), "{note}");
+        assert!(note.contains("every file in the change"), "{note}");
+    }
+
+    /// A filtered tree is a slice: say so, or the agent answers about the whole
+    /// pull request and the filter might as well not exist.
+    #[test]
+    fn note_says_when_the_tree_is_filtered() {
+        let note = ask_changed_note(&["a.ts".into()], "next", false);
+        assert!(note.contains("filtered down to"), "{note}");
+        assert!(!note.contains("every file in the change"), "{note}");
+    }
+
+    /// No base read yet: still a usable question, minus a command that would
+    /// have had a hole in it.
+    #[test]
+    fn note_without_a_base_drops_the_command() {
+        let note = ask_changed_note(&["a.ts".into()], "  ", true);
+        assert!(note.contains("against its base"), "{note}");
+        assert!(!note.contains("git diff"), "{note}");
+    }
+}
+
+#[cfg(test)]
+mod merge_note_tests {
+    use super::*;
+
+    fn doc(title: &str, base: &str) -> PrDoc {
+        PrDoc {
+            number: 5981,
+            loading: false,
+            checks: PrChecks::default(),
+            files: 16,
+            added: 269,
+            removed: 25,
+            title: title.into(),
+            state: PrState::Merged,
+            base: base.into(),
+            head: "fix/cognito-single-provider".into(),
+            author: "adrians5j".into(),
+            url: String::new(),
+        }
+    }
+
+    /// The message carries what the human would have typed, plus the two facts
+    /// that save the agent a lookup: which PR, and where it landed.
+    #[test]
+    fn it_names_the_pr_the_title_and_the_base() {
+        let d = doc("fix(cognito): register the provider once", "next");
+        let note = merged_note(5981, Some(&d));
+        assert!(note.starts_with("#5981 “fix(cognito): register the provider once” is merged into next."), "{note}");
+        assert!(note.ends_with("What's next?"), "{note}");
+    }
+
+    /// A PR merged from a tab TIDE never got metadata for still says the one
+    /// thing that matters, rather than printing empty quotes or `into `.
+    #[test]
+    fn it_degrades_to_the_number_alone() {
+        assert_eq!(merged_note(1235, None), "#1235 is merged.\n\nWhat's next?");
+        let d = doc("   ", "   ");
+        assert_eq!(merged_note(1235, Some(&d)), "#1235 is merged.\n\nWhat's next?");
+    }
+}
+
+#[cfg(test)]
+mod pr_auto_open_tests {
+    use super::*;
+
+    /// The case this exists for: an agent pushed a branch and opened a PR, and
+    /// the refresh it sends afterwards is the first TIDE hears of #5996.
+    #[test]
+    fn a_pr_that_just_appeared_opens() {
+        assert_eq!(pr_tab_to_open(true, None, Some(5996)), Some(5996));
+        // ...and a different PR on a branch that had one before
+        assert_eq!(pr_tab_to_open(true, Some(5981), Some(5996)), Some(5996));
+    }
+
+    /// Refreshing again mid-turn must not keep yanking the reader onto the tab,
+    /// or reopen one they closed.
+    #[test]
+    fn the_same_pr_twice_opens_nothing() {
+        assert_eq!(pr_tab_to_open(true, Some(5996), Some(5996)), None);
+    }
+
+    /// ⌘R and the git poll read the same link; neither is a request to open
+    /// anything.
+    #[test]
+    fn only_an_agents_refresh_opens_a_tab() {
+        assert_eq!(pr_tab_to_open(false, None, Some(5996)), None);
+    }
+
+    /// A branch with no PR, and a PR that went away, both open nothing.
+    #[test]
+    fn nothing_to_open_is_not_an_error() {
+        assert_eq!(pr_tab_to_open(true, None, None), None);
+        assert_eq!(pr_tab_to_open(true, Some(5996), None), None);
+    }
+}
+
+#[cfg(test)]
+mod diffstat_tests {
+    use super::*;
+
+    /// The five blocks are a ratio, not a count, and the rule that matters is
+    /// that a kind which happened at all is never drawn as nothing: a file
+    /// with 400 added and 1 removed still shows one red block.
+    fn split(add: usize, del: usize) -> (usize, usize) {
+        const N: usize = 5;
+        let total = add + del;
+        let greens = if total == 0 {
+            0
+        } else {
+            ((add * N + total - 1) / total).min(N).max(usize::from(add > 0))
+        };
+        let reds = if total == 0 { 0 } else { (N - greens).min(usize::from(del > 0) * N) };
+        (greens, reds)
+    }
+
+    #[test]
+    fn the_blocks_are_a_ratio_that_never_rounds_a_side_away() {
+        assert_eq!(split(0, 0), (0, 0), "an empty file is five empty blocks");
+        assert_eq!(split(10, 0), (5, 0), "all added");
+        assert_eq!(split(0, 10), (0, 5), "all removed");
+        assert_eq!(split(5, 5), (3, 2), "half and half, rounding up on additions");
+        let (g, r) = split(400, 1);
+        assert_eq!(g, 5);
+        assert_eq!(r, 0, "five blocks can't show 1 in 401; the numbers beside them do");
+        let (g, r) = split(1, 400);
+        assert_eq!(g, 1, "but a side that happened is never zero blocks");
+        assert_eq!(r, 4);
+    }
+}
+
+#[cfg(test)]
+mod pr_check_attempt_tests {
+    use super::*;
+
+    fn rollup(items: serde_json::Value) -> PrChecks {
+        pr_checks(&serde_json::json!({ "statusCheckRollup": items }))
+    }
+
+    /// #6007: a push landed while CI was running, so GitHub cancelled the first
+    /// attempt of every job and started a second. The rollup held 38 entries
+    /// for 19 checks, and TIDE read the 16 cancelled ones as "16 of 38 checks
+    /// failing" while the PR page showed nothing red at all.
+    #[test]
+    fn a_rerun_counts_once_by_its_newest_attempt() {
+        let c = rollup(serde_json::json!([
+            { "name": "Build", "status": "COMPLETED", "conclusion": "CANCELLED",
+              "startedAt": "2026-10-14T19:18:03Z", "completedAt": "2026-10-14T19:18:03Z" },
+            { "name": "Build", "status": "COMPLETED", "conclusion": "SUCCESS",
+              "startedAt": "2026-10-14T19:19:34Z", "completedAt": "2026-10-14T19:22:17Z" },
+            { "name": "Static code analysis", "status": "COMPLETED", "conclusion": "CANCELLED",
+              "startedAt": "2026-10-14T19:18:00Z", "completedAt": "2026-10-14T19:18:02Z" },
+            { "name": "Static code analysis", "status": "COMPLETED", "conclusion": "SUCCESS",
+              "startedAt": "2026-10-14T19:19:03Z", "completedAt": "2026-10-14T19:20:19Z" },
+        ]));
+        assert_eq!((c.passed, c.failed, c.stalled, c.total()), (2, 0, 0, 2));
+        assert_eq!(c.summary().0, "2 checks passed");
+    }
+
+    /// #6007 again, from the other end: the topbar dot went red while the PR
+    /// body under it said "19 checks passed". Two readings of the same array,
+    /// one of them counting cancelled attempts. There is one reading now.
+    #[test]
+    fn the_dot_and_the_document_agree() {
+        let items = serde_json::json!([
+            { "name": "Build", "status": "COMPLETED", "conclusion": "CANCELLED",
+              "startedAt": "2026-10-14T19:18:03Z" },
+            { "name": "Build", "status": "COMPLETED", "conclusion": "SUCCESS",
+              "startedAt": "2026-10-14T19:19:34Z" },
+        ]);
+        let v = serde_json::json!({ "statusCheckRollup": items });
+        assert_eq!(pr_checks(&v).summary().0, "1 check passed");
+        assert_eq!(rollup_status(&v), PrStatus::Passing);
+        // and the states that aren't green still aren't
+        let failed = serde_json::json!({ "statusCheckRollup": [
+            { "name": "tests", "status": "COMPLETED", "conclusion": "FAILURE" }] });
+        assert_eq!(rollup_status(&failed), PrStatus::Failing);
+        let running = serde_json::json!({ "statusCheckRollup": [
+            { "name": "tests", "status": "IN_PROGRESS" }] });
+        assert_eq!(rollup_status(&running), PrStatus::Pending);
+        // cancelled and never replaced: amber, not green and not red
+        let stalled = serde_json::json!({ "statusCheckRollup": [
+            { "name": "tests", "status": "COMPLETED", "conclusion": "CANCELLED" }] });
+        assert_eq!(rollup_status(&stalled), PrStatus::Pending);
+        assert_eq!(rollup_status(&serde_json::json!({ "statusCheckRollup": [] })), PrStatus::None);
+    }
+
+    /// The order the attempts arrive in must not decide the verdict: a newer
+    /// failure listed before its older success is still the failure.
+    #[test]
+    fn the_newest_attempt_wins_whatever_the_order() {
+        let items = serde_json::json!([
+            { "name": "tests", "status": "COMPLETED", "conclusion": "FAILURE",
+              "startedAt": "2026-10-14T20:00:00Z" },
+            { "name": "tests", "status": "COMPLETED", "conclusion": "SUCCESS",
+              "startedAt": "2026-10-14T19:00:00Z" },
+        ]);
+        let c = rollup(items);
+        assert_eq!((c.passed, c.failed), (0, 1));
+        assert_eq!(c.notable, vec!["tests"]);
+    }
+
+    /// A skipped run can stamp `completedAt` before its own `startedAt`, so
+    /// ordering takes the later of the two rather than trusting one field.
+    #[test]
+    fn a_backwards_stamp_doesnt_pick_the_older_attempt() {
+        let c = rollup(serde_json::json!([
+            { "name": "lint", "status": "COMPLETED", "conclusion": "SKIPPED",
+              "startedAt": "2026-10-14T19:18:01Z", "completedAt": "2026-10-14T19:18:00Z" },
+            { "name": "lint", "status": "COMPLETED", "conclusion": "FAILURE",
+              "startedAt": "2026-10-14T19:18:04Z", "completedAt": "2026-10-14T19:18:04Z" },
+        ]));
+        assert_eq!((c.passed, c.failed), (0, 1));
+    }
+
+    /// With no newer attempt to replace it, a cancelled check is neither green
+    /// nor red: GitHub draws it grey, and so does the chip.
+    #[test]
+    fn a_cancelled_check_on_its_own_is_not_a_failure() {
+        let c = rollup(serde_json::json!([
+            { "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS" },
+            { "name": "e2e", "status": "COMPLETED", "conclusion": "CANCELLED" },
+        ]));
+        assert_eq!((c.passed, c.failed, c.stalled), (1, 0, 1));
+        assert_eq!(c.summary(), ("1 of 2 checks cancelled".to_string(), MUTED));
+    }
+
+    /// Attempts with no stamps at all still collapse to one, the last listed.
+    #[test]
+    fn stampless_attempts_collapse_to_the_last_one() {
+        let c = rollup(serde_json::json!([
+            { "name": "ci", "status": "COMPLETED", "conclusion": "FAILURE" },
+            { "name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS" },
+        ]));
+        assert_eq!((c.passed, c.failed, c.total()), (1, 0, 1));
+    }
+}
+

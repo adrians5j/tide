@@ -120,9 +120,213 @@ so an agent-named workspace reads the same as a hand-named one. A scope is
 accepted and dropped (`fix(api): …`). A title with no recognized prefix is stored
 as sent.
 
-TIDE takes the name only when the workspace has none — a name the human typed is
-never overwritten, so an agent can send one once without checking first. A named
-workspace also stops being marked free.
+Send it early: the agent is told to name the workspace in its first reply rather
+than at the end of the work.
+
+TIDE takes the name when the workspace has none, and when the current name was
+written by an agent — so an agent can improve its own first guess as the work
+becomes clearer, which is what makes naming early safe. A name the human typed is
+theirs: TIDE ignores an agent's title then, so the call is always safe to make.
+
+To rename a name the human chose, add `"force": true`. That is for a rename they
+asked for, not something to send on your own initiative. A named workspace also
+stops being marked free or paused.
+
+## Working from a phone
+
+The `phone` chip in the agent pane copies a link:
+`http://<your-ip>:<port>/m?t=<token>`. Open it on a phone on the same wifi and
+you get every open workspace, one tap apart, each with its transcript and a
+composer. Anything typed there arrives as if it were typed in that workspace's
+pane.
+
+The listener starts with TIDE and stays up. It costs a bound socket: the only
+real work, building a transcript, happens while a phone is actually polling, and
+only for the workspace it is reading. The link carries the token, so treat it the
+way you would any other key — anyone on that network who has it can type into
+your sessions.
+
+## Pull requests, and where work lives
+
+Open the PR yourself when the work is worth one — a feature that holds together,
+a fix with its tests, a round of changes worth reviewing. Don't stop to ask
+first: a PR is cheaper to close than to wait for.
+
+A PR body is about the code, not about who said what. No names, no "the client",
+no "as discussed", nothing about who noticed or reported it. Say what was wrong,
+what it affected and what changed: "Sven noticed the dropdown closes on scroll"
+is "the dropdown closed on scroll". The conversation that led to the work is
+private to it; the PR outlives it and is read by people who weren't there.
+
+Pictures in a PR body live in the repo: commit them under
+`.github/pr-assets/<pr number>/` and link the raw URL pinned to the commit that
+added them, `raw.githubusercontent.com/<owner>/<repo>/<sha>/...`. A link through
+the branch name dies when the branch is deleted after the merge, which is when
+someone is most likely reading the PR again.
+
+GitHub's own uploader is for comments. A body you rewrite loses its images every
+time, and `gh` has no way to upload to one: that endpoint belongs to the web UI,
+not the API.
+
+Never use git worktrees. Each TIDE workspace is already its own checkout, and a
+worktree inside one puts the work somewhere nothing in TIDE is looking — not the
+file tree, not the PR pane, not the reviewers. Branch in place.
+
+## Saying what you did
+
+When TIDE hands over a job — review comments to address, a branch to bring up to
+date, a conflict to sort out — finish by posting what happened:
+
+```
+POST $TIDE_RPC/summary
+X-Tide-Token: $TIDE_TOKEN
+
+{"title": "Merged origin/next",
+ "text": "Resolved 3 conflicts in CommandPalette.tsx, kept both sides. yyb
+clean, 24 tests pass."}
+```
+
+`title` is two to four words naming the job; it heads the card so a transcript
+full of them can be scanned. Without one the card calls itself "Summary".
+
+It renders as a card in the transcript, set apart from the turn around it, which
+is where the human looks for "so what happened" after a long run of tool calls.
+Markdown, with its line breaks kept — a short paragraph or a few bullets: what
+changed, what was decided, anything still open.
+
+Post it once, at the end, and don't repeat it in the reply. An empty summary is
+a bad request rather than an empty card.
+
+## Where the work stands
+
+One workspace usually holds several stretches of work — the UI, then the backend,
+then the syncing. The title is the whole of it and stays put; the subtitle says
+which stretch is happening now.
+
+```
+POST $TIDE_RPC/title
+X-Tide-Token: $TIDE_TOKEN
+
+{"subtitle": "UI auto syncing"}
+```
+
+Two or three words, and no title in the same call — the two move independently. A
+title alone leaves the subtitle where it was; an empty subtitle clears it, which
+is what to send when a stretch is done and the next hasn't started.
+
+Unlike the title, the subtitle is the agent's to keep current: there is no force
+and no permission, because it describes what is happening rather than what the
+work is called. Move it when the work moves — after a merge, when the next piece
+is picked up. The human reads it in the topbar as `AI Chat (UI auto syncing)`,
+which is how they tell at a glance where a workspace was left. `GET
+$TIDE_RPC/workspace` reports it back under `subtitle`.
+
+## Your own standing instructions
+
+Anything in `~/.config/tide/agent-notes.md` is appended to the briefing verbatim,
+so every new session gets it. That file is the place for things that are true of
+your machine rather than of TIDE: local sign-in details, an API key for a local
+instance, house conventions you repeat often. It sits outside the repo, so
+nothing there can end up in a commit, and editing it needs no rebuild — the gear
+in the agent pane shows the result.
+
+## Showing what you saw in a browser
+
+```
+POST $TIDE_RPC/shot
+X-Tide-Token: $TIDE_TOKEN
+
+{"path": "/tmp/shot.png", "note": "admin after saving the flag"}
+```
+
+TIDE reads the file and puts the picture in the transcript, with the note above
+it. A relative path is relative to the workspace. PNG, JPEG, GIF and WebP, up to
+12 MB.
+
+Pair it with `agent-browser` (installed; `agent-browser skills get core` is its
+own guide): open the page, click through it, `agent-browser screenshot
+/tmp/shot.png`, then post it. Use it when you checked something in a browser and
+the human would otherwise have to take your word for it. `agent-browser console`
+and `agent-browser errors` are worth reading before claiming a page works.
+
+## Filing something on the todo list
+
+```
+POST $TIDE_RPC/todo
+X-Tide-Token: $TIDE_TOKEN
+
+{"todos": [{"text": "drop the WCP shim",
+            "details": "GetFeatureFlagsWithLicense only needs it for the 6.4 backport;\nonce that ships the shim is dead weight.",
+            "category": "refactor", "scope": "api"},
+           "chase the flaky test"],
+ "group": "license gated flags"}
+```
+
+For "note that down", "park it", "backlog this". `text` is the one-line version and the only required
+field; a bare string in the array is just the text. `details` is the long half:
+the reasoning, what was decided, what to watch out for. `category` is one of the type
+words the workspace title uses (feat, fix, docs, …), `status` is todo, doing or
+done, and `link`, `scope` and `client` are optional. One call files the whole batch.
+
+The same path reads the list back:
+
+```
+GET $TIDE_RPC/todo
+X-Tide-Token: $TIDE_TOKEN
+
+{"todos": [{"id": "…", "text": "…", "details": "…", "status": "todo", …}]}
+```
+
+That is the whole list, every workspace's, straight off disk, so it is current
+even while the UI has it open. Use it to check what was filed, or to answer
+"what's on my list".
+
+## Changing one
+
+The same POST edits, when the item carries the `id` that the read gave you:
+
+```
+POST $TIDE_RPC/todo
+X-Tide-Token: $TIDE_TOKEN
+
+{"todos": [{"id": "58w65", "status": "done"},
+           {"id": "eg3m7", "delete": true}]}
+```
+
+Only the fields the request mentions are touched, so marking something done
+needn't repeat its text, and leaving `details` out keeps the details. `delete`
+takes the line off the list.
+
+Without an `id` a post always files a new task — that is the one difference
+between filing and editing, and an edit that forgets the id becomes a duplicate
+instead. An `id` TIDE doesn't recognise is dropped rather than filed as
+something new; the human sees how many were ignored. A batch's top-level `group`
+applies to the tasks it files, not to the ones it edits, which keep the group
+they have unless the item names a different one.
+
+`group` keeps a batch together under one heading in TIDE's list. Send one, or let
+TIDE fall back to the workspace's title. Don't send the workspace itself: TIDE
+records the folder each task was filed from, so a line can always be traced back
+to the checkout it came out of. That's provenance, not ownership. The list is one
+list, shared by every window.
+
+## Which workspace is this?
+
+```
+GET $TIDE_RPC/workspace
+X-Tide-Token: $TIDE_TOKEN
+
+{"folder": "wby-next4", "title": "Event Van Handler",
+ "root": "/Users/adrian/dev/wby-next4", "branch": "adrian/task-definition-split",
+ "base": "next"}
+```
+
+The folder is the checkout on disk; the title is what the human (or `/title`)
+named the workspace, and it can change while a session runs, so read this at the
+moment you need it. `base` is the branch this one merges into (the PR's base, or
+the reflog's guess), which is what a local review diffs against. Agents are told to put a `Workspace: <folder> · <title>` line
+in every PR body they open, which is what traces a PR back to the checkout it was
+written in.
 
 ## Marking PR files as viewed
 

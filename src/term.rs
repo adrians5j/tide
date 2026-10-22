@@ -266,9 +266,10 @@ impl Terminal {
         let chars: Vec<char> = {
             let Ok(guard) = self.term.lock() else { return };
             let content = guard.renderable_content();
+            let scrolled = content.display_offset as i32;
             let mut chars = vec![' '; self.cols];
             for indexed in content.display_iter {
-                if indexed.point.line.0 == row as i32 {
+                if indexed.point.line.0 + scrolled == row as i32 {
                     let c = indexed.point.column.0;
                     if c < chars.len() {
                         chars[c] = if indexed.cell.c == '\0' { ' ' } else { indexed.cell.c };
@@ -322,9 +323,10 @@ impl Terminal {
     fn grid_chars(&self) -> Vec<Vec<char>> {
         let Ok(guard) = self.term.lock() else { return Vec::new() };
         let content = guard.renderable_content();
+        let scrolled = content.display_offset as i32;
         let mut grid = vec![vec![' '; self.cols]; self.rows];
         for indexed in content.display_iter {
-            let r = indexed.point.line.0;
+            let r = indexed.point.line.0 + scrolled;
             let c = indexed.point.column.0;
             if r >= 0 && (r as usize) < self.rows && c < self.cols {
                 grid[r as usize][c] = if indexed.cell.c == '\0' { ' ' } else { indexed.cell.c };
@@ -990,6 +992,12 @@ impl Element for TerminalElement {
             let terminal = self.term.read(cx);
             let guard = terminal.term.lock().unwrap();
             let content = guard.renderable_content();
+            // `display_iter` numbers lines from the *grid*, so scrolled-back
+            // rows come out negative: with the view 5 lines up the top row is
+            // -5. Drawn at `line * line_height` those rows land above the pane
+            // and the bottom five come out blank, which is what scrolling up
+            // looked like. Adding the offset puts row 0 back at the top.
+            let scrolled = content.display_offset as i32;
 
             let mut raw_rows: Vec<RawRow> = Vec::new();
             let mut bgs = Vec::new();
@@ -1003,7 +1011,7 @@ impl Element for TerminalElement {
 
             for indexed in content.display_iter {
                 let cell = indexed.cell;
-                let line = indexed.point.line.0;
+                let line = indexed.point.line.0 + scrolled;
                 let col = indexed.point.column.0;
 
                 if line != cur_line {
@@ -1085,7 +1093,11 @@ impl Element for TerminalElement {
                 raw_rows.push((y, line_str, runs, row_hash));
             }
 
-            (raw_rows, bgs, decorations, content.cursor.point)
+            // the cursor's line is in the same grid coordinates as the rows,
+            // so it needs the same shift or it floats off while scrolled back
+            let mut cursor = content.cursor.point;
+            cursor.line += scrolled;
+            (raw_rows, bgs, decorations, cursor)
         };
 
         // selection highlight (drawn over cell bgs, under text) — one quad per

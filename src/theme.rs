@@ -24,6 +24,10 @@ pub const ACCENT: u32 = 0x3574f0; // JetBrains blue (cursor-line gutter, active 
 pub const ICON_SELECTED_BG: u32 = 0x2f68ee; // background of a selected sidebar icon
 pub const SELECTED_BG: u32 = 0x2e436e; // selected list row background
 pub const SEL_TEXT: u32 = 0xffffff; // text on a selected row
+/// Your own messages in the agent transcript. Darker than SELECTION on purpose:
+/// selecting text inside one has to stay visible, and SELECTION is what paints
+/// it.
+pub const USER_BUBBLE: u32 = 0x233350;
 
 // ── popups / autocomplete ──────────────────────────────────────────────────
 pub const POPUP_BG: u32 = 0x2b2d30;
@@ -52,3 +56,13 @@ pub const COMMENT_TINT_HOVER: u32 = 0xbb9af733;
 
 // ── same-word occurrence highlight (selecting a word marks its twins) ────────
 pub const WORD_MATCH_BG: u32 = 0x33414d;
+
+// ── code tour (a walk the agent prepared, stepped through like a debugger) ──
+/// The stop you are standing on: a bar down the gutter and the line numbers.
+/// Amber, because the two hues already spoken for in the editor are review
+/// purple and diff green/red, and a tour is read against a diff often enough
+/// that it can't borrow either.
+pub const TOUR_MARK: u32 = 0xe0af68;
+/// 11% wash across the stop's lines — enough to find after a jump, faint
+/// enough to read code through.
+pub const TOUR_TINT: u32 = 0xe0af681c;

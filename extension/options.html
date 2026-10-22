@@ -1,0 +1,30 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Talk to TIDE</title>
+<style>
+  body { font: 13px/1.5 -apple-system, system-ui, sans-serif; background: #1b1d1f; color: #d7d9dd;
+         margin: 0; padding: 20px 22px; max-width: 520px }
+  h1 { font-size: 15px; margin: 0 0 4px }
+  p { color: #8b8f96; margin: 0 0 18px }
+  label { display: block; margin: 14px 0 5px; color: #8b8f96; font-size: 12px }
+  input { width: 100%; box-sizing: border-box; background: #121314; color: #d7d9dd;
+          border: 1px solid #2b2d30; border-radius: 6px; padding: 7px 9px; font: inherit }
+  input:focus { outline: none; border-color: #3574f0 }
+  button { margin-top: 18px; background: #3574f0; color: #fff; border: 0; border-radius: 6px;
+           padding: 8px 14px; font: inherit; font-weight: 600 }
+  code { background: #121314; border: 1px solid #2b2d30; border-radius: 4px; padding: 1px 5px }
+  #ok { color: #6aaf6a; margin-left: 10px }
+</style>
+<h1>Talk to TIDE</h1>
+<p>Where TIDE is listening, and the token it is listening with.</p>
+<label for="host">Host</label>
+<input id="host" placeholder="http://127.0.0.1:7420" spellcheck="false">
+<label for="token">Token</label>
+<input id="token" placeholder="the contents of ~/.config/tide/remote-token" spellcheck="false">
+<p style="margin-top:14px">
+  Both are in the link TIDE copies from <code>⌘K → Copy the Phone Link</code>:
+  <code>http://host:7420/m?t=TOKEN</code>. Paste that whole link into Host and it
+  will be split for you.
+</p>
+<button id="save">Save</button><span id="ok" hidden>Saved</span>
+<script src="options.js"></script>

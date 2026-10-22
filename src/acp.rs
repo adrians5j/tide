@@ -41,6 +41,38 @@ pub fn base64(bytes: &[u8]) -> String {
     out
 }
 
+/// The other direction: a picture the phone posted arrives as base64 and has to
+/// become bytes before anything can draw it. Whitespace and a `data:` prefix are
+/// tolerated because a browser's `FileReader` produces both. None when the text
+/// isn't base64 at all.
+pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let s = s.rsplit_once("base64,").map(|(_, rest)| rest).unwrap_or(s);
+    let val = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => (c - b'A') as u32,
+            b'a'..=b'z' => (c - b'a') as u32 + 26,
+            b'0'..=b'9' => (c - b'0') as u32 + 52,
+            b'+' | b'-' => 62, // `-`/`_` so a URL-safe encoding works too
+            b'/' | b'_' => 63,
+            _ => return None,
+        })
+    };
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in s.bytes() {
+        if c == b'=' || c.is_ascii_whitespace() {
+            continue;
+        }
+        acc = (acc << 6) | val(c)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
 /// One thing that happened in the agent conversation, drained by the UI poll.
 pub enum AcpEvent {
     /// Session established; the client is now accepting prompts.
@@ -87,7 +119,7 @@ pub struct Acp {
     events: Arc<Mutex<Vec<AcpEvent>>>,
     dirty: Arc<AtomicBool>,
     ready: Arc<AtomicBool>,
-    _child: Child,
+    child: Mutex<Child>,
 }
 
 impl Acp {
@@ -129,7 +161,7 @@ impl Acp {
             events: Arc::new(Mutex::new(Vec::new())),
             dirty: Arc::new(AtomicBool::new(false)),
             ready: Arc::new(AtomicBool::new(false)),
-            _child: child,
+            child: Mutex::new(child),
         });
 
         // Reader thread: parse each JSON line and route it.
@@ -232,6 +264,15 @@ impl Acp {
     /// Interrupt the turn in flight (ACP `session/cancel`, a notification — the
     /// adapter answers by ending the turn, which arrives as `TurnEnd`). No-op
     /// when no session exists yet.
+    /// Stop the adapter. A session that exists only to answer one question (a
+    /// reviewer) has no reason to keep a Node process alive afterwards.
+    pub fn shutdown(&self) {
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
     pub fn cancel(&self) {
         let Some(sid) = self.session.lock().ok().and_then(|s| s.clone()) else { return };
         self.send(json!({
@@ -592,7 +633,23 @@ fn write_text(path: &str, content: &str) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::base64;
+    use super::{base64, base64_decode};
+
+    /// Decoding undoes encoding for every length, including the two that pad.
+    #[test]
+    fn base64_round_trips() {
+        for n in 0..40usize {
+            let bytes: Vec<u8> = (0..n).map(|i| (i * 37 + 11) as u8).collect();
+            let text = base64(&bytes);
+            assert_eq!(base64_decode(&text).as_deref(), Some(&bytes[..]), "n={n}");
+        }
+        // what a browser's FileReader hands over, prefix and newlines included
+        assert_eq!(base64_decode("data:image/png;base64,aGk=").as_deref(), Some(&b"hi"[..]));
+        assert_eq!(base64_decode("aG\nkh\n").as_deref(), Some(&b"hi!"[..]));
+        // URL-safe alphabet, and plain nonsense
+        assert_eq!(base64_decode("-_8=").as_deref(), Some(&[0xfb, 0xff][..]));
+        assert!(base64_decode("not base64!").is_none());
+    }
 
     #[test]
     fn base64_matches_the_reference_encoding() {

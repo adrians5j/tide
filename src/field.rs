@@ -1,9 +1,11 @@
 //! Shared single-line text-input buffer with caret, selection, undo/redo and
 //! the standard editing keys. Used by every chrome input and the editor search.
 use gpui::{
-    fill, prelude::*, px, rgb, AnyElement, App, Bounds, ElementId, GlobalElementId, HighlightStyle,
-    InspectorElementId, Keystroke, LayoutId, Pixels, StyledText, Window,
+    fill, prelude::*, px, rgb, AnyElement, App, Bounds, DispatchPhase, ElementId, GlobalElementId,
+    HighlightStyle, InspectorElementId, Keystroke, LayoutId, MouseButton, MouseDownEvent, Pixels,
+    StyledText, Window,
 };
+use std::rc::Rc;
 
 fn is_word_sep(c: char) -> bool {
     c.is_whitespace() || matches!(c, '/' | '.' | '_' | '-')
@@ -248,8 +250,57 @@ impl Field {
         CaretText {
             text: StyledText::new(base).with_highlights(hl),
             caret: (!glyph.trim().is_empty()).then(|| self.caret_safe()),
+            on_click: None,
         }
         .into_any_element()
+    }
+
+    /// The same field, but clicking in the text puts the caret where you
+    /// clicked. `place` is handed the byte offset; it is the caller's because
+    /// only the caller knows which field this is and how to redraw.
+    pub fn render_clickable(
+        &self,
+        glyph: &str,
+        sel_bg: u32,
+        place: impl Fn(usize, &mut Window, &mut App) + 'static,
+    ) -> AnyElement {
+        let base = if self.text.is_empty() { " ".to_string() } else { self.text.clone() };
+        let hl: Vec<(std::ops::Range<usize>, HighlightStyle)> = self
+            .selection()
+            .map(|(s, e)| {
+                (s..e, HighlightStyle { background_color: Some(rgb(sel_bg).into()), ..Default::default() })
+            })
+            .into_iter()
+            .collect();
+        CaretText {
+            text: StyledText::new(base).with_highlights(hl),
+            caret: (!glyph.trim().is_empty()).then(|| self.caret_safe()),
+            on_click: Some(Rc::new(place)),
+        }
+        .into_any_element()
+    }
+
+    /// Where the caret lands moving one line `down` (or up). The column is
+    /// counted in characters, not bytes, so it survives anything non-ASCII on
+    /// the way past.
+    fn vertical(&self, down: bool) -> usize {
+        let at = self.caret_safe();
+        let line_start = self.text[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let column = self.text[line_start..at].chars().count();
+        if down {
+            let Some(rel) = self.text[at..].find('\n') else {
+                return self.text.len(); // last line already
+            };
+            let next = at + rel + 1;
+            let end = self.text[next..].find('\n').map(|i| next + i).unwrap_or(self.text.len());
+            step_chars(&self.text, next, end, column)
+        } else {
+            if line_start == 0 {
+                return 0; // first line already
+            }
+            let prev = self.text[..line_start - 1].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            step_chars(&self.text, prev, line_start - 1, column)
+        }
     }
 
     /// Apply a navigation/editing keystroke. `clip` supplies cmd+v text; `accept`
@@ -329,6 +380,11 @@ impl Field {
                 }
                 Some(next_boundary(&self.text, self.caret))
             }
+            // ↑/↓ keep the column and change the line. On the first line ↑ goes
+            // to the start and on the last ↓ goes to the end, which is what a
+            // one-line field wants too — there, they simply are home and end.
+            "up" => Some(self.vertical(false)),
+            "down" => Some(self.vertical(true)),
             "home" => Some(0),
             "end" => Some(self.text.len()),
             _ => None,
@@ -422,6 +478,10 @@ impl Field {
 struct CaretText {
     text: StyledText,
     caret: Option<usize>,
+    /// Told where in the string a click landed. The field itself can't hear the
+    /// mouse — it isn't an entity — so whoever renders it says what to do with
+    /// the offset.
+    on_click: Option<Rc<dyn Fn(usize, &mut Window, &mut App)>>,
 }
 
 impl Element for CaretText {
@@ -470,6 +530,28 @@ impl Element for CaretText {
     ) {
         let color = window.text_style().color;
         self.text.paint(id, inspector, bounds, &mut (), &mut (), window, cx);
+        // a press inside the text moves the caret there. `index_for_position`
+        // is the same layout the caret is drawn from, so the two can't disagree
+        // about where a character is.
+        if let Some(place) = self.on_click.clone() {
+            let layout = self.text.layout().clone();
+            window.on_mouse_event(move |ev: &MouseDownEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble
+                    || ev.button != MouseButton::Left
+                    || !bounds.contains(&ev.position)
+                {
+                    return;
+                }
+                // past the end of a line, `index_for_position` reports the
+                // nearest offset instead of nothing, which is what clicking in
+                // the empty space to the right should do anyway
+                let ix = match layout.index_for_position(ev.position) {
+                    Ok(ix) => ix,
+                    Err(ix) => ix,
+                };
+                place(ix, window, cx);
+            });
+        }
         let Some(ix) = self.caret else { return };
         let layout = self.text.layout();
         if let Some(origin) = layout.position_for_index(ix) {
@@ -489,9 +571,63 @@ impl IntoElement for CaretText {
     }
 }
 
+/// `column` characters into `start..end`, clamped to the end of that line — so
+/// moving from a long line onto a short one lands at the short line's end
+/// rather than overshooting into the next.
+fn step_chars(text: &str, start: usize, end: usize, column: usize) -> usize {
+    text[start..end]
+        .char_indices()
+        .nth(column)
+        .map(|(i, _)| start + i)
+        .unwrap_or(end)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn up_and_down_keep_the_column() {
+        let mut f = field("alpha\nbravo\ncharlie", 0);
+        f.caret = 8; // "br|avo", column 2
+        assert_eq!(f.vertical(false), 2, "same column on the line above");
+        assert_eq!(f.vertical(true), 14, "and on the line below");
+    }
+
+    #[test]
+    fn a_short_line_takes_the_caret_to_its_end() {
+        // column 6 on a line that is only 2 long lands at its end, not past it
+        let mut f = field("alpha!\nno\nomega!", 0);
+        f.caret = 6; // end of "alpha!"
+        assert_eq!(f.vertical(true), 9, "the end of \"no\", not into \"omega\"");
+        f.caret = 16; // end of "omega!"
+        assert_eq!(f.vertical(false), 9);
+    }
+
+    #[test]
+    fn the_first_and_last_lines_go_to_the_ends() {
+        let mut f = field("alpha\nbravo", 0);
+        f.caret = 3;
+        assert_eq!(f.vertical(false), 0, "↑ on the first line is home");
+        f.caret = 8;
+        assert_eq!(f.vertical(true), 11, "↓ on the last line is end");
+        // a single-line field has nowhere to go but the ends
+        let mut one = field("just this", 4);
+        one.multiline = false;
+        assert_eq!(one.vertical(false), 0);
+        assert_eq!(one.vertical(true), 9);
+    }
+
+    #[test]
+    fn a_multibyte_line_counts_characters_not_bytes() {
+        let mut f = field("héllo wörld\nsecond line", 0);
+        f.caret = "héllo wö".len(); // column 8 in characters
+        let landed = f.vertical(true);
+        assert!(f.text.is_char_boundary(landed), "never mid-character");
+        // "héllo wö" is 8 characters, so it lands 8 characters into the next
+        // line — the 'i' of "line", not the byte at offset 8
+        assert_eq!(&f.text[landed..landed + 1], "i");
+    }
 
     fn field(text: &str, caret: usize) -> Field {
         let mut f = Field::multiline();

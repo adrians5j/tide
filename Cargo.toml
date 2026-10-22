@@ -15,6 +15,11 @@ gpui          = { git = "https://github.com/zed-industries/zed" }
 # and no text renders at all (boxes/colors still work via the renderer).
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
 portable-pty = "0.9.0"
+# the live browser mirror: a websocket client for agent-browser's frame/input
+# stream, and the JPEG decode for the frames it sends. `image` is the same
+# version gpui builds against, so a decoded `Frame` is the type gpui wants.
+tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+image = "0.25"
 serde_json = "1.0.150"
 similar = "3.1.1"
 syntect       = { version = "5", default-features = false, features = ["default-themes", "regex-fancy"] }
@@ -25,7 +30,10 @@ wry = "0.52"
 # set the WebKit inspector to open detached (own window) instead of docking
 # into — and resizing — our shared app window
 objc2 = "0.5"
-objc2-foundation = { version = "0.2", features = ["NSUserDefaults", "NSString"] }
+objc2-foundation = { version = "0.2", features = ["NSUserDefaults", "NSString", "NSData"] }
+# the dock icon: unbundled, a Rust binary gets the generic rocket, so the app
+# sets its own at launch from the PNG in assets/
+objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSImage", "NSResponder", "NSGraphics"] }
 
 # Optimize dependencies even in dev builds. Font shaping (gpui), the VT parser
 # (alacritty_terminal), and syntect are the hot paths; at opt-level 0 they make

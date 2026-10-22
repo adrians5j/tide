@@ -10,6 +10,9 @@ pub enum Span {
     Code(String),
     Bold(String),
     Italic(String),
+    /// `![alt](src)`. The renderer draws the picture and falls back to the alt
+    /// text when it can't be fetched, so the line still says something.
+    Image { alt: String, src: String },
 }
 
 /// One rendered line: its bullet (if any), how deep it's nested, and its spans.
@@ -18,6 +21,12 @@ pub enum Span {
 /// fence's info string, so it can be syntax-highlighted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Line {
+    /// 0-based line in the source this came from. The rendered view edits the
+    /// markdown itself, so every row has to be able to find its way back.
+    pub line: usize,
+    /// Byte offset within the source line of each span's content, in step with
+    /// `spans`. The marker is not in it: `- **a**` reports where `a` starts.
+    pub at: Vec<usize>,
     pub indent: usize,
     pub bullet: Option<String>,
     pub spans: Vec<Span>,
@@ -38,13 +47,26 @@ pub struct Line {
 /// Split a line's text into inline spans. Unclosed markers stay literal — a
 /// stray `*` is far more common in prose than a formatting mistake.
 pub fn spans(text: &str) -> Vec<Span> {
+    spans_at(text).into_iter().map(|(s, _)| s).collect()
+}
+
+/// The same, with the byte offset of each span's *content* in `text` — the
+/// text itself, not the marker: `**bold**` reports the offset of `bold`. It is
+/// what lets a rendered document be edited: every character on screen can be
+/// traced back to the character in the source it came from.
+pub fn spans_at(text: &str) -> Vec<(Span, usize)> {
     let b: Vec<char> = text.chars().collect();
-    let mut out = Vec::new();
+    // char index → byte offset, so the offsets reported are byte offsets into
+    // `text` while the parser keeps walking chars
+    let mut at: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    at.push(text.len());
+    let mut out: Vec<(Span, usize)> = Vec::new();
     let mut plain = String::new();
+    let mut plain_at = 0usize;
     let mut i = 0;
-    let flush = |plain: &mut String, out: &mut Vec<Span>| {
+    let flush = |plain: &mut String, plain_at: usize, out: &mut Vec<(Span, usize)>| {
         if !plain.is_empty() {
-            out.push(Span::Text(std::mem::take(plain)));
+            out.push((Span::Text(std::mem::take(plain)), plain_at));
         }
     };
     // find the next occurrence of `close` starting at `from`
@@ -53,18 +75,40 @@ pub fn spans(text: &str) -> Vec<Span> {
     };
     while i < b.len() {
         let rest = &b[i..];
+        // `![alt](src)` — checked before emphasis so a `*` inside a URL or an
+        // alt text can't start a run of italics
+        if rest.starts_with(&['!', '[']) {
+            if let Some(close) = find(i + 2, &[']']) {
+                if b.get(close + 1) == Some(&'(') {
+                    if let Some(end) = find(close + 2, &[')']) {
+                        let src: String = b[close + 2..end].iter().collect();
+                        // a title after the URL (`](src "t")`) is not shown
+                        let src = src.split_whitespace().next().unwrap_or("").to_string();
+                        if !src.is_empty() {
+                            flush(&mut plain, plain_at, &mut out);
+                            out.push((
+                                Span::Image { alt: b[i + 2..close].iter().collect(), src },
+                                at[i],
+                            ));
+                            i = end + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
         if rest.starts_with(&['`']) {
             if let Some(end) = find(i + 1, &['`']) {
-                flush(&mut plain, &mut out);
-                out.push(Span::Code(b[i + 1..end].iter().collect()));
+                flush(&mut plain, plain_at, &mut out);
+                out.push((Span::Code(b[i + 1..end].iter().collect()), at[i + 1]));
                 i = end + 1;
                 continue;
             }
         }
         if rest.starts_with(&['*', '*']) {
             if let Some(end) = find(i + 2, &['*', '*']) {
-                flush(&mut plain, &mut out);
-                out.push(Span::Bold(b[i + 2..end].iter().collect()));
+                flush(&mut plain, plain_at, &mut out);
+                out.push((Span::Bold(b[i + 2..end].iter().collect()), at[i + 2]));
                 i = end + 2;
                 continue;
             }
@@ -79,19 +123,22 @@ pub fn spans(text: &str) -> Vec<Span> {
             if !(m == '_' && word_char_before) {
                 if let Some(end) = find(i + 1, &[m]) {
                     if end > i + 1 && !b[end - 1].is_whitespace() {
-                        flush(&mut plain, &mut out);
-                        out.push(Span::Italic(b[i + 1..end].iter().collect()));
+                        flush(&mut plain, plain_at, &mut out);
+                        out.push((Span::Italic(b[i + 1..end].iter().collect()), at[i + 1]));
                         i = end + 1;
                         continue;
                     }
                 }
             }
         }
+        if plain.is_empty() {
+            plain_at = at[i];
+        }
         plain.push(b[i]);
         i += 1;
     }
     if !plain.is_empty() {
-        out.push(Span::Text(plain));
+        out.push((Span::Text(plain), plain_at));
     }
     out
 }
@@ -102,7 +149,7 @@ pub fn parse(text: &str) -> Vec<Line> {
     let mut out = Vec::new();
     let mut fenced = false;
     let mut lang = String::new();
-    for raw in text.split('\n') {
+    for (ln, raw) in text.split('\n').enumerate() {
         let trimmed = raw.trim_start();
         if let Some(info) = trimmed.strip_prefix("```") {
             // the opening fence names the language; the closing one clears it
@@ -112,6 +159,8 @@ pub fn parse(text: &str) -> Vec<Line> {
         }
         if fenced {
             out.push(Line {
+                line: ln,
+                at: vec![0],
                 indent: 0,
                 bullet: None,
                 spans: vec![Span::Text(raw.to_string())],
@@ -133,6 +182,8 @@ pub fn parse(text: &str) -> Vec<Line> {
                 continue;
             }
             out.push(Line {
+                line: ln,
+                at: Vec::new(),
                 indent: 0,
                 bullet: None,
                 spans: Vec::new(),
@@ -152,10 +203,13 @@ pub fn parse(text: &str) -> Vec<Line> {
             (Some(n), rest)
         } else if let Some((level, rest)) = heading(trimmed) {
             // spans still parse inside a heading (`code` in a title is common)
+            let (sp, at) = split_at(rest, raw.len() - rest.len());
             out.push(Line {
+                line: ln,
+                at,
                 indent: 0,
                 bullet: None,
-                spans: spans(rest),
+                spans: sp,
                 code: false,
                 heading: level,
                 lang: String::new(),
@@ -166,10 +220,13 @@ pub fn parse(text: &str) -> Vec<Line> {
         } else {
             (None, trimmed)
         };
+        let (sp, at) = split_at(body, raw.len() - body.len());
         out.push(Line {
+            line: ln,
+            at,
             indent,
             bullet,
-            spans: spans(body),
+            spans: sp,
             code: false,
             heading: 0,
             lang: String::new(),
@@ -178,6 +235,18 @@ pub fn parse(text: &str) -> Vec<Line> {
         });
     }
     out
+}
+
+/// Spans plus where each one's content sits in the source line: `base` is how
+/// far into the raw line `text` itself starts, past the bullet or the `#`s.
+fn split_at(text: &str, base: usize) -> (Vec<Span>, Vec<usize>) {
+    let mut sp = Vec::new();
+    let mut at = Vec::new();
+    for (s, off) in spans_at(text) {
+        sp.push(s);
+        at.push(base + off);
+    }
+    (sp, at)
 }
 
 /// `| a | b |` → the trimmed cell texts. `None` when the line isn't a table row

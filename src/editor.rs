@@ -3,7 +3,7 @@ use gpui::{
     CursorStyle, FocusHandle, Focusable, GlobalElementId, InspectorElementId, KeyDownEvent, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ScrollWheelEvent,
     ShapedLine, SharedString, Style, TextRun, UTF16Selection, Window, actions, div, fill, font,
-    point, prelude::*, px, relative, rgb, size, ClipboardItem,
+    point, prelude::*, px, relative, rgb, rgba, size, ClipboardItem,
 };
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -165,6 +165,12 @@ pub struct Editor {
     // cursor/click mapping, and vertical movement
     vlines: Vec<VLine>,
     wrap_cols: usize, // columns the last layout wrapped at (for off-render reflow)
+    /// A jump waiting for a layout, as `(start, end, room below)`. The scroll
+    /// is computed with the wrap the editor knows, but a tab that has never
+    /// painted doesn't know its width yet, so it is redone once the real one
+    /// exists — which is what makes a jump into a freshly opened file land on
+    /// the line rather than near it.
+    pending_scroll: Option<(usize, usize, f32)>,
     hl: Highlighter,
     dirty: bool,
     read_only: bool, // when true, all edits are blocked (nav/select/copy still work)
@@ -198,6 +204,11 @@ pub struct Editor {
     /// Span whose comment box is open but not yet saved — drawn like a real span
     /// so the bar doesn't vanish the moment the mouse is released.
     pub pending_span: Option<(usize, usize)>,
+    /// The code-tour stop standing here, 1-based inclusive. The workspace sets
+    /// it as you step; the editor washes those lines and bars the gutter, so a
+    /// jump lands on something you can see rather than a cursor in a wall of
+    /// text.
+    pub tour_span: Option<(usize, usize)>,
     /// Blocks of empty space inserted *after* a logical line: `(line, height)`.
     /// The workspace parks review-comment UI in them, and the text below moves
     /// down instead of being covered (GitHub-style inline forms).
@@ -257,6 +268,7 @@ impl Editor {
             scroll_x: px(0.),
             vlines: Vec::new(),
             wrap_cols: 80,
+            pending_scroll: None,
             hl: Highlighter::new(),
             dirty: false,
             read_only: true, // read-only by default; the workspace sets it per editor
@@ -274,6 +286,7 @@ impl Editor {
             last_char_width: px(8.),
             last_gutter_width: px(56.),
             comment_spans: Vec::new(),
+            tour_span: None,
             gutter_hover: None,
             gutter_drag: None,
             pending_span: None,
@@ -296,6 +309,7 @@ impl Editor {
             lsp.did_open(&self.uri, lang_id(&path), self.version, &content);
         }
         self.content = content;
+        self.reflow(); // the old file's wrap layout is not this file's
         self.path = Some(path);
         self.selected_range = 0..0;
         self.selection_reversed = false;
@@ -408,6 +422,19 @@ impl Editor {
     /// Current buffer text (used by the merge editor to write the result).
     pub fn text(&self) -> String {
         self.content.clone()
+    }
+
+    /// Put a document in this editor that didn't come from a file — a fetched
+    /// pull-request body, say. Unlike `set_log` it starts at the top and drops
+    /// the old selection, because it is something to read rather than a tail
+    /// you were already following.
+    pub fn set_document(&mut self, text: String, cx: &mut Context<Self>) {
+        self.content = text;
+        self.reflow();
+        self.styles = Vec::new();
+        self.selected_range = 0..0;
+        self.scroll_y = px(0.);
+        cx.notify();
     }
 
     pub fn set_log(&mut self, text: String, cx: &mut Context<Self>) {
@@ -627,7 +654,46 @@ impl Editor {
     }
 
     /// Jump to a 1-based line and column, centering it in the viewport.
+    /// Bring `line1..=end1` into view with `room` pixels free underneath it —
+    /// the tour's card is drawn below the span's last line, and centring the
+    /// first line leaves the card, and the step's own text, off the bottom of
+    /// the window. The caret goes to the start of the span, as `goto` does.
+    pub fn reveal_span(&mut self, line1: usize, end1: usize, room: f32, cx: &mut Context<Self>) {
+        if self.vlines.last().map(|v| v.end) != Some(self.content.len()) {
+            self.reflow();
+        }
+        let starts = self.line_starts();
+        if starts.is_empty() {
+            return;
+        }
+        let at = |l: usize| starts[l.saturating_sub(1).min(starts.len() - 1)];
+        let (a, b) = (at(line1), at(end1.max(line1)));
+        self.move_to(a, cx);
+        self.pending_scroll = Some((a, b, room));
+        self.scroll_y = px(self.scroll_for(a, b, room));
+        cx.notify();
+    }
+
+    /// Where the scroll has to be for `a..=b` plus `room` below it to sit in
+    /// the window: centred when the whole block fits, and otherwise with the
+    /// start near the top, which is the half you can still do something with.
+    fn scroll_for(&self, a: usize, b: usize, room: f32) -> f32 {
+        let vh = self.last_bounds.map(|f| f32::from(f.size.height)).unwrap_or(600.);
+        let top = self.voffset(a) as f32 * LINE_HEIGHT;
+        let bottom = (self.voffset(b) + 1) as f32 * LINE_HEIGHT + room;
+        let block = (bottom - top).max(LINE_HEIGHT);
+        let target =
+            if block <= vh { top - (vh - block) / 2.0 } else { top - LINE_HEIGHT * 2.0 };
+        target.max(0.)
+    }
+
     pub fn goto(&mut self, line1: usize, col1: usize, cx: &mut Context<Self>) {
+        // the scroll is computed from the wrap layout, so it has to be this
+        // content's. A jump straight after a load, or after an edit that
+        // hasn't been painted yet, would otherwise scroll by the old one.
+        if self.vlines.last().map(|v| v.end) != Some(self.content.len()) {
+            self.reflow();
+        }
         let starts = self.line_starts();
         if starts.is_empty() {
             return;
@@ -641,12 +707,8 @@ impl Editor {
         };
         let off = (line_start + col1.saturating_sub(1)).min(line_end);
         self.move_to(off, cx);
-
-        // center the target visual row in the viewport
-        let vh = self.last_bounds.map(|b| f32::from(b.size.height)).unwrap_or(600.);
-        let vi = self.voffset(off);
-        let target = (vi as f32 * LINE_HEIGHT) - vh / 2.0;
-        self.scroll_y = px(target.max(0.));
+        self.pending_scroll = Some((off, off, 0.0));
+        self.scroll_y = px(self.scroll_for(off, off, 0.0));
         let _ = row;
         cx.notify();
     }
@@ -1620,6 +1682,8 @@ pub struct EditorElement {
 
 pub struct EditorPrepaint {
     current_line: Option<PaintQuad>,
+    /// Full-width wash over the current tour stop's lines.
+    tour: Vec<PaintQuad>,
     /// `(x offset from the gutter's left edge, y, shaped line)` — the marker and
     /// the number are separate entries so the digits keep one column across
     /// rows, commented or not.
@@ -1771,6 +1835,7 @@ impl Element for EditorElement {
 
         let mut gutter = Vec::new();
         let mut gutter_bars = Vec::new();
+        let mut tour = Vec::new();
         let mut code = Vec::new();
         let mut selections = Vec::new();
         let mut cursor = None;
@@ -1788,6 +1853,17 @@ impl Element for EditorElement {
             let v = &vlines[vi];
             let y = bounds.top() + line_height * (vi as f32) + px(gap_above(vi)) - scroll_y;
 
+            // the tour stop you're standing on, washed across its whole width
+            // (wrapped rows included — the wash follows the logical line)
+            let in_tour =
+                editor.tour_span.is_some_and(|(a, b)| v.row + 1 >= a && v.row + 1 <= b);
+            if in_tour {
+                tour.push(fill(
+                    Bounds::new(point(bounds.left(), y), size(bounds.size.width, line_height)),
+                    rgba(TOUR_TINT),
+                ));
+            }
+
             // gutter number only on a logical line's first visual row
             if v.first {
                 let line1 = v.row + 1;
@@ -1799,7 +1875,13 @@ impl Element for EditorElement {
                     .chain(editor.pending_span.iter())
                     .any(|(a, b)| line1 >= *a && line1 <= *b);
                 let digits = format!("{}", line1);
-                let color = if in_span { rgb(COMMENT_MARK) } else { rgb(LINE_NUMBER) };
+                let color = if in_span {
+                    rgb(COMMENT_MARK)
+                } else if in_tour {
+                    rgb(TOUR_MARK)
+                } else {
+                    rgb(LINE_NUMBER)
+                };
                 // the number always starts past the marker column, so a commented
                 // line's digits stay aligned with every other row's
                 let num_run = TextRun {
@@ -1844,13 +1926,16 @@ impl Element for EditorElement {
                 }
                 // a bar down the side of every commented span (and of the range
                 // being dragged), instead of an icon repeated on each line
-                if in_span || dragging_here {
+                if in_span || dragging_here || in_tour {
                     // hard against the editor's left edge, clear of the icon
                     // column — drawn over the icon it looked like a clipped glyph
                     let x = bounds.left() + px(2.);
+                    // a comment on the stop you're standing on keeps its own
+                    // colour: the bar says which thread it belongs to
+                    let c = if in_span || dragging_here { COMMENT_MARK } else { TOUR_MARK };
                     gutter_bars.push(fill(
                         Bounds::new(point(x, y), size(px(2.), line_height)),
-                        rgb(COMMENT_MARK),
+                        rgb(c),
                     ));
                 }
             }
@@ -1910,16 +1995,27 @@ impl Element for EditorElement {
         }
 
         // stash layout info for mouse mapping + scroll bounds
-        self.editor.update(cx, |e, _| {
+        self.editor.update(cx, |e, cx| {
             e.last_bounds = Some(bounds);
             e.last_char_width = char_width;
             e.last_gutter_width = gutter_width;
             e.vlines = vlines;
+            let rewrapped = e.wrap_cols != cols;
             e.wrap_cols = cols;
+            // a jump that was computed before this layout existed: redo it now
+            // that the wrap is the real one. Only on the frame the layout
+            // changed under it, so an ordinary scroll is never yanked back.
+            if let Some((a, b, room)) = e.pending_scroll.take() {
+                if rewrapped {
+                    e.scroll_y = px(e.scroll_for(a, b, room));
+                    cx.notify();
+                }
+            }
         });
 
         EditorPrepaint {
             current_line,
+            tour,
             gutter,
             gutter_bars,
             code,
@@ -1951,6 +2047,11 @@ impl Element for EditorElement {
         // current-line highlight (behind everything, full width)
         if let Some(cl) = prepaint.current_line.take() {
             window.paint_quad(cl);
+        }
+        // over the current-line stripe: standing on a tour stop, the stop is
+        // what you're meant to see
+        for t in prepaint.tour.drain(..) {
+            window.paint_quad(t);
         }
 
         let editor = self.editor.read(cx);

@@ -59,6 +59,30 @@ pub fn load_limits() -> Option<Limits> {
 
 /// `Aug 27 at 12:30pm` in the machine's own timezone. `date` knows the rules;
 /// re-deriving them from an offset would be wrong twice a year.
+/// How long until `epoch`, as "4h 20m" or "35m". Empty when there's no
+/// timestamp, and "any moment" once it's in the past but the reading hasn't
+/// caught up — the wait is the number you actually want when you're rationing.
+pub fn fmt_left(epoch: i64) -> String {
+    if epoch <= 0 {
+        return String::new();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let secs = epoch - now;
+    if secs <= 0 {
+        return "any moment".into();
+    }
+    let (h, m) = (secs / 3600, (secs % 3600) / 60);
+    match (h, m) {
+        (0, 0) => "under a minute".into(),
+        (0, m) => format!("{m}m"),
+        (h, 0) => format!("{h}h"),
+        (h, m) => format!("{h}h {m}m"),
+    }
+}
+
 pub fn fmt_reset(epoch: i64) -> String {
     if epoch <= 0 {
         return String::new();
@@ -116,6 +140,21 @@ pub fn short(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wait, not the clock time: that's the number you ration against.
+    #[test]
+    fn time_left_reads_as_a_wait() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert_eq!(fmt_left(now + 4 * 3600 + 20 * 60 + 5), "4h 20m");
+        assert_eq!(fmt_left(now + 35 * 60), "35m");
+        assert_eq!(fmt_left(now + 2 * 3600), "2h");
+        assert_eq!(fmt_left(now + 20), "under a minute");
+        assert_eq!(fmt_left(now - 60), "any moment");
+        assert!(fmt_left(0).is_empty());
+    }
 
     #[test]
     fn short_reads_at_a_glance() {
