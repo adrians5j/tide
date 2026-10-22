@@ -21659,6 +21659,12 @@ impl Storm {
             let returns = n.repeat;
             let notes: usize =
                 n.steps.iter().filter_map(|&si| w.stops.get(si)).map(|s| self.stop_notes(s)).sum();
+            let first_step = n.steps.first().copied().unwrap_or(0);
+            let tint = w
+                .stops
+                .get(first_step)
+                .map(|st| self.git_tint(&st.path, if on { TEXT } else { DIR }))
+                .unwrap_or(if on { TEXT } else { DIR });
             // a named part of the tour starts here
             if n.group.trim() != group {
                 group = n.group.trim().to_string();
@@ -21674,15 +21680,22 @@ impl Storm {
                 }
             }
             let mut box_ = div()
+                .id(("tour-map-node", ni))
                 .flex()
                 .flex_col()
                 .gap_1()
                 .px_2()
                 .py_1p5()
                 .rounded_md()
+                .cursor_pointer()
                 .border_1()
                 .border_color(rgb(if on { accent } else { BORDER }))
                 .when(on, |d| d.bg(rgba(TOUR_TINT)))
+                .when(!on, |d| d.hover(|s| s.bg(rgb(HOVER))))
+                // anywhere on the box goes to where the tour enters this file
+                .on_click(cx.listener(move |this, _e, window, cx| {
+                    this.goto_walk_stop(first_step, window, cx)
+                }))
                 .child(
                     div()
                         .flex()
@@ -21708,7 +21721,7 @@ impl Storm {
                                 .min_w(px(0.))
                                 .truncate()
                                 .text_size(px(12.))
-                                .text_color(rgb(if on { TEXT } else { DIR }))
+                                .text_color(rgb(tint))
                                 .child(n.file.clone()),
                         )
                         .when(returns, |d| {
@@ -21764,6 +21777,7 @@ impl Storm {
                 chips = chips.child(
                     div()
                         .id(("tour-map-step", si))
+                        .occlude()
                         .px_1p5()
                         .rounded_md()
                         .cursor_pointer()
@@ -22242,6 +22256,7 @@ impl Storm {
         let accent = if tour.is_some() { TOUR_MARK } else { COMMENT_MARK };
         let title = stop.title.trim().to_string();
         let said = stop.said.trim().to_string();
+        let group = stop.group.trim().to_string();
         let ask_empty = self.tour_ask.is_empty();
         let caret = self.caret();
         let thread: Vec<(bool, String)> = self
@@ -22315,6 +22330,17 @@ impl Storm {
                                     title
                                 }),
                         )
+                        .when(!group.is_empty(), |d| {
+                            // which part of the tour this is, the same name the
+                            // map files it under
+                            d.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(MUTED))
+                                    .child(group.clone()),
+                            )
+                        })
                         .child(
                             div()
                                 .id("card-close")
@@ -22491,6 +22517,24 @@ impl Storm {
         self.send_agent_prompt_as(tour_request(about.as_deref(), None), Some(label), cx);
         self.agent_list.scroll_to_end();
         cx.notify();
+    }
+
+    /// The colour a file's name takes everywhere else in TIDE: green when the
+    /// branch adds it, blue when it changes it, grey when it removes it.
+    /// `fallback` is for a file the branch doesn't touch, which is most of them
+    /// on a tour that explains code rather than a change.
+    fn git_tint(&self, path: &str, fallback: u32) -> u32 {
+        let abs = self
+            .ref_hits
+            .get(path)
+            .cloned()
+            .flatten()
+            .unwrap_or_else(|| self.root.join(path));
+        self.pr_files
+            .iter()
+            .find(|(p, _)| *p == abs)
+            .map(|(_, st)| pr_status_color(*st))
+            .unwrap_or(fallback)
     }
 
     fn load_tour_diff(&mut self, cx: &mut Context<Self>) {
@@ -24681,6 +24725,7 @@ impl Storm {
     /// project are dropped rather than left to fail on arrival — a tour is only
     /// worth anything if every press of ⌥] lands somewhere.
     fn start_tour(&mut self, tour: rpc::Tour, cx: &mut Context<Self>) {
+        self.load_tour_diff(cx); // so the map's file names carry their status
         // no steps is how an agent puts a tour away; it is not a broken one
         if tour.steps.is_empty() {
             let had = self.walk.as_ref().is_some_and(|w| w.tour.is_some());
@@ -24954,6 +24999,7 @@ impl Storm {
     /// Open a stored tour. `restart` takes it from the top; otherwise it picks
     /// up where it was left.
     fn open_tour(&mut self, id: String, restart: bool, cx: &mut Context<Self>) {
+        self.load_tour_diff(cx);
         let Some(rec) = self.tours.iter().find(|t| t.id == id) else {
             self.show_flash("That tour is gone", cx);
             return;
