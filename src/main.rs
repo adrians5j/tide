@@ -22635,18 +22635,6 @@ impl Storm {
                         .flex_row()
                         .items_center()
                         .gap_1p5()
-                        .when(!where_pkg.is_empty(), |d| {
-                            d.child(
-                                div()
-                                    .flex_shrink_0()
-                                    .px_1()
-                                    .rounded_sm()
-                                    .bg(rgb(HOVER))
-                                    .text_size(px(11.))
-                                    .text_color(rgb(DIR))
-                                    .child(where_pkg.clone()),
-                            )
-                        })
                         .child(
                             div()
                                 .flex_grow(1.0)
@@ -22675,6 +22663,24 @@ impl Storm {
                             .child(diffstat_squares(add, del))
                         }),
                 )
+                // the package under the path, as a chip. On the card it takes
+                // the editor's background rather than the map's: POPUP_BG and
+                // HOVER are a hair apart, so the map's chip colour is invisible
+                // against the card it would sit on
+                .when(!where_pkg.is_empty(), |d| {
+                    d.child(
+                        div().flex().flex_row().child(
+                            div()
+                                .flex_shrink_0()
+                                .px_1()
+                                .rounded_sm()
+                                .bg(rgb(BG))
+                                .text_size(px(11.))
+                                .text_color(rgb(DIR))
+                                .child(where_pkg.clone()),
+                        ),
+                    )
+                })
                 .when(!said.is_empty(), |d| {
                     d.child(
                         div()
