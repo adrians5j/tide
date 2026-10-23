@@ -22082,6 +22082,7 @@ impl Storm {
         Some(
             div()
                 .id("tour-bookend")
+                .occlude()
                 .absolute()
                 .left(px(left))
                 .top(px(top))
@@ -22366,6 +22367,8 @@ impl Storm {
         };
         Some(
             div()
+                .id("tour-card")
+                .occlude()
                 .absolute()
                 .left(px(left))
                 .top(px(top))
