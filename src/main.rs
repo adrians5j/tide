@@ -24671,6 +24671,21 @@ impl Storm {
         if n == 0 {
             return;
         }
+        // standing on one of the end cards: stepping off it lands on the stop
+        // at that end, and there is nothing beyond it to step to
+        if w.intro || w.done {
+            let forward = w.intro;
+            if (forward && dir < 0) || (!forward && dir > 0) {
+                return;
+            }
+            w.intro = false;
+            w.done = false;
+            w.at = if forward { 0 } else { n - 1 };
+            let stop = w.stops[w.at].clone();
+            self.open_walk_stop(&stop, window, cx);
+            self.tour_touched();
+            return;
+        }
         // a tour restored from a previous session hasn't opened anything yet:
         // the first press stands on where you left off instead of skipping it
         if w.here.is_none() {
@@ -24678,7 +24693,19 @@ impl Storm {
             self.open_walk_stop(&stop, window, cx);
             return;
         }
-        w.at = ((w.at as i32 + dir).rem_euclid(n as i32)) as usize;
+        // walking off either end shows that end's card rather than wrapping
+        // round to the other, which read as the tour starting over
+        let next = w.at as i32 + dir;
+        if next < 0 || next >= n as i32 {
+            w.intro = next < 0;
+            w.done = next >= n as i32;
+            w.here = None; // nothing to light up while you are at an end
+            self.sync_comment_gutters(cx);
+            self.tour_touched();
+            cx.notify();
+            return;
+        }
+        w.at = next as usize;
         let stop = w.stops[w.at].clone();
         self.open_walk_stop(&stop, window, cx);
         self.tour_touched();
@@ -25037,6 +25064,8 @@ impl Storm {
         let Some(w) = self.walk.as_mut() else { return };
         let Some(stop) = w.stops.get(i).cloned() else { return };
         w.at = i;
+        w.intro = false;
+        w.done = false;
         self.open_walk_stop(&stop, window, cx);
         self.tour_touched(); // the stop you're on is part of the tour's state
     }
