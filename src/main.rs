@@ -22504,6 +22504,25 @@ impl Storm {
                         })
                         .child(
                             div()
+                                .id("card-diff")
+                                .flex_shrink_0()
+                                .px_2()
+                                .py(px(2.))
+                                .rounded_md()
+                                .cursor_pointer()
+                                .text_size(px(11.))
+                                .border_1()
+                                .border_color(rgb(BORDER))
+                                .text_color(rgb(MUTED))
+                                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                .child("diff")
+                                .tooltip(tip("Open this file in the diff window  (⌘D)"))
+                                .on_click(cx.listener(|this, _e, window, cx| {
+                                    this.diff_stop_file(window, cx)
+                                })),
+                        )
+                        .child(
+                            div()
                                 .id("card-clarify")
                                 .flex_shrink_0()
                                 .px_2()
@@ -22651,6 +22670,25 @@ impl Storm {
 
     /// Done with the thread on the stop you are standing on. The same action
     /// the gutter box has, where you are actually reading it.
+    /// The stop's file in the diff window — the one ⌘D opens. When the file is
+    /// part of the pull request it opens against the base with the rest of the
+    /// PR's files beside it, which is the diff a tour of a PR is about;
+    /// otherwise it is the working-tree diff ⌘D would have given.
+    fn diff_stop_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(stop) = self.walk.as_ref().and_then(|w| w.stops.get(w.at).cloned()) else {
+            return;
+        };
+        let Some(path) = self.file_ref_target(&stop.path, cx) else {
+            self.show_flash(&format!("Can't find {} in this project", stop.path), cx);
+            return;
+        };
+        if self.pr_files.iter().any(|(p, _)| p == &path) {
+            self.open_pr_diff(path, window, cx);
+            return;
+        }
+        self.open_diff_window(vec![path], 0, None, None, false, String::new(), PrViewFilter::All, cx);
+    }
+
     fn resolve_stop_thread(&mut self, cx: &mut Context<Self>) {
         let Some(stop) = self.walk.as_ref().and_then(|w| w.stops.get(w.at).cloned()) else {
             return;
