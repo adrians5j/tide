@@ -5816,6 +5816,28 @@ fn pkg_name(path: &str) -> &str {
     ""
 }
 
+/// The commit HEAD is on. Empty when there isn't one yet (a fresh repo) or
+/// git can't say.
+fn git_head_oid(root: &Path) -> String {
+    Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// The pull request a tour's title names, for a tour that arrived without TIDE
+/// having asked for it: the agent is told to lead with `#1234`.
+fn tour_pr_from_title(title: &str) -> Option<u64> {
+    let rest = title.trim().strip_prefix('#')?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
 /// The tail of a path, enough to tell two `index.ts` apart without filling a
 /// 300px column: `…/api/features/TaskService`.
 fn dir_tail(dir: &str, parts: usize) -> String {
@@ -5892,6 +5914,13 @@ struct TourRec {
     /// Put away with ✕. It stays in the list, it just doesn't reopen itself
     /// next launch.
     closed: bool,
+    /// The pull request this tour is of, when it is of one. A tour of a change
+    /// goes stale the moment the change moves; a tour of how something works
+    /// does not, which is why only one of them is worth rebuilding.
+    pr: Option<u64>,
+    /// The commit the tour was built against, so TIDE can tell the code has
+    /// moved out from under its stops.
+    oid: String,
     stops: Vec<Stop>,
 }
 
@@ -6157,6 +6186,8 @@ fn tours_to_json(list: &[TourRec]) -> String {
                 "at": t.at,
                 "made": t.made,
                 "closed": t.closed,
+                "pr": t.pr,
+                "oid": t.oid,
                 "steps": steps,
             })
         })
@@ -6194,6 +6225,8 @@ fn tour_rec_from_json(v: &serde_json::Value) -> Option<TourRec> {
         at: at.min(stops.len() - 1),
         made: v.get("made").and_then(|m| m.as_u64()).unwrap_or(0),
         closed: v.get("closed").and_then(|c| c.as_bool()).unwrap_or(false),
+        pr: v.get("pr").and_then(|n| n.as_u64()),
+        oid: v.get("oid").and_then(|o| o.as_str()).unwrap_or("").to_string(),
         stops,
     })
 }
@@ -6983,6 +7016,15 @@ struct Storm {
     /// report through the RPC channel — hooks can't see this agent, so the panel
     /// reports itself.
     acp_state: Option<AgentState>,
+    /// The commit HEAD is on, refreshed by the git poll. A tour built against
+    /// a different one is describing code that has since moved.
+    head_oid: String,
+    /// The pull request TIDE last asked for a tour of, so the tour that comes
+    /// back can be stamped with it.
+    pending_tour_pr: Option<u64>,
+    /// The commit each PR's tour was last asked for at, so a branch that moves
+    /// twice asks twice and a poll that ticks every five seconds doesn't.
+    tour_asked_at: HashMap<u64, String>,
     // ── Git log panel (bottom dock) ────────────────────────────────────────
     git_open: bool,                          // dock visible
     git_height: f32,                         // dock height
@@ -7519,6 +7561,9 @@ impl Storm {
             agent_list: gpui::ListState::new(0, gpui::ListAlignment::Bottom, px(600.)),
             agent_list_len: 0,
             acp_state: None,
+            head_oid: String::new(),
+            pending_tour_pr: None,
+            tour_asked_at: HashMap::new(),
             git_open: false,
             git_height: 320.,
             resizing_git: false,
@@ -9277,7 +9322,7 @@ impl Storm {
             };
             let root2 = root.clone();
             let base = this.update(cx, |this, _| this.pr_base.clone()).unwrap_or_default();
-            let (status, branch, mem, ignored, (idle, paused), pkgs) = cx
+            let (status, branch, mem, ignored, (idle, paused), pkgs, head_oid) = cx
                 .background_executor()
                 .spawn(async move {
                     let base = if base.is_empty() { git_default_branch(&root2) } else { base };
@@ -9290,6 +9335,7 @@ impl Storm {
                         // workspace idle or paused since the last tick
                         (load_ws_idle(&root2), load_ws_paused(&root2)),
                         changed_packages(&root2, &base),
+                        git_head_oid(&root2),
                     )
                 })
                 .await;
@@ -9308,6 +9354,7 @@ impl Storm {
             if this
                 .update(cx, |this, cx| {
                     this.git_status = status;
+                    this.head_oid = head_oid;
                     this.branch = branch.clone();
                     this.mem_mb = mem;
                     this.watch_pkgs = pkgs;
@@ -9327,6 +9374,7 @@ impl Storm {
                         this.base_sync = None; // a different branch, a different answer
                         this.refresh_base_sync(cx);
                     }
+                    this.tour_auto_tick(cx);
                     // pick up external edits (e.g. from Claude Code) on any open
                     // tab whose buffer has no unsaved changes
                     let editors: Vec<_> = this.tabs.iter().map(|t| t.editor.clone()).collect();
@@ -21844,7 +21892,7 @@ impl Storm {
                                         .px_1()
                                         .rounded_sm()
                                         .bg(rgb(HOVER))
-                                        .text_size(px(9.))
+                                        .text_size(px(11.))
                                         .text_color(rgb(DIR))
                                         .child(pkg.clone()),
                                 )
@@ -21920,8 +21968,19 @@ impl Storm {
     /// from `☰ N steps` in the strip. It stands beside the code rather than
     /// under it: a 38-stop tour is a table of contents, and reading one four
     /// rows at a time through a strip is reading it through a letterbox.
+    /// The stored tour the open walk came from, if it came from one.
+    fn open_tour_rec(&self) -> Option<&TourRec> {
+        let id = self.walk.as_ref()?.id.as_ref()?;
+        self.tours.iter().find(|t| &t.id == id)
+    }
+
     fn render_tour_steps(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let w = self.walk.as_ref().filter(|w| w.list)?;
+        let rec = self.open_tour_rec();
+        let pr = rec.and_then(|t| t.pr);
+        // the branch has moved since this tour was built, so its stops are
+        // describing code that may not be there any more
+        let stale = rec.is_some_and(|t| !t.oid.is_empty() && t.oid != self.head_oid);
         let accent = if w.tour.is_some() { TOUR_MARK } else { COMMENT_MARK };
         let mut list = div()
             .id("tour-steps")
@@ -22044,6 +22103,25 @@ impl Storm {
                                 .items_center()
                                 .gap_2()
                                 .child(format!("{} steps", w.stops.len()))
+                                .when_some(pr, |d, n| {
+                                    d.child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .px_1()
+                                            .rounded_sm()
+                                            .bg(rgb(HOVER))
+                                            .text_color(rgb(DIR))
+                                            .child(format!("#{n}")),
+                                    )
+                                })
+                                .when(stale, |d| {
+                                    d.child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_color(rgb(TOUR_MARK))
+                                            .child("the branch moved"),
+                                    )
+                                })
                                 .child(div().flex_grow(1.0))
                                 .child(
                                     div()
@@ -22054,13 +22132,15 @@ impl Storm {
                                         .rounded_md()
                                         .cursor_pointer()
                                         .border_1()
-                                        .border_color(rgb(BORDER))
-                                        .text_color(rgb(MUTED))
+                                        .border_color(rgb(if stale { TOUR_MARK } else { BORDER }))
+                                        .text_color(rgb(if stale { TOUR_MARK } else { MUTED }))
                                         .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TOUR_MARK)))
                                         .child("⟲ Rebuild")
-                                        .tooltip(tip(
-                                            "Ask for this tour again, from the code as it stands now",
-                                        ))
+                                        .tooltip(tip(if stale {
+                                            "The branch has moved since this tour was built"
+                                        } else {
+                                            "Ask for this tour again, from the code as it stands now"
+                                        }))
                                         .on_click(cx.listener(|this, _e, _w, cx| this.regen_tour(cx))),
                                 ),
                         ),
@@ -22671,6 +22751,7 @@ impl Storm {
 
     /// A tour of the pull request: its changes in the order they should be read.
     fn ask_pr_tour(&mut self, number: u64, base: String, cx: &mut Context<Self>) {
+        self.pending_tour_pr = Some(number);
         let label = format!("Asked for a code tour of #{number}");
         self.agent_open = true;
         self.send_agent_prompt_as(pr_tour_request(number, &base), Some(label), cx);
@@ -22680,8 +22761,46 @@ impl Storm {
 
     /// Build this tour again. A tour is a snapshot: once the code under it has
     /// moved, the stops drift off their lines and the prose stops matching.
+    /// A PR gets a tour without being asked, and a new one each time the
+    /// branch moves under it. A tour of a change is only worth anything while
+    /// it describes the change as it is, and clicking a button to say so after
+    /// every commit is the sort of thing TIDE should be doing itself.
+    ///
+    /// Guarded three ways: nothing while the agent is mid-turn, nothing while
+    /// an earlier request is still unanswered, and at most one request per
+    /// commit, so the five-second poll that calls this costs nothing.
+    fn tour_auto_tick(&mut self, cx: &mut Context<Self>) {
+        let Some((number, ..)) = self.pr_link.clone() else { return };
+        if self.head_oid.is_empty() || self.pending_tour_pr.is_some() {
+            return;
+        }
+        if matches!(self.acp_state, Some(AgentState::Working)) {
+            return;
+        }
+        if self.tour_asked_at.get(&number).is_some_and(|o| *o == self.head_oid) {
+            return;
+        }
+        let base = self.pr_base.clone();
+        match self.tours.iter().find(|t| t.pr == Some(number)) {
+            // the branch has moved out from under the tour it already has
+            Some(t) if t.oid != self.head_oid && !t.oid.is_empty() => {
+                self.tour_asked_at.insert(number, self.head_oid.clone());
+                self.ask_pr_tour(number, base, cx);
+                self.show_flash("The branch moved: asked for the tour again", cx);
+            }
+            Some(_) => {}
+            // no tour of this PR yet
+            None => {
+                self.tour_asked_at.insert(number, self.head_oid.clone());
+                self.ask_pr_tour(number, base, cx);
+                self.show_flash(&format!("Asked for a tour of #{number}"), cx);
+            }
+        }
+    }
+
     fn regen_tour(&mut self, cx: &mut Context<Self>) {
         let Some(name) = self.walk.as_ref().map(|w| w.tour.clone()) else { return };
+        self.pending_tour_pr = self.open_tour_rec().and_then(|t| t.pr);
         let about = match name.as_deref().map(str::trim) {
             Some(n) if !n.is_empty() => format!(
                 "\u{201c}{n}\u{201d}. There is already a tour by that name, but the code has \
@@ -25010,12 +25129,17 @@ impl Storm {
             "" => "Code tour".to_string(),
             t => t.to_string(),
         };
+        // what this tour is of: the PR TIDE asked about, or the one the agent
+        // led the title with when it wasn't asked
+        let pr = self.pending_tour_pr.take().or_else(|| tour_pr_from_title(&title));
         let rec = TourRec {
             id: random_id(),
             title: title.clone(),
             at: 0,
             made: now_secs(),
             closed: false,
+            pr,
+            oid: self.head_oid.clone(),
             stops: stops.clone(),
         };
         self.walk = Some(Walk {
@@ -35681,6 +35805,29 @@ mod code_tour_tests {
         }
     }
 
+    /// A tour of a pull request is told apart from a tour of how something
+    /// works, and keeps that through a restart along with the commit it was
+    /// built at — which is what "the branch moved" is read off.
+    #[test]
+    fn a_pr_tour_knows_which_pr_and_which_commit() {
+        assert_eq!(tour_pr_from_title("#6092 installer password rules"), Some(6092));
+        assert_eq!(tour_pr_from_title("#1 x"), Some(1));
+        assert_eq!(tour_pr_from_title("Background task dispatch"), None);
+        assert_eq!(tour_pr_from_title("fixes #6092"), None); // the number leads, or it isn't one
+        assert_eq!(tour_pr_from_title("#notanumber"), None);
+
+        let mut t = rec("t1", "#6092 installer password rules", 0, false);
+        t.pr = Some(6092);
+        t.oid = "80c32ef7b1".into();
+        let back = tours_from_json(&tours_to_json(&[t]));
+        assert_eq!(back[0].pr, Some(6092));
+        assert_eq!(back[0].oid, "80c32ef7b1");
+        // a tour of the code in general has neither, and never goes stale
+        let plain = tours_from_json(&tours_to_json(&[rec("t2", "How dispatch works", 0, false)]));
+        assert_eq!(plain[0].pr, None);
+        assert!(plain[0].oid.is_empty());
+    }
+
     /// The map labels each file with its package, so a tour full of `index.ts`
     /// and `schema.ts` says which one you are looking at.
     #[test]
@@ -35710,6 +35857,8 @@ mod code_tour_tests {
             at,
             made: 1_760_000_000,
             closed,
+            pr: None,
+            oid: String::new(),
             stops: vec![stop("src/a.ts", 67, 72, "trigger()"), stop("src/b.ts", 12, 12, "loop")],
         }
     }
