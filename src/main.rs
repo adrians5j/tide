@@ -16003,7 +16003,7 @@ impl Storm {
                 }
                 cx.notify();
             })))
-            .child(activity_icon("act-tours", IC_TOUR, "Code Tours", tours_active, 0, cx.listener(|this, _ev, _w, cx| {
+            .child(activity_icon("act-tours", IC_TOUR, "Code Tours", tours_active, self.tours.len(), cx.listener(|this, _ev, _w, cx| {
                 if this.show_left && this.left_view == LeftView::Tours {
                     this.show_left = false;
                 } else {
@@ -21851,51 +21851,77 @@ impl Storm {
                 .border_l_1()
                 .border_color(rgb(BORDER))
                 .child(
+                    // two rows: the tour's name is the thing to read, and the
+                    // count and the rebuild button sit under it with room to be
+                    // aimed at rather than squeezed in beside the title
                     div()
-                        .h(px(36.))
-                        .px_3()
                         .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
+                        .flex_col()
+                        .gap_1p5()
+                        .px_3()
+                        .py_2()
                         .border_b_1()
                         .border_color(rgb(BORDER))
                         .text_size(px(11.))
                         .text_color(rgb(MUTED))
                         .child(
                             div()
-                                .flex_grow(1.0)
-                                .min_w(px(0.))
-                                .truncate()
-                                .text_color(rgb(accent))
-                                .child(w.tour.clone().unwrap_or_else(|| "This answer".to_string())),
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_grow(1.0)
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .text_color(rgb(accent))
+                                        .child(
+                                            w.tour
+                                                .clone()
+                                                .unwrap_or_else(|| "This answer".to_string()),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("tour-steps-close")
+                                        .px_1()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .flex_shrink_0()
+                                        .text_color(rgb(LINE_NUMBER))
+                                        .hover(|s| s.text_color(rgb(TEXT)))
+                                        .child("✕")
+                                        .tooltip(tip("End the tour  (esc)"))
+                                        .on_click(cx.listener(|this, _e, _w, cx| this.end_walk(cx))),
+                                ),
                         )
-                        .child(format!("{} steps", w.stops.len()))
                         .child(
                             div()
-                                .id("tour-steps-regen")
-                                .px_1()
-                                .rounded_md()
-                                .cursor_pointer()
-                                .flex_shrink_0()
-                                .text_color(rgb(LINE_NUMBER))
-                                .hover(|s| s.text_color(rgb(TOUR_MARK)))
-                                .child("⟲")
-                                .tooltip(tip("Build this tour again from the code as it stands now"))
-                                .on_click(cx.listener(|this, _e, _w, cx| this.regen_tour(cx))),
-                        )
-                        .child(
-                            div()
-                                .id("tour-steps-close")
-                                .px_1()
-                                .rounded_md()
-                                .cursor_pointer()
-                                .flex_shrink_0()
-                                .text_color(rgb(LINE_NUMBER))
-                                .hover(|s| s.text_color(rgb(TEXT)))
-                                .child("✕")
-                                .tooltip(tip("End the tour  (esc)"))
-                                .on_click(cx.listener(|this, _e, _w, cx| this.end_walk(cx))),
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .child(format!("{} steps", w.stops.len()))
+                                .child(div().flex_grow(1.0))
+                                .child(
+                                    div()
+                                        .id("tour-steps-regen")
+                                        .flex_shrink_0()
+                                        .px_2()
+                                        .py(px(2.))
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .border_1()
+                                        .border_color(rgb(BORDER))
+                                        .text_color(rgb(MUTED))
+                                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TOUR_MARK)))
+                                        .child("⟲ Rebuild")
+                                        .tooltip(tip(
+                                            "Ask for this tour again, from the code as it stands now",
+                                        ))
+                                        .on_click(cx.listener(|this, _e, _w, cx| this.regen_tour(cx))),
+                                ),
                         ),
                 )
                 .child(self.render_tour_map(w, accent, cx)),
