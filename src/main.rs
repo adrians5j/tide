@@ -20491,11 +20491,16 @@ impl Storm {
     /// full-window transparent backdrop dismisses it on any outside click.
     /// The editor context-menu actions, in display order. Shared by the menu
     /// renderer and the keyboard handler so the numbers always line up.
-    fn editor_ctx_actions() -> [(&'static str, fn(&mut Self, &mut Window, &mut Context<Self>)); 8] {
+    fn editor_ctx_actions() -> [(&'static str, fn(&mut Self, &mut Window, &mut Context<Self>)); 9] {
         [
             ("Reveal in Dir Tree", |this, window, cx| this.reveal_active_in_tree(window, cx)),
             ("Reveal in Changes", |this, window, cx| this.reveal_active_in_changes(window, cx)),
             ("Reveal in PR Review", |this, window, cx| this.reveal_active_in_pr(window, cx)),
+            ("Reveal in Finder", |this, _w, _cx| {
+                if let Some(p) = this.active_path().cloned() {
+                    let _ = Command::new("open").arg("-R").arg(&p).spawn();
+                }
+            }),
             ("Copy Full Path", |this, _w, cx| {
                 if let Some(p) = this.active_path().cloned() {
                     cx.write_to_clipboard(ClipboardItem::new_string(p.to_string_lossy().to_string()));
