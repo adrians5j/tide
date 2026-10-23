@@ -23619,6 +23619,9 @@ impl Storm {
          reproduced, a layout that looks wrong. `agent-browser console` and \
          `agent-browser errors` are worth reading before you say a page works. \
          The local sign-in details are above.\n\n\
+         Run the admin app locally with `wdev`, one word, no arguments. That \
+         is the command here: don't reach for a yarn script or invent a dev \
+         command of your own.\n\n\
          When TIDE hands you a job — review comments to address, a branch to \
          bring up to date, a conflict to sort out — finish by posting what you \
          did. It lands as a card in the transcript rather than as the tail of a \
