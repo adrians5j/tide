@@ -5803,6 +5803,19 @@ fn file_key(n: &TourNode) -> String {
     }
 }
 
+/// The package a file belongs to in a monorepo: the segment after `packages/`.
+/// Empty when the path isn't under one. In a repo where half the tour is
+/// `index.ts` and `schema.ts`, the package is the part that says where you are.
+fn pkg_name(path: &str) -> &str {
+    let mut parts = path.split('/');
+    while let Some(seg) = parts.next() {
+        if seg == "packages" {
+            return parts.next().unwrap_or("");
+        }
+    }
+    ""
+}
+
 /// The tail of a path, enough to tell two `index.ts` apart without filling a
 /// 300px column: `…/api/features/TaskService`.
 fn dir_tail(dir: &str, parts: usize) -> String {
@@ -21650,6 +21663,11 @@ impl Storm {
                 let abs = self.stop_abs(st);
                 self.pr_stats.get(&abs).copied()
             });
+            let pkg = w
+                .stops
+                .get(first_step)
+                .map(|st| pkg_name(&st.path).to_string())
+                .unwrap_or_default();
             // a named part of the tour starts here
             if n.group.trim() != group {
                 group = n.group.trim().to_string();
@@ -21809,13 +21827,28 @@ impl Storm {
                             )
                         }),
                 )
-                .when(!n.dir.is_empty() || stat.is_some(), |d| {
+                .when(!n.dir.is_empty() || stat.is_some() || !pkg.is_empty(), |d| {
                     d.child(
                         div()
                             .flex()
                             .flex_row()
                             .items_center()
                             .gap_1p5()
+                            // the package first: in a monorepo it is the part
+                            // that says where you are, and the tail below it
+                            // only says which of a dozen index.ts this is
+                            .when(!pkg.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .px_1()
+                                        .rounded_sm()
+                                        .bg(rgb(HOVER))
+                                        .text_size(px(9.))
+                                        .text_color(rgb(DIR))
+                                        .child(pkg.clone()),
+                                )
+                            })
                             .child(
                                 div()
                                     .flex_grow(1.0)
@@ -35648,8 +35681,21 @@ mod code_tour_tests {
         }
     }
 
-    /// The strip and the step list both say where a stop is, and a range says
-    /// so rather than pretending to be one line.
+    /// The map labels each file with its package, so a tour full of `index.ts`
+    /// and `schema.ts` says which one you are looking at.
+    #[test]
+    fn a_step_names_its_package() {
+        assert_eq!(pkg_name("packages/api-core/src/features/users/schema.ts"), "api-core");
+        assert_eq!(pkg_name("packages/app-admin/src/base/Admin.tsx"), "app-admin");
+        // a nested workspace still reports the package it is in
+        assert_eq!(pkg_name("apps/web/packages/ui/src/Button.tsx"), "ui");
+        // and a path outside one has nothing to say
+        assert_eq!(pkg_name("src/main.rs"), "");
+        assert_eq!(pkg_name("packages"), "");
+    }
+
+    /// The card and the map both say where a stop is, and a range says so
+    /// rather than pretending to be one line.
     #[test]
     fn a_stop_says_where_it_is() {
         assert_eq!(stop_label(&stop("src/a.ts", 67, 72, "t")), "src/a.ts:67-72");
