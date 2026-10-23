@@ -5816,6 +5816,40 @@ fn pkg_name(path: &str) -> &str {
     ""
 }
 
+/// The other stops a stop's prose points at: the ones whose file or title it
+/// names. A description that says "wakes every driveTask call" is talking about
+/// a stop you have already walked or one that is coming, and without this you
+/// have to walk the tour to find out which.
+///
+/// Matched on the file's name without its extension, and on the stop's own
+/// title, each only when it is long enough that finding it in prose means
+/// something. The extension is dropped on purpose: `index.ts` clears any
+/// length test while `index` does not, and a tour of a monorepo is full of
+/// files whose names carry nothing.
+fn stops_mentioned(stops: &[Stop], at: usize) -> Vec<usize> {
+    const MIN: usize = 6;
+    let Some(here) = stops.get(at) else { return Vec::new() };
+    let said = &here.said;
+    if said.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (i, s) in stops.iter().enumerate() {
+        if i == at {
+            continue;
+        }
+        let base = s.path.rsplit('/').next().unwrap_or(&s.path);
+        let stem = base.split('.').next().unwrap_or(base);
+        let title = s.title.trim();
+        let hit = (stem.len() >= MIN && said.contains(stem))
+            || (title.len() >= MIN && said.contains(title));
+        if hit {
+            out.push(i);
+        }
+    }
+    out
+}
+
 /// The named parts of a tour, in the order the walk reaches them. A part the
 /// tour returns to later is one part, not two: the name is what it is about,
 /// not where it sits.
@@ -22499,6 +22533,17 @@ impl Storm {
             self.pr_stats.get(&abs).copied()
         };
         let where_pkg = pkg_name(&stop.path).to_string();
+        // the other stops this description names, so "it hands back to
+        // RecoverTasksHandler" says whether that is behind you or ahead
+        let points_at: Vec<(usize, String, bool)> = stops_mentioned(&w.stops, w.at)
+            .into_iter()
+            .take(4)
+            .filter_map(|i| {
+                let s = w.stops.get(i)?;
+                let base = s.path.rsplit('/').next().unwrap_or(&s.path).to_string();
+                Some((i, base, i < w.at))
+            })
+            .collect();
         let ask_empty = self.tour_ask.is_empty();
         let caret = self.caret();
         let thread: Vec<(bool, String)> = self
@@ -22692,6 +22737,45 @@ impl Storm {
                                 .text_color(rgb(DIR))
                                 .child(where_pkg.clone()),
                         ),
+                    )
+                })
+                .when(!points_at.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .gap_1p5()
+                            .children(points_at.iter().map(|(i, base, behind)| {
+                                let (i, behind) = (*i, *behind);
+                                div()
+                                    .id(("card-points", i))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    .px_1p5()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .bg(rgb(BG))
+                                    .text_size(px(10.))
+                                    .text_color(rgb(MUTED))
+                                    .hover(|s| s.text_color(rgb(TEXT)))
+                                    .child(
+                                        div()
+                                            .text_color(rgb(if behind { MUTED } else { accent }))
+                                            .child(if behind { "←" } else { "→" }),
+                                    )
+                                    .child(format!("{} {base}", i + 1))
+                                    .tooltip(tip(if behind {
+                                        "Walked already — click to go back to it"
+                                    } else {
+                                        "Still ahead — click to jump to it"
+                                    }))
+                                    .on_click(cx.listener(move |this, _e, window, cx| {
+                                        this.goto_walk_stop(i, window, cx)
+                                    }))
+                            })),
                     )
                 })
                 .when(!said.is_empty(), |d| {
@@ -35871,6 +35955,29 @@ mod code_tour_tests {
             group: String::new(),
             said: "because".into(),
         }
+    }
+
+    /// A stop's prose names other stops, and the card says whether each is
+    /// behind you or ahead rather than making you walk the tour to find out.
+    #[test]
+    fn a_stop_points_at_the_stops_it_names() {
+        let mut s = vec![
+            stop("src/loop/BackgroundTasksLoop.ts", 1, 1, "the loop"),
+            stop("src/handlers/RecoverTasksHandler.ts", 2, 2, "recovery"),
+            stop("src/index.ts", 3, 3, "entry"),
+            stop("src/server/handleShutdownSignals.ts", 4, 4, "x"),
+        ];
+        s[3].said = "stopBackgroundTasks resolves the root BackgroundTasksLoop \
+                     and hands back to RecoverTasksHandler."
+            .into();
+        assert_eq!(stops_mentioned(&s, 3), vec![0, 1]);
+        // a name too short to mean anything in prose doesn't match: index.ts is
+        // every other file in a monorepo
+        s[3].said = "it calls into index.ts".into();
+        assert!(stops_mentioned(&s, 3).is_empty());
+        // and a stop never points at itself
+        s[3].said = "handleShutdownSignals does the work".into();
+        assert!(stops_mentioned(&s, 3).is_empty());
     }
 
     /// The parts of a tour, in the order the walk reaches them, so "part 2 of
