@@ -22004,6 +22004,15 @@ impl Storm {
         // the branch has moved since this tour was built, so its stops are
         // describing code that may not be there any more
         let stale = rec.is_some_and(|t| !t.oid.is_empty() && t.oid != self.head_oid);
+        // on the start card you have walked none of it, on the end card all of
+        // it, and otherwise the stop you are standing on counts
+        let total = w.stops.len();
+        let walked = match (w.intro, w.done) {
+            (true, _) => 0,
+            (_, true) => total,
+            _ => w.at + 1,
+        };
+        let pct = if total == 0 { 0 } else { walked * 100 / total };
         let accent = if w.tour.is_some() { TOUR_MARK } else { COMMENT_MARK };
         let mut list = div()
             .id("tour-steps")
@@ -22125,7 +22134,7 @@ impl Storm {
                                 .flex_row()
                                 .items_center()
                                 .gap_2()
-                                .child(format!("{} steps", w.stops.len()))
+                                .child(format!("{walked}/{total} walked"))
                                 .when_some(pr, |d, n| {
                                     d.child(
                                         div()
@@ -22166,7 +22175,11 @@ impl Storm {
                                         }))
                                         .on_click(cx.listener(|this, _e, _w, cx| this.regen_tour(cx))),
                                 ),
-                        ),
+                        )
+                        // how much of it is behind you. The header sits on
+                        // BG, which HOVER vanishes into, so the unlit cells
+                        // take the border colour to stay countable
+                        .child(segmented_bar_on(pct, accent, 4., BORDER)),
                 )
                 .child(self.render_tour_map(w, accent, cx)),
         )
