@@ -22180,9 +22180,15 @@ impl Storm {
                             div()
                                 .flex()
                                 .flex_row()
+                                .flex_wrap()
                                 .items_center()
                                 .gap_2()
-                                .child(format!("{walked}/{total} walked"))
+                                .gap_y(px(4.))
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .child(format!("{walked}/{total} walked")),
+                                )
                                 .when_some(pr, |d, n| {
                                     d.child(
                                         div()
@@ -22202,7 +22208,6 @@ impl Storm {
                                             .child("the branch moved"),
                                     )
                                 })
-                                .child(div().flex_grow(1.0))
                                 .child(
                                     div()
                                         .id("tour-steps-regen")
