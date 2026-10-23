@@ -22689,8 +22689,7 @@ impl Storm {
                             .max_h(px(TOUR_CARD_ROWS as f32 * TOUR_LINE_H))
                             .overflow_y_scroll()
                             .line_height(px(TOUR_LINE_H))
-                            .text_color(rgb(TEXT))
-                            .child(said),
+                            .child(md_text(&said, 13., TEXT)),
                     )
                 })
                 // what has already been said about this stop, so the card is
@@ -22720,10 +22719,8 @@ impl Storm {
                                     )
                                     .child(
                                         div()
-                                            .text_size(px(12.))
                                             .line_height(px(TOUR_LINE_H))
-                                            .text_color(rgb(TEXT))
-                                            .child(text),
+                                            .child(md_text(&text, 12., TEXT)),
                                     )
                             })),
                     )
