@@ -5816,6 +5816,20 @@ fn pkg_name(path: &str) -> &str {
     ""
 }
 
+/// The named parts of a tour, in the order the walk reaches them. A part the
+/// tour returns to later is one part, not two: the name is what it is about,
+/// not where it sits.
+fn tour_groups(stops: &[Stop]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for s in stops {
+        let g = s.group.trim();
+        if !g.is_empty() && !out.iter().any(|h| h == g) {
+            out.push(g.to_string());
+        }
+    }
+    out
+}
+
 /// The commit HEAD is on. Empty when there isn't one yet (a fresh repo) or
 /// git can't say.
 fn git_head_oid(root: &Path) -> String {
@@ -7019,6 +7033,10 @@ struct Storm {
     /// The commit HEAD is on, refreshed by the git poll. A tour built against
     /// a different one is describing code that has since moved.
     head_oid: String,
+    /// The part of the tour the last stop opened was in, so stepping into a
+    /// new one can say so. A tour is a sequence of screens and the part you
+    /// are in is the only thing that doesn't change every step.
+    walk_group: String,
     /// The pull request TIDE last asked for a tour of, so the tour that comes
     /// back can be stamped with it.
     pending_tour_pr: Option<u64>,
@@ -7562,6 +7580,7 @@ impl Storm {
             agent_list_len: 0,
             acp_state: None,
             head_oid: String::new(),
+            walk_group: String::new(),
             pending_tour_pr: None,
             tour_asked_at: HashMap::new(),
             git_open: false,
@@ -22443,6 +22462,11 @@ impl Storm {
         let title = stop.title.trim().to_string();
         let said = stop.said.trim().to_string();
         let group = stop.group.trim().to_string();
+        // the stop a part begins on, so the cue is still there once the flash
+        // has gone
+        let group_starts = !group.is_empty()
+            && (w.at == 0
+                || w.stops.get(w.at - 1).map(|p| p.group.trim()) != Some(group.as_str()));
         // where this stop is, in the colour the file's name carries everywhere
         // else: the strip used to say it and nothing did once it went
         let where_ = stop_label(stop);
@@ -22528,13 +22552,19 @@ impl Storm {
                         )
                         .when(!group.is_empty(), |d| {
                             // which part of the tour this is, the same name the
-                            // map files it under
+                            // map files it under. On the stop a part opens with
+                            // it reads in the accent, since that is the step
+                            // where knowing the part matters
                             d.child(
                                 div()
                                     .flex_shrink_0()
                                     .text_size(px(10.))
-                                    .text_color(rgb(MUTED))
-                                    .child(group.clone()),
+                                    .text_color(rgb(if group_starts { accent } else { MUTED }))
+                                    .child(if group_starts {
+                                        format!("▸ {group}")
+                                    } else {
+                                        group.clone()
+                                    }),
                             )
                         })
                         .child(
@@ -25020,6 +25050,7 @@ impl Storm {
 
     /// Put the walk (or tour) away and take the highlight off the code with it.
     fn end_walk(&mut self, cx: &mut Context<Self>) {
+        self.walk_group.clear();
         let Some(w) = self.walk.take() else { return };
         // closing a tour means you're done with it for now: it doesn't come
         // back next launch, but it stays in the list to be opened again
@@ -25462,6 +25493,21 @@ impl Storm {
             return;
         };
         self.open_file(p.clone(), window, cx);
+        // walking into a new part of the tour is the one change worth
+        // announcing: every other step moves the file and the prose anyway
+        let group = stop.group.trim().to_string();
+        if group != self.walk_group {
+            if !group.is_empty() {
+                let parts = self.walk.as_ref().map(|w| tour_groups(&w.stops)).unwrap_or_default();
+                let at = parts.iter().position(|g| *g == group).map(|i| i + 1).unwrap_or(0);
+                let msg = match (at, parts.len()) {
+                    (0, _) | (_, 0) => group.clone(),
+                    (i, n) => format!("{group}  ·  part {i} of {n}"),
+                };
+                self.show_flash(&msg, cx);
+            }
+            self.walk_group = group;
+        }
         // the lines this stop is about, lit up until the next step: a jump that
         // only moves the caret leaves you hunting for what it meant
         if let Some(w) = self.walk.as_mut() {
@@ -35803,6 +35849,19 @@ mod code_tour_tests {
             group: String::new(),
             said: "because".into(),
         }
+    }
+
+    /// The parts of a tour, in the order the walk reaches them, so "part 2 of
+    /// 4" means something. A part the tour comes back to is still one part.
+    #[test]
+    fn a_tour_has_parts_in_the_order_it_walks_them() {
+        let mut s = vec![stop("a.ts", 1, 1, "x"), stop("b.ts", 2, 2, "y"), stop("c.ts", 3, 3, "z")];
+        s[0].group = "Shutdown signal".into();
+        s[1].group = "Handing tasks back".into();
+        s[2].group = "Shutdown signal".into(); // back to the first part
+        assert_eq!(tour_groups(&s), vec!["Shutdown signal", "Handing tasks back"]);
+        // stops with no part of their own don't invent one
+        assert!(tour_groups(&[stop("a.ts", 1, 1, "x")]).is_empty());
     }
 
     /// A tour of a pull request is told apart from a tour of how something
