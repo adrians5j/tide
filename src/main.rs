@@ -7163,6 +7163,10 @@ struct Storm {
     /// Something was handed to this workspace's composer: claim focus for it
     /// once there is a Window to do it with.
     agent_focus_pending: bool,
+    /// The tour card's question box was clicked. Claiming focus from inside the
+    /// click handler doesn't hold: the frame that follows settles focus itself.
+    /// Taken in `render`, the way the other panes do it.
+    tour_ask_focus_pending: bool,
     /// A paste prompt that opened from a context menu, which has no Window.
     paste_focus_pending: bool,
     // rename prompt: the path being renamed and the name being typed
@@ -7652,6 +7656,7 @@ impl Storm {
             hand_text: String::new(),
             hand_focus: cx.focus_handle(),
             agent_focus_pending: false,
+            tour_ask_focus_pending: false,
             paste_focus_pending: false,
             rn_path: None,
             rn_paste: None,
@@ -15006,6 +15011,10 @@ impl Render for Storm {
         // of the sentence goes
         if std::mem::take(&mut self.agent_focus_pending) {
             window.focus(&self.agent_focus, cx);
+        }
+        // the tour card's question box was clicked
+        if std::mem::take(&mut self.tour_ask_focus_pending) {
+            window.focus(&self.tour_ask_focus, cx);
         }
         // a tour just arrived from the agent: stand on its first stop. The poll
         // that received it had no Window to open a file with; this does — after
@@ -22467,6 +22476,12 @@ impl Storm {
         let group_starts = !group.is_empty()
             && (w.at == 0
                 || w.stops.get(w.at - 1).map(|p| p.group.trim()) != Some(group.as_str()));
+        // which part this is, for the band the card opens a part with
+        let part_of = group_starts.then(|| {
+            let parts = tour_groups(&w.stops);
+            let at = parts.iter().position(|g| *g == group).map(|i| i + 1).unwrap_or(0);
+            (at, parts.len())
+        });
         // where this stop is, in the colour the file's name carries everywhere
         // else: the strip used to say it and nothing did once it went
         let where_ = stop_label(stop);
@@ -22475,6 +22490,7 @@ impl Storm {
             let abs = self.stop_abs(stop);
             self.pr_stats.get(&abs).copied()
         };
+        let where_pkg = pkg_name(&stop.path).to_string();
         let ask_empty = self.tour_ask.is_empty();
         let caret = self.caret();
         let thread: Vec<(bool, String)> = self
@@ -22522,6 +22538,45 @@ impl Storm {
                 .border_l_2()
                 .shadow_lg()
                 .text_size(px(13.))
+                // a new part of the tour gets a band rather than a word in the
+                // corner: the step that changes which part you are in is the
+                // one step that doesn't look like every other step
+                .when_some(part_of, |d, (at, total)| {
+                    d.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            // bleed to the card's edges, under its rounded top
+                            .mx(px(-8.))
+                            .mt(px(-6.))
+                            .px_2()
+                            .py_1()
+                            .rounded_t_md()
+                            .bg(rgba(TOUR_TINT))
+                            .border_b_1()
+                            .border_color(rgb(accent))
+                            .child(
+                                div()
+                                    .flex_grow(1.0)
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_size(px(13.))
+                                    .text_color(rgb(accent))
+                                    .child(group.clone()),
+                            )
+                            .when(at > 0 && total > 0, |d| {
+                                d.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(10.))
+                                        .text_color(rgb(MUTED))
+                                        .child(format!("part {at} of {total}")),
+                                )
+                            }),
+                    )
+                })
                 .child(
                     div()
                         .flex()
@@ -22550,7 +22605,7 @@ impl Storm {
                                     title
                                 }),
                         )
-                        .when(!group.is_empty(), |d| {
+                        .when(!group.is_empty() && !group_starts, |d| {
                             // which part of the tour this is, the same name the
                             // map files it under. On the stop a part opens with
                             // it reads in the accent, since that is the step
@@ -22559,12 +22614,8 @@ impl Storm {
                                 div()
                                     .flex_shrink_0()
                                     .text_size(px(10.))
-                                    .text_color(rgb(if group_starts { accent } else { MUTED }))
-                                    .child(if group_starts {
-                                        format!("▸ {group}")
-                                    } else {
-                                        group.clone()
-                                    }),
+                                    .text_color(rgb(MUTED))
+                                    .child(group.clone()),
                             )
                         })
                         .child(
@@ -22589,6 +22640,18 @@ impl Storm {
                         .flex_row()
                         .items_center()
                         .gap_1p5()
+                        .when(!where_pkg.is_empty(), |d| {
+                            d.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .px_1()
+                                    .rounded_sm()
+                                    .bg(rgb(HOVER))
+                                    .text_size(px(11.))
+                                    .text_color(rgb(DIR))
+                                    .child(where_pkg.clone()),
+                            )
+                        })
                         .child(
                             div()
                                 .flex_grow(1.0)
@@ -22687,8 +22750,8 @@ impl Storm {
                                 .text_color(rgb(TEXT))
                                 .track_focus(&self.tour_ask_focus)
                                 .on_key_down(cx.listener(Self::tour_ask_key))
-                                .on_click(cx.listener(|this, _e, window, cx| {
-                                    window.focus(&this.tour_ask_focus, cx);
+                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                    this.tour_ask_focus_pending = true;
                                     cx.notify();
                                 }))
                                 .child(if ask_empty {
@@ -25493,21 +25556,6 @@ impl Storm {
             return;
         };
         self.open_file(p.clone(), window, cx);
-        // walking into a new part of the tour is the one change worth
-        // announcing: every other step moves the file and the prose anyway
-        let group = stop.group.trim().to_string();
-        if group != self.walk_group {
-            if !group.is_empty() {
-                let parts = self.walk.as_ref().map(|w| tour_groups(&w.stops)).unwrap_or_default();
-                let at = parts.iter().position(|g| *g == group).map(|i| i + 1).unwrap_or(0);
-                let msg = match (at, parts.len()) {
-                    (0, _) | (_, 0) => group.clone(),
-                    (i, n) => format!("{group}  ·  part {i} of {n}"),
-                };
-                self.show_flash(&msg, cx);
-            }
-            self.walk_group = group;
-        }
         // the lines this stop is about, lit up until the next step: a jump that
         // only moves the caret leaves you hunting for what it meant
         if let Some(w) = self.walk.as_mut() {
