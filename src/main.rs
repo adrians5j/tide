@@ -6936,6 +6936,10 @@ struct Storm {
     /// The question box on the tour card: what you're typing, and its focus.
     /// A tour answers "what happens here"; this is for "but why".
     tour_ask: Field,
+    /// Groups the map has been told to open or close by hand. Without an entry
+    /// a group is open exactly when the tour is standing in it, so walking from
+    /// one part to the next folds the part you've left.
+    tour_group_open: HashMap<String, bool>,
     tour_ask_focus: FocusHandle,
     /// The thread turn that was right-clicked, kept whole: the menu's actions
     /// are about that answer's text, and the thread is rebuilt every frame.
@@ -7487,6 +7491,7 @@ impl Storm {
             md_find_at: 0,
             md_scroll: gpui::ScrollHandle::new(),
             tour_ask: Field::default(),
+            tour_group_open: HashMap::new(),
             tour_ask_focus: cx.focus_handle(),
             ctx_reply: None,
             walk: None,
@@ -21601,7 +21606,17 @@ impl Storm {
             .overflow_y_scroll()
             .px_2()
             .py_2();
+        // the part the tour is standing in. The others fold, so a long tour
+        // reads as a handful of sections rather than thirty boxes, and walking
+        // into the next part opens it and folds the one behind you.
+        let cur_group = nodes
+            .iter()
+            .find(|n| n.steps.contains(&w.at))
+            .map(|n| n.group.trim().to_string())
+            .unwrap_or_default();
         let mut group = String::new();
+        let mut open = true;
+        let mut prev_shown = false;
         for (ni, n) in nodes.iter().enumerate() {
             let on = here == Some(ni);
             // the tour leaves this file and comes back to it later
@@ -21621,16 +21636,69 @@ impl Storm {
             // a named part of the tour starts here
             if n.group.trim() != group {
                 group = n.group.trim().to_string();
+                prev_shown = false;
+                open = group.is_empty()
+                    || self.tour_group_open.get(&group).copied().unwrap_or(group == cur_group);
                 if !group.is_empty() {
+                    let standing_in = group == cur_group;
+                    let files = nodes.iter().filter(|m| m.group.trim() == group).count();
+                    let (g, cur) = (group.clone(), cur_group.clone());
                     col = col.child(
                         div()
-                            .mt_1()
-                            .mb(px(3.))
-                            .text_size(px(10.))
-                            .text_color(rgb(MUTED))
-                            .child(group.clone()),
+                            .id(("tour-group", ni))
+                            .mt_2()
+                            .mb_1()
+                            .px_1()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1p5()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(HOVER)))
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(9.))
+                                    .text_color(rgb(MUTED))
+                                    .child(if open { "▾" } else { "▸" }),
+                            )
+                            .child(
+                                div()
+                                    .flex_grow(1.0)
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_size(px(13.))
+                                    .text_color(rgb(if standing_in { accent } else { TEXT }))
+                                    .child(group.clone()),
+                            )
+                            .when(!open, |d| {
+                                d.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(10.))
+                                        .text_color(rgb(MUTED))
+                                        .child(format!("{files}")),
+                                )
+                            })
+                            .tooltip(tip(if open { "Fold this part" } else { "Open this part" }))
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                let now =
+                                    this.tour_group_open.get(&g).copied().unwrap_or(g == cur);
+                                this.tour_group_open.insert(g.clone(), !now);
+                                cx.notify();
+                            })),
                     );
                 }
+            }
+            if !open {
+                continue;
+            }
+            // the arrow into this file, drawn rather than implied. It goes
+            // before the box so a folded part leaves no arrow pointing at
+            // nothing
+            if prev_shown {
+                col = col.child(map_arrow(here.is_some_and(|h| h == ni || h + 1 == ni), accent));
             }
             let mut box_ = div()
                 .id(("tour-map-node", ni))
@@ -21767,10 +21835,7 @@ impl Storm {
             }
             box_ = box_.child(chips);
             col = col.child(box_);
-            // the arrow to the next file, drawn rather than implied
-            if ni + 1 < nodes.len() {
-                col = col.child(map_arrow(here.is_some_and(|h| h == ni || h == ni + 1), accent));
-            }
+            prev_shown = true;
         }
         col
     }
@@ -22221,6 +22286,10 @@ impl Storm {
         let title = stop.title.trim().to_string();
         let said = stop.said.trim().to_string();
         let group = stop.group.trim().to_string();
+        // where this stop is, in the colour the file's name carries everywhere
+        // else: the strip used to say it and nothing did once it went
+        let where_ = stop_label(stop);
+        let where_tint = self.git_tint(&stop.path, MUTED);
         let ask_empty = self.tour_ask.is_empty();
         let caret = self.caret();
         let thread: Vec<(bool, String)> = self
@@ -22319,6 +22388,15 @@ impl Storm {
                                 .tooltip(tip("End the tour  (esc)"))
                                 .on_click(cx.listener(|this, _e, _w, cx| this.end_walk(cx))),
                         ),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .truncate()
+                        .font_family("Menlo")
+                        .text_size(px(10.))
+                        .text_color(rgb(where_tint))
+                        .child(where_),
                 )
                 .when(!said.is_empty(), |d| {
                     d.child(
@@ -24742,6 +24820,7 @@ impl Storm {
     /// worth anything if every press of ⌥] lands somewhere.
     fn start_tour(&mut self, tour: rpc::Tour, cx: &mut Context<Self>) {
         self.load_tour_diff(cx); // so the map's file names carry their status
+        self.tour_group_open.clear();
         // no steps is how an agent puts a tour away; it is not a broken one
         if tour.steps.is_empty() {
             let had = self.walk.as_ref().is_some_and(|w| w.tour.is_some());
@@ -25015,6 +25094,7 @@ impl Storm {
     /// up where it was left.
     fn open_tour(&mut self, id: String, restart: bool, cx: &mut Context<Self>) {
         self.load_tour_diff(cx);
+        self.tour_group_open.clear();
         let Some(rec) = self.tours.iter().find(|t| t.id == id) else {
             self.show_flash("That tour is gone", cx);
             return;
