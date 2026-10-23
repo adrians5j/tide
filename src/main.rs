@@ -11808,7 +11808,7 @@ impl Storm {
 
     // ── diff ────────────────────────────────────────────────────────────────
 
-    fn act_show_diff(&mut self, _: &ShowDiff, _window: &mut Window, cx: &mut Context<Self>) {
+    fn act_show_diff(&mut self, _: &ShowDiff, window: &mut Window, cx: &mut Context<Self>) {
         // in the Push dialog, cmd+d shows the selected file's diff for the
         // about-to-be-pushed range (the global keybinding fires before the
         // dialog's own key handler, so route it here)
@@ -11818,10 +11818,23 @@ impl Storm {
             }
             return;
         }
+        // standing on a tour stop, cmd+d is that stop's file. The key means
+        // "diff what I'm looking at", and on a tour that is the stop — but only
+        // while the stop's file is the one actually open, so clicking away into
+        // the PR tree gives the PR tree's answer again
+        if let Some(stop) =
+            self.walk.as_ref().filter(|w| !w.intro && !w.done).and_then(|w| w.stops.get(w.at).cloned())
+        {
+            let abs = self.stop_abs(&stop);
+            if self.active_path() == Some(&abs) {
+                self.diff_stop_file(window, cx);
+                return;
+            }
+        }
         // in the PR pane, cmd+d shows the selected file's PR diff (base..HEAD)
         if self.left_view == LeftView::PullRequest {
             if let Some(p) = self.pr_selected.clone() {
-                self.open_pr_diff(p, _window, cx);
+                self.open_pr_diff(p, window, cx);
             }
             return;
         }
@@ -21633,6 +21646,10 @@ impl Storm {
                 .get(first_step)
                 .map(|st| self.git_tint(&st.path, if on { TEXT } else { DIR }))
                 .unwrap_or(if on { TEXT } else { DIR });
+            let stat = w.stops.get(first_step).and_then(|st| {
+                let abs = self.stop_abs(st);
+                self.pr_stats.get(&abs).copied()
+            });
             // a named part of the tour starts here
             if n.group.trim() != group {
                 group = n.group.trim().to_string();
@@ -21792,14 +21809,40 @@ impl Storm {
                             )
                         }),
                 )
-                .when(!n.dir.is_empty(), |d| {
+                .when(!n.dir.is_empty() || stat.is_some(), |d| {
                     d.child(
                         div()
-                            .truncate()
-                            .font_family("Menlo")
-                            .text_size(px(9.))
-                            .text_color(rgb(MUTED))
-                            .child(dir_tail(&n.dir, 2)),
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .flex_grow(1.0)
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .font_family("Menlo")
+                                    .text_size(px(9.))
+                                    .text_color(rgb(MUTED))
+                                    .child(dir_tail(&n.dir, 2)),
+                            )
+                            // what this file costs, the way the PR tree puts it
+                            .when_some(stat, |d, (add, del)| {
+                                d.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(9.))
+                                        .text_color(rgb(GIT_NEW))
+                                        .child(format!("+{add}")),
+                                )
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(9.))
+                                        .text_color(rgb(GIT_DELETED))
+                                        .child(format!("−{del}")),
+                                )
+                            }),
                     )
                 });
             // the stops this file holds, as chips: the route through the file
@@ -22290,6 +22333,10 @@ impl Storm {
         // else: the strip used to say it and nothing did once it went
         let where_ = stop_label(stop);
         let where_tint = self.git_tint(&stop.path, MUTED);
+        let where_stat = {
+            let abs = self.stop_abs(stop);
+            self.pr_stats.get(&abs).copied()
+        };
         let ask_empty = self.tour_ask.is_empty();
         let caret = self.caret();
         let thread: Vec<(bool, String)> = self
@@ -22392,11 +22439,37 @@ impl Storm {
                 .child(
                     div()
                         .w_full()
-                        .truncate()
-                        .font_family("Menlo")
-                        .text_size(px(10.))
-                        .text_color(rgb(where_tint))
-                        .child(where_),
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1p5()
+                        .child(
+                            div()
+                                .flex_grow(1.0)
+                                .min_w(px(0.))
+                                .truncate()
+                                .font_family("Menlo")
+                                .text_size(px(10.))
+                                .text_color(rgb(where_tint))
+                                .child(where_),
+                        )
+                        .when_some(where_stat, |d, (add, del)| {
+                            d.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(GIT_NEW))
+                                    .child(format!("+{add}")),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(GIT_DELETED))
+                                    .child(format!("−{del}")),
+                            )
+                            .child(diffstat_squares(add, del))
+                        }),
                 )
                 .when(!said.is_empty(), |d| {
                     d.child(
@@ -22631,7 +22704,10 @@ impl Storm {
                 .spawn(async move {
                     let base = if base.trim().is_empty() { git_pr_base(&root) } else { base };
                     let files = git_pr_files(&root, &base);
-                    (files, base)
+                    // the counts too, so a tour can say what each file costs
+                    // without the PR pane having been opened
+                    let stats = git_pr_numstat(&root, &base);
+                    (files, base, stats)
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -22640,6 +22716,9 @@ impl Storm {
                     this.pr_files = got.0;
                     if this.pr_base.trim().is_empty() {
                         this.pr_base = got.1;
+                    }
+                    if this.pr_stats.is_empty() {
+                        this.pr_stats = got.2;
                     }
                     cx.notify();
                 }
