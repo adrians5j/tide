@@ -20735,11 +20735,20 @@ impl Storm {
             ];
         }
         if kind == CtxKind::ReviewFile {
-            return vec![("Comment on Whole File", |this, window, cx| {
-                if let Some(p) = this.tree_ctx_path.clone() {
-                    this.begin_comment(p, 0, 0, window, cx);
-                }
-            })];
+            return vec![
+                ("Open Diff", |this, window, cx| {
+                    // against the base with the rest of the PR beside it, which
+                    // is the diff this tree is a list of
+                    if let Some(p) = this.tree_ctx_path.clone() {
+                        this.open_pr_diff(p, window, cx);
+                    }
+                }),
+                ("Comment on Whole File", |this, window, cx| {
+                    if let Some(p) = this.tree_ctx_path.clone() {
+                        this.begin_comment(p, 0, 0, window, cx);
+                    }
+                }),
+            ];
         }
         vec![
             ("New File", |this, window, cx| this.open_new_file_prompt(window, cx)),
