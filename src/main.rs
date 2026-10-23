@@ -7040,9 +7040,6 @@ struct Storm {
     /// The pull request TIDE last asked for a tour of, so the tour that comes
     /// back can be stamped with it.
     pending_tour_pr: Option<u64>,
-    /// The commit each PR's tour was last asked for at, so a branch that moves
-    /// twice asks twice and a poll that ticks every five seconds doesn't.
-    tour_asked_at: HashMap<u64, String>,
     // ── Git log panel (bottom dock) ────────────────────────────────────────
     git_open: bool,                          // dock visible
     git_height: f32,                         // dock height
@@ -7586,7 +7583,6 @@ impl Storm {
             head_oid: String::new(),
             walk_group: String::new(),
             pending_tour_pr: None,
-            tour_asked_at: HashMap::new(),
             git_open: false,
             git_height: 320.,
             resizing_git: false,
@@ -9398,7 +9394,6 @@ impl Storm {
                         this.base_sync = None; // a different branch, a different answer
                         this.refresh_base_sync(cx);
                     }
-                    this.tour_auto_tick(cx);
                     // pick up external edits (e.g. from Claude Code) on any open
                     // tab whose buffer has no unsaved changes
                     let editors: Vec<_> = this.tabs.iter().map(|t| t.editor.clone()).collect();
@@ -22854,43 +22849,6 @@ impl Storm {
 
     /// Build this tour again. A tour is a snapshot: once the code under it has
     /// moved, the stops drift off their lines and the prose stops matching.
-    /// A PR gets a tour without being asked, and a new one each time the
-    /// branch moves under it. A tour of a change is only worth anything while
-    /// it describes the change as it is, and clicking a button to say so after
-    /// every commit is the sort of thing TIDE should be doing itself.
-    ///
-    /// Guarded three ways: nothing while the agent is mid-turn, nothing while
-    /// an earlier request is still unanswered, and at most one request per
-    /// commit, so the five-second poll that calls this costs nothing.
-    fn tour_auto_tick(&mut self, cx: &mut Context<Self>) {
-        let Some((number, ..)) = self.pr_link.clone() else { return };
-        if self.head_oid.is_empty() || self.pending_tour_pr.is_some() {
-            return;
-        }
-        if matches!(self.acp_state, Some(AgentState::Working)) {
-            return;
-        }
-        if self.tour_asked_at.get(&number).is_some_and(|o| *o == self.head_oid) {
-            return;
-        }
-        let base = self.pr_base.clone();
-        match self.tours.iter().find(|t| t.pr == Some(number)) {
-            // the branch has moved out from under the tour it already has
-            Some(t) if t.oid != self.head_oid && !t.oid.is_empty() => {
-                self.tour_asked_at.insert(number, self.head_oid.clone());
-                self.ask_pr_tour(number, base, cx);
-                self.show_flash("The branch moved: asked for the tour again", cx);
-            }
-            Some(_) => {}
-            // no tour of this PR yet
-            None => {
-                self.tour_asked_at.insert(number, self.head_oid.clone());
-                self.ask_pr_tour(number, base, cx);
-                self.show_flash(&format!("Asked for a tour of #{number}"), cx);
-            }
-        }
-    }
-
     fn regen_tour(&mut self, cx: &mut Context<Self>) {
         let Some(name) = self.walk.as_ref().map(|w| w.tour.clone()) else { return };
         self.pending_tour_pr = self.open_tour_rec().and_then(|t| t.pr);
