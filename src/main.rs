@@ -15313,7 +15313,7 @@ impl Render for Storm {
             if let Some(card) = self.render_tour_bookend(start, l, t, bw, cx) {
                 root = root.child(card);
             }
-        } else if let Some(card) = self.render_tour_card(cx) {
+        } else if let Some(card) = self.render_tour_card(window, cx) {
             root = root.child(card);
         }
         if self.hand_open {
@@ -22503,7 +22503,7 @@ impl Storm {
     /// about, in the space the editor carved out under the stop. The strip at
     /// the bottom of the window is for where you are in the tour; this is for
     /// what you're meant to see here.
-    fn render_tour_card(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn render_tour_card(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let (left, top, width) = self.tour_card_at(cx)?;
         let w = self.walk.as_ref()?;
         let stop = w.stops.get(w.at)?;
@@ -22545,6 +22545,7 @@ impl Storm {
             })
             .collect();
         let ask_empty = self.tour_ask.is_empty();
+        let asking = self.tour_ask_focus.is_focused(window);
         let caret = self.caret();
         let thread: Vec<(bool, String)> = self
             .stop_thread(stop)
@@ -22840,7 +22841,7 @@ impl Storm {
                                 .rounded_md()
                                 .bg(rgb(BG))
                                 .border_1()
-                                .border_color(rgb(BORDER))
+                                .border_color(rgb(if asking { accent } else { BORDER }))
                                 .text_size(px(12.))
                                 .text_color(rgb(TEXT))
                                 .track_focus(&self.tour_ask_focus)
@@ -22849,12 +22850,15 @@ impl Storm {
                                     this.tour_ask_focus_pending = true;
                                     cx.notify();
                                 }))
-                                .child(if ask_empty {
+                                .child(if ask_empty && !asking {
                                     div()
                                         .text_color(rgb(MUTED))
                                         .child("Ask about this stop…  ↩")
                                         .into_any_element()
                                 } else {
+                                    // focused and empty still draws the field:
+                                    // the caret is the only thing saying the
+                                    // click landed
                                     self.tour_ask.render(caret, SELECTION).into_any_element()
                                 }),
                         )
