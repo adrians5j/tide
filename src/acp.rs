@@ -23,6 +23,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// Standard base64 (with padding) — image attachments have to reach the adapter
@@ -116,6 +117,13 @@ pub struct Acp {
     session: Arc<Mutex<Option<String>>>,
     queued: Arc<Mutex<Vec<String>>>, // prompts sent before the session existed
     list_id: Arc<Mutex<Option<i64>>>, // id of the in-flight session/list request
+    /// What each in-flight request asked for, so an error can name it. An
+    /// adapter that answers "Invalid request" and dies says nothing about
+    /// which request it refused.
+    asked: Arc<Mutex<HashMap<i64, &'static str>>>,
+    /// The adapter's last words on stderr. Thrown away until now, which left
+    /// a dead agent with no explanation anywhere.
+    stderr_tail: Arc<Mutex<Vec<String>>>,
     events: Arc<Mutex<Vec<AcpEvent>>>,
     dirty: Arc<AtomicBool>,
     ready: Arc<AtomicBool>,
@@ -136,7 +144,7 @@ impl Acp {
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         // The adapter refuses to launch if it thinks it's nested inside another
         // Claude Code session; clear the markers so it starts cleanly.
         cmd.env_remove("CLAUDECODE");
@@ -151,6 +159,7 @@ impl Acp {
         let mut child = cmd.spawn().ok()?;
         let stdin = Arc::new(Mutex::new(child.stdin.take()?));
         let stdout = child.stdout.take()?;
+        let stderr = child.stderr.take();
 
         let acp = Arc::new(Acp {
             stdin: stdin.clone(),
@@ -158,11 +167,35 @@ impl Acp {
             session: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(Vec::new())),
             list_id: Arc::new(Mutex::new(None)),
+            asked: Arc::new(Mutex::new(HashMap::new())),
+            stderr_tail: Arc::new(Mutex::new(Vec::new())),
             events: Arc::new(Mutex::new(Vec::new())),
             dirty: Arc::new(AtomicBool::new(false)),
             ready: Arc::new(AtomicBool::new(false)),
             child: Mutex::new(child),
         });
+
+        // Drain stderr into a short ring. npx and the adapter both write their
+        // real complaints here — a version refusing to install, a bad
+        // argument — and none of it reached the pane before.
+        if let Some(stderr) = stderr {
+            let tail = acp.stderr_tail.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines() {
+                    let Ok(line) = line else { break };
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    if let Ok(mut t) = tail.lock() {
+                        t.push(line);
+                        let n = t.len();
+                        if n > 20 {
+                            t.drain(..n - 20);
+                        }
+                    }
+                }
+            });
+        }
 
         // Reader thread: parse each JSON line and route it.
         {
@@ -186,7 +219,7 @@ impl Acp {
         // 1. initialize
         self.send(json!({
             "jsonrpc": "2.0",
-            "id": self.take_id(),
+            "id": self.take_id_for("initialize"),
             "method": "initialize",
             "params": {
                 "protocolVersion": 1,
@@ -198,7 +231,7 @@ impl Acp {
         // answers `initialize` first, so a short spin-wait is plenty.
         self.send(json!({
             "jsonrpc": "2.0",
-            "id": self.take_id(),
+            "id": self.take_id_for("session/new"),
             "method": "session/new",
             "params": { "cwd": root.to_string_lossy(), "mcpServers": [] }
         }));
@@ -206,6 +239,22 @@ impl Acp {
 
     fn take_id(&self) -> i64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// An id that remembers which request it belongs to, so an error carrying
+    /// it can say what was refused.
+    fn take_id_for(&self, method: &'static str) -> i64 {
+        let id = self.take_id();
+        if let Ok(mut a) = self.asked.lock() {
+            a.insert(id, method);
+            // the handshake and a long session make a handful of entries, not
+            // a leak, but don't let a very long run grow it without bound
+            if a.len() > 64 {
+                a.clear();
+                a.insert(id, method);
+            }
+        }
+        id
     }
 
     fn send(&self, v: Value) {
@@ -290,7 +339,7 @@ impl Acp {
         }
         self.send(json!({
             "jsonrpc": "2.0",
-            "id": self.take_id(),
+            "id": self.take_id_for("session/new"),
             "method": "session/new",
             "params": { "cwd": root.to_string_lossy(), "mcpServers": [] }
         }));
@@ -298,7 +347,7 @@ impl Acp {
 
     /// Ask for this project's sessions. The answer arrives as `Sessions`.
     pub fn list_sessions(&self, root: &Path) {
-        let id = self.take_id();
+        let id = self.take_id_for("session/list");
         if let Ok(mut l) = self.list_id.lock() {
             *l = Some(id);
         }
@@ -316,7 +365,7 @@ impl Acp {
         self.ready.store(false, Ordering::Relaxed);
         self.send(json!({
             "jsonrpc": "2.0",
-            "id": self.take_id(),
+            "id": self.take_id_for("session/load"),
             "method": "session/load",
             "params": {
                 "sessionId": session_id,
@@ -341,7 +390,7 @@ impl Acp {
         }
         self.send(json!({
             "jsonrpc": "2.0",
-            "id": self.take_id(),
+            "id": self.take_id_for("session/prompt"),
             "method": "session/prompt",
             "params": { "sessionId": sid, "prompt": blocks }
         }));
@@ -368,7 +417,16 @@ impl Acp {
         }
         // stdout closed → the adapter exited.
         self.ready.store(false, Ordering::Relaxed);
-        self.push(AcpEvent::Error("agent process exited".into()));
+        let why = self
+            .stderr_tail
+            .lock()
+            .ok()
+            .map(|t| t.iter().rev().take(3).rev().cloned().collect::<Vec<_>>().join(" / "))
+            .filter(|s| !s.is_empty());
+        self.push(AcpEvent::Error(match why {
+            Some(w) => format!("agent process exited: {w}"),
+            None => "agent process exited".into(),
+        }));
     }
 
     /// Handle an agent→client request or a `session/update` notification.
@@ -523,7 +581,14 @@ impl Acp {
     fn on_response(&self, msg: &Value) {
         if let Some(err) = msg.get("error") {
             let m = err.get("message").and_then(|s| s.as_str()).unwrap_or("agent error");
-            self.push(AcpEvent::Error(m.to_string()));
+            let what = msg
+                .get("id")
+                .and_then(|i| i.as_i64())
+                .and_then(|id| self.asked.lock().ok().and_then(|a| a.get(&id).copied()));
+            self.push(AcpEvent::Error(match what {
+                Some(w) => format!("{m} ({w})"),
+                None => m.to_string(),
+            }));
             return;
         }
         let Some(result) = msg.get("result") else { return };
