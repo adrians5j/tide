@@ -585,10 +585,21 @@ impl Acp {
                 .get("id")
                 .and_then(|i| i.as_i64())
                 .and_then(|id| self.asked.lock().ok().and_then(|a| a.get(&id).copied()));
-            self.push(AcpEvent::Error(match what {
+            // JSON-RPC puts *what* was invalid in `data`; the message alone is
+            // the category, which on its own says nothing worth acting on
+            let why = err.get("data").map(|d| match d.as_str() {
+                Some(t) => t.to_string(),
+                None => d.to_string(),
+            });
+            let mut text = match what {
                 Some(w) => format!("{m} ({w})"),
                 None => m.to_string(),
-            }));
+            };
+            if let Some(w) = why.filter(|w| !w.is_empty() && w != "null") {
+                text.push_str(": ");
+                text.push_str(&w);
+            }
+            self.push(AcpEvent::Error(text));
             return;
         }
         let Some(result) = msg.get("result") else { return };
