@@ -212,13 +212,13 @@ impl Acp {
             std::thread::spawn(move || acp.read_loop(stdout, root));
         }
 
-        // Handshake thread: initialize, then create a session. Both are simple
-        // request/response; we watch the reader-populated `session` for the id.
-        {
-            let acp = acp.clone();
-            let root = root.to_path_buf();
-            std::thread::spawn(move || acp.handshake(root));
-        }
+        // The handshake goes out before this returns. It is two writes to a
+        // pipe, so there is nothing to wait for — and on a thread it raced its
+        // own caller: `ensure_acp` followed by `list_sessions` could put
+        // session/list on the wire first, which 0.95.0 answers with
+        // "Invalid request: first ACP request must be initialize" and then
+        // exits. Sending it here is what makes that ordering impossible.
+        acp.handshake(root.to_path_buf());
 
         Some(acp)
     }
