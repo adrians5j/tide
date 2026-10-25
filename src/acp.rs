@@ -139,8 +139,16 @@ impl Acp {
     pub fn new(root: &Path, rpc: Option<(String, String)>) -> Option<Arc<Acp>> {
         let mut cmd = Command::new("npx");
         // renamed from @zed-industries/claude-code-acp, which is deprecated and
-        // frozen at 0.16
-        cmd.args(["-y", "@agentclientprotocol/claude-agent-acp"])
+        // frozen at 0.16.
+        //
+        // Pinned. Unpinned, `npx -y` takes whatever is newest, so a release
+        // published at 8pm changes the agent mid-session with nothing in this
+        // repo moving — and the first spawn after one races npx's own install
+        // of it, which is how 0.95.0 arrived: `initialize` answered, then
+        // `session/list` reached for part of the package that wasn't on disk
+        // yet and the adapter exited. To take a newer one, change the version
+        // here, so the upgrade is a commit that can be reverted.
+        cmd.args(["-y", "@agentclientprotocol/claude-agent-acp@0.95.0"])
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
