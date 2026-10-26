@@ -3896,78 +3896,127 @@ struct MergeConfirm {
     /// next thing is asking it what's next; off for the merge you do while the
     /// agent is in the middle of something else.
     tell: bool,
-    /// Who GitHub says is on it. `None` means the read itself failed, which is
-    /// not the same answer as nobody being asked.
-    reviewers: Option<Vec<String>>,
-    /// Merge with nobody on it anyway. Off by default: the whole point of the
-    /// gate is that you have to reach for this.
+    /// What the reviewers left on this branch, if they have read it at all.
+    review: Option<Reviewed>,
+    /// They read it, and the branch has moved since. Worked out when the dialog
+    /// opens, where the branch you are standing on is still known.
+    moved: bool,
+    /// Merge unreviewed anyway. Off by default: the whole point of the gate is
+    /// that you have to reach for this.
     skip_reviewers: bool,
 }
 
 impl MergeConfirm {
-    /// Nobody has been asked to look at this, and the escape hatch is still
-    /// untouched. A read that failed doesn't block: TIDE can't claim nobody was
-    /// asked when it never got an answer.
+    /// The reviewers have never read this branch, and the escape hatch is still
+    /// untouched. A review that has since gone stale doesn't block: acting on
+    /// what a review found is what moves the branch, and re-reviewing after
+    /// every fix is a loop with no end.
     fn blocked(&self) -> bool {
-        self.reviewers.as_ref().is_some_and(|r| r.is_empty()) && !self.skip_reviewers
+        self.review.is_none() && !self.skip_reviewers
     }
 }
 
-/// Who has been put on this pull request: everyone still asked to look at it,
-/// plus everyone who already gave a verdict.
+/// What the reviewers left behind: the commit they read, when they read it,
+/// and who read it. "Reviewers" here means TIDE's own — the two sessions
+/// `Send in reviewers` starts — not whoever GitHub has been asked for.
+#[derive(Clone, PartialEq, Debug)]
+struct Reviewed {
+    oid: String,
+    when: u64,
+    who: String,
+}
+
+fn reviewed_path(root: &Path) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(
+        PathBuf::from(home)
+            .join(".config/tide/reviewed")
+            .join(format!("{}.json", usage::project_slug(root))),
+    )
+}
+
+/// Every branch of this repo the reviewers have read, by branch name.
+fn reviewed_for(root: &Path, branch: &str) -> Option<Reviewed> {
+    reviewed_all(root).remove(branch.trim())
+}
+
+fn reviewed_all(root: &Path) -> HashMap<String, Reviewed> {
+    let Some(raw) = reviewed_path(root).and_then(|p| std::fs::read_to_string(p).ok()) else {
+        return HashMap::new();
+    };
+    reviewed_from(&raw)
+}
+
+fn reviewed_from(raw: &str) -> HashMap<String, Reviewed> {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return HashMap::new();
+    };
+    map.into_iter()
+        .filter_map(|(branch, v)| {
+            let str_of = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let when = v.get("when").and_then(|x| x.as_u64()).unwrap_or(0);
+            let who = str_of("who");
+            (!branch.is_empty() && !who.is_empty())
+                .then(|| (branch, Reviewed { oid: str_of("oid"), when, who }))
+        })
+        .collect()
+}
+
+fn reviewed_to_json(all: &HashMap<String, Reviewed>) -> String {
+    // newest first, and only the last sixty branches: a repo accumulates
+    // branches for ever and this file is read every time a merge is confirmed
+    let mut rows: Vec<(&String, &Reviewed)> = all.iter().collect();
+    rows.sort_by(|a, b| b.1.when.cmp(&a.1.when));
+    rows.truncate(60);
+    let map: serde_json::Map<String, serde_json::Value> = rows
+        .into_iter()
+        .map(|(branch, r)| {
+            (
+                branch.clone(),
+                serde_json::json!({ "oid": r.oid, "when": r.when, "who": r.who }),
+            )
+        })
+        .collect();
+    serde_json::Value::Object(map).to_string()
+}
+
+/// Remember that the reviewers read this branch.
 ///
-/// A review that only `COMMENTED` doesn't count. The automatic "Copilot
-/// reviewed 4 of 4 files" lands as a comment on every pull request in the repo,
-/// and if that passed for having sent the code to someone the gate would never
-/// close.
-fn pr_reviewers_from(v: &serde_json::Value) -> Vec<String> {
-    let mut who: Vec<String> = Vec::new();
-    if let Some(arr) = v.get("reviewRequests").and_then(|x| x.as_array()) {
-        for r in arr {
-            // a person comes back as `login`, a team as `name`
-            let name = r.get("login").or_else(|| r.get("name")).and_then(|n| n.as_str());
-            who.extend(name.filter(|n| !n.is_empty()).map(str::to_string));
-        }
+/// Keyed by branch, not by commit. Fixing what a review found is what moves
+/// the head, so a store keyed by commit would forget the review the moment it
+/// was acted on, which is exactly backwards.
+fn mark_reviewed(root: &Path, branch: &str, oid: &str, who: &str) {
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return;
     }
-    if let Some(arr) = v.get("latestReviews").and_then(|x| x.as_array()) {
-        for r in arr {
-            let state = r.get("state").and_then(|x| x.as_str()).unwrap_or("");
-            if state != "APPROVED" && state != "CHANGES_REQUESTED" {
-                continue;
-            }
-            let name = r.get("author").and_then(|a| a.get("login")).and_then(|n| n.as_str());
-            who.extend(name.filter(|n| !n.is_empty()).map(str::to_string));
-        }
+    let Some(path) = reviewed_path(root) else { return };
+    let mut all = reviewed_all(root);
+    all.insert(
+        branch.to_string(),
+        Reviewed { oid: oid.to_string(), when: now_secs(), who: who.to_string() },
+    );
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
     }
-    // the ones still pending lead, so the chip reads in the order you'd say it
-    let mut seen = HashSet::new();
-    who.retain(|n| seen.insert(n.clone()));
-    who
+    let _ = std::fs::write(path, reviewed_to_json(&all));
 }
 
-/// What the merge dialog asks GitHub for, in one read: every file the merge
-/// would land, and who is on it to review. The reviewers are `None` when the
-/// read failed.
-fn pr_merge_facts(root: &Path, number: u64) -> (Vec<PrFile>, Option<Vec<String>>) {
+/// Every file the merge would land, which is what the dialog asks before it
+/// asks anything else.
+fn pr_merge_facts(root: &Path, number: u64) -> Vec<PrFile> {
     let out = Command::new("gh")
-        .args([
-            "pr",
-            "view",
-            &number.to_string(),
-            "--json",
-            "files,reviewRequests,latestReviews",
-        ])
+        .args(["pr", "view", &number.to_string(), "--json", "files"])
         .current_dir(root)
         .output()
         .ok()
         .filter(|o| o.status.success());
     let Some(v) = out.and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
     else {
-        return (Vec::new(), None);
+        return Vec::new();
     };
-    let reviewers = Some(pr_reviewers_from(&v));
     let Some(arr) = v.get("files").and_then(|f| f.as_array()) else {
-        return (Vec::new(), reviewers);
+        return Vec::new();
     };
     let mut files: Vec<PrFile> = arr
         .iter()
@@ -3986,7 +4035,7 @@ fn pr_merge_facts(root: &Path, number: u64) -> (Vec<PrFile>, Option<Vec<String>>
         })
         .collect();
     files.sort_by(|a, b| a.path.cmp(&b.path));
-    (files, reviewers)
+    files
 }
 
 /// What CI says about a PR: the counts, and the names of whatever isn't green.
@@ -9201,6 +9250,8 @@ impl Storm {
         );
         // the reports replace the waiting card
         self.agent_msgs.retain(|m| !matches!(m, AgentMsg::Reviewing));
+        // this branch has now been read, which is what the merge button asks
+        mark_reviewed(&self.root, &self.branch, &self.head_oid, &names.join(" + "));
         self.send_agent_prompt_as(
             prompt,
             Some(format!("Reviewers · {}", names.join(" + "))),
@@ -13048,10 +13099,20 @@ impl Storm {
             return;
         };
         let root = self.root.clone();
+        // whether the branch has moved since the reviewers read it is only
+        // answerable here, where the branch you are standing on is known: the
+        // PR being merged is not always the one checked out
+        let review = reviewed_for(&self.root, &doc.head);
+        let moved = review.as_ref().is_some_and(|r| {
+            doc.head == self.branch
+                && !r.oid.is_empty()
+                && !self.head_oid.is_empty()
+                && r.oid != self.head_oid
+        });
         self.show_flash("Reading what it would merge…", cx);
         window.focus(&self.merge_focus, cx);
         cx.spawn(async move |this, cx| {
-            let (files, reviewers) =
+            let files =
                 cx.background_executor().spawn(async move { pr_merge_facts(&root, number) }).await;
             this.update(cx, |this, cx| {
                 this.merge_confirm =
@@ -13061,7 +13122,8 @@ impl Storm {
                         collapsed: HashSet::new(),
                         merging: false,
                         tell: true,
-                        reviewers,
+                        review,
+                        moved,
                         skip_reviewers: false,
                     });
                 cx.notify();
@@ -13101,12 +13163,15 @@ impl Storm {
         if c.merging {
             return; // already asked
         }
-        // nobody has seen this but you. `--admin` would push it past GitHub's
+        // nobody has read this but you. `--admin` would push it past GitHub's
         // own review requirement without a word, so the no is TIDE's to say.
         if c.blocked() {
-            let number = c.doc.number;
+            let branch = c.doc.head.clone();
             self.show_flash(
-                &format!("Nobody is on #{number} · tick Skip reviewers to merge it anyway"),
+                &format!(
+                    "The reviewers haven't read {branch} · ⌘K Send In the Reviewers, or tick \
+                     Skip reviewers"
+                ),
                 cx,
             );
             cx.notify();
@@ -29764,22 +29829,33 @@ impl Storm {
         let verb = "Merge";
         let merging = c.merging;
         let blocked = c.blocked();
-        // who is on it, said the way you'd say it out loud, and amber when the
-        // answer is nobody
-        let (who_text, who_colour, who_tip) = match c.reviewers.as_deref() {
-            None => {
-                ("reviewers unknown".into(), MUTED, "gh couldn't say who is on this".into())
-            }
-            Some([]) => (
-                "no reviewers".into(),
+        // whether the reviewers have read this branch, amber when they have
+        // not and amber again when what they read has moved on
+        let (who_text, who_colour, who_tip) = match c.review.as_ref() {
+            None => (
+                "not reviewed".to_string(),
                 FOLDER_ICON,
-                "Nobody has been asked to look at this".into(),
+                "The reviewers haven't read this branch  ·  ⌘K Send In the Reviewers"
+                    .to_string(),
             ),
-            Some(r) => (
-                format!("{} reviewer{}", r.len(), if r.len() == 1 { "" } else { "s" }),
-                MUTED,
-                r.join(", "),
-            ),
+            Some(r) => {
+                let when = (r.when > 0).then(|| todo::age(r.when)).unwrap_or_default();
+                let said = match when.is_empty() {
+                    true => format!("{} read this branch", r.who),
+                    false => format!("{} read this branch {when}", r.who),
+                };
+                (
+                    match when.is_empty() {
+                        true => "reviewed".to_string(),
+                        false => format!("reviewed {when}"),
+                    },
+                    if c.moved { FOLDER_ICON } else { MUTED },
+                    match c.moved {
+                        true => format!("{said}, and it has moved since"),
+                        false => said,
+                    },
+                )
+            }
         };
 
         // the header's own line, so the dialog says the same things in the same
@@ -29981,13 +30057,11 @@ impl Storm {
         // this workspace to tell
         let tell = self.merge_confirm.as_ref().is_some_and(|c| c.tell);
         let has_agent = self.acp.is_some();
-        // nobody on it is its own answer; the keys only matter once it can go
-        let no_reviewers = self.merge_confirm.as_ref().is_some_and(|c| {
-            c.reviewers.as_ref().is_some_and(|r| r.is_empty())
-        });
+        // a reviewed branch has nothing to skip, so the tick isn't drawn
+        let no_reviewers = self.merge_confirm.as_ref().is_some_and(|c| c.review.is_none());
         let skipping = self.merge_confirm.as_ref().is_some_and(|c| c.skip_reviewers);
         let hint = if blocked {
-            "nobody has been asked to review this · tick Skip reviewers to merge it".into()
+            "the reviewers haven't read this · tick Skip reviewers to merge it".into()
         } else {
             format!(
                 "squash · bypasses the review requirement · ↩ merge{} · esc cancel",
@@ -30025,8 +30099,8 @@ impl Storm {
                                 .child("Skip reviewers"),
                         )
                         .tooltip(tip(
-                            "Merge with nobody on it, for a change too small \
-                             to be worth sending to anyone",
+                            "Merge without sending it to the reviewers, for a change \
+                             too small to be worth the wait",
                         ))
                         .on_click(cx.listener(|this, _e, _w, cx| {
                             let Some(c) = this.merge_confirm.as_mut() else { return };
@@ -37689,7 +37763,7 @@ mod code_tour_tests {
         assert_eq!(repo_of_url("nonsense"), "");
     }
 
-    fn confirm(reviewers: Option<Vec<String>>, skip: bool) -> MergeConfirm {
+    fn confirm(review: Option<Reviewed>, skip: bool) -> MergeConfirm {
         MergeConfirm {
             doc: PrDoc {
                 number: 1,
@@ -37709,49 +37783,56 @@ mod code_tour_tests {
             collapsed: HashSet::new(),
             merging: false,
             tell: true,
-            reviewers,
+            review,
+            moved: false,
             skip_reviewers: skip,
         }
     }
 
-    /// Who is on a pull request: still-pending requests, and verdicts already
-    /// given. A bare comment is neither.
-    #[test]
-    fn the_reviewers_are_whoever_was_asked_or_answered() {
-        let v: serde_json::Value = serde_json::from_str(
-            r#"{
-                "reviewRequests": [
-                    {"__typename": "User", "login": "ostap"},
-                    {"__typename": "Team", "name": "platform"}
-                ],
-                "latestReviews": [
-                    {"author": {"login": "copilot"}, "state": "COMMENTED"},
-                    {"author": {"login": "hendy"}, "state": "APPROVED"},
-                    {"author": {"login": "ostap"}, "state": "CHANGES_REQUESTED"}
-                ]
-            }"#,
-        )
-        .unwrap();
-        // copilot only commented, and ostap is counted once though he appears twice
-        assert_eq!(pr_reviewers_from(&v), vec!["ostap", "platform", "hendy"]);
+    fn read_by(who: &str) -> Reviewed {
+        Reviewed { oid: "abc123".into(), when: 1_700_000_000, who: who.into() }
     }
 
+    /// The merge waits for TIDE's own reviewers — the two sessions `Send in
+    /// reviewers` starts — and the tick is what lets it through without them.
     #[test]
-    fn a_pull_request_nobody_has_seen_has_no_reviewers() {
-        let v: serde_json::Value =
-            serde_json::from_str(r#"{"reviewRequests": [], "latestReviews": []}"#).unwrap();
-        assert!(pr_reviewers_from(&v).is_empty());
+    fn merging_waits_for_the_reviewers_unless_you_skip_them() {
+        assert!(confirm(None, false).blocked());
+        assert!(!confirm(None, true).blocked());
+        assert!(!confirm(Some(read_by("slop cop + code rabbit")), false).blocked());
+        // a review the branch has moved past still counts: acting on what a
+        // review found is what moves the branch
+        let mut moved = confirm(Some(read_by("slop cop")), false);
+        moved.moved = true;
+        assert!(!moved.blocked());
     }
 
-    /// The merge is held back only when GitHub actually said nobody is on it,
-    /// and the tick is what lets it through.
+    /// The store is read on every merge, so it has to survive a file that was
+    /// written by a different version, or by hand, or not at all.
     #[test]
-    fn merging_waits_for_a_reviewer_unless_you_skip_them() {
-        assert!(confirm(Some(Vec::new()), false).blocked());
-        assert!(!confirm(Some(Vec::new()), true).blocked());
-        assert!(!confirm(Some(vec!["ostap".into()]), false).blocked());
-        // the read failed, so there is nothing to hold the merge back on
-        assert!(!confirm(None, false).blocked());
+    fn a_review_is_remembered_by_branch() {
+        let all = reviewed_from(
+            r#"{"fix/scheduler": {"oid": "abc", "when": 1700000000, "who": "slop cop"},
+                 "old": {"who": "code rabbit"},
+                 "nameless": {"oid": "x", "when": 1, "who": ""}}"#,
+        );
+        assert_eq!(all.len(), 2, "a row with nobody on it is no review: {all:?}");
+        let one = all.get("fix/scheduler").unwrap();
+        assert_eq!((one.oid.as_str(), one.when, one.who.as_str()), ("abc", 1_700_000_000, "slop cop"));
+        // a row from before the oid was stored is still a review
+        assert_eq!(all.get("old").map(|r| (r.oid.as_str(), r.when)), Some(("", 0)));
+        assert!(reviewed_from("not json").is_empty());
+        assert!(reviewed_from("[1,2]").is_empty(), "an array is not the map this reads");
+
+        // it comes back the same way it went in, newest sixty branches only
+        let mut many: HashMap<String, Reviewed> = (0..70)
+            .map(|i| (format!("b{i}"), Reviewed { oid: "o".into(), when: i, who: "slop cop".into() }))
+            .collect();
+        many.insert("newest".into(), read_by("code rabbit"));
+        let back = reviewed_from(&reviewed_to_json(&many));
+        assert_eq!(back.len(), 60);
+        assert!(back.contains_key("newest"), "the newest is never the one dropped");
+        assert!(!back.contains_key("b0"), "the oldest goes first");
     }
 
     /// A stop's prose names other stops, and the card says whether each is
