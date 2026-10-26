@@ -4310,9 +4310,11 @@ fn brief_request(number: u64, base: &str) -> String {
          a stale lease as a failure and re-queues it.\",\
          \"diagram\":{{\"kind\":\"flow\",\"caption\":\"one task, start to finish\",\
          \"nodes\":[\
-         {{\"label\":\"trigger()\",\"note\":\"api-tasks\",\"file\":\"packages/api-tasks/src/TaskService.ts\"}},\
+         {{\"label\":\"trigger()\",\"note\":\"api-tasks\",\
+\"file\":\"packages/api-tasks/src/TaskService.ts:84\"}},\
          {{\"label\":\"TaskStore\",\"note\":\"DynamoDB\"}},\
-         {{\"label\":\"Recover\",\"note\":\"every 60s\",\"mark\":\"new\"}}],\
+         {{\"label\":\"Recover\",\"note\":\"every 60s\",\"mark\":\"new\",\
+\"file\":\"packages/api-tasks/src/recover.ts:17\"}}],\
          \"edges\":[\"writes pending\",\"on a stale lease\"]}}}}]}}'\n\n\
          `title` on a slide is a sentence that says something — “Tasks that die \
          halfway now get picked up”, never “Recovery” or “Background”. `text` is \
@@ -4333,11 +4335,14 @@ fn brief_request(number: u64, base: &str) -> String {
          Up to six boxes. `label` is a few words, `note` the smaller line under \
          it. `mark` is `new`, `changed` or `gone` and goes only on the boxes this \
          change actually touched — a diagram where every box is lit says nothing. \
-         `file` makes the box open that file when I click it; use it where there \
-         is a real file behind the box, and leave it off ideas.\n\n\
+         `file` is printed on the box and opens the file when I click it. Write \
+         it as `path/to/File.ts:84`, pointing at the line the box is named \
+         after, and put one on every box that is really a place in the code — \
+         seeing where a box lives is half of what the picture is for. Leave it \
+         off boxes that are ideas rather than code.\n\n\
          Read the diff against {base} before you write any of it. No line \
-         numbers anywhere in the prose: if a slide needs one it belongs in a code \
-         tour instead. Then say in one line that it is up, and stop — don't \
+         numbers anywhere in the prose — `file` is where a line number goes; a \
+         slide that needs one in its text wants a code tour instead. Then say in one line that it is up, and stop — don't \
          repeat the slides in your reply, I'm about to read them.\n"
     )
 }
@@ -15356,6 +15361,17 @@ impl Storm {
 /// rather than asking flex to wrap one: taffy sizes a wrapped row by a single
 /// line of it, so the panel came out one box tall and the picture spilled over
 /// the slide below.
+/// What a box prints under its label: the file's own name and the line, not
+/// the path, which doesn't fit in a 168px box. A tooltip you have to hover for
+/// is no answer to "which file is this one", so the box says it outright.
+fn dia_where(file: &str, line: usize) -> Option<String> {
+    let name = file.trim().trim_end_matches('/').rsplit('/').next().unwrap_or_default().trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(if line > 0 { format!("{name}:{line}") } else { name.to_string() })
+}
+
 fn dia_grid(n: usize, per: usize) -> Vec<std::ops::Range<usize>> {
     let per = per.max(1);
     (0..n).step_by(per).map(|a| a..(a + per).min(n)).collect()
@@ -31421,7 +31437,8 @@ impl Storm {
         let tint = n.mark.tint();
         let edge = tint.unwrap_or(BORDER);
         let (file, line) = (n.file.clone(), n.line);
-        let opens = !file.is_empty();
+        let at = dia_where(&file, line);
+        let opens = at.is_some();
         div()
             .id(("dia-box", key))
             .flex()
@@ -31471,11 +31488,22 @@ impl Storm {
                         .child(n.note.clone()),
                 )
             })
+            .when_some(at, |d, at| {
+                d.child(
+                    div()
+                        .truncate()
+                        .text_size(px(10.))
+                        .font_family("Menlo")
+                        .text_color(rgb(LINE_NUMBER))
+                        .child(at),
+                )
+            })
             .when(opens, |d| {
                 let open = file.clone();
+                let full = if line > 0 { format!("{file}:{line}") } else { file.clone() };
                 d.cursor_pointer()
                     .hover(|s| s.bg(rgb(HOVER)))
-                    .tooltip(tip_owned(format!("Open {file}")))
+                    .tooltip(tip_owned(format!("Open {full}")))
                     .on_click(cx.listener(move |this, _e, window, cx| {
                         this.open_brief_node(open.clone(), line, window, cx)
                     }))
@@ -37203,6 +37231,19 @@ mod code_tour_tests {
         // grid of nothing
         assert_eq!(dia_grid(0, 0), Vec::<std::ops::Range<usize>>::new(), "no divide by zero");
         assert_eq!(dia_grid(2, 0), vec![0..1, 1..2], "a nonsense width is one per row");
+    }
+
+    /// A box that stands for a place in the code says where that place is,
+    /// without being hovered or clicked first.
+    #[test]
+    fn a_diagram_box_says_where_it_goes() {
+        assert_eq!(dia_where("packages/api-tasks/src/Task.ts", 84), Some("Task.ts:84".into()));
+        assert_eq!(dia_where("Task.ts", 0), Some("Task.ts".into()), "no line, no suffix");
+        assert_eq!(dia_where("src/", 12), Some("src:12".into()), "a trailing slash is not a name");
+        // a box that is an idea rather than a file says nothing, and doesn't
+        // open anything either: `opens` is this answer being Some
+        assert_eq!(dia_where("", 9), None);
+        assert_eq!(dia_where("   ", 9), None);
     }
 
     /// A box says what the change did to it in the colour the file tree already
