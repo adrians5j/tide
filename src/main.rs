@@ -2450,6 +2450,12 @@ struct MdRow {
     /// A table's cells (each already flattened the same way).
     cells: Option<Vec<MdRow>>,
     table_header: bool,
+    /// What share of the width each column takes, worked out over the whole
+    /// table once it has been read. Empty means share it out evenly.
+    cols: Vec<f32>,
+    /// The table's last row, which draws no rule under itself: the grid around
+    /// it already has one.
+    table_last: bool,
     /// A blank line — pure paragraph spacing.
     gap: bool,
     /// `(alt, src)` for every `![…](…)` on this line. They draw under the
@@ -2469,6 +2475,39 @@ struct MdRow {
     map: Vec<(usize, usize, usize)>,
 }
 
+/// How wide each of a table's columns wants to be: the longest cell in it,
+/// clamped so one runaway cell can't squeeze the rest to nothing, and then
+/// read as a share of the whole. A heading counts like any other cell.
+fn md_col_shares(table: &[MdRow]) -> Vec<f32> {
+    let n = table.iter().filter_map(|r| r.cells.as_ref()).map(|c| c.len()).max().unwrap_or(0);
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut want = vec![0f32; n];
+    for cells in table.iter().filter_map(|r| r.cells.as_ref()) {
+        for (i, cell) in cells.iter().enumerate() {
+            want[i] = want[i].max(cell.text.chars().count() as f32);
+        }
+    }
+    for w in want.iter_mut() {
+        *w = w.clamp(8., 46.);
+    }
+    let total: f32 = want.iter().sum();
+    want.iter().map(|w| w / total).collect()
+}
+
+/// A cell that is nothing but a verdict reads as one. Only an exact match
+/// counts, so a sentence that happens to begin with "no" keeps its own colour.
+fn md_verdict(text: &str) -> Option<u32> {
+    let word = text.trim().trim_end_matches(['.', '!']).to_ascii_lowercase();
+    match word.as_str() {
+        "took" | "taken" | "yes" | "done" | "fixed" | "agreed" | "pass" => Some(GIT_NEW),
+        "turned down" | "no" | "declined" | "skipped" | "wontfix" => Some(MUTED),
+        "partly" | "partial" | "later" | "deferred" | "todo" => Some(FOLDER_ICON),
+        _ => None,
+    }
+}
+
 fn md_row_blank() -> MdRow {
     MdRow {
         text: SharedString::default(),
@@ -2480,6 +2519,8 @@ fn md_row_blank() -> MdRow {
         indent: 0.0,
         cells: None,
         table_header: false,
+        cols: Vec::new(),
+        table_last: false,
         gap: true,
         images: Vec::new(),
         ix: 0,
@@ -2513,6 +2554,8 @@ fn md_flatten_at(spans: &[md::Span], at: &[usize], size: f32, prefix: &str) -> M
         indent: 0.0,
         cells: None,
         table_header: false,
+        cols: Vec::new(),
+        table_last: false,
         gap: false,
         ix: 0,
         src_line: 0,
@@ -2634,6 +2677,22 @@ fn md_prepare(text: &str) -> Arc<Vec<MdRow>> {
     let mut fence_lang = String::new();
     let mut table: Vec<MdRow> = Vec::new();
 
+    // A table is only measurable once all of it has been read: the columns are
+    // shared out by what is actually in them, so a one-word verdict beside a
+    // sentence doesn't take a third of the width.
+    let flush_table = |table: &mut Vec<MdRow>, rows: &mut Vec<MdRow>| {
+        if table.is_empty() {
+            return;
+        }
+        let shares = md_col_shares(table);
+        let last = table.len() - 1;
+        for (i, row) in table.iter_mut().enumerate() {
+            row.cols = shares.clone();
+            row.table_last = i == last;
+        }
+        rows.append(table);
+    };
+
     // a fenced block becomes one row: the whole body, highlighted by syntect
     let flush_fence = |fence: &mut Vec<String>, lang: &str, rows: &mut Vec<MdRow>| {
         if fence.is_empty() {
@@ -2668,6 +2727,8 @@ fn md_prepare(text: &str) -> Arc<Vec<MdRow>> {
             indent: 0.0,
             cells: None,
             table_header: false,
+            cols: Vec::new(),
+            table_last: false,
             gap: false,
             images: Vec::new(),
             ix: rows.len(),
@@ -2688,9 +2749,7 @@ fn md_prepare(text: &str) -> Arc<Vec<MdRow>> {
             table.push(row);
             continue;
         }
-        if !table.is_empty() {
-            rows.append(&mut table);
-        }
+        flush_table(&mut table, &mut rows);
         if line.code {
             if fence.is_empty() {
                 fence_line = line.line;
@@ -2734,9 +2793,7 @@ fn md_prepare(text: &str) -> Arc<Vec<MdRow>> {
         row.src_line = line.line;
         rows.push(row);
     }
-    if !table.is_empty() {
-        rows.append(&mut table);
-    }
+    flush_table(&mut table, &mut rows);
     let had = rows.len();
     flush_fence(&mut fence, &fence_lang, &mut rows);
     if rows.len() > had {
@@ -2843,15 +2900,18 @@ fn md_row_el(row: &MdRow, selected: Sel) -> AnyElement {
             .flex_row()
             .items_start()
             .when(row.table_header, |d| d.bg(rgb(CURRENT_LINE)))
-            .border_b_1()
-            .border_color(rgb(BORDER));
+            // the grid around the table draws the line under the last row
+            .when(!row.table_last, |d| d.border_b_1().border_color(rgb(BORDER)));
         for (i, cell) in cells.iter().enumerate() {
+            let share = row.cols.get(i).copied().unwrap_or(1.0 / n as f32);
+            let verdict = (!row.table_header).then(|| md_verdict(&cell.text)).flatten();
             el = el.child(
                 div()
-                    .flex_basis(relative(1.0 / n as f32))
+                    .flex_basis(relative(share))
                     .min_w(px(0.))
                     .px_2()
-                    .py_1()
+                    .py_1p5()
+                    .when_some(verdict, |d, c| d.text_color(rgb(c)))
                     .when(i + 1 < n, |d| d.border_r_1().border_color(rgb(BORDER)))
                     .child(md_styled_sel(cell, row.table_header, selected)),
             );
@@ -9069,9 +9129,20 @@ impl Storm {
              Work through them: fix what's real, and for anything you disagree with, say why \
              rather than changing code to satisfy a reviewer. They saw the diff and nothing \
              else, so they may be wrong about intent — you have the conversation.\n\n\
-             When you're done, post the summary with one section per reviewer — {headings} — \
-             saying what you took from that reviewer and what you turned down. Anything that \
-             wasn't either reviewer's point goes under `## Other`. Title it \"Reviewers\"."
+             When you're done, post the summary with one section per reviewer — {headings}. \
+             Under each heading, one table and nothing else:\n\n\
+             | Point | Verdict | What I did |\n\
+             |---|---|---|\n\
+             | Stale lease never re-queued | Took | `recover()` re-queues on a lease older than 60s |\n\
+             | Wait for the whole run | Turned down | a long list of overdue actions would use the \
+             whole shutdown window |\n\n\
+             One row per thing that reviewer raised, in the order they raised it. `Point` is a few \
+             words, not their sentence. The verdict cell is exactly Took or Turned down, no \
+             backticks and nothing else, so the column reads straight down the page. If you only \
+             half took something, that is Took, and the last column says what you left. The last \
+             column is one sentence: what \
+             changed, or why it didn't. Anything that wasn't either reviewer's point goes under \
+             `## Other`, as prose rather than a table. Title it \"Reviewers\"."
         );
         // the reports replace the waiting card
         self.agent_msgs.retain(|m| !matches!(m, AgentMsg::Reviewing));
@@ -35593,6 +35664,40 @@ mod md_flatten_tests {
             .iter()
             .any(|(r, h)| h.font_weight == Some(gpui::FontWeight::BOLD)
                 && row.text[r.clone()].contains("all four are under")));
+    }
+
+    /// A table's columns are shared out by what is in them, and only the last
+    /// row leaves its rule to the grid drawn around the table.
+    #[test]
+    fn a_table_is_measured_once_all_of_it_is_read() {
+        let doc = "| Point | Verdict | What I did |\n\
+                   |---|---|---|\n\
+                   | Stale lease | Took | re-queues on a lease older than sixty seconds |\n\
+                   | Wait for the run | Turned down | the window is eight seconds |\n";
+        let rows = md_prepare(doc);
+        let table: Vec<&MdRow> = rows.iter().filter(|r| r.cells.is_some()).collect();
+        assert_eq!(table.len(), 3, "the rule line is a separator, not a row");
+        let cols = &table[0].cols;
+        assert_eq!(cols.len(), 3);
+        assert!((cols.iter().sum::<f32>() - 1.0).abs() < 0.001, "{cols:?}");
+        assert!(cols[2] > cols[1], "the sentence column is wider than the verdict: {cols:?}");
+        assert!(cols[1] > 0.1, "and the verdict still gets a readable share: {cols:?}");
+        // every row of one table is measured the same way, or the columns zigzag
+        assert_eq!(&table[2].cols, cols);
+        assert!(!table[0].table_last && table[2].table_last);
+    }
+
+    /// A verdict is a word the eye can find going down a column, so TIDE gives
+    /// it the colour the file tree already uses for the same answer.
+    #[test]
+    fn a_cell_that_is_only_a_verdict_is_coloured() {
+        assert_eq!(md_verdict("Took"), Some(GIT_NEW));
+        assert_eq!(md_verdict("turned down"), Some(MUTED));
+        assert_eq!(md_verdict(" Partly."), Some(FOLDER_ICON));
+        // a sentence keeps the colour of the prose around it, however it starts
+        assert_eq!(md_verdict("No, the lease is already checked"), None);
+        assert_eq!(md_verdict("took the first half of it"), None);
+        assert_eq!(md_verdict(""), None);
     }
 
     /// The same for italics, and for emphasis with nothing nested in it.
