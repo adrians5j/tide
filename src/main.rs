@@ -3835,21 +3835,79 @@ struct MergeConfirm {
     /// next thing is asking it what's next; off for the merge you do while the
     /// agent is in the middle of something else.
     tell: bool,
+    /// Who GitHub says is on it. `None` means the read itself failed, which is
+    /// not the same answer as nobody being asked.
+    reviewers: Option<Vec<String>>,
+    /// Merge with nobody on it anyway. Off by default: the whole point of the
+    /// gate is that you have to reach for this.
+    skip_reviewers: bool,
 }
 
-/// The PR's files, newest read, for the merge confirmation.
-fn pr_files(root: &Path, number: u64) -> Vec<PrFile> {
+impl MergeConfirm {
+    /// Nobody has been asked to look at this, and the escape hatch is still
+    /// untouched. A read that failed doesn't block: TIDE can't claim nobody was
+    /// asked when it never got an answer.
+    fn blocked(&self) -> bool {
+        self.reviewers.as_ref().is_some_and(|r| r.is_empty()) && !self.skip_reviewers
+    }
+}
+
+/// Who has been put on this pull request: everyone still asked to look at it,
+/// plus everyone who already gave a verdict.
+///
+/// A review that only `COMMENTED` doesn't count. The automatic "Copilot
+/// reviewed 4 of 4 files" lands as a comment on every pull request in the repo,
+/// and if that passed for having sent the code to someone the gate would never
+/// close.
+fn pr_reviewers_from(v: &serde_json::Value) -> Vec<String> {
+    let mut who: Vec<String> = Vec::new();
+    if let Some(arr) = v.get("reviewRequests").and_then(|x| x.as_array()) {
+        for r in arr {
+            // a person comes back as `login`, a team as `name`
+            let name = r.get("login").or_else(|| r.get("name")).and_then(|n| n.as_str());
+            who.extend(name.filter(|n| !n.is_empty()).map(str::to_string));
+        }
+    }
+    if let Some(arr) = v.get("latestReviews").and_then(|x| x.as_array()) {
+        for r in arr {
+            let state = r.get("state").and_then(|x| x.as_str()).unwrap_or("");
+            if state != "APPROVED" && state != "CHANGES_REQUESTED" {
+                continue;
+            }
+            let name = r.get("author").and_then(|a| a.get("login")).and_then(|n| n.as_str());
+            who.extend(name.filter(|n| !n.is_empty()).map(str::to_string));
+        }
+    }
+    // the ones still pending lead, so the chip reads in the order you'd say it
+    let mut seen = HashSet::new();
+    who.retain(|n| seen.insert(n.clone()));
+    who
+}
+
+/// What the merge dialog asks GitHub for, in one read: every file the merge
+/// would land, and who is on it to review. The reviewers are `None` when the
+/// read failed.
+fn pr_merge_facts(root: &Path, number: u64) -> (Vec<PrFile>, Option<Vec<String>>) {
     let out = Command::new("gh")
-        .args(["pr", "view", &number.to_string(), "--json", "files"])
+        .args([
+            "pr",
+            "view",
+            &number.to_string(),
+            "--json",
+            "files,reviewRequests,latestReviews",
+        ])
         .current_dir(root)
         .output()
         .ok()
         .filter(|o| o.status.success());
     let Some(v) = out.and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
     else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
-    let Some(arr) = v.get("files").and_then(|f| f.as_array()) else { return Vec::new() };
+    let reviewers = Some(pr_reviewers_from(&v));
+    let Some(arr) = v.get("files").and_then(|f| f.as_array()) else {
+        return (Vec::new(), reviewers);
+    };
     let mut files: Vec<PrFile> = arr
         .iter()
         .filter_map(|f| {
@@ -3867,7 +3925,7 @@ fn pr_files(root: &Path, number: u64) -> Vec<PrFile> {
         })
         .collect();
     files.sort_by(|a, b| a.path.cmp(&b.path));
-    files
+    (files, reviewers)
 }
 
 /// What CI says about a PR: the counts, and the names of whatever isn't green.
@@ -12614,8 +12672,8 @@ impl Storm {
         self.show_flash("Reading what it would merge…", cx);
         window.focus(&self.merge_focus, cx);
         cx.spawn(async move |this, cx| {
-            let files =
-                cx.background_executor().spawn(async move { pr_files(&root, number) }).await;
+            let (files, reviewers) =
+                cx.background_executor().spawn(async move { pr_merge_facts(&root, number) }).await;
             this.update(cx, |this, cx| {
                 this.merge_confirm =
                     Some(MergeConfirm {
@@ -12624,6 +12682,8 @@ impl Storm {
                         collapsed: HashSet::new(),
                         merging: false,
                         tell: true,
+                        reviewers,
+                        skip_reviewers: false,
                     });
                 cx.notify();
             })
@@ -12661,6 +12721,17 @@ impl Storm {
         let Some(c) = self.merge_confirm.as_mut() else { return };
         if c.merging {
             return; // already asked
+        }
+        // nobody has seen this but you. `--admin` would push it past GitHub's
+        // own review requirement without a word, so the no is TIDE's to say.
+        if c.blocked() {
+            let number = c.doc.number;
+            self.show_flash(
+                &format!("Nobody is on #{number} · tick Skip reviewers to merge it anyway"),
+                cx,
+            );
+            cx.notify();
+            return;
         }
         c.merging = true;
         let number = c.doc.number;
@@ -29061,6 +29132,24 @@ impl Storm {
         let (checks_text, checks_colour) = pr.checks.summary();
         let verb = "Merge";
         let merging = c.merging;
+        let blocked = c.blocked();
+        // who is on it, said the way you'd say it out loud, and amber when the
+        // answer is nobody
+        let (who_text, who_colour, who_tip) = match c.reviewers.as_deref() {
+            None => {
+                ("reviewers unknown".into(), MUTED, "gh couldn't say who is on this".into())
+            }
+            Some([]) => (
+                "no reviewers".into(),
+                FOLDER_ICON,
+                "Nobody has been asked to look at this".into(),
+            ),
+            Some(r) => (
+                format!("{} reviewer{}", r.len(), if r.len() == 1 { "" } else { "s" }),
+                MUTED,
+                r.join(", "),
+            ),
+        };
 
         // the header's own line, so the dialog says the same things in the same
         // shapes rather than in new words
@@ -29099,6 +29188,19 @@ impl Storm {
                         .child(checks_text),
                 )
             })
+            .child(
+                div()
+                    .id("merge-who")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .text_size(px(11.))
+                    .text_color(rgb(who_colour))
+                    .child(div().size(px(6.)).rounded_full().bg(rgb(who_colour)))
+                    .child(who_text)
+                    .tooltip(tip_owned(who_tip)),
+            )
             .child(div().flex_grow(1.0))
             .child(
                 div()
@@ -29248,10 +29350,18 @@ impl Storm {
         // this workspace to tell
         let tell = self.merge_confirm.as_ref().is_some_and(|c| c.tell);
         let has_agent = self.acp.is_some();
-        let hint = if has_agent {
-            "squash · bypasses the review requirement · ↩ merge · ⌥↩ merge quietly · esc cancel"
+        // nobody on it is its own answer; the keys only matter once it can go
+        let no_reviewers = self.merge_confirm.as_ref().is_some_and(|c| {
+            c.reviewers.as_ref().is_some_and(|r| r.is_empty())
+        });
+        let skipping = self.merge_confirm.as_ref().is_some_and(|c| c.skip_reviewers);
+        let hint = if blocked {
+            "nobody has been asked to review this · tick Skip reviewers to merge it".into()
         } else {
-            "squash · bypasses the review requirement · ↩ merge · esc cancel"
+            format!(
+                "squash · bypasses the review requirement · ↩ merge{} · esc cancel",
+                if has_agent { " · ⌥↩ merge quietly" } else { "" }
+            )
         };
         let buttons = div()
             .flex()
@@ -29264,6 +29374,39 @@ impl Storm {
             .border_color(rgb(BORDER))
             .child(div().text_size(px(10.)).text_color(rgb(LINE_NUMBER)).child(hint))
             .child(div().flex_grow(1.0))
+            // only drawn when there is something to skip: with reviewers on the
+            // PR this is a tick that does nothing
+            .when(no_reviewers, |d| {
+                d.child(
+                    div()
+                        .id("merge-skip-reviewers")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .mr_2()
+                        .when(!merging, |d| d.cursor_pointer())
+                        .child(check_box(skipping))
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(if skipping { FOLDER_ICON } else { MUTED }))
+                                .child("Skip reviewers"),
+                        )
+                        .tooltip(tip(
+                            "Merge with nobody on it, for a change too small \
+                             to be worth sending to anyone",
+                        ))
+                        .on_click(cx.listener(|this, _e, _w, cx| {
+                            let Some(c) = this.merge_confirm.as_mut() else { return };
+                            if c.merging {
+                                return; // the choice is already on its way
+                            }
+                            c.skip_reviewers = !c.skip_reviewers;
+                            cx.notify();
+                        })),
+                )
+            })
             .when(has_agent, |d| {
                 d.child(
                     div()
@@ -29321,11 +29464,20 @@ impl Storm {
                     .py_1()
                     .rounded_md()
                     .text_size(px(11.))
-                    // dimmed and unclickable while GitHub is deciding
-                    .bg(rgb(if merging { HOVER } else { ACCENT }))
-                    .text_color(rgb(if merging { MUTED } else { SEL_TEXT }))
-                    .when(!merging, |d| d.cursor_pointer().hover(|s| s.opacity(0.9)))
+                    // dimmed and unclickable while GitHub is deciding, and the
+                    // same while nobody has been asked to look at it
+                    .bg(rgb(if merging || blocked { HOVER } else { ACCENT }))
+                    .text_color(rgb(if merging || blocked { MUTED } else { SEL_TEXT }))
+                    .when(!merging && !blocked, |d| {
+                        d.cursor_pointer().hover(|s| s.opacity(0.9))
+                    })
                     .child(if merging { "Merging…" } else { verb })
+                    .when(blocked, |d| {
+                        d.tooltip(tip(
+                            "Nobody has been asked to review this · tick Skip \
+                             reviewers to merge it anyway",
+                        ))
+                    })
                     .on_click(cx.listener(|this, _e, window, cx| {
                         this.do_confirmed_merge(window, cx)
                     })),
@@ -30925,7 +31077,7 @@ impl Storm {
                         })
                         .child(label)
                         .tooltip(tip(
-                            "Squash-merges this pull request, bypassing the review requirement",
+                            "Squash-merge this pull request, after a look at what it would land",
                         ))
                         .on_click(cx.listener(move |this, _e, window, cx| {
                             if this.pr_merging.is_some() {
@@ -36189,6 +36341,71 @@ mod code_tour_tests {
     fn a_pr_card_names_the_repo_it_is_in() {
         assert_eq!(repo_of_url("https://github.com/webiny/webiny-js/pull/6080"), "webiny/webiny-js");
         assert_eq!(repo_of_url("nonsense"), "");
+    }
+
+    fn confirm(reviewers: Option<Vec<String>>, skip: bool) -> MergeConfirm {
+        MergeConfirm {
+            doc: PrDoc {
+                number: 1,
+                loading: false,
+                checks: PrChecks::default(),
+                files: 0,
+                added: 0,
+                removed: 0,
+                title: String::new(),
+                state: PrState::Open,
+                base: String::new(),
+                head: String::new(),
+                author: String::new(),
+                url: String::new(),
+            },
+            files: Vec::new(),
+            collapsed: HashSet::new(),
+            merging: false,
+            tell: true,
+            reviewers,
+            skip_reviewers: skip,
+        }
+    }
+
+    /// Who is on a pull request: still-pending requests, and verdicts already
+    /// given. A bare comment is neither.
+    #[test]
+    fn the_reviewers_are_whoever_was_asked_or_answered() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{
+                "reviewRequests": [
+                    {"__typename": "User", "login": "ostap"},
+                    {"__typename": "Team", "name": "platform"}
+                ],
+                "latestReviews": [
+                    {"author": {"login": "copilot"}, "state": "COMMENTED"},
+                    {"author": {"login": "hendy"}, "state": "APPROVED"},
+                    {"author": {"login": "ostap"}, "state": "CHANGES_REQUESTED"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        // copilot only commented, and ostap is counted once though he appears twice
+        assert_eq!(pr_reviewers_from(&v), vec!["ostap", "platform", "hendy"]);
+    }
+
+    #[test]
+    fn a_pull_request_nobody_has_seen_has_no_reviewers() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"reviewRequests": [], "latestReviews": []}"#).unwrap();
+        assert!(pr_reviewers_from(&v).is_empty());
+    }
+
+    /// The merge is held back only when GitHub actually said nobody is on it,
+    /// and the tick is what lets it through.
+    #[test]
+    fn merging_waits_for_a_reviewer_unless_you_skip_them() {
+        assert!(confirm(Some(Vec::new()), false).blocked());
+        assert!(!confirm(Some(Vec::new()), true).blocked());
+        assert!(!confirm(Some(vec!["ostap".into()]), false).blocked());
+        // the read failed, so there is nothing to hold the merge back on
+        assert!(!confirm(None, false).blocked());
     }
 
     /// A stop's prose names other stops, and the card says whether each is
