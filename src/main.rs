@@ -4293,6 +4293,38 @@ fn tour_question(tour: &str, at: usize, total: usize, stop: &Stop, q: &str) -> S
     )
 }
 
+/// A question asked under a slide, with the slide it was asked under. Same
+/// shape as `tour_question`: your words first, then where you were standing.
+fn slide_question(
+    brief: &str,
+    pr: Option<u64>,
+    at: usize,
+    total: usize,
+    slide: &Slide,
+    q: &str,
+) -> String {
+    let named = match (pr, brief.trim()) {
+        (Some(p), "") => format!(" of the brief for #{p}"),
+        (Some(p), t) => format!(" of \"{t}\" (#{p})"),
+        (None, "") => " of the brief".to_string(),
+        (None, t) => format!(" of \"{t}\""),
+    };
+    let title = match slide.title.trim() {
+        "" => String::new(),
+        t => format!(", \"{t}\""),
+    };
+    let said = match slide.text.trim() {
+        "" => String::new(),
+        t => format!(", which says:\n> {}\n", t.replace('\n', "\n> ")),
+    };
+    format!(
+        "{}\n\n\
+         (I'm on slide {at}/{total}{named}{title}{said})\n\
+         Answer the question. Don't rewrite the brief unless I ask for it.\n",
+        q.trim(),
+    )
+}
+
 fn tour_request(about: Option<&str>, answer: Option<&str>) -> String {
     // the answer is the route: it already has the references, in the order it
     // walked them
@@ -6302,6 +6334,13 @@ const CLARIFY_NOTE: &str = "This step isn't clear to me. Explain what happens \
      here and why it matters, in plainer terms, and say what I'd have to know \
      to follow it.";
 
+/// The same button under a slide of a brief. A slide is prose rather than a
+/// place in a file, so what it asks for is a second telling, not a tour of
+/// where to look.
+const SLIDE_CLARIFY_NOTE: &str = "This slide isn't clear to me. Say what it \
+     means again in plainer terms, and tell me what I would have to know \
+     already for it to make sense.";
+
 /// The route drawn small, for the cards at either end of it: three stops and
 /// the arrows between them, with the end you are standing at lit. A card that
 /// is only words reads as a dialog; this says "you are at one end of a walk".
@@ -7583,6 +7622,13 @@ struct Storm {
     /// one part to the next folds the part you've left.
     tour_group_open: HashMap<String, bool>,
     tour_ask_focus: FocusHandle,
+    /// The same box, under a slide of a brief: what you're typing, which slide
+    /// it belongs to, and its focus. One box moves between the slides rather
+    /// than one per slide, because a question is about the slide you are
+    /// looking at and there is only ever one of those.
+    brief_ask: Field,
+    brief_ask_at: Option<usize>,
+    brief_ask_focus: FocusHandle,
     /// The thread turn that was right-clicked, kept whole: the menu's actions
     /// are about that answer's text, and the thread is rebuilt every frame.
     ctx_reply: Option<String>,
@@ -7746,6 +7792,10 @@ struct Storm {
     /// click handler doesn't hold: the frame that follows settles focus itself.
     /// Taken in `render`, the way the other panes do it.
     tour_ask_focus_pending: bool,
+    brief_ask_focus_pending: bool,
+    /// Whether the slide's question box holds the keyboard, read once a frame
+    /// where there is a Window to ask.
+    brief_ask_live: bool,
     /// A paste prompt that opened from a context menu, which has no Window.
     paste_focus_pending: bool,
     // rename prompt: the path being renamed and the name being typed
@@ -8150,6 +8200,9 @@ impl Storm {
             tour_ask: Field::default(),
             tour_group_open: HashMap::new(),
             tour_ask_focus: cx.focus_handle(),
+            brief_ask: Field::default(),
+            brief_ask_at: None,
+            brief_ask_focus: cx.focus_handle(),
             ctx_reply: None,
             walk: None,
             tour_jump: None,
@@ -8236,6 +8289,8 @@ impl Storm {
             hand_focus: cx.focus_handle(),
             agent_focus_pending: false,
             tour_ask_focus_pending: false,
+            brief_ask_focus_pending: false,
+            brief_ask_live: false,
             paste_focus_pending: false,
             rn_path: None,
             rn_paste: None,
@@ -15581,6 +15636,9 @@ impl Storm {
         if self.tour_ask_focus.is_focused(window) {
             return Some(&mut self.tour_ask);
         }
+        if self.brief_ask_focus.is_focused(window) {
+            return Some(&mut self.brief_ask);
+        }
         if self.md_find_focus.is_focused(window) {
             return Some(&mut self.md_find);
         }
@@ -15723,9 +15781,13 @@ impl Render for Storm {
         if std::mem::take(&mut self.agent_focus_pending) {
             window.focus(&self.agent_focus, cx);
         }
+        self.brief_ask_live = self.brief_ask_focus.is_focused(window);
         // the tour card's question box was clicked
         if std::mem::take(&mut self.tour_ask_focus_pending) {
             window.focus(&self.tour_ask_focus, cx);
+        }
+        if std::mem::take(&mut self.brief_ask_focus_pending) {
+            window.focus(&self.brief_ask_focus, cx);
         }
         // a tour just arrived from the agent: stand on its first stop. The poll
         // that received it had no Window to open a file with; this does — after
@@ -26387,6 +26449,50 @@ impl Storm {
         cx.notify();
     }
 
+    /// Send what's in a slide's question box, with the slide it was asked
+    /// under. Focus stays in the box: the answer lands in the pane beside it,
+    /// and the next question is usually a follow-up to this one.
+    fn ask_about_slide(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let q = self.brief_ask.text.trim().to_string();
+        if q.is_empty() {
+            return;
+        }
+        let Some(brief) = self.tabs.get(self.active).and_then(|t| t.brief.clone()) else {
+            return;
+        };
+        let Some(slide) = brief.slides.get(ix) else { return };
+        let text =
+            slide_question(&brief.title, brief.pr, ix + 1, brief.slides.len(), slide, &q);
+        self.brief_ask.clear();
+        self.agent_open = true;
+        self.send_agent_prompt_by(text, Some(q), Sender::You, cx);
+        self.agent_list.scroll_to_end();
+        cx.notify();
+    }
+
+    /// Keys in a slide's question box: ↩ sends, esc closes it.
+    fn brief_ask_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        match ks.key.as_str() {
+            "escape" => {
+                self.brief_ask.clear();
+                self.brief_ask_at = None;
+                self.focus_active(window, cx);
+            }
+            "enter" => {
+                if let Some(ix) = self.brief_ask_at {
+                    self.ask_about_slide(ix, cx);
+                }
+            }
+            _ => {
+                if !Self::text_comes_via_input_handler(ks) {
+                    Self::field_input(&mut self.brief_ask, ks, cx, |_| true);
+                }
+            }
+        }
+        cx.notify();
+    }
+
     /// Keys in the tour card's question box: ↩ sends, esc leaves it.
     fn tour_ask_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
@@ -31365,7 +31471,8 @@ impl Storm {
             })
             .when_some(slide.dia.clone(), |d, dia| {
                 d.child(div().pl(px(40.)).child(self.brief_diagram(ix, &dia, cx)))
-            });
+            })
+            .child(self.brief_ask_row(ix, cx));
 
         // not seen yet: laid out, and drawn at nothing. The padding it will
         // animate away is already spent here, so the reveal moves the words
@@ -31393,17 +31500,157 @@ impl Storm {
             // take a click off a diagram box
             .child(brief_probe(ix, me))
             .child(body)
-            .when(ix + 1 == total, |d| {
+            .when(ix + 1 == total, |d| d.child(self.brief_end(cx)))
+            .into_any_element()
+    }
+
+    /// The end of the deck. You have just read what the change does; what you
+    /// want next is the code, and a brief deliberately has no line numbers in
+    /// it, so the tour is the door out of here.
+    fn brief_end(&self, cx: &mut Context<Self>) -> Div {
+        let brief = self.tabs.get(self.active).and_then(|t| t.brief.clone());
+        let pr = brief.as_ref().and_then(|b| b.pr);
+        let base = self.pr_base.clone();
+        let stale = brief.as_ref().is_some_and(|b| {
+            !b.oid.is_empty() && !self.head_oid.is_empty() && b.oid != self.head_oid
+        });
+        let button = |key: &'static str, label: &'static str, lit: u32| {
+            div()
+                .id(key)
+                .flex_shrink_0()
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .text_size(px(12.))
+                .border_1()
+                .border_color(rgb(BORDER))
+                .text_color(rgb(MUTED))
+                .hover(move |s| s.bg(rgb(HOVER)).text_color(rgb(lit)))
+                .child(label)
+        };
+        div()
+            .pt_8()
+            .pl(px(40.))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(div().text_size(px(11.)).text_color(rgb(LINE_NUMBER)).child("end of the brief"))
+            .when_some(pr, |d, p| {
+                let (tour_base, again_base) = (base.clone(), base.clone());
                 d.child(
                     div()
-                        .pt_8()
-                        .pl(px(40.))
-                        .text_size(px(11.))
-                        .text_color(rgb(LINE_NUMBER))
-                        .child("end of the brief"),
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            button("brief-end-tour", "Code tour", TOUR_MARK)
+                                .tooltip(tip(
+                                    "The same change as a walk through the code, stop by stop",
+                                ))
+                                .on_click(cx.listener(move |this, _e, _w, cx| {
+                                    this.ask_pr_tour(p, tour_base.clone(), cx)
+                                })),
+                        )
+                        .child(
+                            button("brief-end-body", "The description", TEXT)
+                                .tooltip(tip("Open the pull request itself"))
+                                .on_click(cx.listener(move |this, _e, _w, cx| {
+                                    this.open_pr_number(Some(p), cx)
+                                })),
+                        )
+                        .child(
+                            button(
+                                "brief-end-again",
+                                "Write it again",
+                                if stale { FOLDER_ICON } else { TEXT },
+                            )
+                            .tooltip(tip(
+                                "Ask for this brief again, from the branch as it stands now",
+                            ))
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                this.ask_pr_brief(p, again_base.clone(), true, cx)
+                            })),
+                        ),
                 )
             })
+    }
+
+    /// Asking under the slide, rather than scrolling to the agent pane and
+    /// describing which slide you meant. The box is quiet until it is the one
+    /// in use: a deck with an outlined input under every slide reads as a form.
+    fn brief_ask_row(&self, ix: usize, cx: &mut Context<Self>) -> Div {
+        let here = self.brief_ask_at == Some(ix);
+        // the caret is only real when the box has the keyboard, so a box left
+        // open on a slide you have scrolled past doesn't blink at you
+        let caret = self.caret_if(self.brief_ask_live);
+        let box_ = div()
+            .id(("brief-ask", ix))
+            .flex_grow(1.0)
+            .min_w(px(0.))
+            .px_1p5()
+            .py(px(3.))
+            .rounded_md()
+            .bg(rgb(BG))
+            .border_1()
+            .border_color(rgb(if here { ACCENT } else { PANEL_BG }))
+            .hover(move |s| s.border_color(rgb(if here { ACCENT } else { BORDER })))
+            .text_size(px(13.))
+            .text_color(rgb(TEXT))
+            .on_click(cx.listener(move |this, _e, _w, cx| {
+                // moving the box to another slide would take the half-typed
+                // question with it, which is never what was meant
+                if this.brief_ask_at != Some(ix) {
+                    this.brief_ask.clear();
+                    this.brief_ask_at = Some(ix);
+                }
+                this.brief_ask_focus_pending = true;
+                cx.notify();
+            }));
+        // one focus handle for the deck, so only the slide holding the box may
+        // register it: two elements tracking one handle and the last painted
+        // wins the keys
+        let box_ = if here {
+            box_.track_focus(&self.brief_ask_focus)
+                .on_key_down(cx.listener(Self::brief_ask_key))
+                .child(self.brief_ask.render(caret, SELECTION))
+                .into_any_element()
+        } else {
+            box_.child(
+                div().text_color(rgb(LINE_NUMBER)).child("Ask about this slide…  ↩"),
+            )
             .into_any_element()
+        };
+        div()
+            .pl(px(40.))
+            .max_w(px(680.))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1p5()
+            .child(box_)
+            .child(
+                div()
+                    .id(("brief-clarify", ix))
+                    .flex_shrink_0()
+                    .px_2()
+                    .py(px(2.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_size(px(11.))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .text_color(rgb(MUTED))
+                    .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                    .child("clarify")
+                    .tooltip(tip("Ask the agent to say this slide again, more plainly"))
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                        this.brief_ask_at = Some(ix);
+                        this.brief_ask.set(SLIDE_CLARIFY_NOTE.to_string());
+                        this.ask_about_slide(ix, cx);
+                    })),
+            )
     }
 
     /// The picture on a slide, in a panel of its own so it reads as an inset
@@ -37403,6 +37650,37 @@ mod code_tour_tests {
         let n = &b.slides[0].dia.as_ref().unwrap().nodes[0];
         assert_eq!(n.mark, Mark::New);
         assert_eq!((n.file.as_str(), n.line), ("src/a.ts", 12));
+    }
+
+    /// A question typed under a slide goes with the slide attached: the agent
+    /// is in another pane and has no idea which one you were looking at.
+    #[test]
+    fn a_question_under_a_slide_carries_the_slide() {
+        let slide = Slide {
+            title: "A failing action is retried once a day".into(),
+            text: "A failed run leaves the action stored with its error.".into(),
+            dia: None,
+        };
+        let q = slide_question("Background task recovery", Some(6098), 4, 7, &slide, "  why a day? ");
+        assert!(q.starts_with("why a day?"), "your words lead, trimmed: {q}");
+        assert!(q.contains("slide 4/7"), "{q}");
+        assert!(q.contains("#6098"), "{q}");
+        assert!(q.contains("> A failed run leaves"), "the slide is quoted back: {q}");
+        assert!(q.contains("Don't rewrite the brief"), "{q}");
+        // an untitled brief with no pull request behind it still says where
+        // the question was asked
+        let bare = slide_question("", None, 1, 1, &slide, "and this?");
+        assert!(bare.contains("slide 1/1 of the brief"), "{bare}");
+        assert!(!bare.contains("#"), "nothing to cite: {bare}");
+    }
+
+    /// The clarify button writes what gets typed out most often under a slide,
+    /// and it has to read as something you would have typed.
+    #[test]
+    fn the_slide_clarify_note_asks_for_a_second_telling() {
+        assert!(SLIDE_CLARIFY_NOTE.starts_with("This slide"));
+        assert!(SLIDE_CLARIFY_NOTE.contains("plainer terms"));
+        assert!(!SLIDE_CLARIFY_NOTE.contains("  "), "folded continuation lines doubled a space");
     }
 
     #[test]
