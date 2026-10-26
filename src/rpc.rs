@@ -134,6 +134,71 @@ pub struct Tour {
     pub steps: Vec<TourStep>,
 }
 
+/// One box in a slide's picture.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BriefNode {
+    /// What the box says. A few words.
+    pub label: String,
+    /// The smaller line under it: the package, the trigger, the cost.
+    pub note: String,
+    /// How the change touched it: `new`, `changed`, `gone`, or empty for a part
+    /// that was already there and stays as it was. It picks the box's colour,
+    /// which is the same green/blue/grey the file tree uses.
+    pub mark: String,
+    /// The file the box stands for, so clicking it opens that file. Empty when
+    /// the box is an idea rather than a place in the repo.
+    pub file: String,
+    /// 1-based line in `file`, 0 for none.
+    pub line: usize,
+}
+
+/// The picture on a slide. Three shapes, each with a layout that can't go
+/// wrong: a chain, a fan, or a grid. There is deliberately no general graph —
+/// a diagram TIDE has to route edges for is one it can draw badly.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BriefDiagram {
+    /// `flow` (left to right, arrows between), `split` (the first node on top,
+    /// the rest fanning out under it) or `parts` (a grid, no arrows).
+    pub kind: String,
+    /// One line under the picture saying what it shows.
+    pub caption: String,
+    pub nodes: Vec<BriefNode>,
+    /// `flow` only: what to write on each arrow. One shorter than `nodes`;
+    /// missing or empty entries draw a bare arrow.
+    pub edges: Vec<String>,
+}
+
+/// One slide of a brief.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BriefSlide {
+    /// The headline, written as a sentence that says something — "Tasks that
+    /// die halfway now get picked up", not "Recovery".
+    pub title: String,
+    /// Two or three sentences under it.
+    pub text: String,
+    pub diagram: Option<BriefDiagram>,
+}
+
+/// A high-level walkthrough of a change: what it does and why, as slides, for
+/// the pull request whose body is too dense to take in at once. A code tour
+/// says where in the code; a brief says what and why, and never names a line.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Brief {
+    /// The pull request it is about, when it is about one.
+    pub pr: Option<u64>,
+    pub title: String,
+    pub slides: Vec<BriefSlide>,
+    /// Unix seconds it was written. The agent never sends this; TIDE writes it
+    /// into the copy it keeps, so a brief read back off disk can say its age.
+    pub made: u64,
+    /// The commit it was written against, same bargain as `made`. A brief is a
+    /// snapshot of a branch and goes out of date when the branch moves.
+    pub oid: String,
+    /// The body exactly as it was posted, so TIDE can keep it without needing a
+    /// second way to write a brief down.
+    pub raw: String,
+}
+
 /// A name proposed for the workspace.
 pub struct Title {
     /// The workspace's name. Empty when the call is only moving the subtitle.
@@ -187,6 +252,8 @@ pub struct Server {
     summaries: Arc<Mutex<Vec<Summary>>>,
     /// Code tours posted to `/tour`. An empty-step tour means "put it away".
     tours: Arc<Mutex<Vec<Tour>>>,
+    /// Briefs posted to `/brief`.
+    briefs: Arc<Mutex<Vec<Brief>>>,
     /// What this workspace *is*, as JSON, for `GET /workspace`: the folder, the
     /// title TIDE shows for it, the branch. Kept up to date by the UI, since the
     /// server thread can't see any of it.
@@ -210,10 +277,11 @@ impl Server {
         let shots = Arc::new(Mutex::new(Vec::new()));
         let summaries = Arc::new(Mutex::new(Vec::new()));
         let tours = Arc::new(Mutex::new(Vec::new()));
+        let briefs = Arc::new(Mutex::new(Vec::new()));
         {
             let (queue, replies, dirty, token) =
                 (queue.clone(), replies.clone(), dirty.clone(), token.clone());
-            let (refresh, titles, viewed, info, todos, shots, summaries, tours) = (
+            let (refresh, titles, viewed, info, todos, shots, summaries, tours, briefs) = (
                 refresh.clone(),
                 titles.clone(),
                 viewed.clone(),
@@ -222,6 +290,7 @@ impl Server {
                 shots.clone(),
                 summaries.clone(),
                 tours.clone(),
+                briefs.clone(),
             );
             std::thread::spawn(move || {
                 for stream in listener.incoming().flatten() {
@@ -230,7 +299,7 @@ impl Server {
                     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
                     handle(
                         stream, &token, &queue, &replies, &dirty, &refresh, &titles, &viewed,
-                        &info, &todos, &shots, &summaries, &tours,
+                        &info, &todos, &shots, &summaries, &tours, &briefs,
                     );
                 }
             });
@@ -249,6 +318,7 @@ impl Server {
             shots,
             summaries,
             tours,
+            briefs,
         })
     }
 
@@ -295,6 +365,11 @@ impl Server {
         self.tours.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default()
     }
 
+    /// Briefs posted since the last call.
+    pub fn drain_briefs(&self) -> Vec<Brief> {
+        self.briefs.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default()
+    }
+
     /// Tasks filed on the todo list since the last call.
     pub fn drain_todos(&self) -> Vec<NewTodo> {
         self.todos.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default()
@@ -330,6 +405,7 @@ fn handle(
     shots: &Mutex<Vec<Shot>>,
     summaries: &Mutex<Vec<Summary>>,
     tours: &Mutex<Vec<Tour>>,
+    briefs: &Mutex<Vec<Brief>>,
 ) {
     let Some((method, path, headers, body)) = read_request(&mut stream) else {
         respond(&mut stream, 400, "{\"error\":\"bad request\"}");
@@ -473,6 +549,28 @@ fn handle(
                 "{\"error\":\"want {\\\"steps\\\":[{\\\"file\\\":\\\"<path>\\\",\\\"line\\\":<n>,\
                  \\\"title\\\":\\\"<a few words>\\\",\\\"text\\\":\\\"<what happens here>\\\"}]}, \
                  and {\\\"steps\\\":[]} to put the tour away\"}",
+            ),
+        }
+        return;
+    }
+    // the change at arm's length: what it does and why, as slides, for the
+    // pull request whose body is too much to take in at once
+    if path == "/brief" {
+        match parse_brief(&body) {
+            Some(brief) => {
+                if let Ok(mut q) = briefs.lock() {
+                    if q.len() > 4 {
+                        q.remove(0);
+                    }
+                    q.push(brief);
+                }
+                dirty.store(true, Ordering::Relaxed);
+                respond(&mut stream, 200, "{\"ok\":true}");
+            }
+            None => respond(
+                &mut stream,
+                400,
+                "{\"error\":\"want {\\\"title\\\":\\\"<what the change is>\\\",\\\"slides\\\":                 [{\\\"title\\\":\\\"<a sentence>\\\",\\\"text\\\":\\\"<two or three more>\\\",                 \\\"diagram\\\":{\\\"kind\\\":\\\"flow|split|parts\\\",                 \\\"nodes\\\":[{\\\"label\\\":\\\"<a few words>\\\"}]}}]}\"}",
             ),
         }
         return;
@@ -855,6 +953,144 @@ fn parse_tour(body: &str) -> Option<Tour> {
     }
     let title = clean(v.get("title").and_then(|t| t.as_str()).unwrap_or(""), 120);
     Some(Tour { title, steps })
+}
+
+/// Read a brief off the wire. Anything the agent got wrong about the shape is
+/// dropped rather than refused: a slide with no title is skipped, an unknown
+/// diagram `kind` becomes `parts` (a grid always draws), and a diagram with no
+/// boxes becomes no diagram. A brief with nothing left is `None`, which the
+/// route answers with the shape it wanted.
+pub fn parse_brief(body: &str) -> Option<Brief> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let clean = |s: &str, cap: usize| -> String {
+        s.chars().filter(|c| *c == '\n' || !c.is_control()).take(cap).collect::<String>().trim().to_string()
+    };
+    let str_at = |item: &serde_json::Value, keys: &[&str], cap: usize| -> String {
+        for k in keys {
+            if let Some(x) = item.get(k).and_then(|x| x.as_str()) {
+                let out = clean(x, cap);
+                if !out.is_empty() {
+                    return out;
+                }
+            }
+        }
+        String::new()
+    };
+    let arr = match v.get("slides").or_else(|| v.get("steps")) {
+        Some(serde_json::Value::Array(a)) => a.clone(),
+        _ => return None,
+    };
+    let mut slides = Vec::new();
+    for item in arr.iter().take(24) {
+        let title = str_at(item, &["title", "headline", "heading"], 160);
+        let text = str_at(item, &["text", "body", "desc", "note"], 1200);
+        if title.is_empty() && text.is_empty() {
+            continue;
+        }
+        slides.push(BriefSlide { title, text, diagram: parse_diagram(item.get("diagram")) });
+    }
+    if slides.is_empty() {
+        return None;
+    }
+    let pr = match v.get("pr") {
+        Some(serde_json::Value::Number(n)) => n.as_u64(),
+        Some(serde_json::Value::String(s)) => s.trim().trim_start_matches('#').parse().ok(),
+        _ => None,
+    };
+    let num = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    Some(Brief {
+        pr,
+        title: clean(v.get("title").and_then(|t| t.as_str()).unwrap_or(""), 160),
+        slides,
+        made: num("made"),
+        oid: clean(v.get("oid").and_then(|x| x.as_str()).unwrap_or(""), 40),
+        raw: body.to_string(),
+    })
+}
+
+/// The picture on one slide, or `None` when there isn't one worth drawing.
+fn parse_diagram(v: Option<&serde_json::Value>) -> Option<BriefDiagram> {
+    let v = v?;
+    let clean = |s: &str, cap: usize| -> String {
+        s.chars().filter(|c| !c.is_control()).take(cap).collect::<String>().trim().to_string()
+    };
+    // `"diagram": [ … ]` is a bare node list, which reads as a grid
+    let (kind, nodes_val, caption, edges_val) = match v {
+        serde_json::Value::Array(_) => ("parts".to_string(), Some(v), String::new(), None),
+        serde_json::Value::Object(_) => (
+            clean(v.get("kind").or_else(|| v.get("type")).and_then(|k| k.as_str()).unwrap_or(""), 20)
+                .to_lowercase(),
+            v.get("nodes").or_else(|| v.get("boxes")).or_else(|| v.get("steps")),
+            clean(v.get("caption").and_then(|c| c.as_str()).unwrap_or(""), 160),
+            v.get("edges").or_else(|| v.get("labels")),
+        ),
+        _ => return None,
+    };
+    let serde_json::Value::Array(raw) = nodes_val? else { return None };
+    let mut nodes = Vec::new();
+    for n in raw.iter().take(12) {
+        // a node given as a bare string is just its label
+        let n = match n {
+            serde_json::Value::String(s) => serde_json::json!({ "label": s }),
+            other => other.clone(),
+        };
+        let label = clean(
+            n.get("label").or_else(|| n.get("name")).or_else(|| n.get("title"))
+                .and_then(|l| l.as_str()).unwrap_or(""),
+            60,
+        );
+        if label.is_empty() {
+            continue;
+        }
+        let file = clean(n.get("file").or_else(|| n.get("path")).and_then(|f| f.as_str()).unwrap_or(""), 500);
+        let (file, glued, _) = split_line_suffix(&file);
+        let line = match n.get("line") {
+            Some(serde_json::Value::Number(x)) => x.as_u64().map(|x| x as usize),
+            Some(serde_json::Value::String(x)) => x.trim().parse().ok(),
+            _ => None,
+        }
+        .or(glued)
+        .unwrap_or(0);
+        nodes.push(BriefNode {
+            label,
+            note: clean(n.get("note").or_else(|| n.get("sub")).and_then(|x| x.as_str()).unwrap_or(""), 60),
+            mark: clean(n.get("mark").or_else(|| n.get("state")).and_then(|x| x.as_str()).unwrap_or(""), 12)
+                .to_lowercase(),
+            file,
+            line,
+        });
+    }
+    if nodes.is_empty() {
+        return None;
+    }
+    // an unknown kind draws as a grid, which is the one layout that is right
+    // for any number of boxes
+    let kind = match kind.as_str() {
+        "flow" | "chain" | "sequence" => "flow",
+        "split" | "fan" | "branch" => "split",
+        _ => "parts",
+    }
+    .to_string();
+    let edges = match edges_val {
+        Some(serde_json::Value::Array(a)) => a
+            .iter()
+            .take(12)
+            .map(|e| match e {
+                serde_json::Value::String(s) => clean(s, 40),
+                // `[from, to, "label"]` and `{"label": …}` both arrive; only
+                // the label is used, since the chain is the order of the nodes
+                serde_json::Value::Array(t) => {
+                    t.iter().filter_map(|x| x.as_str()).next_back().map(|s| clean(s, 40)).unwrap_or_default()
+                }
+                serde_json::Value::Object(_) => {
+                    clean(e.get("label").and_then(|x| x.as_str()).unwrap_or(""), 40)
+                }
+                _ => String::new(),
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    Some(BriefDiagram { kind, caption, nodes, edges })
 }
 
 /// `src/a.ts:67-72` → `("src/a.ts", Some(67), Some(72))`. Anything that isn't a
@@ -2073,6 +2309,81 @@ mod tests {
         assert_eq!(s.drain_titles()[0].subtitle, None);
         // and a call that says neither is a bad request
         assert!(post(s.port, "/title", Some("tok"), "{}").starts_with("HTTP/1.1 400"));
+    }
+
+    /// The shape a brief arrives in, and the three ways the agent is likely to
+    /// write it loosely.
+    #[test]
+    fn a_brief_arrives_as_slides() {
+        let s = Server::start("tok".into()).unwrap();
+        let body = "{\"pr\":6084,\"title\":\"Task recovery\",\"slides\":[\
+            {\"title\":\"Dead tasks get picked up\",\"text\":\"They used to sit as running.\",\
+             \"diagram\":{\"kind\":\"flow\",\"caption\":\"one task\",\
+             \"nodes\":[{\"label\":\"trigger()\",\"file\":\"src/a.ts:67\"},\
+                       {\"label\":\"Recover\",\"mark\":\"NEW\",\"note\":\"every 60s\"}],\
+             \"edges\":[\"writes pending\"]}},\
+            {\"title\":\"What to watch\",\"text\":\"The lease is 60s.\"}]}";
+        assert!(post(s.port, "/brief", Some("tok"), body).starts_with("HTTP/1.1 200"));
+        let got = s.drain_briefs();
+        assert_eq!(got.len(), 1);
+        let b = &got[0];
+        assert_eq!(b.pr, Some(6084));
+        assert_eq!(b.title, "Task recovery");
+        assert_eq!(b.slides.len(), 2);
+        let d = b.slides[0].diagram.as_ref().expect("a diagram");
+        assert_eq!(d.kind, "flow");
+        assert_eq!(d.caption, "one task");
+        assert_eq!(d.edges, vec!["writes pending"]);
+        // the line rides on the path the way it does everywhere else in TIDE
+        assert_eq!(d.nodes[0].file, "src/a.ts");
+        assert_eq!(d.nodes[0].line, 67);
+        assert_eq!(d.nodes[1].mark, "new", "the mark is matched without case");
+        assert_eq!(d.nodes[1].note, "every 60s");
+        assert!(b.slides[1].diagram.is_none(), "most slides have no picture");
+    }
+
+    /// Everything the agent can get wrong about the shape is dropped rather
+    /// than refused: only a brief with no slides left at all is a bad request.
+    #[test]
+    fn a_loose_brief_is_taken_as_far_as_it_makes_sense() {
+        let s = Server::start("tok".into()).unwrap();
+        // an unknown kind draws as a grid, bare strings are labels, and a
+        // slide with neither a title nor text is dropped
+        let body = "{\"slides\":[{\"title\":\"A\",\"diagram\":{\"kind\":\"sankey\",\
+            \"nodes\":[\"Admin\",\"API\",{\"label\":\"\"}]}},{\"text\":\"  \"}]}";
+        assert!(post(s.port, "/brief", Some("tok"), body).starts_with("HTTP/1.1 200"));
+        let got = s.drain_briefs();
+        assert_eq!(got[0].slides.len(), 1, "the empty slide went");
+        let d = got[0].slides[0].diagram.as_ref().expect("a diagram");
+        assert_eq!(d.kind, "parts", "an unknown kind still draws");
+        assert_eq!(d.nodes.len(), 2, "the unlabelled box went");
+        assert_eq!(d.nodes[0].label, "Admin");
+        // a diagram with no boxes left is no diagram
+        let empty = "{\"slides\":[{\"title\":\"A\",\"diagram\":{\"kind\":\"flow\",\"nodes\":[]}}]}";
+        assert!(post(s.port, "/brief", Some("tok"), empty).starts_with("HTTP/1.1 200"));
+        assert!(s.drain_briefs()[0].slides[0].diagram.is_none());
+        // and nothing to show is a bad request, not an empty deck
+        assert!(post(s.port, "/brief", Some("tok"), "{\"slides\":[]}").starts_with("HTTP/1.1 400"));
+        assert!(post(s.port, "/brief", Some("tok"), "{\"title\":\"x\"}").starts_with("HTTP/1.1 400"));
+        assert!(s.drain_briefs().is_empty());
+        assert!(post(s.port, "/brief", None, "{\"slides\":[{\"title\":\"x\"}]}")
+            .starts_with("HTTP/1.1 403"));
+    }
+
+    /// TIDE writes `made` and `oid` into the copy it keeps on disk, and reads
+    /// them back through the same parser the wire uses — so there is one format
+    /// for a brief, not two.
+    #[test]
+    fn a_kept_brief_remembers_when_and_against_what() {
+        let posted = "{\"slides\":[{\"title\":\"A\",\"text\":\"B\"}]}";
+        let fresh = parse_brief(posted).expect("a brief");
+        assert_eq!((fresh.made, fresh.oid.as_str()), (0, ""), "the agent never sends these");
+        assert_eq!(fresh.raw, posted, "kept verbatim, so TIDE can write it straight back");
+        let kept = "{\"slides\":[{\"title\":\"A\",\"text\":\"B\"}],\"made\":1700000000,\"oid\":\"a1b2c3d\"}";
+        let back = parse_brief(kept).expect("a brief");
+        assert_eq!(back.made, 1_700_000_000);
+        assert_eq!(back.oid, "a1b2c3d");
+        assert_eq!(back.slides.len(), 1);
     }
 
     /// A summary comes back as markdown, so it keeps its line breaks where the

@@ -3,6 +3,7 @@ use gpui::{
     ElementInputHandler, EntityInputHandler, EventEmitter, ExternalPaths, FocusHandle, KeyBinding, WeakEntity, relative,
     KeyDownEvent, Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ScrollStrategy, SharedString,
+    Animation, AnimationExt,
     StyledText, TextRun, Window, WindowBounds, WindowOptions, actions, div, font, prelude::*, px,
     rgb, rgba, size, uniform_list, ScrollHandle, UniformListScrollHandle,
 };
@@ -4057,6 +4058,39 @@ struct PrDoc {
 
 /// The open pull request as a markdown document: a heading and the body as
 /// written. `None` when there is no PR or no `gh`.
+/// Where a pull request's brief is kept, so asking for it twice doesn't cost a
+/// second agent turn. Next to the PR bodies, which are cached for the same
+/// reason.
+fn brief_cache_path(number: u64) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(format!(".config/tide/brief-cache/{number}.json")))
+}
+
+/// Keep the brief as the agent posted it, with the two things TIDE knows and it
+/// doesn't: when, and against what. Written back through the same parser it
+/// came in on, so there is no second format to keep in step.
+fn save_brief_cache(number: u64, raw: &str, oid: &str) {
+    let Some(path) = brief_cache_path(number) else { return };
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(raw) else { return };
+    let Some(obj) = v.as_object_mut() else { return };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    obj.insert("made".into(), serde_json::json!(now));
+    obj.insert("oid".into(), serde_json::json!(oid));
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, v.to_string());
+}
+
+/// The brief written for this pull request last time, if there is one.
+fn brief_cached(number: u64) -> Option<Brief> {
+    let raw = std::fs::read_to_string(brief_cache_path(number)?).ok()?;
+    Some(brief_from(rpc::parse_brief(&raw)?))
+}
+
 /// Where a PR's last-read JSON lives, so reopening it is instant and offline.
 fn pr_cache_path(number: u64) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
@@ -4249,6 +4283,62 @@ fn tour_request(about: Option<&str>, answer: Option<&str>) -> String {
          wrong place costs me more than a missing one. Ten to twenty stops is a \
          flow. Then say in one line what the tour covers and stop — don't \
          repeat the stops in your reply, they're on screen.\n{source}"
+    )
+}
+
+/// Ask for a brief: the change at arm's length, as slides. The opposite end of
+/// the telescope from `tour_request` — that one wants files and lines, this one
+/// forbids them. A brief that starts naming line numbers has become a worse
+/// code tour.
+fn brief_request(number: u64, base: &str) -> String {
+    let base = match base.trim().strip_prefix("origin/").unwrap_or(base.trim()) {
+        "" => "the base branch".to_string(),
+        b => b.to_string(),
+    };
+    format!(
+        "Write me a brief of #{number} — what it does and why, as slides I read \
+         before I read the code.\n\n\
+         I already have the pull request body and a code tour. The body is the \
+         problem: by the time I have read it I am holding too much at once. A \
+         brief is five to eight slides, each one idea, each one standing on its \
+         own. Post the whole thing in one call:\n\
+         \x20 curl -s -X POST \"$TIDE_RPC/brief\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n\
+         \x20   -d '{{\"pr\":{number},\"title\":\"Background task recovery\",\"slides\":[\
+         {{\"title\":\"Tasks that die halfway now get picked up\",\
+         \"text\":\"A task whose worker crashed mid-run used to sit as `running` \
+         for ever, because nothing ever looked at it again. The loop now treats \
+         a stale lease as a failure and re-queues it.\",\
+         \"diagram\":{{\"kind\":\"flow\",\"caption\":\"one task, start to finish\",\
+         \"nodes\":[\
+         {{\"label\":\"trigger()\",\"note\":\"api-tasks\",\"file\":\"packages/api-tasks/src/TaskService.ts\"}},\
+         {{\"label\":\"TaskStore\",\"note\":\"DynamoDB\"}},\
+         {{\"label\":\"Recover\",\"note\":\"every 60s\",\"mark\":\"new\"}}],\
+         \"edges\":[\"writes pending\",\"on a stale lease\"]}}}}]}}'\n\n\
+         `title` on a slide is a sentence that says something — “Tasks that die \
+         halfway now get picked up”, never “Recovery” or “Background”. `text` is \
+         two or three sentences: what changed, what it was before, and the one \
+         thing I would get wrong if nobody told me. Backticks for identifiers.\n\n\
+         The first slide is what the change is for, in the terms of whoever asked \
+         for it. The last is what to watch now that it has landed — what could \
+         still bite, what is deliberately left undone. The ones in between are \
+         the moving parts, in the order they would happen.\n\n\
+         `diagram` is optional and most slides are better without one; put one on \
+         the two or three where a picture genuinely carries the idea. Three \
+         shapes, and no others:\n\
+         \x20 • `flow` — a chain, left to right, an arrow between each pair. \
+         `edges` writes on the arrows, one entry fewer than there are nodes.\n\
+         \x20 • `split` — the first node on top, the rest fanning out underneath.\n\
+         \x20 • `parts` — a grid of boxes with no arrows: the pieces of a thing \
+         rather than a path through it.\n\
+         Up to six boxes. `label` is a few words, `note` the smaller line under \
+         it. `mark` is `new`, `changed` or `gone` and goes only on the boxes this \
+         change actually touched — a diagram where every box is lit says nothing. \
+         `file` makes the box open that file when I click it; use it where there \
+         is a real file behind the box, and leave it off ideas.\n\n\
+         Read the diff against {base} before you write any of it. No line \
+         numbers anywhere in the prose: if a slide needs one it belongs in a code \
+         tour instead. Then say in one line that it is up, and stop — don't \
+         repeat the slides in your reply, I'm about to read them.\n"
     )
 }
 
@@ -6246,6 +6336,148 @@ struct Walk {
     here: Option<(PathBuf, usize, usize)>,
 }
 
+/// How a change touched one box in a diagram. It picks the box's colour, which
+/// is the green/blue/grey the file tree already uses for the same three things.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Mark {
+    /// Already there, and the change leaves it alone. Most boxes are this: a
+    /// diagram where everything is lit says nothing about what moved.
+    Same,
+    New,
+    Changed,
+    Gone,
+}
+
+impl Mark {
+    fn of(s: &str) -> Mark {
+        match s {
+            "new" | "added" | "add" => Mark::New,
+            "changed" | "modified" | "edit" | "edited" => Mark::Changed,
+            "gone" | "removed" | "deleted" | "delete" => Mark::Gone,
+            _ => Mark::Same,
+        }
+    }
+
+    /// The colour, and `None` for a box the change didn't touch — which draws
+    /// in the ordinary border and text colours rather than a fourth hue.
+    fn tint(self) -> Option<u32> {
+        match self {
+            Mark::Same => None,
+            Mark::New => Some(GIT_NEW),
+            Mark::Changed => Some(GIT_MODIFIED),
+            Mark::Gone => Some(GIT_DELETED),
+        }
+    }
+
+    /// The word on the chip in the box's corner, so the diagram still reads
+    /// without colour.
+    fn word(self) -> &'static str {
+        match self {
+            Mark::Same => "",
+            Mark::New => "new",
+            Mark::Changed => "changed",
+            Mark::Gone => "gone",
+        }
+    }
+}
+
+/// Which of the three pictures a slide draws.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum DiaKind {
+    /// A chain, left to right, an arrow between each pair. Wraps.
+    Flow,
+    /// The first box on top, the rest fanning out underneath it.
+    Split,
+    /// A grid, no arrows: the parts of a thing rather than a path through it.
+    Parts,
+}
+
+/// One box.
+#[derive(Clone)]
+struct DiaNode {
+    label: String,
+    note: String,
+    mark: Mark,
+    /// The file it stands for, so clicking the box opens it. Empty when the box
+    /// is an idea rather than a place in the repo.
+    file: String,
+    line: usize,
+}
+
+/// A slide's picture. Three layouts, none of which needs edges routed — a
+/// diagram TIDE would have to lay out properly is one it would lay out badly.
+#[derive(Clone)]
+struct Diagram {
+    kind: DiaKind,
+    caption: String,
+    nodes: Vec<DiaNode>,
+    /// `Flow` only: what rides on each arrow. Short, and often empty.
+    edges: Vec<String>,
+}
+
+/// One slide: a sentence that says something, a few more under it, and
+/// sometimes a picture.
+#[derive(Clone)]
+struct Slide {
+    title: String,
+    text: String,
+    dia: Option<Diagram>,
+}
+
+/// A change explained at arm's length. A code tour answers "where": it opens
+/// files and lights up lines. A brief answers "what" and "why", names no line
+/// at all, and is what you read when the pull request body is more than you can
+/// take in at once.
+#[derive(Clone)]
+struct Brief {
+    pr: Option<u64>,
+    title: String,
+    /// Unix seconds it was written, for "2h ago" in the header.
+    made: u64,
+    /// The commit it was written against. A brief is a snapshot of a branch:
+    /// once the branch has moved, the header says so rather than letting you
+    /// read a description of code that isn't there any more.
+    oid: String,
+    slides: Vec<Slide>,
+}
+
+fn brief_from(b: rpc::Brief) -> Brief {
+    Brief {
+        pr: b.pr,
+        title: b.title,
+        made: b.made,
+        oid: b.oid,
+        slides: b
+            .slides
+            .into_iter()
+            .map(|s| Slide {
+                title: s.title,
+                text: s.text,
+                dia: s.diagram.map(|d| Diagram {
+                    kind: match d.kind.as_str() {
+                        "flow" => DiaKind::Flow,
+                        "split" => DiaKind::Split,
+                        _ => DiaKind::Parts,
+                    },
+                    caption: d.caption,
+                    nodes: d
+                        .nodes
+                        .into_iter()
+                        .map(|n| DiaNode {
+                            label: n.label,
+                            note: n.note,
+                            mark: Mark::of(&n.mark),
+                            file: n.file,
+                            line: n.line,
+                        })
+                        .collect(),
+                    edges: d.edges,
+                }),
+            })
+            .collect(),
+    }
+}
+
 /// Which box an attached image's `[Image #n]` token is typed into.
 #[derive(Clone, Copy, PartialEq)]
 enum ImgToken {
@@ -6824,6 +7056,10 @@ struct Tab {
     /// tab — an empty scratch one, so everything that walks the tab list keeps
     /// working — but nothing ever renders or saves it.
     browser: bool,
+    /// A brief rather than a file: slides about a change, drawn by TIDE from
+    /// what the agent posted. Carries a scratch editor for the same reason the
+    /// browser does.
+    brief: Option<Brief>,
 }
 
 struct Storm {
@@ -6871,6 +7107,9 @@ struct Storm {
     rc_resize: Option<(f32, f32, f32, f32, bool)>,
     /// User-set box width (corner drag); `None` sizes to the pane.
     rc_width: Option<f32>,
+    /// Slides of the open brief that have come up the window far enough to be
+    /// drawn. Cleared when a new brief arrives, so it reveals itself again.
+    brief_seen: HashSet<usize>,
     ws_idle: bool,   // persisted "nobody is on this workspace" marker
     ws_paused: bool, // persisted "skip me in ⌥Tab" marker
     show_terminal: bool,
@@ -7598,6 +7837,7 @@ impl Storm {
             rc_thread_h: None,
             rc_resize: None,
             rc_width: None,
+            brief_seen: HashSet::new(),
             ws_idle,
             ws_paused,
             active_term: 0,
@@ -9145,6 +9385,11 @@ impl Storm {
                     for tour in tours {
                         this.start_tour(tour, cx);
                     }
+                    let briefs =
+                        this.agent_rpc.as_ref().map(|s| s.drain_briefs()).unwrap_or_default();
+                    for brief in briefs {
+                        this.start_brief(brief, cx);
+                    }
                     let summaries =
                         this.agent_rpc.as_ref().map(|s| s.drain_summaries()).unwrap_or_default();
                     for summary in summaries {
@@ -10372,6 +10617,7 @@ impl Storm {
             preview: false,
             browser: false,
             pr: None,
+            brief: None,
             label: None,
         });
         self.active = self.tabs.len() - 1;
@@ -10434,6 +10680,7 @@ impl Storm {
                 preview,
                 browser: false,
                 pr: None,
+                brief: None,
                 label: None,
             });
             self.active = self.tabs.len() - 1;
@@ -10668,6 +10915,7 @@ impl Storm {
                     preview: false,
                     browser: true,
                     pr: None,
+                    brief: None,
                     label: None,
                 });
                 self.active = self.tabs.len() - 1;
@@ -13001,6 +13249,7 @@ impl Storm {
             preview: true, // rendered, since that is how a PR body is meant to read
             browser: false,
             pr: Some(meta.clone()),
+            brief: None,
             label: Some(meta.title.clone()),
         });
         if activate {
@@ -15101,6 +15350,63 @@ impl Storm {
             .to_string_lossy()
             .to_string()
     }
+}
+
+/// One arrow between two boxes in a `flow`, with whatever the brief wanted
+/// written over it.
+fn dia_arrow(label: &str) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .flex_shrink_0()
+        .gap(px(2.))
+        .px(px(2.))
+        .when(!label.trim().is_empty(), |d| {
+            d.child(
+                div()
+                    .max_w(px(96.))
+                    .text_size(px(9.))
+                    .text_color(rgb(MUTED))
+                    .child(label.to_string()),
+            )
+        })
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .child(div().w(px(16.)).h(px(2.)).bg(rgb(BORDER)))
+                .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child("▸")),
+        )
+}
+
+/// Tells the brief when a slide has come far enough up the window to be worth
+/// showing. Measured during paint rather than computed from the scroll offset:
+/// the deck's own height, the window's, and the dock widths all move, and a
+/// slide that reveals itself at the wrong moment is worse than one that doesn't.
+///
+/// It only ever flips a slide from unseen to seen, so this settles after one
+/// frame per slide rather than redrawing for ever.
+fn brief_probe(ix: usize, me: WeakEntity<Storm>) -> impl IntoElement {
+    gpui::canvas(
+        |_, _, _| (),
+        move |bounds, _, window, cx| {
+            let fold = f32::from(window.viewport_size().height) - 80.;
+            if f32::from(bounds.origin.y) > fold {
+                return;
+            }
+            if let Some(me) = me.upgrade() {
+                me.update(cx, |s, cx| {
+                    if s.brief_seen.insert(ix) {
+                        cx.notify();
+                    }
+                });
+            }
+        },
+    )
+    .absolute()
+    .size_full()
 }
 
 /// A zero-size overlay whose only job is to register `ElementInputHandler` for
@@ -25525,6 +25831,106 @@ impl Storm {
     /// A tour the agent posted to `/tour`. Stops whose file isn't in this
     /// project are dropped rather than left to fail on arrival — a tour is only
     /// worth anything if every press of ⌥] lands somewhere.
+    /// The Brief button. A brief already written for this pull request opens
+    /// straight away — it cost an agent turn once and the answer doesn't change
+    /// on its own. `again` is the header's "Write it again", which always asks.
+    fn ask_pr_brief(&mut self, number: u64, base: String, again: bool, cx: &mut Context<Self>) {
+        if !again {
+            if let Some(b) = brief_cached(number) {
+                let when = (b.made > 0).then(|| todo::age(b.made)).unwrap_or_default();
+                self.open_brief(b, cx);
+                if !when.is_empty() {
+                    self.show_flash(&format!("The brief you already had · written {when}"), cx);
+                }
+                return;
+            }
+        }
+        let label = format!("Asked for a brief of #{number}");
+        self.agent_open = true;
+        self.send_agent_prompt_as(brief_request(number, &base), Some(label), cx);
+        self.agent_list.scroll_to_end();
+        cx.notify();
+    }
+
+    /// A brief arrived off the wire. Keep it, then show it.
+    fn start_brief(&mut self, brief: rpc::Brief, cx: &mut Context<Self>) {
+        if let Some(p) = brief.pr {
+            save_brief_cache(p, &brief.raw, &self.head_oid);
+        }
+        let mut brief = brief_from(brief);
+        // the copy on disk carries these; the one off the wire is being written
+        // right now, against what is checked out right now
+        if brief.made == 0 {
+            brief.made = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+        }
+        if brief.oid.is_empty() {
+            brief.oid = self.head_oid.clone();
+        }
+        let n = brief.slides.len();
+        self.open_brief(brief, cx);
+        self.show_flash(&format!("Brief is up · {n} slide{}", if n == 1 { "" } else { "s" }), cx);
+    }
+
+    /// Put a brief in its own tab next to the pull request body, so the two are
+    /// a click apart: the brief for what the change is, the body for what was
+    /// actually written about it.
+    fn open_brief(&mut self, brief: Brief, cx: &mut Context<Self>) {
+        let name = match brief.pr {
+            Some(p) => format!("Brief #{p}"),
+            None => "Brief".to_string(),
+        };
+        let label = match brief.title.trim() {
+            "" => name.clone(),
+            t => t.to_string(),
+        };
+        let path = PathBuf::from(&name);
+        self.brief_seen.clear(); // a new deck reveals itself again
+        if let Some(ix) = self.tabs.iter().position(|t| t.path == path) {
+            self.tabs[ix].brief = Some(brief);
+            self.tabs[ix].label = Some(label);
+            self.active = ix;
+        } else {
+            self.save_tab(self.active, cx);
+            let editor = cx.new(|cx| Editor::new(None, cx));
+            editor.update(cx, |e, _cx| e.set_read_only(true));
+            self.tabs.push(Tab {
+                path,
+                editor,
+                scratch: true,
+                preview: false,
+                browser: false,
+                pr: None,
+                brief: Some(brief),
+                label: Some(label),
+            });
+            self.active = self.tabs.len() - 1;
+        }
+        cx.notify();
+    }
+
+    /// Click a box that names a file: open it, at its line when it gave one.
+    fn open_brief_node(
+        &mut self,
+        file: String,
+        line: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(p) = self.file_ref_target(&file, cx) else {
+            self.show_flash(&format!("Can't find {file} in this project"), cx);
+            return;
+        };
+        self.open_file(p, window, cx);
+        if line > 0 {
+            if let Some(tab) = self.tabs.get(self.active) {
+                tab.editor.update(cx, |e, cx| e.reveal_span(line, line, 0., cx));
+            }
+        }
+    }
+
     fn start_tour(&mut self, tour: rpc::Tour, cx: &mut Context<Self>) {
         self.load_tour_diff(cx); // so the map's file names carry their status
         self.tour_group_open.clear();
@@ -30656,6 +31062,358 @@ impl Storm {
             )
     }
 
+    /// The brief tab: the title bar, then the slides down the page. Each slide
+    /// is laid out from the moment the tab opens — the scroll height has to be
+    /// the real one — but draws at nothing until you have scrolled to it, and
+    /// then fades up into place. The reveal is the point: a page that arrives
+    /// all at once is the pull request body again.
+    fn render_brief(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(brief) = self.tabs.get(self.active).and_then(|t| t.brief.clone()) else {
+            return div().into_any_element();
+        };
+        let me = cx.entity().downgrade();
+        let n = brief.slides.len();
+        let pr = brief.pr;
+        let base = self.pr_base.clone();
+        let made = (brief.made > 0).then(|| todo::age(brief.made)).unwrap_or_default();
+        // the branch has moved since this was written, so some of what it says
+        // is about code that is no longer there
+        let stale = !brief.oid.is_empty()
+            && !self.head_oid.is_empty()
+            && brief.oid != self.head_oid;
+
+        let head = div()
+            .h(px(34.))
+            .flex_shrink_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .bg(rgb(BG))
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .child(
+                div()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_size(px(14.))
+                    .text_color(rgb(TEXT))
+                    .child(match brief.title.trim() {
+                        "" => "Brief".to_string(),
+                        t => t.to_string(),
+                    }),
+            )
+            .when_some(pr, |d, p| {
+                d.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(11.))
+                        .text_color(rgb(MUTED))
+                        .child(format!("#{p}")),
+                )
+            })
+            .child(div().flex_grow(1.0))
+            .when(stale, |d| {
+                d.child(
+                    div()
+                        .id("brief-stale")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .flex_shrink_0()
+                        .text_size(px(11.))
+                        .text_color(rgb(FOLDER_ICON))
+                        .child(div().size(px(6.)).rounded_full().bg(rgb(FOLDER_ICON)))
+                        .child("stale")
+                        .tooltip(tip(
+                            "The branch has moved since this was written · write it again for \
+                             the change as it stands now",
+                        )),
+                )
+            })
+            .when(!made.is_empty(), |d| {
+                d.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(11.))
+                        .text_color(rgb(LINE_NUMBER))
+                        .child(format!("written {made}")),
+                )
+            })
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(11.))
+                    .text_color(rgb(LINE_NUMBER))
+                    .child(format!("{n} slide{}", if n == 1 { "" } else { "s" })),
+            )
+            // a brief is a snapshot of a branch the same way a tour is, and goes
+            // out of date the same way
+            .when_some(pr, |d, p| {
+                let base = base.clone();
+                d.child(
+                    div()
+                        .id("brief-again")
+                        .flex_shrink_0()
+                        .px_1p5()
+                        .py(px(1.))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_size(px(11.))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .text_color(rgb(if stale { FOLDER_ICON } else { MUTED }))
+                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                        .child("Write it again")
+                        .tooltip(tip("Ask for this brief again, from the branch as it stands now"))
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            this.ask_pr_brief(p, base.clone(), true, cx)
+                        })),
+                )
+            });
+
+        let mut deck = div()
+            .id("brief-deck")
+            .flex()
+            .flex_col()
+            .flex_grow(1.0)
+            .overflow_y_scroll()
+            .px_8()
+            // the last slide gets to sit in the middle of the window like every
+            // other one, rather than pinned to the bottom edge
+            .pb(px(340.));
+        for (ix, slide) in brief.slides.iter().enumerate() {
+            deck = deck.child(self.brief_slide(ix, slide, n, me.clone(), cx));
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_grow(1.0)
+            .h_full()
+            .bg(rgb(BG))
+            .child(head)
+            .child(deck)
+            .into_any_element()
+    }
+
+    fn brief_slide(
+        &self,
+        ix: usize,
+        slide: &Slide,
+        total: usize,
+        me: WeakEntity<Storm>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let seen = self.brief_seen.contains(&ix);
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .max_w(px(780.))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_baseline()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .w(px(28.))
+                            .text_size(px(11.))
+                            .font_family("Menlo")
+                            .text_color(rgb(LINE_NUMBER))
+                            .child(format!("{:02}", ix + 1)),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .text_size(px(22.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(TEXT))
+                            .child(slide.title.clone()),
+                    ),
+            )
+            .when(!slide.text.trim().is_empty(), |d| {
+                d.child(div().pl(px(40.)).max_w(px(680.)).child(md_text(&slide.text, 15., TEXT)))
+            })
+            .when_some(slide.dia.clone(), |d, dia| {
+                d.child(div().pl(px(40.)).child(self.brief_diagram(ix, &dia, cx)))
+            });
+
+        // not seen yet: laid out, and drawn at nothing. The padding it will
+        // animate away is already spent here, so the reveal moves the words
+        // without moving anything below them.
+        let body = if seen {
+            body.with_animation(
+                ("brief-in", ix),
+                Animation::new(Duration::from_millis(360)).with_easing(gpui::ease_out_quint()),
+                |d, t| d.pt(px(18. * (1. - t))).pb(px(18. * t)).opacity(t),
+            )
+            .into_any_element()
+        } else {
+            body.pt(px(18.)).opacity(0.).into_any_element()
+        };
+
+        div()
+            .id(("brief-slide", ix))
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .py_8()
+            .when(ix > 0, |d| d.border_t_1().border_color(rgb(BORDER)))
+            // the probe goes in first so it paints under the slide and can't
+            // take a click off a diagram box
+            .child(brief_probe(ix, me))
+            .child(body)
+            .when(ix + 1 == total, |d| {
+                d.child(
+                    div()
+                        .pt_8()
+                        .pl(px(40.))
+                        .text_size(px(11.))
+                        .text_color(rgb(LINE_NUMBER))
+                        .child("end of the brief"),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// The picture on a slide, in a panel of its own so it reads as an inset
+    /// rather than more prose.
+    fn brief_diagram(&self, slide: usize, d: &Diagram, cx: &mut Context<Self>) -> Div {
+        let key = |j: usize| slide * 64 + j;
+        let picture = match d.kind {
+            DiaKind::Flow => {
+                let mut row = div().flex().flex_row().flex_wrap().items_center().gap_2();
+                for (j, n) in d.nodes.iter().enumerate() {
+                    if j > 0 {
+                        row = row.child(dia_arrow(d.edges.get(j - 1).map(String::as_str).unwrap_or("")));
+                    }
+                    row = row.child(self.dia_box(key(j), n, cx));
+                }
+                row
+            }
+            DiaKind::Split => {
+                let mut col = div().flex().flex_col().items_center().gap_2();
+                let mut rest = div().flex().flex_row().flex_wrap().items_start().justify_center().gap_2();
+                for (j, n) in d.nodes.iter().enumerate() {
+                    if j == 0 {
+                        col = col
+                            .child(self.dia_box(key(0), n, cx))
+                            .child(div().w(px(2.)).h(px(12.)).bg(rgb(BORDER)))
+                            .child(div().text_size(px(10.)).text_color(rgb(MUTED)).child("▼"));
+                        continue;
+                    }
+                    rest = rest.child(self.dia_box(key(j), n, cx));
+                }
+                col.child(rest)
+            }
+            DiaKind::Parts => {
+                let mut row = div().flex().flex_row().flex_wrap().items_start().gap_2();
+                for (j, n) in d.nodes.iter().enumerate() {
+                    row = row.child(self.dia_box(key(j), n, cx));
+                }
+                row
+            }
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .p_4()
+                    .rounded_md()
+                    .bg(rgb(PANEL_BG))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .child(picture),
+            )
+            .when(!d.caption.trim().is_empty(), |x| {
+                x.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(LINE_NUMBER))
+                        .child(d.caption.clone()),
+                )
+            })
+    }
+
+    /// One box. It takes the file tree's colours for what the change did to it,
+    /// and opens its file when it names one.
+    fn dia_box(&self, key: usize, n: &DiaNode, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+        let tint = n.mark.tint();
+        let edge = tint.unwrap_or(BORDER);
+        let (file, line) = (n.file.clone(), n.line);
+        let opens = !file.is_empty();
+        div()
+            .id(("dia-box", key))
+            .flex()
+            .flex_col()
+            .gap(px(3.))
+            .flex_shrink_0()
+            .px_3()
+            .py_2()
+            .min_w(px(96.))
+            .max_w(px(200.))
+            .rounded_md()
+            .bg(rgb(BG))
+            .border_1()
+            .border_color(rgb(edge))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .text_size(px(13.))
+                            .text_color(rgb(tint.unwrap_or(TEXT)))
+                            .child(n.label.clone()),
+                    )
+                    // the word as well as the colour: the diagram has to read
+                    // in a screenshot and on a phone
+                    .when(n.mark != Mark::Same, |d| {
+                        d.child(
+                            div()
+                                .flex_shrink_0()
+                                .px_1()
+                                .rounded_sm()
+                                .bg(rgb(BORDER))
+                                .text_size(px(9.))
+                                .text_color(rgb(edge))
+                                .child(n.mark.word()),
+                        )
+                    }),
+            )
+            .when(!n.note.trim().is_empty(), |d| {
+                d.child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(rgb(MUTED))
+                        .child(n.note.clone()),
+                )
+            })
+            .when(opens, |d| {
+                let open = file.clone();
+                d.cursor_pointer()
+                    .hover(|s| s.bg(rgb(HOVER)))
+                    .tooltip(tip_owned(format!("Open {file}")))
+                    .on_click(cx.listener(move |this, _e, window, cx| {
+                        this.open_brief_node(open.clone(), line, window, cx)
+                    }))
+            })
+    }
+
     fn render_editor(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let has_tabs = !self.tabs.is_empty();
 
@@ -30669,6 +31427,12 @@ impl Storm {
         if self.tabs.get(self.active).is_some_and(|t| t.browser) {
             let page = self.render_mirror(cx);
             return col.child(page);
+        }
+        // a brief has no file either: TIDE draws it from what the agent posted,
+        // and there is nothing above it to put a path in
+        if self.tabs.get(self.active).is_some_and(|t| t.brief.is_some()) {
+            let deck = self.render_brief(cx);
+            return col.child(deck);
         }
         if has_tabs {
             // breadcrumb bar above the file (Zed-style): rel path + copy button
@@ -30977,6 +31741,7 @@ impl Storm {
             .when(pr.state == PrState::Open || pr.state == PrState::Draft, |d| {
                 let (number, base) = (pr.number, pr.base.clone());
                 let tour_base = base.clone();
+                let brief_base = base.clone();
                 d.child(
                     div()
                         .id("pr-doc-body-check")
@@ -31013,6 +31778,27 @@ impl Storm {
                         .tooltip(tip("Ask for a code tour of this pull request"))
                         .on_click(cx.listener(move |this, _e, _w, cx| {
                             this.ask_pr_tour(number, tour_base.clone(), cx)
+                        })),
+                )
+                .child(
+                    div()
+                        .id("pr-doc-brief")
+                        .px_1p5()
+                        .py(px(1.))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_size(px(11.))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .text_color(rgb(MUTED))
+                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                        .child("Brief")
+                        .tooltip(tip(
+                            "The change as slides: what it does and why, no line numbers  ·  \
+                             ⌥click to write it again",
+                        ))
+                        .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _w, cx| {
+                            this.ask_pr_brief(number, brief_base.clone(), e.modifiers().alt, cx)
                         })),
                 )
             })
@@ -36335,6 +37121,60 @@ mod code_tour_tests {
         assert!(out.ends_with('…'), "{out}");
         assert_eq!(out.chars().count(), 41);
         assert_eq!(pr_excerpt("## only a heading\n", 180), "");
+    }
+
+    /// A box says what the change did to it in the colour the file tree already
+    /// uses, and in a word as well, so the diagram survives a screenshot.
+    #[test]
+    fn a_diagram_box_wears_what_the_change_did_to_it() {
+        assert_eq!(Mark::of("added"), Mark::New);
+        assert_eq!(Mark::of("modified"), Mark::Changed);
+        assert_eq!(Mark::of("removed"), Mark::Gone);
+        // anything else is a part the change left alone, which is most of them
+        assert_eq!(Mark::of(""), Mark::Same);
+        assert_eq!(Mark::of("shiny"), Mark::Same);
+        assert_eq!(Mark::New.tint(), Some(GIT_NEW));
+        assert_eq!(Mark::Same.tint(), None, "an untouched box is not a fourth colour");
+        assert_eq!(Mark::Gone.word(), "gone");
+        assert_eq!(Mark::Same.word(), "", "nothing to say, so no chip");
+    }
+
+    /// The wire's loose strings become the three layouts TIDE can actually
+    /// draw; anything else lands on the one that is right for any number of
+    /// boxes.
+    #[test]
+    fn a_brief_off_the_wire_becomes_three_layouts() {
+        let dia = |kind: &str| rpc::BriefDiagram {
+            kind: kind.into(),
+            caption: String::new(),
+            nodes: vec![rpc::BriefNode {
+                label: "API".into(),
+                note: String::new(),
+                mark: "new".into(),
+                file: "src/a.ts".into(),
+                line: 12,
+            }],
+            edges: Vec::new(),
+        };
+        let slide = |kind: &str| rpc::BriefSlide {
+            title: "A".into(),
+            text: "B".into(),
+            diagram: Some(dia(kind)),
+        };
+        let b = brief_from(rpc::Brief {
+            pr: Some(7),
+            title: "T".into(),
+            slides: vec![slide("flow"), slide("split"), slide("parts"), slide("whatever")],
+            made: 0,
+            oid: String::new(),
+            raw: String::new(),
+        });
+        let kinds: Vec<DiaKind> = b.slides.iter().filter_map(|s| s.dia.as_ref()).map(|d| d.kind).collect();
+        assert_eq!(kinds, vec![DiaKind::Flow, DiaKind::Split, DiaKind::Parts, DiaKind::Parts]);
+        assert_eq!(b.pr, Some(7));
+        let n = &b.slides[0].dia.as_ref().unwrap().nodes[0];
+        assert_eq!(n.mark, Mark::New);
+        assert_eq!((n.file.as_str(), n.line), ("src/a.ts", 12));
     }
 
     #[test]
