@@ -15352,6 +15352,38 @@ impl Storm {
     }
 }
 
+/// Rows of at most `per` boxes, as index ranges. TIDE lays a grid out itself
+/// rather than asking flex to wrap one: taffy sizes a wrapped row by a single
+/// line of it, so the panel came out one box tall and the picture spilled over
+/// the slide below.
+fn dia_grid(n: usize, per: usize) -> Vec<std::ops::Range<usize>> {
+    let per = per.max(1);
+    (0..n).step_by(per).map(|a| a..(a + per).min(n)).collect()
+}
+
+/// The arrow between two boxes when the chain runs down the page, drawn the way
+/// the tour map draws its route: a stem, a head, and the label beside it rather
+/// than over it, so a long label doesn't push the column sideways.
+fn dia_down(label: &str) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .pl(px(16.))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .child(div().w(px(2.)).h(px(10.)).bg(rgb(BORDER)))
+                .child(div().text_size(px(9.)).text_color(rgb(MUTED)).child("▼")),
+        )
+        .when(!label.trim().is_empty(), |d| {
+            d.child(div().text_size(px(9.)).text_color(rgb(MUTED)).child(label.to_string()))
+        })
+}
+
 /// One arrow between two boxes in a `flow`, with whatever the brief wanted
 /// written over it.
 fn dia_arrow(label: &str) -> Div {
@@ -31217,12 +31249,16 @@ impl Storm {
                 div()
                     .flex()
                     .flex_row()
-                    .items_baseline()
+                    .items_start()
                     .gap_3()
                     .child(
+                        // the gutter number sits on the title's first line, not
+                        // on its baseline: a baseline row puts an 11px number
+                        // well under a 22px heading
                         div()
                             .flex_shrink_0()
                             .w(px(28.))
+                            .pt(px(7.))
                             .text_size(px(11.))
                             .font_family("Menlo")
                             .text_color(rgb(LINE_NUMBER))
@@ -31285,40 +31321,64 @@ impl Storm {
 
     /// The picture on a slide, in a panel of its own so it reads as an inset
     /// rather than more prose.
+    ///
+    /// Nothing here wraps. A wrapped flex row is sized by one line of itself,
+    /// so the panel came out a single box tall and the slide underneath was
+    /// drawn over the rest of the picture. Every layout below picks a fixed
+    /// number of boxes per row and stacks the rows itself, which is one more
+    /// loop and no guessing.
     fn brief_diagram(&self, slide: usize, d: &Diagram, cx: &mut Context<Self>) -> Div {
         let key = |j: usize| slide * 64 + j;
+        let edge_at = |j: usize| d.edges.get(j).map(String::as_str).unwrap_or("");
         let picture = match d.kind {
-            DiaKind::Flow => {
-                let mut row = div().flex().flex_row().flex_wrap().items_center().gap_2();
+            // a short chain reads left to right; a long one would run off the
+            // slide, so it turns the corner and runs down the page instead,
+            // which is how the tour map already draws a route
+            DiaKind::Flow if d.nodes.len() <= 3 => {
+                let mut row = div().flex().flex_row().items_stretch().gap_2();
                 for (j, n) in d.nodes.iter().enumerate() {
                     if j > 0 {
-                        row = row.child(dia_arrow(d.edges.get(j - 1).map(String::as_str).unwrap_or("")));
+                        row = row.child(dia_arrow(edge_at(j - 1)));
                     }
-                    row = row.child(self.dia_box(key(j), n, cx));
+                    row = row.child(self.dia_box(key(j), n, Some(176.), cx));
                 }
                 row
+            }
+            DiaKind::Flow => {
+                let mut col = div().flex().flex_col().items_start().gap(px(4.));
+                for (j, n) in d.nodes.iter().enumerate() {
+                    if j > 0 {
+                        col = col.child(dia_down(edge_at(j - 1)));
+                    }
+                    col = col.child(self.dia_box(key(j), n, Some(252.), cx));
+                }
+                col
             }
             DiaKind::Split => {
-                let mut col = div().flex().flex_col().items_center().gap_2();
-                let mut rest = div().flex().flex_row().flex_wrap().items_start().justify_center().gap_2();
-                for (j, n) in d.nodes.iter().enumerate() {
-                    if j == 0 {
-                        col = col
-                            .child(self.dia_box(key(0), n, cx))
-                            .child(div().w(px(2.)).h(px(12.)).bg(rgb(BORDER)))
-                            .child(div().text_size(px(10.)).text_color(rgb(MUTED)).child("▼"));
-                        continue;
+                let mut col = div().flex().flex_col().items_start().gap_2();
+                let Some(head) = d.nodes.first() else { return div() };
+                col = col
+                    .child(self.dia_box(key(0), head, Some(176.), cx))
+                    .child(dia_down(""));
+                for row in dia_grid(d.nodes.len() - 1, 3) {
+                    let mut line = div().flex().flex_row().items_stretch().gap_2();
+                    for j in row {
+                        line = line.child(self.dia_box(key(j + 1), &d.nodes[j + 1], Some(168.), cx));
                     }
-                    rest = rest.child(self.dia_box(key(j), n, cx));
+                    col = col.child(line);
                 }
-                col.child(rest)
+                col
             }
             DiaKind::Parts => {
-                let mut row = div().flex().flex_row().flex_wrap().items_start().gap_2();
-                for (j, n) in d.nodes.iter().enumerate() {
-                    row = row.child(self.dia_box(key(j), n, cx));
+                let mut col = div().flex().flex_col().items_start().gap_2();
+                for row in dia_grid(d.nodes.len(), 3) {
+                    let mut line = div().flex().flex_row().items_stretch().gap_2();
+                    for j in row {
+                        line = line.child(self.dia_box(key(j), &d.nodes[j], Some(168.), cx));
+                    }
+                    col = col.child(line);
                 }
-                row
+                col
             }
         };
         div()
@@ -31329,6 +31389,7 @@ impl Storm {
                 div()
                     .flex()
                     .flex_col()
+                    .items_start()
                     .p_4()
                     .rounded_md()
                     .bg(rgb(PANEL_BG))
@@ -31347,8 +31408,16 @@ impl Storm {
     }
 
     /// One box. It takes the file tree's colours for what the change did to it,
-    /// and opens its file when it names one.
-    fn dia_box(&self, key: usize, n: &DiaNode, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+    /// and opens its file when it names one. `width` is fixed rather than sized
+    /// to the label: boxes of three different widths in one row read as three
+    /// different kinds of thing.
+    fn dia_box(
+        &self,
+        key: usize,
+        n: &DiaNode,
+        width: Option<f32>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
         let tint = n.mark.tint();
         let edge = tint.unwrap_or(BORDER);
         let (file, line) = (n.file.clone(), n.line);
@@ -31361,8 +31430,7 @@ impl Storm {
             .flex_shrink_0()
             .px_3()
             .py_2()
-            .min_w(px(96.))
-            .max_w(px(200.))
+            .when_some(width, |d, w| d.w(px(w)))
             .rounded_md()
             .bg(rgb(BG))
             .border_1()
@@ -37121,6 +37189,20 @@ mod code_tour_tests {
         assert!(out.ends_with('…'), "{out}");
         assert_eq!(out.chars().count(), 41);
         assert_eq!(pr_excerpt("## only a heading\n", 180), "");
+    }
+
+    /// TIDE lays a diagram's rows out itself. Flex wrapping sized the panel by
+    /// one row of boxes, which left the picture spilling over the slide below.
+    #[test]
+    fn a_diagram_lays_its_own_rows_out() {
+        assert_eq!(dia_grid(5, 3), vec![0..3, 3..5]);
+        assert_eq!(dia_grid(3, 3), vec![0..3], "a full row is one row");
+        assert_eq!(dia_grid(1, 3), vec![0..1]);
+        assert_eq!(dia_grid(0, 3), Vec::<std::ops::Range<usize>>::new());
+        // a `split` with one box has nothing fanning out of it, and asks for a
+        // grid of nothing
+        assert_eq!(dia_grid(0, 0), Vec::<std::ops::Range<usize>>::new(), "no divide by zero");
+        assert_eq!(dia_grid(2, 0), vec![0..1, 1..2], "a nonsense width is one per row");
     }
 
     /// A box says what the change did to it in the colour the file tree already
