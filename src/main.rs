@@ -2043,6 +2043,181 @@ fn pr_links(
         .collect()
 }
 
+/// What a pull request looks like under the cursor: enough to decide whether
+/// to open it. Built from the same cache the PR tab reads, so hovering costs
+/// no network and works offline.
+struct PrCardView {
+    number: u64,
+    title: SharedString,
+    state: PrState,
+    repo: SharedString,
+    base: SharedString,
+    head: SharedString,
+    author: SharedString,
+    excerpt: SharedString,
+    counts: SharedString,
+}
+
+/// The first couple of sentences of a PR body, with the markdown taken out.
+/// A card is a glance, so it gets a glance's worth.
+fn pr_excerpt(body: &str, max: usize) -> String {
+    let mut out = String::new();
+    for line in body.lines() {
+        let t = line.trim();
+        // skip headings, images, html comments and the checklists most
+        // templates open with: none of them say what the PR does
+        if t.is_empty()
+            || t.starts_with('#')
+            || t.starts_with("![")
+            || t.starts_with("<!--")
+            || t.starts_with("- [")
+            || t.starts_with('|')
+        {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(t);
+        if out.chars().count() >= max {
+            break;
+        }
+    }
+    let out = out.replace("**", "").replace('`', "");
+    match out.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", out[..i].trim_end()),
+        None => out,
+    }
+}
+
+/// The owner/repo a PR url names, for the line the card leads with.
+fn repo_of_url(url: &str) -> String {
+    let rest = url.split("github.com/").nth(1).unwrap_or("");
+    rest.split("/pull/").next().unwrap_or("").to_string()
+}
+
+impl Render for PrCardView {
+    fn render(&mut self, _w: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(px(360.))
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .px_3()
+            .py_2p5()
+            .bg(rgb(POPUP_BG))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .rounded_md()
+            .shadow_lg()
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(rgb(MUTED))
+                    .child(self.repo.clone()),
+            )
+            .child(
+                div()
+                    .text_size(px(14.))
+                    .text_color(rgb(TEXT))
+                    .child(self.title.clone()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(MUTED))
+                            .child(format!("#{}", self.number)),
+                    )
+                    .child(pr_state_pill(self.state, 10.)),
+            )
+            .when(!self.excerpt.is_empty(), |d| {
+                d.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(MUTED))
+                        .child(self.excerpt.clone()),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1p5()
+                    .text_size(px(10.))
+                    .child(branch_name_el(&self.base).text_size(px(10.)))
+                    .child(div().text_color(rgb(MUTED)).child("←"))
+                    .child(branch_name_el(&self.head).text_size(px(10.))),
+            )
+            .when(!self.counts.is_empty(), |d| {
+                d.child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(rgb(MUTED))
+                        .child(self.counts.clone()),
+                )
+            })
+            .when(!self.author.is_empty(), |d| {
+                d.child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(rgb(MUTED))
+                        .child(format!("opened by {}", self.author)),
+                )
+            })
+    }
+}
+
+/// PRs whose cache is being filled right now, so hovering the same number for
+/// a few seconds asks `gh` once rather than once a frame.
+fn pr_warming() -> &'static Mutex<HashSet<u64>> {
+    static S: std::sync::OnceLock<Mutex<HashSet<u64>>> = std::sync::OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// The card for a PR number, from the cache. On a miss it reads the PR in the
+/// background and answers nothing this time: the card is a convenience, and
+/// blocking a frame on `gh` to draw one is not a trade worth making.
+fn pr_card_view(number: u64, root: PathBuf, cx: &mut App) -> Option<AnyView> {
+    let Some((_, body, doc)) = pr_body_cached(number) else {
+        if let Ok(mut w) = pr_warming().lock() {
+            if w.insert(number) {
+                std::thread::spawn(move || {
+                    pr_body_doc(&root, Some(number));
+                    if let Ok(mut w) = pr_warming().lock() {
+                        w.remove(&number);
+                    }
+                });
+            }
+        }
+        return None;
+    };
+    let counts = match (doc.files, doc.added, doc.removed) {
+        (0, 0, 0) => String::new(),
+        (f, a, r) => format!("{f} file{}  +{a}  −{r}", if f == 1 { "" } else { "s" }),
+    };
+    Some(
+        cx.new(|_| PrCardView {
+            number: doc.number,
+            title: doc.title.clone().into(),
+            state: doc.state,
+            repo: repo_of_url(&doc.url).into(),
+            base: doc.base.clone().into(),
+            head: doc.head.clone().into(),
+            author: doc.author.clone().into(),
+            excerpt: pr_excerpt(&body, 180).into(),
+            counts: counts.into(),
+        })
+        .into(),
+    )
+}
+
 /// [`md_text`], with file references and URLs turned into links: a thread reply
 /// quotes as much code as the answer it hangs off, and reading it without being
 /// able to open what it names is the same problem twice.
@@ -2077,8 +2252,19 @@ fn md_links(
             let ranges: Vec<std::ops::Range<usize>> = links.iter().map(|(r, _)| r.clone()).collect();
             let targets: Vec<LinkTarget> = links.iter().map(|(_, t)| t.clone()).collect();
             let styled = md_styled_links(row, row.heading, Sel::None, &ranges);
+            let hover_ranges = ranges.clone();
+            let hover_targets = targets.clone();
+            let hover_me = me.clone();
             let me = me.clone();
             gpui::InteractiveText::new(("thread-link", id * 1_000 + i), styled)
+                .tooltip(move |at, _w, cx| {
+                    // `at` is a character index; find which link covers it
+                    let hit = hover_ranges.iter().position(|r| r.contains(&at))?;
+                    let Some(LinkTarget::Url(u)) = hover_targets.get(hit) else { return None };
+                    let number: u64 = u.rsplit("/pull/").next()?.parse().ok()?;
+                    let root = hover_me.upgrade()?.read(cx).root.clone();
+                    pr_card_view(number, root, cx)
+                })
                 .on_click(ranges, move |ix, window, cx| match targets.get(ix) {
                     Some(LinkTarget::Url(u)) => open_browser(u),
                     Some(LinkTarget::File(path, line)) => {
@@ -35978,6 +36164,31 @@ mod code_tour_tests {
             group: String::new(),
             said: "because".into(),
         }
+    }
+
+    /// The hovercard gets a glance's worth of the body: the prose, without the
+    /// heading, the screenshot and the checklist most templates open with.
+    #[test]
+    fn a_pr_card_excerpts_the_prose() {
+        let body = "## Summary\n\n<!-- a comment -->\n- [ ] tests\n![shot](a.png)\n\n\
+                    On the standalone server, **background tasks** run in a loop \
+                    inside the `server` process.\n| a | b |\n";
+        assert_eq!(
+            pr_excerpt(body, 180),
+            "On the standalone server, background tasks run in a loop inside the server process."
+        );
+        // a long body is cut and marked, never left to fill the screen
+        let long = "x".repeat(400);
+        let out = pr_excerpt(&long, 40);
+        assert!(out.ends_with('…'), "{out}");
+        assert_eq!(out.chars().count(), 41);
+        assert_eq!(pr_excerpt("## only a heading\n", 180), "");
+    }
+
+    #[test]
+    fn a_pr_card_names_the_repo_it_is_in() {
+        assert_eq!(repo_of_url("https://github.com/webiny/webiny-js/pull/6080"), "webiny/webiny-js");
+        assert_eq!(repo_of_url("nonsense"), "");
     }
 
     /// A stop's prose names other stops, and the card says whether each is
