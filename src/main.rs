@@ -7890,6 +7890,9 @@ struct Storm {
     /// request and slide. The answers arrive the way a review comment's does:
     /// the agent posts to `/comment` with the id its question carried.
     slide_asks: HashMap<(u64, usize), SlideThread>,
+    /// The deck's scroll, so the strip along the bottom can say which slide
+    /// you are on and jump to another one.
+    brief_scroll: gpui::ScrollHandle,
     /// What there is to read about the branch's pull request. The brief lives
     /// on disk, so this is worked out when the pull request or the commit
     /// under it moves, not on every frame.
@@ -8470,6 +8473,7 @@ impl Storm {
             brief_ask: Field::multiline(),
             brief_ask_at: None,
             slide_asks: HashMap::new(),
+            brief_scroll: gpui::ScrollHandle::new(),
             reading: None,
             reading_key: None,
             brief_ask_focus: cx.focus_handle(),
@@ -32071,6 +32075,7 @@ impl Storm {
             .flex_col()
             .flex_grow(1.0)
             .overflow_y_scroll()
+            .track_scroll(&self.brief_scroll)
             .px_8()
             // the last slide gets to sit in the middle of the window like every
             // other one, rather than pinned to the bottom edge
@@ -32102,7 +32107,82 @@ impl Storm {
             )
             .child(head)
             .child(deck)
+            .child(self.brief_progress(&brief, cx))
             .into_any_element()
+    }
+
+    /// Where you are in the deck, along the bottom. One segment per slide, so
+    /// the strip says three things at once: how far through you are, which
+    /// slides you have read, and how much is left. Clicking a segment goes
+    /// there, which is the only way to move around a deck without scrolling.
+    fn brief_progress(&self, brief: &Brief, cx: &mut Context<Self>) -> Div {
+        let n = brief.slides.len();
+        let at = self.brief_scroll.top_item().min(n.saturating_sub(1));
+        let title = brief.slides.get(at).map(|s| s.title.clone()).unwrap_or_default();
+        let mut bar = div().flex().flex_row().items_center().gap(px(2.)).h(px(3.));
+        for ix in 0..n {
+            let read = brief.read.contains(&ix);
+            let here = ix == at;
+            let colour = if here {
+                ACCENT
+            } else if read {
+                GIT_NEW
+            } else {
+                BORDER
+            };
+            bar = bar.child(
+                div()
+                    .id(("brief-bar", ix))
+                    .flex_grow(1.0)
+                    .h_full()
+                    .rounded_sm()
+                    .bg(rgb(colour))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(if here { ACCENT } else { MUTED })))
+                    .tooltip(tip_owned(format!(
+                        "{:02}  {}",
+                        ix + 1,
+                        brief.slides.get(ix).map(|s| s.title.clone()).unwrap_or_default()
+                    )))
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                        this.brief_scroll.scroll_to_top_of_item(ix);
+                        cx.notify();
+                    })),
+            );
+        }
+        div()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .px_8()
+            .py_2()
+            .bg(rgb(BG))
+            .border_t_1()
+            .border_color(rgb(BORDER))
+            .child(bar)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(10.))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .font_family("Menlo")
+                            .text_color(rgb(LINE_NUMBER))
+                            .child(format!("{:02} / {:02}", at + 1, n)),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_color(rgb(MUTED))
+                            .child(title),
+                    ),
+            )
     }
 
     fn brief_slide(
