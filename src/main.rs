@@ -32289,6 +32289,8 @@ impl Storm {
         // own inside here occludes, so a link still opens its file.
         let said = div()
             .id(("brief-said", ix))
+            // the pointer is the only thing that says the words are a button
+            .cursor_pointer()
             .flex()
             .flex_col()
             .gap_4()
