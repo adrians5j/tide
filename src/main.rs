@@ -6390,6 +6390,44 @@ const CLARIFY_NOTE: &str = "This step isn't clear to me. Explain what happens \
      here and why it matters, in plainer terms, and say what I'd have to know \
      to follow it.";
 
+/// What there is to read about a pull request, and whether it still matches
+/// the branch. Two things that go stale together and are wanted together: the
+/// brief for what the change does, the tour for where it does it.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+struct PrReading {
+    has_brief: bool,
+    brief_stale: bool,
+    has_tour: bool,
+    tour_stale: bool,
+}
+
+impl PrReading {
+    fn stale(self) -> bool {
+        self.brief_stale || self.tour_stale
+    }
+    /// Nothing to build and nothing out of date.
+    fn current(self) -> bool {
+        self.has_brief && self.has_tour && !self.stale()
+    }
+    /// What a click asks for: whatever is missing, plus whatever has gone out
+    /// of date. `force` is the ⌥click that rebuilds both regardless.
+    fn wanted(self, force: bool) -> (bool, bool) {
+        (
+            force || !self.has_brief || self.brief_stale,
+            force || !self.has_tour || self.tour_stale,
+        )
+    }
+    /// What the chip reads. The same two words whether they exist or not:
+    /// what the button is for doesn't change, only what it would cost.
+    fn verb(self) -> &'static str {
+        if self.stale() {
+            "Brief + tour · stale"
+        } else {
+            "Brief + tour"
+        }
+    }
+}
+
 /// A question asked under a slide, and the answer when it comes back.
 #[derive(Clone, PartialEq, Debug)]
 struct SlideTurn {
@@ -7732,6 +7770,11 @@ struct Storm {
     /// request and slide. The answers arrive the way a review comment's does:
     /// the agent posts to `/comment` with the id its question carried.
     slide_asks: HashMap<(u64, usize), SlideThread>,
+    /// What there is to read about the branch's pull request. The brief lives
+    /// on disk, so this is worked out when the pull request or the commit
+    /// under it moves, not on every frame.
+    reading: Option<PrReading>,
+    reading_key: Option<(Option<u64>, String)>,
     brief_ask_focus: FocusHandle,
     /// The thread turn that was right-clicked, kept whole: the menu's actions
     /// are about that answer's text, and the thread is rebuilt every frame.
@@ -8307,6 +8350,8 @@ impl Storm {
             brief_ask: Field::default(),
             brief_ask_at: None,
             slide_asks: HashMap::new(),
+            reading: None,
+            reading_key: None,
             brief_ask_focus: cx.focus_handle(),
             ctx_reply: None,
             walk: None,
@@ -15935,6 +15980,13 @@ impl Render for Storm {
             window.focus(&self.agent_focus, cx);
         }
         self.brief_ask_live = self.brief_ask_focus.is_focused(window);
+        // the brief is a file on disk and the tour is a list in memory: ask
+        // both only when the pull request or the commit under it has moved
+        let reading_key = (self.pr_link.as_ref().map(|p| p.0), self.head_oid.clone());
+        if self.reading_key.as_ref() != Some(&reading_key) {
+            self.reading = reading_key.0.map(|n| self.pr_reading(n));
+            self.reading_key = Some(reading_key);
+        }
         // the tour card's question box was clicked
         if std::mem::take(&mut self.tour_ask_focus_pending) {
             window.focus(&self.tour_ask_focus, cx);
@@ -26172,6 +26224,55 @@ impl Storm {
     /// The Brief button. A brief already written for this pull request opens
     /// straight away — it cost an agent turn once and the answer doesn't change
     /// on its own. `again` is the header's "Write it again", which always asks.
+    /// What there is to read about a pull request. A tour or a brief written
+    /// against another commit is stale; one written before TIDE recorded the
+    /// commit is taken at its word, since there is nothing to compare.
+    fn pr_reading(&self, number: u64) -> PrReading {
+        let head = self.head_oid.trim();
+        let moved = |oid: &str| !oid.is_empty() && !head.is_empty() && oid != head;
+        let brief = brief_cached(number);
+        // the newest tour of this pull request is the one a click would
+        // replace, and the only one worth asking about
+        let tour = self.tours.iter().filter(|t| t.pr == Some(number)).max_by_key(|t| t.made);
+        PrReading {
+            has_brief: brief.is_some(),
+            brief_stale: brief.as_ref().is_some_and(|b| moved(&b.oid)),
+            has_tour: tour.is_some(),
+            tour_stale: tour.is_some_and(|t| moved(&t.oid)),
+        }
+    }
+
+    /// The one button for reading a change: the brief for what it does and the
+    /// tour for where, built when they are missing and built again when the
+    /// branch has moved past them. Wanting one and not the other is rare
+    /// enough that two buttons were two decisions to make every time.
+    fn catch_up_pr(&mut self, number: u64, base: String, force: bool, cx: &mut Context<Self>) {
+        let reading = self.pr_reading(number);
+        let (brief, tour) = reading.wanted(force);
+        if !brief && !tour {
+            self.show_flash(
+                &format!("The brief and the tour of #{number} are both current"),
+                cx,
+            );
+            return;
+        }
+        // the brief first: it is the one you read before the code, and the
+        // second prompt waits in the queue until the first turn ends anyway
+        if brief {
+            self.ask_pr_brief(number, base.clone(), true, cx);
+        }
+        if tour {
+            self.ask_pr_tour(number, base, cx);
+        }
+        let what = match (brief, tour) {
+            (true, true) => "a brief and a code tour",
+            (true, false) => "a brief",
+            _ => "a code tour",
+        };
+        self.show_flash(&format!("Asked for {what} of #{number}"), cx);
+        cx.notify();
+    }
+
     fn ask_pr_brief(&mut self, number: u64, base: String, again: bool, cx: &mut Context<Self>) {
         if !again {
             if let Some(b) = brief_cached(number) {
@@ -26197,6 +26298,7 @@ impl Storm {
     fn start_brief(&mut self, brief: rpc::Brief, cx: &mut Context<Self>) {
         let pr = brief.pr.unwrap_or(0);
         self.slide_asks.retain(|(p, _), _| *p != pr);
+        self.reading_key = None; // there is a new brief to find on disk
         if let Some(p) = brief.pr {
             save_brief_cache(p, &brief.raw, &self.head_oid);
         }
@@ -26279,6 +26381,7 @@ impl Storm {
     }
 
     fn start_tour(&mut self, tour: rpc::Tour, cx: &mut Context<Self>) {
+        self.reading_key = None; // a tour just landed, stale or not
         self.load_tour_diff(cx); // so the map's file names carry their status
         self.tour_group_open.clear();
         // no steps is how an agent puts a tour away; it is not a broken one
@@ -37984,6 +38087,32 @@ mod code_tour_tests {
         let bare = slide_question("", None, 1, 1, &slide, "and this?", "zz001");
         assert!(bare.contains("slide 1/1 of the brief"), "{bare}");
         assert!(!bare.contains("#"), "nothing to cite: {bare}");
+    }
+
+    /// One button, and what it would ask for depends only on what is already
+    /// there and whether the branch has moved past it.
+    #[test]
+    fn one_button_builds_whatever_is_missing_or_stale() {
+        let nothing = PrReading::default();
+        assert_eq!(nothing.wanted(false), (true, true), "neither exists: build both");
+        assert!(!nothing.current() && !nothing.stale());
+
+        let both = PrReading { has_brief: true, has_tour: true, ..Default::default() };
+        assert_eq!(both.wanted(false), (false, false), "nothing to do");
+        assert!(both.current());
+        assert_eq!(both.wanted(true), (true, true), "⌥click writes them again anyway");
+        assert_eq!(both.verb(), "Brief + tour");
+
+        // the branch moved under the brief but not the tour: only the brief
+        // is written again, and the chip says something is out of date
+        let half = PrReading { brief_stale: true, ..both };
+        assert_eq!(half.wanted(false), (true, false));
+        assert!(half.stale() && !half.current());
+        assert_eq!(half.verb(), "Brief + tour · stale");
+
+        // a tour of this change but no brief yet
+        let tour_only = PrReading { has_tour: true, ..Default::default() };
+        assert_eq!(tour_only.wanted(false), (true, false));
     }
 
     /// A second question under a slide keeps the first. The answer to it is
