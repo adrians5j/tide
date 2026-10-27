@@ -7909,6 +7909,10 @@ struct Storm {
     /// a group is open exactly when the tour is standing in it, so walking from
     /// one part to the next folds the part you've left.
     tour_group_open: HashMap<String, bool>,
+    /// The part of the tour the last stop opened was in. Walking into another
+    /// part drops the folds you set by hand, so the map folds what you have
+    /// left and opens what you are in.
+    tour_group_at: String,
     tour_ask_focus: FocusHandle,
     /// The same box, under a slide of a brief: what you're typing, which slide
     /// it belongs to, and its focus. One box moves between the slides rather
@@ -8499,6 +8503,7 @@ impl Storm {
             md_scroll: gpui::ScrollHandle::new(),
             tour_ask: Field::default(),
             tour_group_open: HashMap::new(),
+            tour_group_at: String::new(),
             tour_ask_focus: cx.focus_handle(),
             brief_ask: Field::multiline(),
             brief_ask_at: None,
@@ -26771,6 +26776,7 @@ impl Storm {
         self.reading_key = None; // a tour just landed, stale or not
         self.load_tour_diff(cx); // so the map's file names carry their status
         self.tour_group_open.clear();
+        self.tour_group_at = String::new();
         // no steps is how an agent puts a tour away; it is not a broken one
         if tour.steps.is_empty() {
             let had = self.walk.as_ref().is_some_and(|w| w.tour.is_some());
@@ -27076,6 +27082,7 @@ impl Storm {
     fn open_tour(&mut self, id: String, restart: bool, cx: &mut Context<Self>) {
         self.load_tour_diff(cx);
         self.tour_group_open.clear();
+        self.tour_group_at = String::new();
         let Some(rec) = self.tours.iter().find(|t| t.id == id) else {
             self.show_flash("That tour is gone", cx);
             return;
@@ -27216,6 +27223,15 @@ impl Storm {
             self.show_flash(&format!("Can't find {} in this project", stop.path), cx);
             return;
         };
+        // reaching into another part of the tour folds the one you have left.
+        // A group opened by hand stays open while you are in that part, and a
+        // pinned-open group two parts back is what left three of them open at
+        // once.
+        let part = stop.group.trim().to_string();
+        if part != self.tour_group_at {
+            self.tour_group_open.clear();
+            self.tour_group_at = part;
+        }
         self.open_file(p.clone(), window, cx);
         // the lines this stop is about, lit up until the next step: a jump that
         // only moves the caret leaves you hunting for what it meant
