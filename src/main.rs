@@ -23301,14 +23301,19 @@ impl Storm {
         // past does not
         let total = w.stops.len();
         let read = w.seen.len().min(total);
-        // the bar is position, not reading: how far along the route the stop
-        // you are standing on is. What has been read is the count beside it,
-        // which the ticks move and walking does not.
-        let pct = match (w.intro, w.done) {
-            _ if total == 0 => 0,
+        // the bar is position: how far along the route the stop you are
+        // standing on is. The number in front of it says the same thing, or
+        // the two read as one fact disagreeing with itself — the ticks are
+        // the second number, and walking doesn't move them.
+        let pos = match (w.intro, w.done) {
             (true, _) => 0,
-            (_, true) => 100,
-            _ => (w.at + 1) * 100 / total,
+            (_, true) => total,
+            _ => w.at + 1,
+        };
+        let pct = if total == 0 { 0 } else { pos * 100 / total };
+        let count = match read {
+            0 => format!("{pos}/{total}"),
+            r => format!("{pos}/{total} · {r} read"),
         };
         let accent = if w.tour.is_some() { TOUR_MARK } else { COMMENT_MARK };
         let mut list = div()
@@ -23453,7 +23458,7 @@ impl Storm {
                                 .child(
                                     div()
                                         .flex_shrink_0()
-                                        .child(format!("{read}/{total} read")),
+                                        .child(count),
                                 )
                                 .when_some(pr, |d, n| {
                                     d.child(
