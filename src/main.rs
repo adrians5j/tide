@@ -4194,6 +4194,19 @@ fn save_brief_cache(number: u64, raw: &str, oid: &str) {
     let _ = std::fs::write(path, v.to_string());
 }
 
+/// Write back which slides have been read, leaving the rest of the file as it
+/// was. A tick is not worth rewriting the brief for, so it edits the one key.
+fn save_brief_read(number: u64, read: &HashSet<usize>) {
+    let Some(path) = brief_cache_path(number) else { return };
+    let Ok(raw) = std::fs::read_to_string(&path) else { return };
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) else { return };
+    let Some(obj) = v.as_object_mut() else { return };
+    let mut list: Vec<usize> = read.iter().copied().collect();
+    list.sort_unstable();
+    obj.insert("read".into(), serde_json::json!(list));
+    let _ = std::fs::write(path, v.to_string());
+}
+
 /// The brief written for this pull request last time, if there is one.
 fn brief_cached(number: u64) -> Option<Brief> {
     let raw = std::fs::read_to_string(brief_cache_path(number)?).ok()?;
@@ -4468,14 +4481,58 @@ fn tour_request(about: Option<&str>, answer: Option<&str>) -> String {
 /// the telescope from `tour_request` — that one wants files and lines, this one
 /// forbids them. A brief that starts naming line numbers has become a worse
 /// code tour.
-fn brief_request(number: u64, base: &str) -> String {
+/// What a rewrite should leave alone, the same bargain the tour's rebuild
+/// makes: the slides already read are the ones to keep where what they say is
+/// still true, and the rest is where the work goes.
+fn brief_read_note(slides: &[Slide], read: &HashSet<usize>) -> String {
+    let mut done: Vec<usize> = read.iter().copied().filter(|i| *i < slides.len()).collect();
+    done.sort_unstable();
+    if done.is_empty() || done.len() == slides.len() {
+        return String::new();
+    }
+    let lines: String = done
+        .iter()
+        .filter_map(|i| {
+            let title = slides[*i].title.trim();
+            (!title.is_empty()).then(|| format!("\x20 • {title}\n"))
+        })
+        .collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\nI have already read these slides:\n{lines}\n\
+         Keep them, with the same titles and much the same words, unless what \
+         they say has stopped being true — then fix that one and say which. \
+         The rest of the deck is what I haven't read, so that is where the \
+         work is, along with anything the branch has brought in since.\n\n"
+    )
+}
+
+/// Which slides of a rewritten deck were already read. Only an exact match
+/// counts: a slide whose words have changed is a slide to read again.
+fn brief_read_carried(old: &Brief, fresh: &[Slide]) -> HashSet<usize> {
+    let done: Vec<&Slide> = old
+        .read
+        .iter()
+        .filter_map(|i| old.slides.get(*i))
+        .collect();
+    fresh
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| done.iter().any(|d| d.title == s.title && d.text == s.text))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn brief_request(number: u64, base: &str, read: &str) -> String {
     let base = match base.trim().strip_prefix("origin/").unwrap_or(base.trim()) {
         "" => "the base branch".to_string(),
         b => b.to_string(),
     };
     format!(
         "Write me a brief of #{number} — what it does and why, as slides I read \
-         before I read the code.\n\n\
+         before I read the code.\n\n{read}\
          I already have the pull request body and a code tour. The body is the \
          problem: by the time I have read it I am holding too much at once. A \
          brief is five to eight slides, each one idea, each one standing on its \
@@ -6711,6 +6768,9 @@ struct Slide {
 /// take in at once.
 #[derive(Clone)]
 struct Brief {
+    /// Slides you have read. Kept with the brief on disk, so reopening one
+    /// doesn't hand back eight unread slides.
+    read: HashSet<usize>,
     pr: Option<u64>,
     title: String,
     /// Unix seconds it was written, for "2h ago" in the header.
@@ -6724,6 +6784,7 @@ struct Brief {
 
 fn brief_from(b: rpc::Brief) -> Brief {
     Brief {
+        read: b.read.iter().copied().collect(),
         pr: b.pr,
         title: b.title,
         made: b.made,
@@ -26502,8 +26563,13 @@ impl Storm {
             }
         }
         let label = format!("Asked for a brief of #{number}");
+        // the slides already read ride along, so a rewrite isn't eight slides
+        // to read from the top again
+        let read = brief_cached(number)
+            .map(|b| brief_read_note(&b.slides, &b.read))
+            .unwrap_or_default();
         self.agent_open = true;
-        self.send_agent_prompt_as(brief_request(number, &base), Some(label), cx);
+        self.send_agent_prompt_as(brief_request(number, &base, &read), Some(label), cx);
         self.agent_list.scroll_to_end();
         cx.notify();
     }
@@ -26516,10 +26582,19 @@ impl Storm {
         let pr = brief.pr.unwrap_or(0);
         self.slide_asks.retain(|(p, _), _| *p != pr);
         self.reading_key = None; // there is a new brief to find on disk
+        // what was read before, read off disk before the new deck lands on
+        // top of it: the slides that came back unchanged keep their ticks
+        let before = brief.pr.and_then(brief_cached);
         if let Some(p) = brief.pr {
             save_brief_cache(p, &brief.raw, &self.head_oid);
         }
         let mut brief = brief_from(brief);
+        if let Some(before) = before {
+            brief.read = brief_read_carried(&before, &brief.slides);
+            if let Some(p) = brief.pr {
+                save_brief_read(p, &brief.read);
+            }
+        }
         // the copy on disk carries these; the one off the wire is being written
         // right now, against what is checked out right now
         if brief.made == 0 {
@@ -26578,6 +26653,26 @@ impl Storm {
     }
 
     /// Click a box that names a file: open it, at its line when it gave one.
+    /// Mark a slide read, or put it back. Kept with the brief on disk: a deck
+    /// you have worked through once should say so when you open it again.
+    fn mark_slide_read(&mut self, ix: usize, on: bool, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let Some(brief) = tab.brief.as_mut() else { return };
+        if ix >= brief.slides.len() {
+            return;
+        }
+        if on {
+            brief.read.insert(ix);
+        } else {
+            brief.read.remove(&ix);
+        }
+        if let Some(number) = brief.pr {
+            let read = brief.read.clone();
+            save_brief_read(number, &read);
+        }
+        cx.notify();
+    }
+
     fn open_brief_node(
         &mut self,
         file: String,
@@ -31902,7 +31997,10 @@ impl Storm {
                     .flex_shrink_0()
                     .text_size(px(11.))
                     .text_color(rgb(LINE_NUMBER))
-                    .child(format!("{n} slide{}", if n == 1 { "" } else { "s" })),
+                    .child(match brief.read.len().min(n) {
+                        0 => format!("{n} slide{}", if n == 1 { "" } else { "s" }),
+                        r => format!("{r}/{n} read"),
+                    }),
             )
             // a brief is a snapshot of a branch the same way a tour is, and goes
             // out of date the same way
@@ -31979,6 +32077,11 @@ impl Storm {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let seen = self.brief_seen.contains(&ix);
+        let read = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.brief.as_ref())
+            .is_some_and(|b| b.read.contains(&ix));
         let body = div()
             .flex()
             .flex_col()
@@ -31998,10 +32101,39 @@ impl Storm {
                             .flex_shrink_0()
                             .w(px(28.))
                             .pt(px(7.))
-                            .text_size(px(11.))
-                            .font_family("Menlo")
-                            .text_color(rgb(LINE_NUMBER))
-                            .child(format!("{:02}", ix + 1)),
+                            .flex()
+                            .flex_col()
+                            .items_start()
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .font_family("Menlo")
+                                    .text_color(rgb(if read { GIT_NEW } else { LINE_NUMBER }))
+                                    .child(format!("{:02}", ix + 1)),
+                            )
+                            // the tick lives under the number rather than
+                            // beside the title: the gutter is the one column
+                            // that is about the slide rather than in it
+                            .child(
+                                div()
+                                    .id(("brief-read", ix))
+                                    .px(px(2.))
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(if read { GIT_NEW } else { PANEL_BG }))
+                                    .hover(|s| s.text_color(rgb(if read { GIT_NEW } else { MUTED })))
+                                    .child("✓")
+                                    .tooltip(tip(if read {
+                                        "Read  ·  click to put it back"
+                                    } else {
+                                        "Mark this slide as read"
+                                    }))
+                                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                                        this.mark_slide_read(ix, !read, cx)
+                                    })),
+                            ),
                     )
                     .child(
                         div()
@@ -38302,6 +38434,7 @@ mod code_tour_tests {
             made: 0,
             oid: String::new(),
             raw: String::new(),
+            read: Vec::new(),
         });
         let kinds: Vec<DiaKind> = b.slides.iter().filter_map(|s| s.dia.as_ref()).map(|d| d.kind).collect();
         assert_eq!(kinds, vec![DiaKind::Flow, DiaKind::Split, DiaKind::Parts, DiaKind::Parts]);
@@ -38573,6 +38706,41 @@ mod code_tour_tests {
             seen: vec![at],
             stops: vec![stop("src/a.ts", 67, 72, "trigger()"), stop("src/b.ts", 12, 12, "loop")],
         }
+    }
+
+    /// A deck half read is rewritten around the half that isn't, and the
+    /// slides that come back word for word keep their ticks.
+    #[test]
+    fn a_brief_is_rewritten_around_what_is_unread() {
+        let slide = |t: &str, x: &str| Slide { title: t.into(), text: x.into(), dia: None };
+        let slides = vec![
+            slide("Secrets come from env now", "The build no longer holds them."),
+            slide("A missing secret stops the boot", "It fails at startup, not on login."),
+        ];
+        let note = brief_read_note(&slides, &HashSet::from([0]));
+        assert!(note.contains("Secrets come from env now"), "{note}");
+        assert!(!note.contains("stops the boot"), "the unread slide is the work: {note}");
+        assert!(note.contains("Keep them"), "{note}");
+        // nothing read, or the whole deck read, and there is nothing to say
+        assert_eq!(brief_read_note(&slides, &HashSet::new()), "");
+        assert_eq!(brief_read_note(&slides, &HashSet::from([0, 1])), "");
+
+        // the rewrite comes back with the first slide untouched and the second
+        // rewritten: the tick follows the words, not the slide number
+        let old = Brief {
+            read: HashSet::from([0]),
+            pr: Some(1),
+            title: "T".into(),
+            made: 0,
+            oid: String::new(),
+            slides: slides.clone(),
+        };
+        let fresh = vec![
+            slide("Where the values come from", "A new opening slide."),
+            slide("Secrets come from env now", "The build no longer holds them."),
+            slide("A missing secret stops the boot", "Reworded, so read it again."),
+        ];
+        assert_eq!(brief_read_carried(&old, &fresh), HashSet::from([1]));
     }
 
     /// A rebuild is told what has already been read, so it keeps those stops

@@ -197,6 +197,9 @@ pub struct Brief {
     /// The body exactly as it was posted, so TIDE can keep it without needing a
     /// second way to write a brief down.
     pub raw: String,
+    /// Slides you have read, by index. Written into the copy TIDE keeps, the
+    /// same bargain as `made` and `oid`: the agent never sends it.
+    pub read: Vec<usize>,
 }
 
 /// A name proposed for the workspace.
@@ -998,6 +1001,19 @@ pub fn parse_brief(body: &str) -> Option<Brief> {
         _ => None,
     };
     let num = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    let mut read: Vec<usize> = v
+        .get("read")
+        .and_then(|r| r.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|i| i.as_u64())
+                .map(|i| i as usize)
+                .filter(|i| *i < slides.len())
+                .collect()
+        })
+        .unwrap_or_default();
+    read.sort_unstable();
+    read.dedup();
     Some(Brief {
         pr,
         title: clean(v.get("title").and_then(|t| t.as_str()).unwrap_or(""), 160),
@@ -1005,6 +1021,7 @@ pub fn parse_brief(body: &str) -> Option<Brief> {
         made: num("made"),
         oid: clean(v.get("oid").and_then(|x| x.as_str()).unwrap_or(""), 40),
         raw: body.to_string(),
+        read,
     })
 }
 
@@ -2379,11 +2396,14 @@ mod tests {
         let fresh = parse_brief(posted).expect("a brief");
         assert_eq!((fresh.made, fresh.oid.as_str()), (0, ""), "the agent never sends these");
         assert_eq!(fresh.raw, posted, "kept verbatim, so TIDE can write it straight back");
-        let kept = "{\"slides\":[{\"title\":\"A\",\"text\":\"B\"}],\"made\":1700000000,\"oid\":\"a1b2c3d\"}";
+        assert!(fresh.read.is_empty(), "nor this one");
+        let kept = "{\"slides\":[{\"title\":\"A\",\"text\":\"B\"}],\"made\":1700000000,\"oid\":\"a1b2c3d\",\"read\":[0,0,9]}";
         let back = parse_brief(kept).expect("a brief");
         assert_eq!(back.made, 1_700_000_000);
         assert_eq!(back.oid, "a1b2c3d");
         assert_eq!(back.slides.len(), 1);
+        // read back sorted, with duplicates and slides that aren't there dropped
+        assert_eq!(back.read, vec![0]);
     }
 
     /// A summary comes back as markdown, so it keeps its line breaks where the
