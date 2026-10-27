@@ -33062,8 +33062,15 @@ impl Storm {
                             let _ = Command::new("open").arg(&checks_url).spawn();
                         })),
                 )
-            })
-            .child(div().flex_grow(1.0))
+            });
+        // the actions are a row of their own under the pills. On one
+        // row they sat against the right edge, a window's width from the
+        // state they are about.
+        let actions = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
             // the two questions worth asking about a PR you are looking at
             .when(pr.state == PrState::Open || pr.state == PrState::Draft, |d| {
                 let (number, base) = (pr.number, pr.base.clone());
@@ -33244,6 +33251,7 @@ impl Storm {
                     .child(div().min_w(px(0.)).text_color(rgb(TEXT)).child(pr.title.clone())),
             )
             .child(meta)
+            .child(actions)
             // what the squash landed as. GitHub writes this message from the
             // repo's own setting, and the merge itself tells you nothing about
             // it — so it is shown here, and a click takes the whole thing.
