@@ -32290,11 +32290,14 @@ impl Storm {
             .get(self.active)
             .and_then(|t| t.brief.as_ref())
             .is_some_and(|b| b.read.contains(&ix));
-        let body = div()
+        // the words are the tick: reading a slide and then aiming at a 14px
+        // box is two actions for one thought. Everything with a click of its
+        // own inside here occludes, so a link still opens its file.
+        let said = div()
+            .id(("brief-said", ix))
             .flex()
             .flex_col()
             .gap_4()
-            .max_w(px(780.))
             .child(
                 div()
                     .flex()
@@ -32329,6 +32332,9 @@ impl Storm {
                             .child(
                                 div()
                                     .id(("brief-read", ix))
+                                    // the slide's own click would undo this
+                                    // one on the way past
+                                    .occlude()
                                     .child(check_box(read))
                                     .tooltip(tip(if read {
                                         "Read  ·  click to put it back"
@@ -32355,6 +32361,16 @@ impl Storm {
             .when(!slide.files.is_empty(), |d| {
                 d.child(div().pl(px(40.)).child(self.brief_files(ix, &slide.files, cx)))
             })
+            .on_click(cx.listener(move |this, _e, _w, cx| {
+                this.mark_slide_read(ix, !read, cx)
+            }));
+
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .max_w(px(780.))
+            .child(said)
             .when_some(slide.dia.clone(), |d, dia| {
                 d.child(div().pl(px(40.)).child(self.brief_diagram(ix, &dia, cx)))
             })
@@ -32664,31 +32680,41 @@ impl Storm {
     /// from a slide into the code it is talking about, without reading the
     /// diagram for a box that happens to carry a path.
     fn brief_files(&self, ix: usize, files: &[(String, usize)], cx: &mut Context<Self>) -> Div {
-        let mut row = div().flex().flex_row().items_center().gap_2().flex_wrap().gap_y(px(4.));
-        for (j, (path, line)) in files.iter().enumerate().take(8) {
-            let (open, at) = (path.clone(), *line);
-            let name = dia_where(path, *line).unwrap_or_else(|| path.clone());
-            row = row.child(
-                div()
-                    .id(("brief-file", ix * 16 + j))
-                    .flex_shrink_0()
-                    .px_1p5()
-                    .py(px(1.))
-                    .rounded_md()
-                    .cursor_pointer()
-                    .bg(rgb(PANEL_BG))
-                    .font_family("Menlo")
-                    .text_size(px(10.5))
-                    .text_color(rgb(MUTED))
-                    .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(ACCENT)))
-                    .child(name)
-                    .tooltip(tip_owned(format!("Open {path}")))
-                    .on_click(cx.listener(move |this, _e, window, cx| {
-                        this.open_brief_node(open.clone(), at, window, cx)
-                    })),
-            );
+        let files: Vec<&(String, usize)> = files.iter().take(8).collect();
+        // rows of three, laid out here. A wrapped row is sized by one line of
+        // itself, so a fourth link was drawn over whatever came next.
+        let mut col = div().flex().flex_col().gap(px(4.));
+        for span in dia_grid(files.len(), 3) {
+            let mut row = div().flex().flex_row().items_center().gap_2();
+            for j in span {
+                let (path, line) = files[j];
+                let (open, at) = (path.clone(), *line);
+                let name = dia_where(path, *line).unwrap_or_else(|| path.clone());
+                row = row.child(
+                    div()
+                        .id(("brief-file", ix * 16 + j))
+                        // its own click, not the slide's: this one opens a file
+                        .occlude()
+                        .flex_shrink_0()
+                        .px_1p5()
+                        .py(px(1.))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .bg(rgb(PANEL_BG))
+                        .font_family("Menlo")
+                        .text_size(px(10.5))
+                        .text_color(rgb(MUTED))
+                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(ACCENT)))
+                        .child(name)
+                        .tooltip(tip_owned(format!("Open {path}")))
+                        .on_click(cx.listener(move |this, _e, window, cx| {
+                            this.open_brief_node(open.clone(), at, window, cx)
+                        })),
+                );
+            }
+            col = col.child(row);
         }
-        row
+        col
     }
 
     /// The picture on a slide, in a panel of its own so it reads as an inset
