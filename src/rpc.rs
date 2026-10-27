@@ -177,6 +177,10 @@ pub struct BriefSlide {
     /// Two or three sentences under it.
     pub text: String,
     pub diagram: Option<BriefDiagram>,
+    /// The files this slide is about, as `path` or `path:line`. The prose of a
+    /// brief deliberately carries no line numbers; this is where they go, so
+    /// the slide can open what it is talking about.
+    pub files: Vec<(String, usize)>,
 }
 
 /// A high-level walkthrough of a change: what it does and why, as slides, for
@@ -990,7 +994,12 @@ pub fn parse_brief(body: &str) -> Option<Brief> {
         if title.is_empty() && text.is_empty() {
             continue;
         }
-        slides.push(BriefSlide { title, text, diagram: parse_diagram(item.get("diagram")) });
+        slides.push(BriefSlide {
+            title,
+            text,
+            diagram: parse_diagram(item.get("diagram")),
+            files: parse_slide_files(item.get("files").or_else(|| item.get("refs"))),
+        });
     }
     if slides.is_empty() {
         return None;
@@ -1026,6 +1035,44 @@ pub fn parse_brief(body: &str) -> Option<Brief> {
 }
 
 /// The picture on one slide, or `None` when there isn't one worth drawing.
+/// `"files": ["packages/x/src/A.ts:18", {"file": "B.ts", "line": 4}]`. Loose
+/// on the way in like everything else here: a bare string is a path, an object
+/// may carry the line separately, and anything without a path is dropped.
+fn parse_slide_files(v: Option<&serde_json::Value>) -> Vec<(String, usize)> {
+    let one = |item: &serde_json::Value| -> Option<(String, usize)> {
+        let (raw, line) = match item {
+            serde_json::Value::String(s) => (s.clone(), 0),
+            serde_json::Value::Object(_) => (
+                item.get("file")
+                    .or_else(|| item.get("path"))
+                    .and_then(|f| f.as_str())?
+                    .to_string(),
+                item.get("line").and_then(|l| l.as_u64()).unwrap_or(0) as usize,
+            ),
+            _ => return None,
+        };
+        let raw: String = raw.chars().filter(|c| !c.is_control()).take(300).collect();
+        let (path, at, _) = split_line_suffix(raw.trim());
+        let path = path.trim().trim_start_matches("./").to_string();
+        (!path.is_empty()).then(|| (path, at.unwrap_or(line)))
+    };
+    let items = match v {
+        Some(serde_json::Value::Array(a)) => a.clone(),
+        // one file given on its own, without the array around it
+        Some(one @ serde_json::Value::String(_)) => vec![one.clone()],
+        _ => return Vec::new(),
+    };
+    let mut out: Vec<(String, usize)> = Vec::new();
+    for item in items.iter().take(8) {
+        if let Some(hit) = one(item) {
+            if !out.iter().any(|(p, _)| *p == hit.0) {
+                out.push(hit);
+            }
+        }
+    }
+    out
+}
+
 fn parse_diagram(v: Option<&serde_json::Value>) -> Option<BriefDiagram> {
     let v = v?;
     let clean = |s: &str, cap: usize| -> String {
@@ -2390,6 +2437,31 @@ mod tests {
     /// TIDE writes `made` and `oid` into the copy it keeps on disk, and reads
     /// them back through the same parser the wire uses — so there is one format
     /// for a brief, not two.
+    /// The files a slide is about: the only line numbers a brief carries, and
+    /// loose on the way in like everything else here.
+    #[test]
+    fn a_slide_says_which_files_it_is_about() {
+        let b = parse_brief(
+            r#"{"slides":[
+                {"title":"A","text":"B","files":["packages/x/src/A.ts:84",
+                  {"file":"./src/B.ts","line":4}, {"path":"src/A.ts"}, 7, {"line":9}]},
+                {"title":"C","text":"D","files":"src/only.ts:3"},
+                {"title":"E","text":"F"}
+            ]}"#,
+        )
+        .expect("a brief");
+        assert_eq!(
+            b.slides[0].files,
+            vec![("packages/x/src/A.ts".to_string(), 84), ("src/B.ts".to_string(), 4),
+                 ("src/A.ts".to_string(), 0)],
+            "the line rides on the path or beside it, `./` goes, and a row with no path is dropped"
+        );
+        // one file given without the array around it
+        assert_eq!(b.slides[1].files, vec![("src/only.ts".to_string(), 3)]);
+        // a slide that named none says none, rather than guessing
+        assert!(b.slides[2].files.is_empty());
+    }
+
     #[test]
     fn a_kept_brief_remembers_when_and_against_what() {
         let posted = "{\"slides\":[{\"title\":\"A\",\"text\":\"B\"}]}";

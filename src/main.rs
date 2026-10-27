@@ -4543,6 +4543,8 @@ fn brief_request(number: u64, base: &str, read: &str) -> String {
          \"text\":\"A task whose worker crashed mid-run used to sit as `running` \
          for ever, because nothing ever looked at it again. The loop now treats \
          a stale lease as a failure and re-queues it.\",\
+         \"files\":[\"packages/api-tasks/src/TaskService.ts:84\",\
+         \"packages/api-tasks/src/recover.ts:17\"],\
          \"diagram\":{{\"kind\":\"flow\",\"caption\":\"one task, start to finish\",\
          \"nodes\":[\
          {{\"label\":\"trigger()\",\"note\":\"api-tasks\",\
@@ -4555,6 +4557,11 @@ fn brief_request(number: u64, base: &str, read: &str) -> String {
          halfway now get picked up”, never “Recovery” or “Background”. `text` is \
          two or three sentences: what changed, what it was before, and the one \
          thing I would get wrong if nobody told me. Backticks for identifiers.\n\n\
+         `files` is the way from a slide into the code: the two or three files \
+         that slide is about, as `path/to/File.ts:84`, pointing at the line \
+         worth landing on. Put them on every slide that is about code at all — \
+         they draw as links under the prose, and they are the only line numbers \
+         in a brief.\n\n\
          The first slide is what the change is for, in the terms of whoever asked \
          for it. The last is what to watch now that it has landed — what could \
          still bite, what is deliberately left undone. The ones in between are \
@@ -6761,6 +6768,9 @@ struct Slide {
     title: String,
     text: String,
     dia: Option<Diagram>,
+    /// The files this slide is about: the quick way into the code it talks
+    /// about, since the prose itself carries no line numbers.
+    files: Vec<(String, usize)>,
 }
 
 /// A change explained at arm's length. A code tour answers "where": it opens
@@ -6783,6 +6793,20 @@ struct Brief {
     slides: Vec<Slide>,
 }
 
+/// The files a diagram's boxes stand for, in the order they are drawn. The
+/// fallback for a slide that didn't list any of its own.
+fn slide_files_from(d: Option<&rpc::BriefDiagram>) -> Vec<(String, usize)> {
+    let mut out: Vec<(String, usize)> = Vec::new();
+    for n in d.into_iter().flat_map(|d| d.nodes.iter()) {
+        let path = n.file.trim();
+        if path.is_empty() || out.iter().any(|(p, _)| p == path) {
+            continue;
+        }
+        out.push((path.to_string(), n.line));
+    }
+    out
+}
+
 fn brief_from(b: rpc::Brief) -> Brief {
     Brief {
         read: b.read.iter().copied().collect(),
@@ -6794,6 +6818,12 @@ fn brief_from(b: rpc::Brief) -> Brief {
             .slides
             .into_iter()
             .map(|s| Slide {
+                // a slide that named no files still has the ones its diagram
+                // boxes point at, which is the same question answered twice
+                files: match s.files.is_empty() {
+                    false => s.files,
+                    true => slide_files_from(s.diagram.as_ref()),
+                },
                 title: s.title,
                 text: s.text,
                 dia: s.diagram.map(|d| Diagram {
@@ -22882,6 +22912,47 @@ impl Storm {
             )
     }
 
+    /// The route as a strip: one segment per stop, the one you are standing on
+    /// in the accent, the ones you have read in the green the ticks use, the
+    /// rest in the border colour. Clicking a segment goes there.
+    fn tour_bar(&self, w: &Walk, accent: u32, cx: &mut Context<Self>) -> Div {
+        let total = w.stops.len();
+        let mut row = div().flex().flex_row().items_center().gap(px(2.)).w_full().h(px(4.));
+        for i in 0..total {
+            let here = i == w.at && !w.intro && !w.done;
+            let read = w.seen.contains(&i);
+            let colour = if here {
+                accent
+            } else if read {
+                GIT_NEW
+            } else {
+                BORDER
+            };
+            let title = w
+                .stops
+                .get(i)
+                .map(|s| {
+                    if s.title.trim().is_empty() { s.said.clone() } else { s.title.clone() }
+                })
+                .unwrap_or_default();
+            row = row.child(
+                div()
+                    .id(("tour-bar", i))
+                    .flex_grow(1.0)
+                    .h_full()
+                    .rounded_sm()
+                    .bg(rgb(colour))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(if here { accent } else { MUTED })))
+                    .tooltip(tip_owned(format!("{}. {title}", i + 1)))
+                    .on_click(cx.listener(move |this, _e, window, cx| {
+                        this.goto_walk_stop(i, window, cx)
+                    })),
+            );
+        }
+        row
+    }
+
     /// The tour drawn as what it is: files, in the order the work moves through
     /// them, joined by the arrows the tour takes. The file you are standing in
     /// is lit, and so is the stop inside it.
@@ -23266,7 +23337,6 @@ impl Storm {
         // past does not
         let total = w.stops.len();
         let read = w.seen.len().min(total);
-        let pct = if total == 0 { 0 } else { read * 100 / total };
         let accent = if w.tour.is_some() { TOUR_MARK } else { COMMENT_MARK };
         let mut list = div()
             .id("tour-steps")
@@ -23454,10 +23524,11 @@ impl Storm {
                                         .on_click(cx.listener(|this, _e, _w, cx| this.regen_tour(cx))),
                                 ),
                         )
-                        // how much of it is behind you. The header sits on
-                        // BG, which HOVER vanishes into, so the unlit cells
-                        // take the border colour to stay countable
-                        .child(segmented_bar_on(pct, accent, 4., BORDER)),
+                        // where you are and what you have read, a segment per
+                        // stop. A ten-cell percentage bar said neither: on
+                        // stop seven of eight with one of them read it drew a
+                        // tenth of a bar at the left-hand end.
+                        .child(self.tour_bar(w, accent, cx)),
                 )
                 .child(self.render_tour_map(w, accent, cx)),
         )
@@ -32281,6 +32352,9 @@ impl Storm {
             .when(!slide.text.trim().is_empty(), |d| {
                 d.child(div().pl(px(40.)).max_w(px(680.)).child(md_text(&slide.text, 15., TEXT)))
             })
+            .when(!slide.files.is_empty(), |d| {
+                d.child(div().pl(px(40.)).child(self.brief_files(ix, &slide.files, cx)))
+            })
             .when_some(slide.dia.clone(), |d, dia| {
                 d.child(div().pl(px(40.)).child(self.brief_diagram(ix, &dia, cx)))
             })
@@ -32583,6 +32657,38 @@ impl Storm {
                         this.ask_about_slide(ix, cx);
                     })),
             )
+    }
+
+    /// The files a slide is about, as a row of links under its prose. A brief
+    /// says what a change does and names no lines in its text; this is the way
+    /// from a slide into the code it is talking about, without reading the
+    /// diagram for a box that happens to carry a path.
+    fn brief_files(&self, ix: usize, files: &[(String, usize)], cx: &mut Context<Self>) -> Div {
+        let mut row = div().flex().flex_row().items_center().gap_2().flex_wrap().gap_y(px(4.));
+        for (j, (path, line)) in files.iter().enumerate().take(8) {
+            let (open, at) = (path.clone(), *line);
+            let name = dia_where(path, *line).unwrap_or_else(|| path.clone());
+            row = row.child(
+                div()
+                    .id(("brief-file", ix * 16 + j))
+                    .flex_shrink_0()
+                    .px_1p5()
+                    .py(px(1.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(rgb(PANEL_BG))
+                    .font_family("Menlo")
+                    .text_size(px(10.5))
+                    .text_color(rgb(MUTED))
+                    .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(ACCENT)))
+                    .child(name)
+                    .tooltip(tip_owned(format!("Open {path}")))
+                    .on_click(cx.listener(move |this, _e, window, cx| {
+                        this.open_brief_node(open.clone(), at, window, cx)
+                    })),
+            );
+        }
+        row
     }
 
     /// The picture on a slide, in a panel of its own so it reads as an inset
@@ -38579,6 +38685,7 @@ mod code_tour_tests {
             title: "A".into(),
             text: "B".into(),
             diagram: Some(dia(kind)),
+            files: Vec::new(),
         };
         let b = brief_from(rpc::Brief {
             pr: Some(7),
@@ -38605,6 +38712,7 @@ mod code_tour_tests {
             title: "A failing action is retried once a day".into(),
             text: "A failed run leaves the action stored with its error.".into(),
             dia: None,
+            files: Vec::new(),
         };
         let q =
             slide_question("Background task recovery", Some(6098), 4, 7, &slide, "  why a day? ", "k3m9p");
@@ -38861,11 +38969,37 @@ mod code_tour_tests {
         }
     }
 
+    /// A slide that named no files of its own still has the ones its diagram
+    /// boxes point at: the same question, answered in the other place.
+    #[test]
+    fn a_slide_falls_back_to_its_diagram_for_files() {
+        let node = |file: &str, line: usize| rpc::BriefNode {
+            label: "A".into(),
+            note: String::new(),
+            mark: String::new(),
+            file: file.into(),
+            line,
+        };
+        let dia = rpc::BriefDiagram {
+            kind: "flow".into(),
+            caption: String::new(),
+            nodes: vec![node("src/a.ts", 12), node("", 0), node("src/a.ts", 99), node("src/b.ts", 0)],
+            edges: Vec::new(),
+        };
+        assert_eq!(
+            slide_files_from(Some(&dia)),
+            vec![("src/a.ts".to_string(), 12), ("src/b.ts".to_string(), 0)],
+            "an idea has no file, and a file named twice is one link"
+        );
+        assert!(slide_files_from(None).is_empty());
+    }
+
     /// A deck half read is rewritten around the half that isn't, and the
     /// slides that come back word for word keep their ticks.
     #[test]
     fn a_brief_is_rewritten_around_what_is_unread() {
-        let slide = |t: &str, x: &str| Slide { title: t.into(), text: x.into(), dia: None };
+        let slide =
+            |t: &str, x: &str| Slide { title: t.into(), text: x.into(), dia: None, files: Vec::new() };
         let slides = vec![
             slide("Secrets come from env now", "The build no longer holds them."),
             slide("A missing secret stops the boot", "It fails at startup, not on login."),
