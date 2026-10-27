@@ -30656,9 +30656,12 @@ impl Storm {
         let hint = if blocked {
             "the reviewers haven't read this · tick Skip reviewers to merge it".into()
         } else {
+            // short, because the row it sits in holds two ticks and two
+            // buttons: what it used to say about the review requirement is
+            // now the chip in the header
             format!(
-                "squash · bypasses the review requirement · ↩ merge{} · esc cancel",
-                if has_agent { " · ⌥↩ merge quietly" } else { "" }
+                "squash · ↩ merge{} · esc cancel",
+                if has_agent { " · ⌥↩ quietly" } else { "" }
             )
         };
         let buttons = div()
@@ -30670,8 +30673,19 @@ impl Storm {
             .py_2()
             .border_t_1()
             .border_color(rgb(BORDER))
-            .child(div().text_size(px(10.)).text_color(rgb(LINE_NUMBER)).child(hint))
-            .child(div().flex_grow(1.0))
+            // the hint gives way, and nothing else does: with both ticks
+            // drawn the row was wider than the dialog and the Merge button
+            // was painted past its right edge
+            .child(
+                div()
+                    .min_w(px(0.))
+                    .flex_shrink(1.)
+                    .truncate()
+                    .text_size(px(10.))
+                    .text_color(rgb(LINE_NUMBER))
+                    .child(hint),
+            )
+            .child(div().flex_grow(1.0).flex_shrink_0().min_w(px(0.)))
             // only drawn when there is something to skip: with reviewers on the
             // PR this is a tick that does nothing
             .when(no_reviewers, |d| {
@@ -30679,6 +30693,7 @@ impl Storm {
                     div()
                         .id("merge-skip-reviewers")
                         .flex()
+                        .flex_shrink_0()
                         .flex_row()
                         .items_center()
                         .gap_2()
@@ -30710,6 +30725,7 @@ impl Storm {
                     div()
                         .id("merge-tell")
                         .flex()
+                        .flex_shrink_0()
                         .flex_row()
                         .items_center()
                         .gap_2()
@@ -30735,6 +30751,7 @@ impl Storm {
             .child(
                 div()
                     .id("merge-cancel")
+                    .flex_shrink_0()
                     .px_2()
                     .py_1()
                     .rounded_md()
@@ -30758,6 +30775,7 @@ impl Storm {
             .child(
                 div()
                     .id("merge-go")
+                    .flex_shrink_0()
                     .px_2()
                     .py_1()
                     .rounded_md()
@@ -30790,6 +30808,7 @@ impl Storm {
             .border_1()
             .border_color(rgb(ACCENT))
             .rounded_md()
+            .overflow_hidden()
             .shadow_lg()
             .flex()
             .flex_col()
