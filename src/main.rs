@@ -6676,9 +6676,9 @@ struct Walk {
     /// Where the current stop resolved to on disk, so the editor can be told
     /// which lines to light up without resolving the path on every frame.
     here: Option<(PathBuf, usize, usize)>,
-    /// Which stops have been read. Standing on one puts it here; so does the
-    /// tick in the map, which is the point: a tour of twenty stops is mostly
-    /// code you already know, and saying so is what leaves the rest visible.
+    /// Which stops have been read. Only the ticks put one here: stepping
+    /// through a tour is how you look for the part you need, and marking
+    /// everything you passed would say you had read all of it.
     seen: HashSet<usize>,
 }
 
@@ -22912,47 +22912,6 @@ impl Storm {
             )
     }
 
-    /// The route as a strip: one segment per stop, the one you are standing on
-    /// in the accent, the ones you have read in the green the ticks use, the
-    /// rest in the border colour. Clicking a segment goes there.
-    fn tour_bar(&self, w: &Walk, accent: u32, cx: &mut Context<Self>) -> Div {
-        let total = w.stops.len();
-        let mut row = div().flex().flex_row().items_center().gap(px(2.)).w_full().h(px(4.));
-        for i in 0..total {
-            let here = i == w.at && !w.intro && !w.done;
-            let read = w.seen.contains(&i);
-            let colour = if here {
-                accent
-            } else if read {
-                GIT_NEW
-            } else {
-                BORDER
-            };
-            let title = w
-                .stops
-                .get(i)
-                .map(|s| {
-                    if s.title.trim().is_empty() { s.said.clone() } else { s.title.clone() }
-                })
-                .unwrap_or_default();
-            row = row.child(
-                div()
-                    .id(("tour-bar", i))
-                    .flex_grow(1.0)
-                    .h_full()
-                    .rounded_sm()
-                    .bg(rgb(colour))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(if here { accent } else { MUTED })))
-                    .tooltip(tip_owned(format!("{}. {title}", i + 1)))
-                    .on_click(cx.listener(move |this, _e, window, cx| {
-                        this.goto_walk_stop(i, window, cx)
-                    })),
-            );
-        }
-        row
-    }
-
     /// The tour drawn as what it is: files, in the order the work moves through
     /// them, joined by the arrows the tour takes. The file you are standing in
     /// is lit, and so is the stop inside it.
@@ -23337,6 +23296,15 @@ impl Storm {
         // past does not
         let total = w.stops.len();
         let read = w.seen.len().min(total);
+        // the bar is position, not reading: how far along the route the stop
+        // you are standing on is. What has been read is the count beside it,
+        // which the ticks move and walking does not.
+        let pct = match (w.intro, w.done) {
+            _ if total == 0 => 0,
+            (true, _) => 0,
+            (_, true) => 100,
+            _ => (w.at + 1) * 100 / total,
+        };
         let accent = if w.tour.is_some() { TOUR_MARK } else { COMMENT_MARK };
         let mut list = div()
             .id("tour-steps")
@@ -23524,11 +23492,10 @@ impl Storm {
                                         .on_click(cx.listener(|this, _e, _w, cx| this.regen_tour(cx))),
                                 ),
                         )
-                        // where you are and what you have read, a segment per
-                        // stop. A ten-cell percentage bar said neither: on
-                        // stop seven of eight with one of them read it drew a
-                        // tenth of a bar at the left-hand end.
-                        .child(self.tour_bar(w, accent, cx)),
+                        // how far along you are. The header sits on BG, which
+                        // HOVER vanishes into, so the unlit cells take the
+                        // border colour to stay countable
+                        .child(segmented_bar_on(pct, accent, 4., BORDER)),
                 )
                 .child(self.render_tour_map(w, accent, cx)),
         )
@@ -27240,7 +27207,6 @@ impl Storm {
         w.at = i;
         w.intro = false;
         w.done = false;
-        w.seen.insert(i); // standing on it is reading it
         self.open_walk_stop(&stop, window, cx);
         self.tour_touched(); // the stop you're on is part of the tour's state
     }
@@ -32196,7 +32162,19 @@ impl Storm {
                 }),
             )
             .child(head)
-            .child(deck)
+            // the deck scrolls, so it says so: the same thumb the diff pane
+            // draws, over a column that is otherwise eight slides of prose
+            // with nothing to say how much of it there is
+            .child(
+                div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .flex_grow(1.0)
+                    .min_h(px(0.))
+                    .child(deck)
+                    .child(v_scrollbar(&self.brief_scroll)),
+            )
             .child(self.brief_progress(&brief, cx))
             .into_any_element()
     }
