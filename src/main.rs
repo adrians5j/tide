@@ -10277,7 +10277,10 @@ impl Storm {
             // belongs to the page
             let fh = if tab.browser {
                 self.mirror_focus.clone()
-            } else if is_image_file(&tab.path) || (tab.preview && is_markdown(&tab.path)) {
+            } else if tab.brief.is_some()
+                || is_image_file(&tab.path)
+                || (tab.preview && is_markdown(&tab.path))
+            {
                 // the rendered view, where the editor isn't on screen to hold
                 // the key context for ⌘W and the rest
                 self.md_focus.clone()
@@ -11023,6 +11026,18 @@ impl Storm {
     fn act_close_others(&mut self, _: &CloseOthers, _window: &mut Window, cx: &mut Context<Self>) {
         if self.tabs.is_empty() {
             return;
+        }
+        // the others leave the way ⌘W sends one: saved first, their comment
+        // drafts kept, and the mirror shut down if the browser was among them
+        for ix in (0..self.tabs.len()).rev() {
+            if ix == self.active {
+                continue;
+            }
+            self.save_tab(ix, cx);
+            self.stash_comment_draft(ix, cx);
+            if self.tabs[ix].browser {
+                self.drop_mirror();
+            }
         }
         let keep = self.tabs.remove(self.active);
         self.tabs.clear();
@@ -26134,6 +26149,10 @@ impl Storm {
         };
         let path = PathBuf::from(&name);
         self.brief_seen.clear(); // a new deck reveals itself again
+        self.brief_ask_at = None;
+        // the poll that received this had no Window to focus with, and the
+        // deck holds the key context for ⌘W and the rest
+        self.md_focus_pending = true;
         if let Some(ix) = self.tabs.iter().position(|t| t.path == path) {
             self.tabs[ix].brief = Some(brief);
             self.tabs[ix].label = Some(label);
@@ -29208,6 +29227,9 @@ impl Storm {
         let page = div()
             .id("mirror-page")
             .track_focus(&self.mirror_focus)
+            // `mirror_key` hands every ⌘ and ⌃ chord back to TIDE, which needs
+            // somewhere to land: the editor isn't on screen in this mode either
+            .key_context("Editor")
             .on_key_down(cx.listener(Self::mirror_key))
             .flex_grow(1.0)
             .min_h(px(0.))
@@ -31493,6 +31515,21 @@ impl Storm {
             .flex_grow(1.0)
             .h_full()
             .bg(rgb(BG))
+            // a brief has no editor on screen, so without this the tab's own
+            // shortcuts (⌘W, ⌘⇧W, ⌘1…) dispatch to nothing while you read it
+            .track_focus(&self.md_focus)
+            .key_context("Editor")
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _e, window, cx| {
+                    // clicking the deck gives it the keyboard, the same way
+                    // clicking the rendered markdown does
+                    if !this.brief_ask_live {
+                        window.focus(&this.md_focus, cx);
+                    }
+                    cx.notify();
+                }),
+            )
             .child(head)
             .child(deck)
             .into_any_element()
