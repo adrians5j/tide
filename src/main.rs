@@ -4351,6 +4351,7 @@ fn slide_question(
     total: usize,
     slide: &Slide,
     q: &str,
+    id: &str,
 ) -> String {
     let named = match (pr, brief.trim()) {
         (Some(p), "") => format!(" of the brief for #{p}"),
@@ -4369,7 +4370,13 @@ fn slide_question(
     format!(
         "{}\n\n\
          (I'm on slide {at}/{total}{named}{title}{said})\n\
-         Answer the question. Don't rewrite the brief unless I ask for it.\n",
+         Answer the question, then post the answer back to the slide I asked \
+         it under, the way you answer a review comment:\n\
+         \x20 curl -s -X POST \"$TIDE_RPC/comment\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n\
+         \x20   -d '{{\"id\":\"{id}\",\"text\":\"<the answer, in markdown>\"}}'\n\
+         Two or three sentences there, under the slide where I am reading; the \
+         working out can stay in the transcript. Don't rewrite the brief unless \
+         I ask for it.\n",
         q.trim(),
     )
 }
@@ -6383,6 +6390,17 @@ const CLARIFY_NOTE: &str = "This step isn't clear to me. Explain what happens \
      here and why it matters, in plainer terms, and say what I'd have to know \
      to follow it.";
 
+/// A question asked under a slide, and the answer when it comes back.
+#[derive(Clone, PartialEq, Debug)]
+struct SlideAsk {
+    /// What the agent answers to. The same id space as a review comment's,
+    /// because it is the same route home.
+    id: String,
+    q: String,
+    answer: String,
+    when: u64,
+}
+
 /// The same button under a slide of a brief. A slide is prose rather than a
 /// place in a file, so what it asks for is a second telling, not a tour of
 /// where to look.
@@ -7677,6 +7695,10 @@ struct Storm {
     /// looking at and there is only ever one of those.
     brief_ask: Field,
     brief_ask_at: Option<usize>,
+    /// What has been asked under a slide and what came back, by pull request
+    /// and slide. The answer arrives the way a review comment's does: the
+    /// agent posts it to `/comment` with the id the question carried.
+    slide_asks: HashMap<(u64, usize), SlideAsk>,
     brief_ask_focus: FocusHandle,
     /// The thread turn that was right-clicked, kept whole: the menu's actions
     /// are about that answer's text, and the thread is rebuilt every frame.
@@ -8251,6 +8273,7 @@ impl Storm {
             tour_ask_focus: cx.focus_handle(),
             brief_ask: Field::default(),
             brief_ask_at: None,
+            slide_asks: HashMap::new(),
             brief_ask_focus: cx.focus_handle(),
             ctx_reply: None,
             walk: None,
@@ -9653,16 +9676,30 @@ impl Storm {
                     }
                     if !replies.is_empty() {
                         let mut landed = 0usize;
+                        let mut on_slides = 0usize;
                         for r in replies {
                             if let Some(c) = this.review.iter_mut().find(|c| c.id == r.id) {
                                 c.replies.push(ReviewReply { who: "agent".into(), text: r.text });
                                 landed += 1;
+                                continue;
+                            }
+                            // the other place a thread can live: under the
+                            // slide of a brief it was asked on
+                            if let Some(a) =
+                                this.slide_asks.values_mut().find(|a| a.id == r.id)
+                            {
+                                a.answer = r.text;
+                                on_slides += 1;
                             }
                         }
                         if landed > 0 {
                             this.save_review();
+                        }
+                        if landed + on_slides > 0 {
+                            let n = landed + on_slides;
+                            let where_ = if landed == 0 { "under the slide" } else { "in review threads" };
                             this.show_flash(
-                                &format!("{landed} answer{} in review threads", if landed == 1 { "" } else { "s" }),
+                                &format!("{n} answer{} {where_}", if n == 1 { "" } else { "s" }),
                                 cx,
                             );
                             cx.notify();
@@ -23689,6 +23726,10 @@ impl Storm {
                                 .text_color(rgb(TEXT))
                                 .track_focus(&self.tour_ask_focus)
                                 .on_key_down(cx.listener(Self::tour_ask_key))
+                                .relative()
+                                // the same input handler every other box has:
+                                // typed text arrives through `insertText:`
+                                .child(input_sink(self.tour_ask_focus.clone(), cx.entity()))
                                 .on_click(cx.listener(|this, _e, _w, cx| {
                                     this.tour_ask_focus_pending = true;
                                     cx.notify();
@@ -26114,7 +26155,12 @@ impl Storm {
     }
 
     /// A brief arrived off the wire. Keep it, then show it.
+    /// A brief that just arrived replaces the one that was there, and its
+    /// slides are not the old ones: a thread kept by slide number would end up
+    /// under whatever now sits in that place.
     fn start_brief(&mut self, brief: rpc::Brief, cx: &mut Context<Self>) {
+        let pr = brief.pr.unwrap_or(0);
+        self.slide_asks.retain(|(p, _), _| *p != pr);
         if let Some(p) = brief.pr {
             save_brief_cache(p, &brief.raw, &self.head_oid);
         }
@@ -26545,8 +26591,13 @@ impl Storm {
             return;
         };
         let Some(slide) = brief.slides.get(ix) else { return };
+        let id = random_id();
         let text =
-            slide_question(&brief.title, brief.pr, ix + 1, brief.slides.len(), slide, &q);
+            slide_question(&brief.title, brief.pr, ix + 1, brief.slides.len(), slide, &q, &id);
+        self.slide_asks.insert(
+            (brief.pr.unwrap_or(0), ix),
+            SlideAsk { id, q: q.clone(), answer: String::new(), when: now_secs() },
+        );
         self.brief_ask.clear();
         self.agent_open = true;
         self.send_agent_prompt_by(text, Some(q), Sender::You, cx);
@@ -31506,7 +31557,7 @@ impl Storm {
             // other one, rather than pinned to the bottom edge
             .pb(px(340.));
         for (ix, slide) in brief.slides.iter().enumerate() {
-            deck = deck.child(self.brief_slide(ix, slide, n, me.clone(), cx));
+            deck = deck.child(self.brief_slide(ix, slide, n, pr.unwrap_or(0), me.clone(), cx));
         }
 
         div()
@@ -31540,6 +31591,7 @@ impl Storm {
         ix: usize,
         slide: &Slide,
         total: usize,
+        pr: u64,
         me: WeakEntity<Storm>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -31583,6 +31635,7 @@ impl Storm {
             .when_some(slide.dia.clone(), |d, dia| {
                 d.child(div().pl(px(40.)).child(self.brief_diagram(ix, &dia, cx)))
             })
+            .children(self.brief_thread(pr, ix, cx))
             .child(self.brief_ask_row(ix, cx));
 
         // not seen yet: laid out, and drawn at nothing. The padding it will
@@ -31688,6 +31741,77 @@ impl Storm {
             })
     }
 
+    /// What was asked under this slide and what came back. The answer lands
+    /// here rather than only in the agent pane, the same way an answer to a
+    /// line comment lands in the thread you opened at that line.
+    fn brief_thread(&self, pr: u64, ix: usize, cx: &mut Context<Self>) -> Option<Div> {
+        let ask = self.slide_asks.get(&(pr, ix))?;
+        let waiting = ask.answer.trim().is_empty();
+        let when = (ask.when > 0).then(|| todo::age(ask.when)).unwrap_or_default();
+        Some(
+            div()
+                .ml(px(40.))
+                .max_w(px(680.))
+                .pl_3()
+                .py_2()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .border_l_2()
+                .border_color(rgb(if waiting { BORDER } else { ACCENT }))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_start()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_grow(1.0)
+                                .min_w(px(0.))
+                                .text_size(px(13.))
+                                .text_color(rgb(MUTED))
+                                .child(ask.q.clone()),
+                        )
+                        .when(!when.is_empty(), |d| {
+                            d.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(LINE_NUMBER))
+                                    .child(when.clone()),
+                            )
+                        })
+                        .child(
+                            div()
+                                .id(("brief-ask-done", ix))
+                                .flex_shrink_0()
+                                .px_1p5()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .text_size(px(10.))
+                                .text_color(rgb(LINE_NUMBER))
+                                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                .child("done")
+                                .tooltip(tip("Clear this thread off the slide"))
+                                .on_click(cx.listener(move |this, _e, _w, cx| {
+                                    this.slide_asks.remove(&(pr, ix));
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(if waiting {
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(LINE_NUMBER))
+                        .child("waiting for the answer…")
+                        .into_any_element()
+                } else {
+                    md_text(&ask.answer, 14., TEXT).into_any_element()
+                }),
+        )
+    }
+
     /// Asking under the slide, rather than scrolling to the agent pane and
     /// describing which slide you meant. The box is quiet until it is the one
     /// in use: a deck with an outlined input under every slide reads as a form.
@@ -31725,6 +31849,11 @@ impl Storm {
         let box_ = if here {
             box_.track_focus(&self.brief_ask_focus)
                 .on_key_down(cx.listener(Self::brief_ask_key))
+                .relative()
+                // dictation, IME and ordinary typing all arrive through
+                // `insertText:`, and macOS only sends it where an input
+                // handler is registered for the focused element
+                .child(input_sink(self.brief_ask_focus.clone(), cx.entity()))
                 .child(self.brief_ask.render(caret, SELECTION))
                 .into_any_element()
         } else {
@@ -37772,15 +37901,19 @@ mod code_tour_tests {
             text: "A failed run leaves the action stored with its error.".into(),
             dia: None,
         };
-        let q = slide_question("Background task recovery", Some(6098), 4, 7, &slide, "  why a day? ");
+        let q =
+            slide_question("Background task recovery", Some(6098), 4, 7, &slide, "  why a day? ", "k3m9p");
         assert!(q.starts_with("why a day?"), "your words lead, trimmed: {q}");
         assert!(q.contains("slide 4/7"), "{q}");
         assert!(q.contains("#6098"), "{q}");
         assert!(q.contains("> A failed run leaves"), "the slide is quoted back: {q}");
         assert!(q.contains("Don't rewrite the brief"), "{q}");
+        // the answer has a way back to the slide it was asked under
+        assert!(q.contains("$TIDE_RPC/comment"), "{q}");
+        assert!(q.contains("\"id\":\"k3m9p\""), "{q}");
         // an untitled brief with no pull request behind it still says where
         // the question was asked
-        let bare = slide_question("", None, 1, 1, &slide, "and this?");
+        let bare = slide_question("", None, 1, 1, &slide, "and this?", "zz001");
         assert!(bare.contains("slide 1/1 of the brief"), "{bare}");
         assert!(!bare.contains("#"), "nothing to cite: {bare}");
     }
