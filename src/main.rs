@@ -16756,6 +16756,83 @@ impl Storm {
                                 })),
                         )
                     })
+                    // the two things worth reading before the diff, as one
+                    // chip: what the change does, and where it does it
+                    .when_some(
+                        self.pr_link.clone().zip(self.reading),
+                        |d, ((num, _url, _status, base, _head, _state), reading)| {
+                            let base = match base.trim() {
+                                "" => self.pr_base.clone(),
+                                b => b.to_string(),
+                            };
+                            let (colour, hint) = if reading.stale() {
+                                (
+                                    FOLDER_ICON,
+                                    format!(
+                                        "The branch has moved past {}  ·  click to write them \
+                                         again from the code as it stands now",
+                                        match (reading.brief_stale, reading.tour_stale) {
+                                            (true, true) => "the brief and the tour",
+                                            (true, false) => "the brief",
+                                            _ => "the tour",
+                                        }
+                                    ),
+                                )
+                            } else if reading.current() {
+                                (
+                                    LINE_NUMBER,
+                                    "The brief and the tour are both current  ·  ⌥click to \
+                                     write them again"
+                                        .to_string(),
+                                )
+                            } else {
+                                (
+                                    MUTED,
+                                    format!(
+                                        "Ask for {} of #{num}: the brief for what it does, the \
+                                         tour for where",
+                                        match (reading.has_brief, reading.has_tour) {
+                                            (false, false) => "a brief and a code tour",
+                                            (true, false) => "a code tour",
+                                            _ => "a brief",
+                                        }
+                                    ),
+                                )
+                            };
+                            d.child(
+                                div()
+                                    .id("pr-catch-up")
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    .px_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(colour))
+                                    .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                    .child(
+                                        div()
+                                            .font_family(ICON_FONT)
+                                            .text_size(px(11.))
+                                            .child(IC_TOUR),
+                                    )
+                                    .child(reading.verb())
+                                    .tooltip(tip_owned(hint))
+                                    .on_click(cx.listener(
+                                        move |this, e: &gpui::ClickEvent, _w, cx| {
+                                            this.catch_up_pr(
+                                                num,
+                                                base.clone(),
+                                                e.modifiers().alt,
+                                                cx,
+                                            )
+                                        },
+                                    )),
+                            )
+                        },
+                    )
                     // no PR for this branch yet → say so, so the refresh icon reads clearly
                     .when(self.pr_link.is_none() && !self.branch.is_empty(), |d| {
                         d.child(div().text_size(px(12.)).text_color(rgb(MUTED)).child("No PR"))
