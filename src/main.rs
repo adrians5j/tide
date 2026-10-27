@@ -6392,13 +6392,46 @@ const CLARIFY_NOTE: &str = "This step isn't clear to me. Explain what happens \
 
 /// A question asked under a slide, and the answer when it comes back.
 #[derive(Clone, PartialEq, Debug)]
-struct SlideAsk {
+struct SlideTurn {
     /// What the agent answers to. The same id space as a review comment's,
     /// because it is the same route home.
     id: String,
     q: String,
     answer: String,
     when: u64,
+}
+
+/// Everything that has been asked under one slide, oldest first. Asking a
+/// second question keeps the first: a thread you can't read back is a worse
+/// place to ask than the agent pane.
+#[derive(Clone, Default, PartialEq, Debug)]
+struct SlideThread {
+    turns: Vec<SlideTurn>,
+    /// Folded to its header, for a slide you have finished arguing with.
+    folded: bool,
+}
+
+impl SlideThread {
+    /// A thread is as old as its last turn: what you want to know of a thread
+    /// you folded is when it was last touched.
+    fn when(&self) -> u64 {
+        self.turns.last().map(|t| t.when).unwrap_or(0)
+    }
+    fn waiting(&self) -> bool {
+        self.turns.last().is_some_and(|t| t.answer.trim().is_empty())
+    }
+
+    /// Add a question to the end of the thread. The ones before it stay: this
+    /// is the whole point of a thread rather than a box.
+    fn ask(&mut self, id: String, q: String, when: u64) {
+        self.turns.push(SlideTurn { id, q, answer: String::new(), when });
+        // a slide you have asked a dozen questions about is a slide that
+        // wants writing again, not a longer thread
+        if self.turns.len() > 12 {
+            self.turns.remove(0);
+        }
+        self.folded = false; // a question you just asked is one you want to see
+    }
 }
 
 /// The same button under a slide of a brief. A slide is prose rather than a
@@ -7695,10 +7728,10 @@ struct Storm {
     /// looking at and there is only ever one of those.
     brief_ask: Field,
     brief_ask_at: Option<usize>,
-    /// What has been asked under a slide and what came back, by pull request
-    /// and slide. The answer arrives the way a review comment's does: the
-    /// agent posts it to `/comment` with the id the question carried.
-    slide_asks: HashMap<(u64, usize), SlideAsk>,
+    /// What has been asked under each slide and what came back, by pull
+    /// request and slide. The answers arrive the way a review comment's does:
+    /// the agent posts to `/comment` with the id its question carried.
+    slide_asks: HashMap<(u64, usize), SlideThread>,
     brief_ask_focus: FocusHandle,
     /// The thread turn that was right-clicked, kept whole: the menu's actions
     /// are about that answer's text, and the thread is rebuilt every frame.
@@ -9685,10 +9718,13 @@ impl Storm {
                             }
                             // the other place a thread can live: under the
                             // slide of a brief it was asked on
-                            if let Some(a) =
-                                this.slide_asks.values_mut().find(|a| a.id == r.id)
+                            if let Some(turn) = this
+                                .slide_asks
+                                .values_mut()
+                                .flat_map(|t| t.turns.iter_mut())
+                                .find(|t| t.id == r.id)
                             {
-                                a.answer = r.text;
+                                turn.answer = r.text;
                                 on_slides += 1;
                             }
                         }
@@ -26594,10 +26630,10 @@ impl Storm {
         let id = random_id();
         let text =
             slide_question(&brief.title, brief.pr, ix + 1, brief.slides.len(), slide, &q, &id);
-        self.slide_asks.insert(
-            (brief.pr.unwrap_or(0), ix),
-            SlideAsk { id, q: q.clone(), answer: String::new(), when: now_secs() },
-        );
+        self.slide_asks
+            .entry((brief.pr.unwrap_or(0), ix))
+            .or_default()
+            .ask(id, q.clone(), now_secs());
         self.brief_ask.clear();
         self.agent_open = true;
         self.send_agent_prompt_by(text, Some(q), Sender::You, cx);
@@ -31741,13 +31777,93 @@ impl Storm {
             })
     }
 
-    /// What was asked under this slide and what came back. The answer lands
-    /// here rather than only in the agent pane, the same way an answer to a
-    /// line comment lands in the thread you opened at that line.
+    /// What has been asked under this slide and what came back. The answers
+    /// land here rather than only in the agent pane, the same way an answer to
+    /// a line comment lands in the thread you opened at that line.
+    ///
+    /// Nothing that wraps sits in a flex row here. A paragraph measured beside
+    /// a `flex_shrink_0` chip is measured at the row's full width and painted
+    /// at what is left of it, so it came out a line short and the answer was
+    /// drawn over its last line.
     fn brief_thread(&self, pr: u64, ix: usize, cx: &mut Context<Self>) -> Option<Div> {
-        let ask = self.slide_asks.get(&(pr, ix))?;
-        let waiting = ask.answer.trim().is_empty();
-        let when = (ask.when > 0).then(|| todo::age(ask.when)).unwrap_or_default();
+        let thread = self.slide_asks.get(&(pr, ix))?;
+        if thread.turns.is_empty() {
+            return None;
+        }
+        let folded = thread.folded;
+        let waiting = thread.waiting();
+        let n = thread.turns.len();
+        let when = (thread.when() > 0).then(|| todo::age(thread.when())).unwrap_or_default();
+        let count = match n {
+            1 => "1 question".to_string(),
+            n => format!("{n} questions"),
+        };
+        let chip = |key: &'static str, label: &'static str| {
+            div()
+                .id((key, ix))
+                .flex_shrink_0()
+                .px_1p5()
+                .rounded_md()
+                .cursor_pointer()
+                .text_size(px(10.))
+                .text_color(rgb(LINE_NUMBER))
+                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                .child(label)
+        };
+        let head = div()
+            .id(("brief-thread-head", ix))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .cursor_pointer()
+            .text_size(px(10.))
+            .text_color(rgb(LINE_NUMBER))
+            .child(div().flex_shrink_0().child(if folded { "▸" } else { "▾" }))
+            .child(div().flex_shrink_0().child(count))
+            .when(!when.is_empty(), |d| d.child(div().flex_shrink_0().child(when)))
+            .when(waiting, |d| {
+                d.child(div().flex_shrink_0().text_color(rgb(MUTED)).child("waiting…"))
+            })
+            .child(div().flex_grow(1.0))
+            .child(
+                chip("brief-ask-done", "done")
+                    .tooltip(tip("Clear this thread off the slide"))
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                        this.slide_asks.remove(&(pr, ix));
+                        cx.notify();
+                    })),
+            )
+            .on_click(cx.listener(move |this, _e, _w, cx| {
+                if let Some(t) = this.slide_asks.get_mut(&(pr, ix)) {
+                    t.folded = !t.folded;
+                }
+                cx.notify();
+            }));
+
+        let mut body = div().flex().flex_col().gap_3();
+        for turn in &thread.turns {
+            let answered = !turn.answer.trim().is_empty();
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1p5()
+                    // the question reads as the quieter half: it is the part
+                    // you already know, having just typed it
+                    .child(div().text_size(px(13.)).text_color(rgb(MUTED)).child(turn.q.clone()))
+                    .child(if answered {
+                        md_text(&turn.answer, 14., TEXT).into_any_element()
+                    } else {
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(LINE_NUMBER))
+                            .child("waiting for the answer…")
+                            .into_any_element()
+                    }),
+            );
+        }
+
         Some(
             div()
                 .ml(px(40.))
@@ -31759,56 +31875,8 @@ impl Storm {
                 .gap_2()
                 .border_l_2()
                 .border_color(rgb(if waiting { BORDER } else { ACCENT }))
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_start()
-                        .gap_2()
-                        .child(
-                            div()
-                                .flex_grow(1.0)
-                                .min_w(px(0.))
-                                .text_size(px(13.))
-                                .text_color(rgb(MUTED))
-                                .child(ask.q.clone()),
-                        )
-                        .when(!when.is_empty(), |d| {
-                            d.child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_size(px(10.))
-                                    .text_color(rgb(LINE_NUMBER))
-                                    .child(when.clone()),
-                            )
-                        })
-                        .child(
-                            div()
-                                .id(("brief-ask-done", ix))
-                                .flex_shrink_0()
-                                .px_1p5()
-                                .rounded_md()
-                                .cursor_pointer()
-                                .text_size(px(10.))
-                                .text_color(rgb(LINE_NUMBER))
-                                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                                .child("done")
-                                .tooltip(tip("Clear this thread off the slide"))
-                                .on_click(cx.listener(move |this, _e, _w, cx| {
-                                    this.slide_asks.remove(&(pr, ix));
-                                    cx.notify();
-                                })),
-                        ),
-                )
-                .child(if waiting {
-                    div()
-                        .text_size(px(12.))
-                        .text_color(rgb(LINE_NUMBER))
-                        .child("waiting for the answer…")
-                        .into_any_element()
-                } else {
-                    md_text(&ask.answer, 14., TEXT).into_any_element()
-                }),
+                .child(head)
+                .when(!folded, |d| d.child(body)),
         )
     }
 
@@ -37916,6 +37984,36 @@ mod code_tour_tests {
         let bare = slide_question("", None, 1, 1, &slide, "and this?", "zz001");
         assert!(bare.contains("slide 1/1 of the brief"), "{bare}");
         assert!(!bare.contains("#"), "nothing to cite: {bare}");
+    }
+
+    /// A second question under a slide keeps the first. The answer to it is
+    /// often the thing you are about to argue with, so losing it on the way to
+    /// asking is the one thing the thread must not do.
+    #[test]
+    fn a_slide_thread_keeps_what_came_before() {
+        let mut t = SlideThread::default();
+        t.ask("aaa11".into(), "why a day?".into(), 100);
+        t.turns[0].answer = "Because the sweep is hourly.".into();
+        assert!(!t.waiting());
+        t.ask("bbb22".into(), "and the pepper?".into(), 200);
+        assert_eq!(t.turns.len(), 2, "the first turn is still there");
+        assert_eq!(t.turns[0].answer, "Because the sweep is hourly.");
+        assert!(t.waiting(), "the newest turn has nothing back yet");
+        assert_eq!(t.when(), 200, "a thread is as old as its last turn");
+
+        // folded by hand, then asked again: you want to see what you just said
+        t.folded = true;
+        t.ask("ccc33".into(), "and this?".into(), 300);
+        assert!(!t.folded);
+
+        // and it does not grow for ever
+        for i in 0..20 {
+            t.ask(format!("x{i:04}"), format!("q{i}"), 400 + i);
+        }
+        assert_eq!(t.turns.len(), 12);
+        // 3 + 20 asked, 12 kept: the last twelve, oldest dropped first
+        assert_eq!(t.turns[0].q, "q8");
+        assert_eq!(t.turns[11].q, "q19");
     }
 
     /// The clarify button writes what gets typed out most often under a slide,
