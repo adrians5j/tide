@@ -6506,13 +6506,14 @@ impl PrReading {
             force || !self.has_tour || self.tour_stale,
         )
     }
-    /// What the chip reads. The same two words whether they exist or not:
-    /// what the button is for doesn't change, only what it would cost.
+    /// What the chip reads. An explanation the branch has moved past is a
+    /// warning, worded the way the base-branch chip next to it is worded; one
+    /// that is missing or current is a plain thing to press.
     fn verb(self) -> &'static str {
         if self.stale() {
-            "Brief + tour · stale"
+            "explanation outdated"
         } else {
-            "Brief + tour"
+            "Explain PR"
         }
     }
 }
@@ -16817,87 +16818,6 @@ impl Storm {
                                 })),
                         )
                     })
-                    // the two things worth reading before the diff, as one
-                    // chip: what the change does, and where it does it
-                    .when_some(
-                        self.pr_link.clone().zip(self.reading),
-                        |d, ((num, _url, _status, base, _head, _state), reading)| {
-                            let base = match base.trim() {
-                                "" => self.pr_base.clone(),
-                                b => b.to_string(),
-                            };
-                            let (colour, hint) = if reading.stale() {
-                                (
-                                    FOLDER_ICON,
-                                    format!(
-                                        "The branch has moved past {}  ·  click to write them \
-                                         again from the code as it stands now",
-                                        match (reading.brief_stale, reading.tour_stale) {
-                                            (true, true) => "the brief and the tour",
-                                            (true, false) => "the brief",
-                                            _ => "the tour",
-                                        }
-                                    ),
-                                )
-                            } else if reading.current() {
-                                (
-                                    LINE_NUMBER,
-                                    "The brief and the tour are both current  ·  ⌥click to \
-                                     write them again"
-                                        .to_string(),
-                                )
-                            } else {
-                                (
-                                    MUTED,
-                                    format!(
-                                        "Ask for {} of #{num}: the brief for what it does, the \
-                                         tour for where",
-                                        match (reading.has_brief, reading.has_tour) {
-                                            (false, false) => "a brief and a code tour",
-                                            (true, false) => "a code tour",
-                                            _ => "a brief",
-                                        }
-                                    ),
-                                )
-                            };
-                            d.child(
-                                div()
-                                    .id("pr-catch-up")
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_1()
-                                    .px_1()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .text_size(px(11.))
-                                    .text_color(rgb(colour))
-                                    .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                                    .child(
-                                        div()
-                                            .font_family(ICON_FONT)
-                                            .text_size(px(11.))
-                                            .child(IC_TOUR),
-                                    )
-                                    .child(reading.verb())
-                                    .tooltip(tip_owned(hint))
-                                    .on_click(cx.listener(
-                                        move |this, e: &gpui::ClickEvent, _w, cx| {
-                                            this.catch_up_pr(
-                                                num,
-                                                base.clone(),
-                                                e.modifiers().alt,
-                                                cx,
-                                            )
-                                        },
-                                    )),
-                            )
-                        },
-                    )
-                    // no PR for this branch yet → say so, so the refresh icon reads clearly
-                    .when(self.pr_link.is_none() && !self.branch.is_empty(), |d| {
-                        d.child(div().text_size(px(12.)).text_color(rgb(MUTED)).child("No PR"))
-                    })
                     // refresh the PR link + checks status (otherwise only updates
                     // on branch change / cmd+R)
                     .when(!self.branch.is_empty(), |d| {
@@ -16922,6 +16842,94 @@ impl Storm {
                                 })
                                 .on_click(cx.listener(|this, _e, _w, cx| this.refresh_pr_link(cx))),
                         )
+                    })
+                    // the two things worth reading before the diff, as one
+                    // chip: what the change does, and where it does it
+                    .when_some(
+                        self.pr_link.clone().zip(self.reading),
+                        |d, ((num, _url, _status, base, _head, _state), reading)| {
+                            let base = match base.trim() {
+                                "" => self.pr_base.clone(),
+                                b => b.to_string(),
+                            };
+                            let stale = reading.stale();
+                            let (colour, hint) = if stale {
+                                (
+                                    FOLDER_ICON,
+                                    format!(
+                                        "The branch has moved past {}  ·  click to write it \
+                                         again from the code as it stands now",
+                                        match (reading.brief_stale, reading.tour_stale) {
+                                            (true, true) => "the brief and the tour",
+                                            (true, false) => "the brief",
+                                            _ => "the tour",
+                                        }
+                                    ),
+                                )
+                            } else if reading.current() {
+                                (
+                                    MUTED,
+                                    "Read the brief, and the tour at the end of it  ·  ⌥click \
+                                     to write them again"
+                                        .to_string(),
+                                )
+                            } else {
+                                (
+                                    MUTED,
+                                    format!(
+                                        "Ask for {} of #{num}: the brief for what it does, the \
+                                         tour for where",
+                                        match (reading.has_brief, reading.has_tour) {
+                                            (false, false) => "a brief and a code tour",
+                                            (true, false) => "a code tour",
+                                            _ => "a brief",
+                                        }
+                                    ),
+                                )
+                            };
+                            d.child(
+                                div()
+                                    .id("pr-explain")
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    .px_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(colour))
+                                    // an outdated explanation is drawn as the
+                                    // warning it is, in the same amber outline
+                                    // as "2 behind next" beside it
+                                    .when(stale, |d| {
+                                        d.rounded_sm().border_1().border_color(rgb(FOLDER_ICON))
+                                    })
+                                    .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                    .child(
+                                        div()
+                                            .font_family(ICON_FONT)
+                                            .text_size(px(11.))
+                                            .child(if stale { "↻" } else { IC_TOUR }),
+                                    )
+                                    .child(reading.verb())
+                                    .tooltip(tip_owned(hint))
+                                    .on_click(cx.listener(
+                                        move |this, e: &gpui::ClickEvent, _w, cx| {
+                                            this.explain_pr(
+                                                num,
+                                                base.clone(),
+                                                e.modifiers().alt,
+                                                cx,
+                                            )
+                                        },
+                                    )),
+                            )
+                        },
+                    )
+                    // no PR for this branch yet → say so, so the refresh icon reads clearly
+                    .when(self.pr_link.is_none() && !self.branch.is_empty(), |d| {
+                        d.child(div().text_size(px(12.)).text_color(rgb(MUTED)).child("No PR"))
                     })
                     // out of step with the base: how far behind, and whether
                     // catching up would conflict. Either chip hands the same
@@ -26520,20 +26528,32 @@ impl Storm {
         }
     }
 
-    /// The one button for reading a change: the brief for what it does and the
-    /// tour for where, built when they are missing and built again when the
-    /// branch has moved past them. Wanting one and not the other is rare
-    /// enough that two buttons were two decisions to make every time.
-    fn catch_up_pr(&mut self, number: u64, base: String, force: bool, cx: &mut Context<Self>) {
+    /// Walk the tour of a pull request: the one already built if there is
+    /// one, otherwise ask for it. The brief ends with this, which is the only
+    /// place the two halves of an explanation meet.
+    fn walk_pr_tour(&mut self, number: u64, base: String, cx: &mut Context<Self>) {
+        let id = self
+            .tours
+            .iter()
+            .filter(|t| t.pr == Some(number))
+            .max_by_key(|t| t.made)
+            .map(|t| t.id.clone());
+        match id {
+            Some(id) => self.open_tour(id, false, cx),
+            None => self.ask_pr_tour(number, base, cx),
+        }
+    }
+
+    /// Explain this pull request: the brief for what it does and the tour for
+    /// where it does it. One button, because wanting one and not the other is
+    /// rare enough that two were two decisions to make every time.
+    ///
+    /// It writes whatever is missing and whatever the branch has moved past,
+    /// and opens the brief when there is one to open — the deck links on to
+    /// the tour at the end of it, so one press is enough to start reading.
+    fn explain_pr(&mut self, number: u64, base: String, force: bool, cx: &mut Context<Self>) {
         let reading = self.pr_reading(number);
         let (brief, tour) = reading.wanted(force);
-        if !brief && !tour {
-            self.show_flash(
-                &format!("The brief and the tour of #{number} are both current"),
-                cx,
-            );
-            return;
-        }
         // the brief first: it is the one you read before the code, and the
         // second prompt waits in the queue until the first turn ends anyway
         if brief {
@@ -26542,12 +26562,22 @@ impl Storm {
         if tour {
             self.ask_pr_tour(number, base, cx);
         }
-        let what = match (brief, tour) {
-            (true, true) => "a brief and a code tour",
-            (true, false) => "a brief",
-            _ => "a code tour",
-        };
-        self.show_flash(&format!("Asked for {what} of #{number}"), cx);
+        // nothing to write for the brief means there is one on disk, and a
+        // button that explains the change should put it on screen
+        if !brief {
+            self.ask_pr_brief(number, String::new(), false, cx);
+        }
+        match (brief, tour) {
+            (false, false) => {}
+            (b, t) => {
+                let what = match (b, t) {
+                    (true, true) => "a brief and a code tour",
+                    (true, false) => "a brief",
+                    _ => "a code tour",
+                };
+                self.show_flash(&format!("Asked for {what} of #{number}"), cx);
+            }
+        }
         cx.notify();
     }
 
@@ -32193,6 +32223,9 @@ impl Storm {
         let stale = brief.as_ref().is_some_and(|b| {
             !b.oid.is_empty() && !self.head_oid.is_empty() && b.oid != self.head_oid
         });
+        // there is a tour of this change already, so the button walks it
+        // rather than asking for another one
+        let has_tour = pr.is_some_and(|p| self.tours.iter().any(|t| t.pr == Some(p)));
         let button = |key: &'static str, label: &'static str, lit: u32| {
             div()
                 .id(key)
@@ -32225,11 +32258,14 @@ impl Storm {
                         .gap_2()
                         .child(
                             button("brief-end-tour", "Code tour", TOUR_MARK)
-                                .tooltip(tip(
-                                    "The same change as a walk through the code, stop by stop",
-                                ))
+                                .tooltip(tip(if has_tour {
+                                    "Walk the tour of this change, stop by stop"
+                                } else {
+                                    "Ask for a tour of this change: the same code, \
+                                     walked stop by stop"
+                                }))
                                 .on_click(cx.listener(move |this, _e, _w, cx| {
-                                    this.ask_pr_tour(p, tour_base.clone(), cx)
+                                    this.walk_pr_tour(p, tour_base.clone(), cx)
                                 })),
                         )
                         .child(
@@ -38482,14 +38518,14 @@ mod code_tour_tests {
         assert_eq!(both.wanted(false), (false, false), "nothing to do");
         assert!(both.current());
         assert_eq!(both.wanted(true), (true, true), "⌥click writes them again anyway");
-        assert_eq!(both.verb(), "Brief + tour");
+        assert_eq!(both.verb(), "Explain PR");
 
         // the branch moved under the brief but not the tour: only the brief
         // is written again, and the chip says something is out of date
         let half = PrReading { brief_stale: true, ..both };
         assert_eq!(half.wanted(false), (true, false));
         assert!(half.stale() && !half.current());
-        assert_eq!(half.verb(), "Brief + tour · stale");
+        assert_eq!(half.verb(), "explanation outdated", "it reads as the warning it is");
 
         // a tour of this change but no brief yet
         let tour_only = PrReading { has_tour: true, ..Default::default() };
