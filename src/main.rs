@@ -23448,10 +23448,8 @@ impl Storm {
                             div()
                                 .flex()
                                 .flex_row()
-                                .flex_wrap()
                                 .items_center()
                                 .gap_2()
-                                .gap_y(px(4.))
                                 .child(
                                     div()
                                         .flex_shrink_0()
@@ -32191,49 +32189,22 @@ impl Storm {
                     .child(deck)
                     .child(v_scrollbar(&self.brief_scroll)),
             )
-            .child(self.brief_progress(&brief, cx))
+            .child(self.brief_progress(&brief))
             .into_any_element()
     }
 
-    /// Where you are in the deck, along the bottom. One segment per slide, so
-    /// the strip says three things at once: how far through you are, which
-    /// slides you have read, and how much is left. Clicking a segment goes
-    /// there, which is the only way to move around a deck without scrolling.
-    fn brief_progress(&self, brief: &Brief, cx: &mut Context<Self>) -> Div {
+    /// Where you are in the deck, along the bottom: the same cell bar the tour
+    /// draws over its map, filled by how far down the deck you have scrolled.
+    /// Under it, the number and the title of the slide at the top of the view.
+    fn brief_progress(&self, brief: &Brief) -> Div {
         let n = brief.slides.len();
         let at = self.brief_scroll.top_item().min(n.saturating_sub(1));
         let title = brief.slides.get(at).map(|s| s.title.clone()).unwrap_or_default();
-        let mut bar = div().flex().flex_row().items_center().gap(px(2.)).h(px(3.));
-        for ix in 0..n {
-            let read = brief.read.contains(&ix);
-            let here = ix == at;
-            let colour = if here {
-                ACCENT
-            } else if read {
-                GIT_NEW
-            } else {
-                BORDER
-            };
-            bar = bar.child(
-                div()
-                    .id(("brief-bar", ix))
-                    .flex_grow(1.0)
-                    .h_full()
-                    .rounded_sm()
-                    .bg(rgb(colour))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(if here { ACCENT } else { MUTED })))
-                    .tooltip(tip_owned(format!(
-                        "{:02}  {}",
-                        ix + 1,
-                        brief.slides.get(ix).map(|s| s.title.clone()).unwrap_or_default()
-                    )))
-                    .on_click(cx.listener(move |this, _e, _w, cx| {
-                        this.brief_scroll.scroll_to_top_of_item(ix);
-                        cx.notify();
-                    })),
-            );
-        }
+        // the scroll rather than the slide number: a deck moves continuously,
+        // and a part-filled cell is what the bar has for saying so
+        let max = f32::from(self.brief_scroll.max_offset().y).max(0.0);
+        let off = (-f32::from(self.brief_scroll.offset().y)).clamp(0.0, max);
+        let pct = if max <= 0.5 { 100 } else { (off / max * 100.0).round() as usize };
         div()
             .flex_shrink_0()
             .flex()
@@ -32244,7 +32215,7 @@ impl Storm {
             .bg(rgb(BG))
             .border_t_1()
             .border_color(rgb(BORDER))
-            .child(bar)
+            .child(segmented_bar_on(pct, ACCENT, 4., BORDER))
             .child(
                 div()
                     .flex()
@@ -32259,13 +32230,7 @@ impl Storm {
                             .text_color(rgb(LINE_NUMBER))
                             .child(format!("{:02} / {:02}", at + 1, n)),
                     )
-                    .child(
-                        div()
-                            .min_w(px(0.))
-                            .truncate()
-                            .text_color(rgb(MUTED))
-                            .child(title),
-                    ),
+                    .child(div().min_w(px(0.)).truncate().text_color(rgb(MUTED)).child(title)),
             )
     }
 
