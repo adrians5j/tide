@@ -33199,8 +33199,7 @@ impl Storm {
             // the two questions worth asking about a PR you are looking at
             .when(pr.state == PrState::Open || pr.state == PrState::Draft, |d| {
                 let (number, base) = (pr.number, pr.base.clone());
-                let tour_base = base.clone();
-                let brief_base = base.clone();
+                let explain_base = base.clone();
                 d.child(
                     div()
                         .id("pr-doc-body-check")
@@ -33221,9 +33220,11 @@ impl Storm {
                             this.ask_pr_body_check(number, base.clone(), e.modifiers().alt, cx)
                         })),
                 )
+                // one button, the same one the topbar carries: the brief for
+                // what the change does and the tour for where, wanted together
                 .child(
                     div()
-                        .id("pr-doc-tour")
+                        .id("pr-doc-explain")
                         .px_1p5()
                         .py(px(1.))
                         .rounded_md()
@@ -33233,31 +33234,13 @@ impl Storm {
                         .border_color(rgb(BORDER))
                         .text_color(rgb(MUTED))
                         .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TOUR_MARK)))
-                        .child("Tour")
-                        .tooltip(tip("Ask for a code tour of this pull request"))
-                        .on_click(cx.listener(move |this, _e, _w, cx| {
-                            this.ask_pr_tour(number, tour_base.clone(), cx)
-                        })),
-                )
-                .child(
-                    div()
-                        .id("pr-doc-brief")
-                        .px_1p5()
-                        .py(px(1.))
-                        .rounded_md()
-                        .cursor_pointer()
-                        .text_size(px(11.))
-                        .border_1()
-                        .border_color(rgb(BORDER))
-                        .text_color(rgb(MUTED))
-                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                        .child("Brief")
+                        .child("Explain")
                         .tooltip(tip(
-                            "The change as slides: what it does and why, no line numbers  ·  \
-                             ⌥click to write it again",
+                            "The brief for what this change does and the tour for where  ·  \
+                             ⌥click to write them again",
                         ))
                         .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _w, cx| {
-                            this.ask_pr_brief(number, brief_base.clone(), e.modifiers().alt, cx)
+                            this.explain_pr(number, explain_base.clone(), e.modifiers().alt, cx)
                         })),
                 )
             })
