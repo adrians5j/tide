@@ -8467,7 +8467,7 @@ impl Storm {
             tour_ask: Field::default(),
             tour_group_open: HashMap::new(),
             tour_ask_focus: cx.focus_handle(),
-            brief_ask: Field::default(),
+            brief_ask: Field::multiline(),
             brief_ask_at: None,
             slide_asks: HashMap::new(),
             reading: None,
@@ -16836,6 +16836,9 @@ impl Storm {
                                 .text_size(px(12.))
                                 .text_color(rgb(MUTED))
                                 .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                // against the number it refreshes, inside the
+                                // row's gap rather than a chip away from it
+                                .when(self.pr_link.is_some(), |d| d.ml(px(-6.)))
                                 .child("↻")
                                 .tooltip(move |_w, cx| {
                                     cx.new(|_| TooltipView { text: tip.into() }).into()
@@ -27121,6 +27124,11 @@ impl Storm {
                 self.brief_ask_at = None;
                 self.focus_active(window, cx);
             }
+            // ↩ sends, since that is what the box says it does; the other
+            // three ↩s are how a paragraph gets its second line
+            "enter" if ks.modifiers.shift || ks.modifiers.platform || ks.modifiers.alt => {
+                self.brief_ask.newline();
+            }
             "enter" => {
                 if let Some(ix) = self.brief_ask_at {
                     self.ask_about_slide(ix, cx);
@@ -32145,16 +32153,13 @@ impl Storm {
                             // the tick lives under the number rather than
                             // beside the title: the gutter is the one column
                             // that is about the slide rather than in it
+                            // the same box the tour's step list uses. It was
+                            // a ✓ drawn in the panel colour until the pointer
+                            // was near it, which is a control nobody finds
                             .child(
                                 div()
                                     .id(("brief-read", ix))
-                                    .px(px(2.))
-                                    .rounded_sm()
-                                    .cursor_pointer()
-                                    .text_size(px(11.))
-                                    .text_color(rgb(if read { GIT_NEW } else { PANEL_BG }))
-                                    .hover(|s| s.text_color(rgb(if read { GIT_NEW } else { MUTED })))
-                                    .child("✓")
+                                    .child(check_box(read))
                                     .tooltip(tip(if read {
                                         "Read  ·  click to put it back"
                                     } else {
@@ -32411,6 +32416,9 @@ impl Storm {
             .py(px(3.))
             .rounded_md()
             .bg(rgb(BG))
+            // a question worth asking under a slide is usually a paragraph, so
+            // the box opens as one rather than a line that scrolls sideways
+            .when(here, |d| d.min_h(px(58.)))
             .border_1()
             .border_color(rgb(if here { ACCENT } else { PANEL_BG }))
             .hover(move |s| s.border_color(rgb(if here { ACCENT } else { BORDER })))
@@ -32450,7 +32458,9 @@ impl Storm {
             .max_w(px(680.))
             .flex()
             .flex_row()
-            .items_center()
+            // the clarify button stays on the first line of a box that has
+            // grown to a paragraph
+            .items_start()
             .gap_1p5()
             .child(box_)
             .child(
