@@ -4381,6 +4381,36 @@ fn slide_question(
     )
 }
 
+/// What a rebuild should leave alone. A tour is built again because the
+/// branch moved under it, not because it was wrong, so the stops already read
+/// are the ones to keep where the code under them hasn't moved. It also says
+/// where the work is: the stops nobody has read yet.
+fn tour_read_note(stops: &[Stop], seen: &HashSet<usize>) -> String {
+    let mut read: Vec<usize> = seen.iter().copied().filter(|i| *i < stops.len()).collect();
+    read.sort_unstable();
+    if read.is_empty() || read.len() == stops.len() {
+        return String::new();
+    }
+    let lines: String = read
+        .iter()
+        .map(|i| {
+            let stop = &stops[*i];
+            let title = match stop.title.trim() {
+                "" => String::new(),
+                t => format!(" — {t}"),
+            };
+            format!("\x20 • {}{}\n", stop_label(stop), title)
+        })
+        .collect();
+    format!(
+        "\n\nI have already read these stops:\n{lines}\n\
+         Keep them as they are, in the same order, unless the code under one \
+         has actually moved — then fix that one and say which. The rest is \
+         what I haven't read, so that is where the work is: check each one \
+         still holds, and cover what the branch has brought in since.\n"
+    )
+}
+
 fn tour_request(about: Option<&str>, answer: Option<&str>) -> String {
     // the answer is the route: it already has the references, in the order it
     // walked them
@@ -4531,8 +4561,10 @@ fn pr_body_check(number: u64, base: &str, update: bool) -> String {
 /// than from the conversation, and ordered the way the change wants to be
 /// read. Reviewing a 26-file PR top to bottom in the files list is reading a
 /// story in the order the pages were printed.
-fn pr_tour_request(number: u64, base: &str) -> String {
-    let about = format!("#{number} — what it changes, in the order it should be read");
+fn pr_tour_request(number: u64, base: &str, read: &str) -> String {
+    let about = format!(
+        "#{number} — what it changes, in the order it should be read{read}"
+    );
     let against = match base.trim() {
         "" => "its base".to_string(),
         b => format!("`{b}`"),
@@ -6545,6 +6577,9 @@ struct TourRec {
     /// The commit the tour was built against, so TIDE can tell the code has
     /// moved out from under its stops.
     oid: String,
+    /// Stops you have read, by index. Standing on one marks it; the tick in
+    /// the map marks it without going there, for the stop you already know.
+    seen: Vec<usize>,
     stops: Vec<Stop>,
 }
 
@@ -6576,6 +6611,10 @@ struct Walk {
     /// Where the current stop resolved to on disk, so the editor can be told
     /// which lines to light up without resolving the path on every frame.
     here: Option<(PathBuf, usize, usize)>,
+    /// Which stops have been read. Standing on one puts it here; so does the
+    /// tick in the map, which is the point: a tour of twenty stops is mostly
+    /// code you already know, and saying so is what leaves the rest visible.
+    seen: HashSet<usize>,
 }
 
 /// How a change touched one box in a diagram. It picks the box's colour, which
@@ -6954,6 +6993,7 @@ fn tours_to_json(list: &[TourRec]) -> String {
                 "closed": t.closed,
                 "pr": t.pr,
                 "oid": t.oid,
+                "seen": t.seen,
                 "steps": steps,
             })
         })
@@ -6993,6 +7033,21 @@ fn tour_rec_from_json(v: &serde_json::Value) -> Option<TourRec> {
         closed: v.get("closed").and_then(|c| c.as_bool()).unwrap_or(false),
         pr: v.get("pr").and_then(|n| n.as_u64()),
         oid: v.get("oid").and_then(|o| o.as_str()).unwrap_or("").to_string(),
+        seen: v
+            .get("seen")
+            .and_then(|s| s.as_array())
+            .map(|a| {
+                let mut v: Vec<usize> = a
+                    .iter()
+                    .filter_map(|i| i.as_u64())
+                    .map(|i| i as usize)
+                    .filter(|i| *i < stops.len())
+                    .collect();
+                v.sort_unstable();
+                v.dedup();
+                v
+            })
+            .unwrap_or_default(),
         stops,
     })
 }
@@ -7019,6 +7074,9 @@ fn load_tours(root: &Path) -> Vec<TourRec> {
 fn walk_from_rec(t: &TourRec, restart: bool) -> Walk {
     Walk {
         at: if restart { 0 } else { t.at.min(t.stops.len().saturating_sub(1)) },
+        // walking it again is still the same tour: what you have read stays
+        // read, or every rebuild would hand back twenty unread stops
+        seen: t.seen.iter().copied().collect(),
         stops: t.stops.clone(),
         tour: Some(t.title.clone()),
         id: Some(t.id.clone()),
@@ -22859,6 +22917,32 @@ impl Storm {
                                     .tooltip(tip("The tour comes back to this file")),
                             )
                         })
+                        // read the whole visit in one tick: twenty stops
+                        // marked one at a time is why nobody marks them
+                        .child({
+                            let steps = n.steps.clone();
+                            let all = !steps.is_empty()
+                                && steps.iter().all(|i| w.seen.contains(i));
+                            div()
+                                .id(("tour-seen", ni))
+                                .occlude()
+                                .flex_shrink_0()
+                                .px_1()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_size(px(10.))
+                                .text_color(rgb(if all { GIT_NEW } else { LINE_NUMBER }))
+                                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(GIT_NEW)))
+                                .child("✓")
+                                .tooltip(tip(if all {
+                                    "Read  ·  click to put it back"
+                                } else {
+                                    "Mark every stop in this file as read"
+                                }))
+                                .on_click(cx.listener(move |this, _e, _w, cx| {
+                                    this.mark_stops_seen(steps.clone(), !all, cx)
+                                }))
+                        })
                         .when(notes > 0, |d| {
                             // an answered thread reads in the accent, an
                             // unanswered one in the comment colour: the point is
@@ -22950,6 +23034,7 @@ impl Storm {
             let mut chips = div().flex().flex_row().flex_wrap().gap(px(3.));
             for &si in &n.steps {
                 let cur = si == w.at;
+                let read = w.seen.contains(&si);
                 let title = w
                     .stops
                     .get(si)
@@ -22966,14 +23051,36 @@ impl Storm {
                         .cursor_pointer()
                         .text_size(px(10.))
                         .border_1()
-                        .border_color(rgb(if cur { accent } else { BORDER }))
+                        .border_color(rgb(if cur {
+                            accent
+                        } else if read {
+                            GIT_NEW
+                        } else {
+                            BORDER
+                        }))
                         .bg(rgb(if cur { SELECTED_BG } else { BG }))
-                        .text_color(rgb(if cur { SEL_TEXT } else { MUTED }))
+                        .text_color(rgb(if cur {
+                            SEL_TEXT
+                        } else if read {
+                            GIT_NEW
+                        } else {
+                            MUTED
+                        }))
                         .hover(|s| s.bg(rgb(if cur { SELECTED_BG } else { HOVER })).text_color(rgb(TEXT)))
                         .child(format!("{}", si + 1))
-                        .tooltip(tip_owned(format!("{}. {title}", si + 1)))
-                        .on_click(cx.listener(move |this, _e, window, cx| {
-                            this.goto_walk_stop(si, window, cx)
+                        .tooltip(tip_owned(format!(
+                            "{}. {title}{}",
+                            si + 1,
+                            if read { "  ·  read  ·  ⌥click to put it back" } else { "  ·  ⌥click to mark it read" }
+                        )))
+                        .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
+                            // ⌥click marks it without going there: the stop you
+                            // already know is the one you don't want to open
+                            if e.modifiers().alt {
+                                this.mark_stops_seen(vec![si], !read, cx);
+                            } else {
+                                this.goto_walk_stop(si, window, cx)
+                            }
                         })),
                 );
             }
@@ -23001,15 +23108,12 @@ impl Storm {
         // the branch has moved since this tour was built, so its stops are
         // describing code that may not be there any more
         let stale = rec.is_some_and(|t| !t.oid.is_empty() && t.oid != self.head_oid);
-        // on the start card you have walked none of it, on the end card all of
-        // it, and otherwise the stop you are standing on counts
+        // what you have read, which is not the same as how far the cursor has
+        // got: a stop you ticked without opening counts, and one you scrolled
+        // past does not
         let total = w.stops.len();
-        let walked = match (w.intro, w.done) {
-            (true, _) => 0,
-            (_, true) => total,
-            _ => w.at + 1,
-        };
-        let pct = if total == 0 { 0 } else { walked * 100 / total };
+        let read = w.seen.len().min(total);
+        let pct = if total == 0 { 0 } else { read * 100 / total };
         let accent = if w.tour.is_some() { TOUR_MARK } else { COMMENT_MARK };
         let mut list = div()
             .id("tour-steps")
@@ -23020,6 +23124,7 @@ impl Storm {
             .overflow_y_scroll();
         for (i, s) in w.stops.iter().enumerate() {
             let on = i == w.at;
+            let read = w.seen.contains(&i);
             let label = if s.title.trim().is_empty() { s.said.clone() } else { s.title.clone() };
             list = list.child(
                 div()
@@ -23063,6 +23168,24 @@ impl Storm {
                                     .text_color(rgb(MUTED))
                                     .child(stop_label(s)),
                             ),
+                    )
+                    // the same tick as the map's, where there is room for a
+                    // real box rather than a glyph
+                    .child(
+                        div()
+                            .id(("tour-step-seen", i))
+                            .occlude()
+                            .flex_shrink_0()
+                            .mt(px(2.))
+                            .child(check_box(read))
+                            .tooltip(tip(if read {
+                                "Read  ·  click to put it back"
+                            } else {
+                                "Mark this stop as read"
+                            }))
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                this.mark_stops_seen(vec![i], !read, cx)
+                            })),
                     )
                     .on_click(cx.listener(move |this, _e, window, cx| {
                         this.goto_walk_stop(i, window, cx)
@@ -23136,7 +23259,7 @@ impl Storm {
                                 .child(
                                     div()
                                         .flex_shrink_0()
-                                        .child(format!("{walked}/{total} walked")),
+                                        .child(format!("{read}/{total} read")),
                                 )
                                 .when_some(pr, |d, n| {
                                     d.child(
@@ -23917,8 +24040,17 @@ impl Storm {
     fn ask_pr_tour(&mut self, number: u64, base: String, cx: &mut Context<Self>) {
         self.pending_tour_pr = Some(number);
         let label = format!("Asked for a code tour of #{number}");
+        // a tour of this pull request already read in part: the stops you have
+        // read are the ones a rebuild should leave alone
+        let read = self
+            .tours
+            .iter()
+            .filter(|t| t.pr == Some(number))
+            .max_by_key(|t| t.made)
+            .map(|t| tour_read_note(&t.stops, &t.seen.iter().copied().collect()))
+            .unwrap_or_default();
         self.agent_open = true;
-        self.send_agent_prompt_as(pr_tour_request(number, &base), Some(label), cx);
+        self.send_agent_prompt_as(pr_tour_request(number, &base, &read), Some(label), cx);
         self.agent_list.scroll_to_end();
         cx.notify();
     }
@@ -23928,13 +24060,20 @@ impl Storm {
     fn regen_tour(&mut self, cx: &mut Context<Self>) {
         let Some(name) = self.walk.as_ref().map(|w| w.tour.clone()) else { return };
         self.pending_tour_pr = self.open_tour_rec().and_then(|t| t.pr);
+        // what is already read rides along: a rebuild that hands back twenty
+        // unread stops is a rebuild that costs the reading twice
+        let read = self
+            .walk
+            .as_ref()
+            .map(|w| tour_read_note(&w.stops, &w.seen))
+            .unwrap_or_default();
         let about = match name.as_deref().map(str::trim) {
             Some(n) if !n.is_empty() => format!(
                 "\u{201c}{n}\u{201d}. There is already a tour by that name, but the code has \
                  moved under it. Build it again from the code as it stands now, \
-                 and keep the name."
+                 and keep the name.{read}"
             ),
-            _ => "this answer, again, from the code as it stands now".to_string(),
+            _ => format!("this answer, again, from the code as it stands now{read}"),
         };
         let label = match name.as_deref().map(str::trim) {
             Some(n) if !n.is_empty() => format!("Asked for \u{201c}{n}\u{201d} to be built again"),
@@ -26142,6 +26281,7 @@ impl Storm {
                 id: None,
                 list: true,
                 here: None,
+                seen: HashSet::new(),
             });
     }
 
@@ -26428,6 +26568,7 @@ impl Storm {
             closed: false,
             pr,
             oid: self.head_oid.clone(),
+            seen: Vec::new(),
             stops: stops.clone(),
         };
         self.walk = Some(Walk {
@@ -26439,6 +26580,7 @@ impl Storm {
             id: Some(rec.id.clone()),
             list: true,
             here: None,
+            seen: HashSet::new(),
         });
         // newest first, and the rest are put away: one tour is open at a time
         for t in self.tours.iter_mut() {
@@ -26646,16 +26788,40 @@ impl Storm {
     /// Copy where you've got to back into the stored tour. The stop you're on
     /// is part of a tour the way the scroll position is part of a book.
     fn tour_touched(&mut self) {
-        let Some((id, at)) = self.walk.as_ref().and_then(|w| Some((w.id.clone()?, w.at))) else {
+        let Some((id, at, seen)) = self.walk.as_ref().and_then(|w| {
+            let mut seen: Vec<usize> = w.seen.iter().copied().collect();
+            seen.sort_unstable();
+            Some((w.id.clone()?, w.at, seen))
+        }) else {
             return;
         };
         let Some(rec) = self.tours.iter_mut().find(|t| t.id == id) else { return };
-        if rec.at == at && !rec.closed {
+        if rec.at == at && rec.seen == seen && !rec.closed {
             return; // nothing moved
         }
         rec.at = at;
+        rec.seen = seen;
         rec.closed = false;
         self.save_tours();
+    }
+
+    /// Mark stops read, or unread, without walking to them. `on` is what they
+    /// all become, so ticking a file whose stops are half read finishes it
+    /// rather than inverting it one by one.
+    fn mark_stops_seen(&mut self, which: Vec<usize>, on: bool, cx: &mut Context<Self>) {
+        let Some(w) = self.walk.as_mut() else { return };
+        for i in which {
+            if i >= w.stops.len() {
+                continue;
+            }
+            if on {
+                w.seen.insert(i);
+            } else {
+                w.seen.remove(&i);
+            }
+        }
+        self.tour_touched();
+        cx.notify();
     }
 
     /// Open a stored tour. `restart` takes it from the top; otherwise it picks
@@ -26789,6 +26955,7 @@ impl Storm {
         w.at = i;
         w.intro = false;
         w.done = false;
+        w.seen.insert(i); // standing on it is reading it
         self.open_walk_stop(&stop, window, cx);
         self.tour_touched(); // the stop you're on is part of the tour's state
     }
@@ -37639,7 +37806,7 @@ mod pr_body_check_tests {
     /// read the change from and what order to put it in.
     #[test]
     fn a_pr_tour_is_built_from_the_change() {
-        let q = pr_tour_request(6080, "next");
+        let q = pr_tour_request(6080, "next", "");
         // it is a tour, so it still carries the shape an answer has to take
         assert!(q.contains("$TIDE_RPC/tour"), "{q}");
         assert!(q.contains("\"steps\""), "{q}");
@@ -37650,7 +37817,10 @@ mod pr_body_check_tests {
         assert!(q.contains("the entry point first"), "{q}");
         assert!(q.contains("version bumps"), "{q}");
         // no base read yet: still a usable ask
-        assert!(pr_tour_request(42, "  ").contains("against its base"));
+        assert!(pr_tour_request(42, "  ", "").contains("against its base"));
+        // and a tour half read asks for the half that isn't
+        let again = pr_tour_request(6080, "next", "\n\nI have already read these stops:\n  • src/a.ts:1\n");
+        assert!(again.contains("I have already read these stops"), "{again}");
     }
 
     /// ⌥click asks for the rewrite too, and for the refresh that makes TIDE
@@ -37811,6 +37981,7 @@ mod tour_end_tests {
                 })
                 .collect(),
             at: 0,
+            seen: HashSet::new(),
             tour: Some("A tour".into()),
             id: Some("t1".into()),
             intro: false,
@@ -38322,8 +38493,29 @@ mod code_tour_tests {
             closed,
             pr: None,
             oid: String::new(),
+            seen: vec![at],
             stops: vec![stop("src/a.ts", 67, 72, "trigger()"), stop("src/b.ts", 12, 12, "loop")],
         }
+    }
+
+    /// A rebuild is told what has already been read, so it keeps those stops
+    /// instead of handing back a tour that has to be walked from the top.
+    #[test]
+    fn a_rebuild_is_told_what_has_been_read() {
+        let stops =
+            vec![stop("src/a.ts", 67, 72, "trigger()"), stop("src/b.ts", 12, 12, "the loop")];
+        let note = tour_read_note(&stops, &HashSet::from([0]));
+        assert!(note.contains("src/a.ts:67-72"), "{note}");
+        assert!(note.contains("trigger()"), "{note}");
+        assert!(!note.contains("src/b.ts"), "the unread stop is the work, not the list: {note}");
+        assert!(note.contains("Keep them as they are"), "{note}");
+
+        // nothing read, or all of it read, and there is nothing to say: a
+        // tour nobody has opened is rebuilt whole, and so is one read through
+        assert_eq!(tour_read_note(&stops, &HashSet::new()), "");
+        assert_eq!(tour_read_note(&stops, &HashSet::from([0, 1])), "");
+        // an index left over from a shorter tour is not a stop
+        assert_eq!(tour_read_note(&stops, &HashSet::from([9])), "");
     }
 
     /// Tours survive a restart: the stops, their prose, where you had got to,
@@ -38333,6 +38525,10 @@ mod code_tour_tests {
         let list = vec![rec("t1", "Task dispatch", 1, false), rec("t2", "Uploads", 0, true)];
         let back = tours_from_json(&tours_to_json(&list));
         assert_eq!(back.len(), 2);
+        // what you have read comes back with it: a tour reopened as all-unread
+        // is a tour you have to walk twice
+        assert_eq!(back[0].seen, vec![1]);
+        assert_eq!(back[1].seen, vec![0]);
         assert_eq!(back[0].id, "t1");
         assert_eq!(back[0].title, "Task dispatch");
         assert_eq!(back[0].at, 1);
