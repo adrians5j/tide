@@ -132,6 +132,26 @@ enum AgentMsg {
     },
 }
 
+/// A turn whose working is folded away in the transcript. The question was
+/// asked from a slide or a tour stop and its answer is going back there, so
+/// the tool calls and the long version in the pane are a wall of text between
+/// you and the next question. `at` is the user message that started it, and
+/// `end` is the user message that ended it — `None` while it is still the last
+/// turn in the transcript.
+#[derive(Clone)]
+struct QuietTurn {
+    at: usize,
+    end: Option<usize>,
+    open: bool,
+}
+
+/// Which folded turn a transcript row belongs to. A turn runs from the user
+/// message that started it up to the user message that ended it, and a turn
+/// still waiting for its last word has no end yet.
+fn quiet_at(turns: &[QuietTurn], ix: usize) -> Option<&QuietTurn> {
+    turns.iter().find(|q| ix >= q.at && q.end.is_none_or(|e| ix < e))
+}
+
 /// The live `@` mention in front of the caret: where its `@` sits and what has
 /// been typed after it. A mention starts a word (never an e-mail's `a@b`) and
 /// ends at the first space, so `@wby` is live and `@wby next` is plain text
@@ -6390,6 +6410,8 @@ struct Queued {
     /// What the transcript shows in place of the prompt, when they differ.
     label: Option<String>,
     imgs: Vec<PastedImage>,
+    /// Asked from a slide or a stop: its working folds when it finally goes.
+    quiet: bool,
 }
 
 /// One stop on a walk through an answer's code references: the file, the lines,
@@ -8032,6 +8054,12 @@ struct Storm {
     /// Prompts typed while a turn was still running, sent in order as each turn
     /// ends — the same queueing Claude Code does in the terminal.
     agent_queue: Vec<Queued>,
+    /// Turns whose working is folded in the transcript, oldest first.
+    quiet_turns: Vec<QuietTurn>,
+    /// Set by the asker just before it sends, read where the user message
+    /// lands: a prompt sent while a turn is running waits in the queue, so the
+    /// message it will become has no index yet.
+    quiet_next: bool,
     /// Virtualized transcript state, and the item count it was last told about.
     agent_list: gpui::ListState,
     agent_list_len: usize,
@@ -8606,6 +8634,8 @@ impl Storm {
             agent_jump_query: Field::default(),
             agent_jump_focus: cx.focus_handle(),
             agent_queue: Vec::new(),
+            quiet_turns: Vec::new(),
+            quiet_next: false,
             agent_list: gpui::ListState::new(0, gpui::ListAlignment::Bottom, px(600.)),
             agent_list_len: 0,
             acp_state: None,
@@ -24764,6 +24794,7 @@ impl Storm {
         self.agent_list.scroll_to_end(); // a replayed session opens at its end
         self.agent_picker = false;
         self.agent_msgs.clear();
+        self.quiet_turns.clear();
         self.agent_cur = None;
         self.agent_cur_thought = None;
         self.agent_ctx = None;
@@ -25529,6 +25560,9 @@ impl Storm {
             self.show_flash("The reviewers are still reading — hold on", cx);
             return;
         }
+        // read before the paths that queue it, so a question asked from a
+        // slide while the agent is busy is still folded when it goes
+        let quiet = std::mem::take(&mut self.quiet_next);
         self.ensure_acp(cx);
         let Some(acp) = self.acp.clone() else { return };
         // the plan window is spent: a prompt sent now comes back as a
@@ -25537,7 +25571,7 @@ impl Storm {
         // handing over reports nobody can type again
         if let Some(why) = self.usage_block() {
             let imgs = self.agent_imgs.drain(..).collect();
-            self.agent_queue.push(Queued { text, label, imgs, by });
+            self.agent_queue.push(Queued { text, label, imgs, by, quiet });
             self.show_flash(&format!("{why}. Held in the queue — Send anyway in the composer."), cx);
             self.agent_list.scroll_to_end();
             cx.notify();
@@ -25548,7 +25582,7 @@ impl Storm {
         if self.agent_busy {
             // the attachments go with it, not with the next thing you send
             let imgs = self.agent_imgs.drain(..).collect();
-            self.agent_queue.push(Queued { text, label, imgs, by });
+            self.agent_queue.push(Queued { text, label, imgs, by, quiet });
             self.agent_list.scroll_to_end();
             cx.notify();
             return;
@@ -25566,6 +25600,7 @@ impl Storm {
         };
         acp.prompt_with(&sent, &imgs);
         self.agent_msgs.push(AgentMsg::User { text: shown, imgs: kept, by });
+        self.mark_turn_start(quiet);
         self.agent_turn_start = Some(std::time::Instant::now());
         self.start_agent_spinner(cx);
         // same signal a terminal agent's UserPromptSubmit hook sends
@@ -27366,6 +27401,7 @@ impl Storm {
         self.stop_asks.entry(key).or_default().ask(id, q.clone(), now_secs());
         self.tour_ask.clear();
         self.agent_open = true;
+        self.quiet_next = true; // same bargain as a slide's question
         self.send_agent_prompt_by(text, Some(q), Sender::You, cx);
         self.agent_list.scroll_to_end();
         // the answer lands in the pane; typing carries on in the editor
@@ -27394,6 +27430,9 @@ impl Storm {
             .ask(id, q.clone(), now_secs());
         self.brief_ask.clear();
         self.agent_open = true;
+        // the answer comes back under the slide, so the pane doesn't need the
+        // tool calls and the long version of it as well
+        self.quiet_next = true;
         self.send_agent_prompt_by(text, Some(q), Sender::You, cx);
         self.agent_list.scroll_to_end();
         cx.notify();
@@ -27723,6 +27762,68 @@ impl Storm {
         cx.notify();
     }
 
+    /// A user message has just landed in the transcript. Whatever turn was
+    /// running is over, so a fold that was still growing stops here; and when
+    /// this question came from a slide or a stop, its own working folds.
+    fn mark_turn_start(&mut self, quiet: bool) {
+        let at = self.agent_msgs.len().saturating_sub(1);
+        if let Some(q) = self.quiet_turns.last_mut().filter(|q| q.end.is_none()) {
+            q.end = Some(at);
+        }
+        if quiet {
+            self.quiet_turns.push(QuietTurn { at, end: None, open: false });
+        }
+    }
+
+    /// The folded turn this message falls inside, if any. The turn's own user
+    /// message is part of it: that is where the chip that unfolds it goes.
+    fn quiet_turn(&self, ix: usize) -> Option<&QuietTurn> {
+        quiet_at(&self.quiet_turns, ix)
+    }
+
+    /// The line under your question that says what was folded away, and
+    /// unfolds it. Nothing to show means nothing has come back yet.
+    fn quiet_chip(&self, ix: usize, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let q = self.quiet_turns.iter().find(|q| q.at == ix)?;
+        let end = q.end.unwrap_or(self.agent_msgs.len());
+        let steps = end.saturating_sub(ix + 1);
+        if steps == 0 {
+            return None;
+        }
+        let open = q.open;
+        Some(
+            div()
+                .id(("quiet-fold", ix))
+                .flex_shrink_0()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .px_1()
+                .rounded_md()
+                .cursor_pointer()
+                .text_size(px(10.))
+                .text_color(rgb(MUTED))
+                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                .child(if open { "▾" } else { "▸" })
+                .child(format!(
+                    "{steps} step{} · answered where you asked",
+                    if steps == 1 { "" } else { "s" }
+                ))
+                .tooltip(tip(if open {
+                    "Fold the working away again"
+                } else {
+                    "Show what the agent did to answer this"
+                }))
+                .on_click(cx.listener(move |this, _e, _w, cx| {
+                    if let Some(q) = this.quiet_turns.iter_mut().find(|q| q.at == ix) {
+                        q.open = !q.open;
+                    }
+                    cx.notify();
+                })),
+        )
+    }
+
     /// Send the next queued prompt, if any. Called when a turn ends.
     fn agent_next_queued(&mut self) {
         // a queued prompt is not a running turn: it waits out the limit in the
@@ -27730,7 +27831,7 @@ impl Storm {
         if self.agent_queue.is_empty() || self.usage_block().is_some() {
             return;
         }
-        let Queued { text, label, imgs, by } = self.agent_queue.remove(0);
+        let Queued { text, label, imgs, by, quiet } = self.agent_queue.remove(0);
         if let Some(acp) = self.acp.clone() {
             let sent = if self.agent_briefed {
                 text.clone()
@@ -27745,6 +27846,7 @@ impl Storm {
                 imgs: kept,
                 by,
             });
+            self.mark_turn_start(quiet);
             self.agent_turn_start = Some(std::time::Instant::now());
             self.acp_state = Some(AgentState::Working);
             self.agent_cur = None;
@@ -28330,6 +28432,12 @@ impl Storm {
             gpui::list(
                 self.agent_list.clone(),
                 cx.processor(|this: &mut Self, ix: usize, window: &mut Window, cx: &mut Context<Self>| {
+                    // a question asked from a slide or a stop keeps its working
+                    // to itself: the answer is going back where it was asked,
+                    // and the chip under the question unfolds the rest
+                    if this.quiet_turn(ix).is_some_and(|q| !q.open && ix > q.at) {
+                        return div().into_any_element();
+                    }
                     if let Some(m) = this.agent_msgs.get(ix) {
                         // the closing summary, in its own card
                         if matches!(m, AgentMsg::Reviewing) {
@@ -28462,6 +28570,7 @@ impl Storm {
                                         .child(this.render_agent_md(ix, &text, window, cx)),
                                 )
                                 .children(user_images(&imgs, ix))
+                                .children(this.quiet_chip(ix, cx))
                                 .into_any_element();
                         }
                         return div().px_3().py_1().child(render_agent_msg(m, ix, this.shot_width())).into_any_element();
@@ -38853,6 +38962,28 @@ mod code_tour_tests {
         assert!(q.contains("$TIDE_RPC/comment"), "{q}");
         assert!(q.contains("\"id\":\"q7x2b\""), "{q}");
         assert!(q.contains("Don't rebuild the tour"), "{q}");
+    }
+
+    /// A question asked from a slide folds its own working and nothing else:
+    /// the turn before it and the turn after it are somebody else's rows.
+    #[test]
+    fn a_folded_turn_owns_its_own_rows_only() {
+        let turns = vec![
+            QuietTurn { at: 2, end: Some(6), open: false },
+            QuietTurn { at: 9, end: None, open: false },
+        ];
+        // the question itself is part of the fold: that is where the chip goes
+        assert!(quiet_at(&turns, 2).is_some());
+        assert!(quiet_at(&turns, 5).is_some());
+        // the message that ended it belongs to the next turn
+        assert!(quiet_at(&turns, 6).is_none());
+        assert!(quiet_at(&turns, 8).is_none());
+        // a turn still running swallows everything after it
+        assert!(quiet_at(&turns, 9).is_some());
+        assert!(quiet_at(&turns, 400).is_some());
+        // and nothing before the first fold
+        assert!(quiet_at(&turns, 0).is_none());
+        assert!(quiet_at(&[], 3).is_none());
     }
 
     /// The card draws what the stop's own lines used to say, and only that:
