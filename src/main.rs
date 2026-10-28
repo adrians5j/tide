@@ -27661,10 +27661,13 @@ impl Storm {
                 self.brief_ask_at = None;
                 self.focus_active(window, cx);
             }
-            // ⇧↩ sends and a plain ↩ writes a line: this is a box you type a
-            // paragraph into, and the key you reach for without thinking
-            // should be the one that can't send half a question
-            "enter" if ks.modifiers.shift => {
+            // ⌘↩ or ⇧↩ sends and a plain ↩ writes a line: this is a box you
+            // type a paragraph into, and the key you reach for without
+            // thinking should be the one that can't send half a question.
+            // ⌘↩ is the submit key everywhere else in TIDE — the todo form,
+            // the commit box, a review comment — so it is the one that gets
+            // pressed here, whatever the hint says
+            "enter" if ks.modifiers.shift || ks.modifiers.platform => {
                 if let Some(ix) = self.brief_ask_at {
                     self.ask_about_slide(ix, cx);
                 }
@@ -33192,7 +33195,7 @@ impl Storm {
                 this.ask_about_slide(ix, cx);
             }));
         let send = chip("brief-send", "send")
-            .tooltip(tip("Ask the agent about this slide  (⇧↩)"))
+            .tooltip(tip("Ask the agent about this slide  (⌘↩ or ⇧↩)"))
             .on_click(cx.listener(move |this, _e, _w, cx| this.ask_about_slide(ix, cx)));
         let box_ = div()
             .id(("brief-ask", ix))
@@ -33258,7 +33261,7 @@ impl Storm {
                             .min_w(px(0.))
                             .truncate()
                             .text_color(rgb(LINE_NUMBER))
-                            .child("Ask about this slide…  ⇧↩"),
+                            .child("Ask about this slide…  ⌘↩"),
                     )
                     .child(clarify),
             )
