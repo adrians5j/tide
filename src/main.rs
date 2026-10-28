@@ -4356,23 +4356,23 @@ fn merged_note(number: u64, about: Option<&PrDoc>) -> String {
 }
 
 
-/// What happened to one line of a stop's own code.
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum StopMark {
-    Same,
-    Add,
-    Del,
-}
-
-/// One line of a stop's own before/after, ready to draw: what happened to it,
-/// the number beside it, the text, and the syntax runs the editor would give
-/// that text. `runs` is filled in by whoever has the file; empty draws plain.
+/// One side of a row in a stop's own before/after: the line number to print,
+/// the text, and the syntax runs the editor would paint on it. `runs` is
+/// filled in by whoever has the file; empty draws plain.
 #[derive(Clone, Debug)]
-struct StopLine {
-    mark: StopMark,
+struct StopSide {
     no: usize,
     text: String,
     runs: Vec<Run>,
+}
+
+/// One row of a stop's own before/after, paired the way the diff window pairs
+/// a file: what the line was on the left, what it is on the right. A side is
+/// `None` where that file has no line for this row.
+#[derive(Clone, Debug)]
+struct StopRow {
+    left: Option<StopSide>,
+    right: Option<StopSide>,
 }
 
 /// A stop's own lines with the change still in them, in file order: the lines
@@ -4381,12 +4381,14 @@ struct StopLine {
 /// file's diff, which is what the diff window is for. An empty answer means
 /// there is nothing worth drawing: a stop on code nothing touched, a file that
 /// is new all through, or more changed lines than `cap`.
-fn stop_before_after(old: &str, new: &str, line: usize, end: usize, cap: usize) -> Vec<StopLine> {
+fn stop_before_after(old: &str, new: &str, line: usize, end: usize, cap: usize) -> Vec<StopRow> {
     if old.trim().is_empty() || new.trim().is_empty() {
         return Vec::new();
     }
-    let row = |mark, no, text| StopLine { mark, no, text, runs: Vec::new() };
-    let mut out: Vec<StopLine> = Vec::new();
+    let side = |no: Option<usize>, text: Option<String>| {
+        no.zip(text).map(|(no, text)| StopSide { no, text, runs: Vec::new() })
+    };
+    let mut out: Vec<StopRow> = Vec::new();
     let mut last_right = 0usize;
     let mut moved = 0usize;
     for r in diff::compute(old, new) {
@@ -4400,23 +4402,12 @@ fn stop_before_after(old: &str, new: &str, line: usize, end: usize, cap: usize) 
         if at < line || at > end {
             continue;
         }
-        let gone = r.left_no.unwrap_or(0);
-        match r.kind {
-            DiffKind::Equal => out.push(row(StopMark::Same, at, r.right.unwrap_or_default())),
-            DiffKind::Del => {
-                moved += 1;
-                out.push(row(StopMark::Del, gone, r.left.unwrap_or_default()));
-            }
-            DiffKind::Ins => {
-                moved += 1;
-                out.push(row(StopMark::Add, at, r.right.unwrap_or_default()));
-            }
-            DiffKind::Replace => {
-                moved += 2;
-                out.push(row(StopMark::Del, gone, r.left.unwrap_or_default()));
-                out.push(row(StopMark::Add, at, r.right.unwrap_or_default()));
-            }
-        }
+        moved += match r.kind {
+            DiffKind::Equal => 0,
+            DiffKind::Replace => 2,
+            _ => 1,
+        };
+        out.push(StopRow { left: side(r.left_no, r.left), right: side(r.right_no, r.right) });
         // the cap counts what changed, not what is drawn around it: a stop
         // over twenty untouched lines is still a snippet, a stop over twenty
         // changed ones is a diff
@@ -6569,6 +6560,34 @@ fn pkg_name(path: &str) -> &str {
     ""
 }
 
+/// The directory of the package a file is in, as the repo spells it:
+/// `packages/languages`. Empty when the path isn't under a `packages/`.
+fn pkg_dir(path: &str) -> &str {
+    let mut at = 0usize;
+    for seg in path.split('/') {
+        if seg == "packages" {
+            let rest = path.get(at + seg.len() + 1..).unwrap_or("");
+            let name = rest.split('/').next().unwrap_or("");
+            if name.is_empty() {
+                return "";
+            }
+            return &path[..at + seg.len() + 1 + name.len()];
+        }
+        at += seg.len() + 1;
+    }
+    ""
+}
+
+/// What a package calls itself: the `name` out of its package.json. `None`
+/// when there is no package.json there, or it has no name — a directory name
+/// is not what anybody types or searches for.
+fn pkg_json_name(root: &Path, dir: &str) -> Option<String> {
+    let text = std::fs::read_to_string(root.join(dir).join("package.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let name = v.get("name")?.as_str()?.trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
 /// The other stops a stop's prose points at: the ones whose file or title it
 /// names. A description that says "wakes every driveTask call" is talking about
 /// a stop you have already walked or one that is coming, and without this you
@@ -8102,7 +8121,11 @@ struct Storm {
     /// for: file, lines and head. Computed once a stop rather than once a
     /// frame, since it costs two `git show`s.
     stop_diff_key: Option<(PathBuf, usize, usize, String)>,
-    stop_diff: Vec<StopLine>,
+    stop_diff: Vec<StopRow>,
+    /// What each package a tour touches calls itself, by its directory:
+    /// `packages/languages` → `@webiny/languages`. Read off disk once, because
+    /// the map asks for it per stop and the answer doesn't move.
+    pkg_names: HashMap<String, String>,
     /// The deck's scroll, so the strip along the bottom can say which slide
     /// you are on and jump to another one.
     brief_scroll: gpui::ScrollHandle,
@@ -8702,6 +8725,7 @@ impl Storm {
             stop_asks: HashMap::new(),
             stop_diff_key: None,
             stop_diff: Vec::new(),
+            pkg_names: HashMap::new(),
             brief_scroll: gpui::ScrollHandle::new(),
             reading: None,
             reading_key: None,
@@ -23208,7 +23232,7 @@ impl Storm {
             let pkg = w
                 .stops
                 .get(first_step)
-                .map(|st| pkg_name(&st.path).to_string())
+                .map(|st| self.pkg_label(&st.path))
                 .unwrap_or_default();
             // a named part of the tour starts here
             if n.group.trim() != group {
@@ -24024,6 +24048,7 @@ impl Storm {
     fn render_tour_card(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let (left, top, width) = self.tour_card_at(cx)?;
         self.ensure_stop_diff();
+        self.ensure_pkg_names();
         let changed = self.stop_diff.clone();
         let w = self.walk.as_ref()?;
         let stop = w.stops.get(w.at)?;
@@ -24052,7 +24077,7 @@ impl Storm {
             let abs = self.stop_abs(stop);
             self.pr_stats.get(&abs).copied()
         };
-        let where_pkg = pkg_name(&stop.path).to_string();
+        let where_pkg = self.pkg_label(&stop.path);
         // the other stops this description names, so "it hands back to
         // RecoverTasksHandler" says whether that is behind you or ahead
         let points_at: Vec<(usize, String, bool)> = stops_mentioned(&w.stops, w.at)
@@ -24348,63 +24373,76 @@ impl Storm {
                             .text_size(px(11.))
                             .line_height(px(16.))
                             .children(changed.into_iter().map(|row| {
-                                let runs = diff_line_runs(
-                                    &row.text,
-                                    (!row.runs.is_empty()).then_some(&row.runs),
-                                    &[],
-                                );
-                                let plain = row.runs.is_empty();
+                                // one column per side, the way the diff window
+                                // puts them: what the line was, what it is
+                                let half = |side: Option<StopSide>, tint: u32| {
+                                    let mut col = div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .h_full()
+                                        .flex_grow(1.0)
+                                        .flex_basis(relative(0.))
+                                        .min_w(px(0.))
+                                        .overflow_hidden();
+                                    // no line on this side of the change: the
+                                    // column stays, so the two files line up
+                                    let Some(side) = side else { return col };
+                                    if tint != 0 {
+                                        col = col.bg(rgb(tint));
+                                    }
+                                    let plain = side.runs.is_empty();
+                                    let runs =
+                                        diff_line_runs(&side.text, (!plain).then_some(&side.runs), &[]);
+                                    col
+                                        // the gutter the editor has, so a line
+                                        // on the card and the same line on
+                                        // screen are the same line
+                                        .child(
+                                            div()
+                                                .w(px(30.))
+                                                .flex_shrink_0()
+                                                .pr_1()
+                                                .flex()
+                                                .justify_end()
+                                                .text_color(rgb(LINE_NUMBER))
+                                                .child(side.no.to_string()),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_grow(1.0)
+                                                .min_w(px(0.))
+                                                .pr_1()
+                                                .overflow_hidden()
+                                                .when(plain, |d| d.text_color(rgb(TEXT)))
+                                                .child(if plain {
+                                                    div().truncate().child(side.text).into_any_element()
+                                                } else {
+                                                    StyledText::new(side.text.clone())
+                                                        .with_runs(runs)
+                                                        .into_any_element()
+                                                }),
+                                        )
+                                };
+                                // a row where both sides carry the same text is
+                                // one nothing happened to: it draws plain, and
+                                // only the halves that moved are tinted
+                                let kept = row.left.as_ref().map(|s| &s.text)
+                                    == row.right.as_ref().map(|s| &s.text);
+                                let (lt, rt) = if kept {
+                                    (0, 0)
+                                } else {
+                                    (DIFF_REMOVE_BG, DIFF_ADD_BG)
+                                };
                                 div()
                                     .w_full()
                                     .flex()
                                     .flex_row()
                                     .items_center()
                                     .h(px(16.))
-                                    .when(row.mark == StopMark::Add, |d| d.bg(rgb(DIFF_ADD_BG)))
-                                    .when(row.mark == StopMark::Del, |d| d.bg(rgb(DIFF_REMOVE_BG)))
-                                    // the gutter the editor has, so a line on
-                                    // the card and the same line on screen are
-                                    // the same line
-                                    .child(
-                                        div()
-                                            .w(px(34.))
-                                            .flex_shrink_0()
-                                            .pr_1()
-                                            .flex()
-                                            .justify_end()
-                                            .text_color(rgb(LINE_NUMBER))
-                                            .child(row.no.to_string()),
-                                    )
-                                    .child(
-                                        div()
-                                            .w(px(10.))
-                                            .flex_shrink_0()
-                                            .text_color(rgb(match row.mark {
-                                                StopMark::Add => GIT_NEW,
-                                                StopMark::Del => GIT_DELETED,
-                                                StopMark::Same => LINE_NUMBER,
-                                            }))
-                                            .child(match row.mark {
-                                                StopMark::Add => "+",
-                                                StopMark::Del => "−",
-                                                StopMark::Same => " ",
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_grow(1.0)
-                                            .min_w(px(0.))
-                                            .pr_1()
-                                            .overflow_hidden()
-                                            .when(plain, |d| d.text_color(rgb(TEXT)))
-                                            .child(if plain {
-                                                div().truncate().child(row.text).into_any_element()
-                                            } else {
-                                                StyledText::new(row.text.clone())
-                                                    .with_runs(runs)
-                                                    .into_any_element()
-                                            }),
-                                    )
+                                    .child(half(row.left, lt))
+                                    .child(div().w(px(1.)).h_full().flex_shrink_0().bg(rgb(BORDER)))
+                                    .child(half(row.right, rt))
                             })),
                     )
                 })
@@ -24703,6 +24741,34 @@ impl Storm {
     /// Fill `stop_diff` for the stop you are standing on. Two `git show`s, so
     /// it runs once when the stop changes rather than once a frame: the key is
     /// the stop's file and lines plus the head it was read against.
+    /// What the packages this tour touches call themselves, read once each.
+    /// The map labels every stop with one, so the read has to be off the
+    /// render path.
+    fn ensure_pkg_names(&mut self) {
+        let Some(w) = self.walk.as_ref() else { return };
+        let dirs: Vec<String> = w
+            .stops
+            .iter()
+            .map(|s| pkg_dir(&s.path).to_string())
+            .filter(|d| !d.is_empty() && !self.pkg_names.contains_key(d))
+            .collect();
+        for dir in dirs {
+            let name = pkg_json_name(&self.root, &dir)
+                .unwrap_or_else(|| pkg_name(&dir).to_string());
+            self.pkg_names.insert(dir, name);
+        }
+    }
+
+    /// The label for the package a stop's file is in: what its package.json
+    /// says, falling back to the directory while the read hasn't happened.
+    fn pkg_label(&self, path: &str) -> String {
+        let dir = pkg_dir(path);
+        if dir.is_empty() {
+            return String::new();
+        }
+        self.pkg_names.get(dir).cloned().unwrap_or_else(|| pkg_name(path).to_string())
+    }
+
     fn ensure_stop_diff(&mut self) {
         let Some(stop) = self.walk.as_ref().and_then(|w| w.stops.get(w.at)).cloned() else {
             self.stop_diff_key = None;
@@ -24736,11 +24802,16 @@ impl Storm {
         if !rows.is_empty() {
             let was = highlight_lines(&old, &abs);
             let now = highlight_lines(&new, &abs);
-            for r in &mut rows {
-                let src = if r.mark == StopMark::Del { &was } else { &now };
-                if let Some(runs) = r.no.checked_sub(1).and_then(|i| src.get(i)) {
-                    r.runs = runs.clone();
+            let paint = |side: &mut Option<StopSide>, src: &[Vec<Run>]| {
+                if let Some(s) = side.as_mut() {
+                    if let Some(runs) = s.no.checked_sub(1).and_then(|i| src.get(i)) {
+                        s.runs = runs.clone();
+                    }
                 }
+            };
+            for r in &mut rows {
+                paint(&mut r.left, &was);
+                paint(&mut r.right, &now);
             }
         }
         self.stop_diff = rows;
@@ -39351,36 +39422,42 @@ mod code_tour_tests {
     /// the rest of the file's diff is what the diff window is for.
     #[test]
     fn a_stop_shows_what_its_own_lines_used_to_say() {
-        fn shape(rows: &[StopLine]) -> Vec<(StopMark, usize, &str)> {
-            rows.iter().map(|r| (r.mark, r.no, r.text.as_str())).collect()
+        /// Each row as (left line, left text, right line, right text), with a
+        /// missing side as 0 and "".
+        fn shape(rows: &[StopRow]) -> Vec<(usize, &str, usize, &str)> {
+            fn at(s: &Option<StopSide>) -> (usize, &str) {
+                s.as_ref().map(|s| (s.no, s.text.as_str())).unwrap_or((0, ""))
+            }
+            rows.iter()
+                .map(|r| {
+                    let (ln, lt) = at(&r.left);
+                    let (rn, rt) = at(&r.right);
+                    (ln, lt, rn, rt)
+                })
+                .collect()
         }
         let old = "a\nb\nold one\nold two\nz\n";
         let new = "a\nb\nnew one\nnew two\nz\n";
-        // the stop covers the two lines that changed, and each line keeps the
-        // number of the side it came from
+        // the stop covers the two lines that changed, and each side keeps the
+        // number its own file gives that line
         assert_eq!(
             shape(&stop_before_after(old, new, 3, 4, 12)),
-            vec![
-                (StopMark::Del, 3, "old one"),
-                (StopMark::Add, 3, "new one"),
-                (StopMark::Del, 4, "old two"),
-                (StopMark::Add, 4, "new two"),
-            ]
+            vec![(3, "old one", 3, "new one"), (4, "old two", 4, "new two")]
         );
         // a stop standing somewhere nothing moved has nothing to draw
         assert!(stop_before_after(old, new, 1, 2, 12).is_empty());
-        // a deleted line belongs to the line that replaced it, and the line
-        // that is still there comes along as context
+        // a deleted line belongs to the line that replaced it, has no right
+        // side at all, and the line that is still there comes along as context
         let cut = "a\ngone\nz\n";
         assert_eq!(
             shape(&stop_before_after(cut, "a\nz\n", 2, 2, 12)),
-            vec![(StopMark::Del, 2, "gone"), (StopMark::Same, 2, "z")]
+            vec![(2, "gone", 0, ""), (3, "z", 2, "z")]
         );
         // the cap counts what changed, so untouched lines never spend it
         assert!(stop_before_after(old, new, 3, 4, 2).is_empty());
         // four changed lines and three untouched: a cap of four lets it all
         // through
-        assert_eq!(shape(&stop_before_after(old, new, 1, 5, 4)).len(), 7);
+        assert_eq!(shape(&stop_before_after(old, new, 1, 5, 4)).len(), 5);
         // a file that is new all through has no before to show
         assert!(stop_before_after("", new, 1, 5, 12).is_empty());
     }
@@ -39598,6 +39675,12 @@ mod code_tour_tests {
         // and a path outside one has nothing to say
         assert_eq!(pkg_name("src/main.rs"), "");
         assert_eq!(pkg_name("packages"), "");
+        // and the directory the package.json lives in, for reading its name
+        assert_eq!(pkg_dir("packages/languages/src/api/Extension.ts"), "packages/languages");
+        assert_eq!(pkg_dir("apps/web/packages/ui/src/Button.tsx"), "apps/web/packages/ui");
+        assert_eq!(pkg_dir("src/main.rs"), "");
+        assert_eq!(pkg_dir("packages"), "");
+        assert_eq!(pkg_dir("packages/"), "");
     }
 
     /// The card and the map both say where a stop is, and a range says so
