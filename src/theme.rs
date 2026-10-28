@@ -13,6 +13,10 @@ pub const CURSOR: u32 = 0xced0d6;
 // ── UI chrome (sidebar, panels, tabs, bars) ────────────────────────────────
 pub const PANEL_BG: u32 = 0x222426; // sidebar / top + bottom bar / tab bar
 pub const BORDER: u32 = 0x2b2d30; // subtle separators
+/// A rule drawn inside a surface: the dividers in the top bar, in a menu,
+/// between the halves of a diff. Brighter than BORDER, which edges a panel
+/// and reads fine at low contrast because the two sides differ in colour.
+pub const SEPARATOR: u32 = 0x3c3f43;
 pub const MUTED: u32 = 0x7a7e85; // muted text
 pub const ICON: u32 = 0xa9adb5; // sidebar/activity icons (resting + active)
 pub const DIR: u32 = 0xbcbec4; // folder names render as default text

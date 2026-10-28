@@ -17194,7 +17194,7 @@ impl Storm {
                             }),
                     )
                     .when(!self.branch.is_empty(), |d| {
-                        d.child(div().w(px(1.)).h(px(16.)).mx_1().bg(rgb(BORDER))) // separator
+                        d.child(div().w(px(1.)).h(px(16.)).mx_1().bg(rgb(SEPARATOR))) // separator
                             .child(
                             div()
                                 .flex()
@@ -17576,13 +17576,13 @@ impl Storm {
                 // what this workspace runs, and what it reports: two groups
                 // that happen to share an edge of the bar
                 .when(self.app_url().is_some() || self.render_watch_btn(cx).is_some(), |d| {
-                    d.child(div().w(px(1.)).h(px(14.)).bg(rgb(BORDER)))
+                    d.child(div().w(px(1.)).h(px(14.)).bg(rgb(SEPARATOR)))
                 })
                 .children(self.render_build_chip(cx))
                 // build state and workspace states are different things: keep a
                 // rule between them
                 .when(self.render_build_chip(cx).is_some() && self.ws_states.len() > 1, |d| {
-                    d.child(div().w(px(1.)).h(px(14.)).bg(rgb(BORDER)))
+                    d.child(div().w(px(1.)).h(px(14.)).bg(rgb(SEPARATOR)))
                 })
                 .children(self.render_ws_tally(cx))
                 .children(self.render_todo_chip(cx))
@@ -17691,7 +17691,7 @@ impl Storm {
             );
         }
         panel
-            .child(div().h(px(1.)).bg(rgb(BORDER)).my_1())
+            .child(div().h(px(1.)).bg(rgb(SEPARATOR)).my_1())
             .child(
                 div()
                     .id("ws-open-project")
@@ -24672,7 +24672,7 @@ impl Storm {
                                 &left_h,
                                 "card-diff-left",
                             ))
-                            .child(div().w(px(1.)).h_full().flex_shrink_0().bg(rgb(BORDER)))
+                            .child(div().w(px(1.)).h_full().flex_shrink_0().bg(rgb(SEPARATOR)))
                             .child(stop_diff_side(
                                 &changed,
                                 false,
@@ -30701,7 +30701,7 @@ impl Storm {
                     .text_color(rgb(TEXT))
                     .child(if self.git_details_msg.is_empty() { c.subject.clone() } else { self.git_details_msg.clone() }),
             )
-            .child(div().h(px(1.)).bg(rgb(BORDER)))
+            .child(div().h(px(1.)).bg(rgb(SEPARATOR)))
             .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(format!("{} file(s) changed", self.git_details_files.len())));
         for (path, state) in &self.git_details_files {
             let rel = self.rel(path);
@@ -34473,7 +34473,7 @@ impl Storm {
                             })),
                     ),
             )
-            .child(div().h(px(1.)).bg(rgb(BORDER)))
+            .child(div().h(px(1.)).bg(rgb(SEPARATOR)))
             // current branch
             .child(
                 row(IC_BRANCH, ACCENT)
@@ -35659,7 +35659,7 @@ impl Render for Workspace {
                 if free && !free_seen {
                     free_seen = true;
                     if pos > 0 {
-                        grid = grid.child(div().h(px(1.)).my_1().mx_2().bg(rgb(BORDER)));
+                        grid = grid.child(div().h(px(1.)).my_1().mx_2().bg(rgb(SEPARATOR)));
                     }
                 }
                 let label_drag = name.clone();
