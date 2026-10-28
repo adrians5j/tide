@@ -4466,6 +4466,12 @@ fn tour_request(about: Option<&str>, answer: Option<&str>) -> String {
          what happens here, what it does with what the stop before handed it, \
          and anything that would surprise me. I'll be reading the code right \
          next to it, so don't retell the lines; say what I can't see from them.\n\n\
+         Name things. \"SendToIdentity and friends\", \"and so on\", \"various \
+         callers\", \"a few places\" are all a question I then have to ask, and \
+         the answer was always in front of you when you wrote it: say the four \
+         callers, or say \"four callers, all in `api-websockets`\". If the list \
+         is too long to write, that is the useful fact — say how many and where \
+         they live.\n\n\
          Where the tour moves from one stretch of the work to another, name \
          the stretch with `group` on each stop in it (\"The AWS side\", \
          \"Standalone\") — consecutive stops sharing one become a section with \
@@ -4565,7 +4571,10 @@ fn brief_request(number: u64, base: &str, read: &str) -> String {
          message down a websocket the browser is holding open)”. The test is \
          whether I could ask “what do you mean by that?” about any noun on the \
          slide. If I could, the slide isn't written yet, and I have to stop \
-         reading and ask, which is the thing a brief exists to save me.\n\n\
+         reading and ask, which is the thing a brief exists to save me. The same \
+         goes for a list you waved at rather than wrote: \"and friends\", \
+         \"and so on\", \"a few places\". Name them, or say how many there \
+         are and where they live.\n\n\
          `files` is the way from a slide into the code: the two or three files \
          that slide is about, as `path/to/File.ts:84`, pointing at the line \
          worth landing on. Put them on every slide that is about code at all — \
@@ -38990,6 +38999,12 @@ mod code_tour_tests {
         let tour = pr_tour_request(6110, "next", "");
         assert!(tour.contains("only means something inside this"), "{tour}");
         assert!(tour.contains("in a clause"), "{tour}");
+
+        // and a list waved at rather than written is the same question asked
+        // a different way: "SendToIdentity and friends" cost a round trip
+        assert!(tour.contains("Name things."), "{tour}");
+        assert!(tour.contains("say how many and where"), "{tour}");
+        assert!(brief.contains("a list you waved at rather than wrote"), "{brief}");
     }
 
     /// Tours survive a restart: the stops, their prose, where you had got to,
