@@ -2012,6 +2012,8 @@ enum CtxKind {
     MdPreview,
     /// One turn inside a review thread — the agent's answer to a note.
     ThreadReply,
+    /// A row in the code-tour library.
+    Tour,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -6295,6 +6297,9 @@ const TOUR_CARD_ROWS: usize = 8;
 /// the before/after is a diff, not a snippet, and the diff window is the thing
 /// that reads diffs.
 const STOP_DIFF_LINES: usize = 12;
+/// How tall the block gets before it scrolls inside itself. Eight rows, the
+/// same as the description above it.
+const STOP_DIFF_H: f32 = TOUR_CARD_ROWS as f32 * 16.0;
 /// Header row, the file line under it, the note box, padding and borders.
 const TOUR_CARD_CHROME: f32 = 87.0;
 /// Air above and below the card, so the code it parts doesn't touch it.
@@ -7733,6 +7738,8 @@ struct Storm {
     /// Which action list the open context menu shows — the dir tree's, or the
     /// short one a file row in Changes / PR Review gets.
     tree_ctx_kind: CtxKind,
+    /// The tour a right-click in the library landed on.
+    ctx_tour: Option<String>,
     tree_ctx_focus: FocusHandle,
     git_status: HashMap<PathBuf, GitState>,
     // pull-request review
@@ -8504,6 +8511,7 @@ impl Storm {
             tree_ctx: None,
             tree_ctx_path: None,
             tree_ctx_kind: CtxKind::Tree,
+            ctx_tour: None,
             tree_ctx_focus: cx.focus_handle(),
             git_status: HashMap::new(),
             finder_open: false,
@@ -22094,6 +22102,20 @@ impl Storm {
                 }),
             ];
         }
+        if kind == CtxKind::Tour {
+            return vec![
+                ("Delete", |this, _w, cx| {
+                    if let Some(id) = this.ctx_tour.clone() {
+                        this.delete_tour(id, cx);
+                    }
+                }),
+                ("Delete All Except This", |this, _w, cx| {
+                    let Some(id) = this.ctx_tour.clone() else { return };
+                    this.delete_tours(|t| t.id != id, cx);
+                }),
+                ("Delete All", |this, _w, cx| this.delete_tours(|_| true, cx)),
+            ];
+        }
         if kind == CtxKind::ThreadReply {
             return vec![
                 // the answer in a thread is the one most worth touring: it is
@@ -22318,6 +22340,7 @@ impl Storm {
             CtxKind::MdPreview => 210.0_f32,
             CtxKind::ThreadReply => 210.0_f32,
             CtxKind::Tree => 200.0_f32,
+            CtxKind::Tour => 230.0_f32,
         };
         let row_h = 28.0_f32;
         let menu_h = actions.len() as f32 * row_h + 10.0;
@@ -24362,7 +24385,12 @@ impl Storm {
                         div()
                             .id("card-diff-lines")
                             .w_full()
-                            .max_h(px(TOUR_CARD_ROWS as f32 * 16.))
+                            .flex_shrink_0()
+                            // a definite height, not a cap: inside a column
+                            // these rows are shrinkable, and a block left to
+                            // size itself came out short and cut its own
+                            // first and last lines in half
+                            .h(px(STOP_DIFF_H.min(changed.len() as f32 * 16.) + 4.))
                             .overflow_y_scroll()
                             .flex()
                             .flex_col()
@@ -24441,6 +24469,7 @@ impl Storm {
                                 };
                                 div()
                                     .w_full()
+                                    .flex_shrink_0()
                                     .flex()
                                     .flex_row()
                                     .items_center()
@@ -27425,7 +27454,7 @@ impl Storm {
         for (i, t) in self.tours.iter().enumerate() {
             let on = open_id.as_deref() == Some(t.id.as_str());
             let id = t.id.clone();
-            let (restart_id, delete_id) = (id.clone(), id.clone());
+            let (restart_id, delete_id, ctx_id) = (id.clone(), id.clone(), id.clone());
             let steps = t.stops.len();
             let where_ = t
                 .stops
@@ -27522,7 +27551,22 @@ impl Storm {
                     )
                     .on_click(cx.listener(move |this, _e, _w, cx| {
                         this.open_tour(id.clone(), false, cx)
-                    })),
+                    }))
+                    // they pile up: one per rebuild, one per PR, and the ✕ on
+                    // each row is a long way to go to clear a dozen
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                            this.ctx_tour = Some(ctx_id.clone());
+                            this.tree_ctx_kind = CtxKind::Tour;
+                            this.tree_ctx = Some((
+                                f32::from(ev.position.x),
+                                f32::from(ev.position.y),
+                            ));
+                            window.focus(&this.tree_ctx_focus, cx);
+                            cx.notify();
+                        }),
+                    ),
             );
         }
         div()
@@ -27657,6 +27701,25 @@ impl Storm {
         self.save_tours();
         self.tour_jump = Some(at); // render has the Window to open a file with
         self.show_flash(&format!("Tour: {n} steps  ·  ⌥] / ⌥[ to step"), cx);
+        cx.notify();
+    }
+
+    /// Drop every tour `gone` picks out. The open one goes off screen with
+    /// them, and nothing is written until the whole pass is done.
+    fn delete_tours(&mut self, keep: impl Fn(&TourRec) -> bool, cx: &mut Context<Self>) {
+        let before = self.tours.len();
+        let open = self.walk.as_ref().and_then(|w| w.id.clone());
+        self.tours.retain(&keep);
+        let n = before - self.tours.len();
+        if n == 0 {
+            return;
+        }
+        if open.is_some_and(|id| !self.tours.iter().any(|t| t.id == id)) {
+            self.walk = None;
+            self.sync_comment_gutters(cx);
+        }
+        self.save_tours();
+        self.show_flash(&format!("{n} tour{} deleted", if n == 1 { "" } else { "s" }), cx);
         cx.notify();
     }
 
