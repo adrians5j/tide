@@ -15347,7 +15347,7 @@ impl Storm {
                         v
                     })
                     .unwrap_or_default();
-                let h = tour_gap_h(&said) + tour_thread_h(&turns);
+                let h = tour_gap_h(&said) + tour_thread_h(&turns) + self.stop_diff_h();
                 match gaps.iter_mut().find(|(l, _)| l == end) {
                     Some(g) => g.1 += h,
                     None => gaps.push((*end, h)),
@@ -24811,6 +24811,16 @@ impl Storm {
         self.pkg_names.get(dir).cloned().unwrap_or_else(|| pkg_name(path).to_string())
     }
 
+    /// What the before/after block adds to the card, so the editor parts the
+    /// file by as much as the card actually covers. Zero when the stop has
+    /// nothing to show.
+    fn stop_diff_h(&self) -> f32 {
+        if self.stop_diff.is_empty() {
+            return 0.0;
+        }
+        STOP_DIFF_H.min(self.stop_diff.len() as f32 * 16.0) + 4.0 + 4.0
+    }
+
     fn ensure_stop_diff(&mut self) {
         let Some(stop) = self.walk.as_ref().and_then(|w| w.stops.get(w.at)).cloned() else {
             self.stop_diff_key = None;
@@ -27893,7 +27903,7 @@ impl Storm {
                     v
                 })
                 .unwrap_or_default();
-            let room = tour_gap_h(&stop.said) + tour_thread_h(&turns);
+            let room = tour_gap_h(&stop.said) + tour_thread_h(&turns) + self.stop_diff_h();
             let (a, b) = (stop.line, stop.end.max(stop.line));
             if let Some(tab) = self.tabs.get(self.active) {
                 tab.editor.update(cx, |e, cx| e.reveal_span(a, b, room, cx));
