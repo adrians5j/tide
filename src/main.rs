@@ -5384,6 +5384,7 @@ enum Cmd {
     HandOff,
     AgentBriefing,
     PhoneLink,
+    PhoneLinkIp,
     ProcessManager,
     ToggleReadOnly,
     ResolveConflicts,
@@ -5437,6 +5438,7 @@ const PALETTE: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::HandOff, "Send to Another Workspace  (⌥⇧↩)", IC_AGENT, ""),
     (Cmd::AgentBriefing, "Show the Agent Briefing", IC_GEAR, ""),
     (Cmd::PhoneLink, "Copy the Phone Link", IC_BROWSER, ""),
+    (Cmd::PhoneLinkIp, "Copy the Phone Link  (by IP)", IC_BROWSER, ""),
     (Cmd::ProcessManager, "Process Manager", IC_TOOLS, ""),
     (Cmd::ToggleReadOnly, "Toggle Read-Only / Edit Mode", IC_HOME, ""),
     (Cmd::ResolveConflicts, "Resolve Merge Conflicts", IC_BRANCH, ""),
@@ -14667,13 +14669,22 @@ impl Storm {
                 self.agent_brief_text = self.tide_briefing();
                 self.agent_brief_open = true;
             }
-            Cmd::PhoneLink => match self.remote_url.clone() {
-                Some(url) => {
-                    cx.write_to_clipboard(ClipboardItem::new_string(url));
-                    self.show_flash("Link copied — open it on your phone", cx);
+            // the `.local` name first, and the IP as its own entry: a phone
+            // that can't resolve `.local` still needs a way in
+            Cmd::PhoneLink | Cmd::PhoneLinkIp => {
+                let by_ip = matches!(cmd, Cmd::PhoneLinkIp);
+                let link = match by_ip {
+                    true => self.remote_url_ip.clone().or_else(|| self.remote_url.clone()),
+                    false => self.remote_url.clone(),
+                };
+                match link {
+                    Some(url) => {
+                        cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
+                        self.show_flash(&format!("Copied {url} — open it on your phone"), cx);
+                    }
+                    None => self.show_flash("No phone link: the remote hub isn't up", cx),
                 }
-                None => self.show_flash("No phone link: the remote hub isn't up", cx),
-            },
+            }
             Cmd::ProcessManager => self.open_process_manager(window, cx),
             Cmd::ToggleReadOnly => self.toggle_read_only(cx),
             Cmd::ResolveConflicts => self.open_conflicts(window, cx),
@@ -27988,61 +27999,6 @@ impl Storm {
                                 .tooltip(move |_w, cx| {
                                     cx.new(|_| TooltipView { text: tip_text.clone().into() }).into()
                                 }),
-                        )
-                    })
-                    // a phone on the same wifi, in this same session
-                    .when_some(self.remote_url.clone(), |d, url| {
-                        // one link for the whole window: the phone picks the
-                        // workspace once it is open
-                        d.child(
-                            div()
-                                .id("agent-remote")
-                                .flex_shrink_0()
-                                .px_1p5()
-                                .rounded_md()
-                                .cursor_pointer()
-                                .text_size(px(10.))
-                                .text_color(rgb(MUTED))
-                                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                                .child("phone")
-                                .tooltip({
-                                    let u = url.clone();
-                                    // the IP line only earns its place when it
-                                    // says something the first line doesn't
-                                    let ip = self
-                                        .remote_url_ip
-                                        .clone()
-                                        .filter(|i| *i != u)
-                                        .map(|i| format!("\n⌥click for {i}"))
-                                        .unwrap_or_default();
-                                    let reach = if self.remote_far {
-                                        "works anywhere your phone has the tailnet"
-                                    } else {
-                                        "same wifi only"
-                                    };
-                                    move |_w, cx| {
-                                        cx.new(|_| TooltipView {
-                                            text: format!(
-                                                "{u}{ip}\n\nclick to copy — every workspace is on it\n\
-                                                 bookmark it: the link is the same next launch\n\
-                                                 {reach}  ·  anyone holding it can type here"
-                                            )
-                                            .into(),
-                                        })
-                                        .into()
-                                    }
-                                })
-                                .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _w, cx| {
-                                    // ⌥click is the fallback: a phone that
-                                    // can't resolve `.local` still needs a way in
-                                    let link = if e.modifiers().alt {
-                                        this.remote_url_ip.clone().unwrap_or_else(|| url.clone())
-                                    } else {
-                                        url.clone()
-                                    };
-                                    cx.write_to_clipboard(ClipboardItem::new_string(link));
-                                    this.show_flash("Link copied — open it on your phone", cx);
-                                })),
                         )
                     })
                     // the briefing panel is on the palette ("Show the Agent
