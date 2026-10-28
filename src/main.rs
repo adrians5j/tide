@@ -32353,9 +32353,6 @@ impl Storm {
         let brief = self.tabs.get(self.active).and_then(|t| t.brief.clone());
         let pr = brief.as_ref().and_then(|b| b.pr);
         let base = self.pr_base.clone();
-        let stale = brief.as_ref().is_some_and(|b| {
-            !b.oid.is_empty() && !self.head_oid.is_empty() && b.oid != self.head_oid
-        });
         // there is a tour of this change already, so the button walks it
         // rather than asking for another one
         let has_tour = pr.is_some_and(|p| self.tours.iter().any(|t| t.pr == Some(p)));
@@ -32382,7 +32379,7 @@ impl Storm {
             .gap_3()
             .child(div().text_size(px(11.)).text_color(rgb(LINE_NUMBER)).child("end of the brief"))
             .when_some(pr, |d, p| {
-                let (tour_base, again_base) = (base.clone(), base.clone());
+                let tour_base = base.clone();
                 d.child(
                     div()
                         .flex()
@@ -32400,26 +32397,6 @@ impl Storm {
                                 .on_click(cx.listener(move |this, _e, _w, cx| {
                                     this.walk_pr_tour(p, tour_base.clone(), cx)
                                 })),
-                        )
-                        .child(
-                            button("brief-end-body", "The description", TEXT)
-                                .tooltip(tip("Open the pull request itself"))
-                                .on_click(cx.listener(move |this, _e, _w, cx| {
-                                    this.open_pr_number(Some(p), cx)
-                                })),
-                        )
-                        .child(
-                            button(
-                                "brief-end-again",
-                                "Write it again",
-                                if stale { FOLDER_ICON } else { TEXT },
-                            )
-                            .tooltip(tip(
-                                "Ask for this brief again, from the branch as it stands now",
-                            ))
-                            .on_click(cx.listener(move |this, _e, _w, cx| {
-                                this.ask_pr_brief(p, again_base.clone(), true, cx)
-                            })),
                         ),
                 )
             })
