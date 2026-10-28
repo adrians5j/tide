@@ -16960,6 +16960,11 @@ impl Storm {
                                     .items_center()
                                     .gap_1()
                                     .px_1()
+                                    // the number, its refresh and its
+                                    // explanation are one group: the row's
+                                    // gap_3 between them reads as three
+                                    // unrelated things
+                                    .ml(px(-6.))
                                     .rounded_md()
                                     .cursor_pointer()
                                     .text_size(px(11.))
