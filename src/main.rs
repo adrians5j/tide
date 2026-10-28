@@ -13336,6 +13336,7 @@ impl Storm {
                     "Check the PR's conflict report".to_string(),
                 )
             };
+            self.job_next = Some(label.clone());
             self.send_agent_prompt_as(p, Some(label), cx);
             return;
         }
@@ -13371,6 +13372,10 @@ impl Storm {
         } else {
             format!("Merge {base} and resolve the conflicts")
         };
+        // a merge is a long turn of fetching, resolving and building, and what
+        // you want out of it is the summary at the end, which a closed job
+        // still shows
+        self.job_next = Some(label.clone());
         self.send_agent_prompt_as(p, Some(label), cx);
     }
 
@@ -28748,10 +28753,14 @@ impl Storm {
             gpui::list(
                 self.agent_list.clone(),
                 cx.processor(|this: &mut Self, ix: usize, window: &mut Window, cx: &mut Context<Self>| {
-                    // a question asked from a slide or a stop keeps its working
-                    // to itself: the answer is going back where it was asked,
-                    // and the chip under the question unfolds the rest
-                    if this.job_turn(ix).is_some_and(|q| !q.open && ix > q.at) {
+                    // a closed job hides its working, not what came of it: a
+                    // summary card is the agent's closing word on the job, and
+                    // a screenshot is something it meant you to see
+                    let result = matches!(
+                        this.agent_msgs.get(ix),
+                        Some(AgentMsg::Summary { .. } | AgentMsg::Shot { .. })
+                    );
+                    if !result && this.job_turn(ix).is_some_and(|q| !q.open && ix > q.at) {
                         return div().into_any_element();
                     }
                     if let Some(m) = this.agent_msgs.get(ix) {
