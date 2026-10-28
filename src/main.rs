@@ -236,6 +236,15 @@ fn highlighter() -> &'static syntax::Highlighter {
     H.get_or_init(syntax::Highlighter::new)
 }
 
+/// Syntax runs per line, skipping the work for a file too big or too wide to
+/// be worth it — the same guard the editor applies when it loads one.
+fn highlight_lines(content: &str, path: &Path) -> Vec<Vec<syntax::Run>> {
+    if content.len() > 512 * 1024 || content.split('\n').take(4000).any(|l| l.len() > 2000) {
+        return Vec::new();
+    }
+    highlighter().highlight(content, path)
+}
+
 const FIND_CAP: usize = 500;
 /// Height above the find dialog's results: title 24 + search 42 + scope 22 +
 /// the syntax legend 20.
@@ -4350,40 +4359,78 @@ fn merged_note(number: u64, about: Option<&PrDoc>) -> String {
 }
 
 
-/// What changed inside a stop's own lines, as `(added, text)` in file order.
-/// Small on purpose: this is the two or three lines the stop is about, read on
-/// the card, not the file's diff, which is what the diff window is for. An
-/// empty answer means there is nothing worth drawing — a stop on code nothing
-/// touched, a file that is new all through, or a change too big to read here.
-fn stop_before_after(old: &str, new: &str, line: usize, end: usize, cap: usize) -> Vec<(bool, String)> {
+/// What happened to one line of a stop's own code.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum StopMark {
+    Same,
+    Add,
+    Del,
+}
+
+/// One line of a stop's own before/after, ready to draw: what happened to it,
+/// the number beside it, the text, and the syntax runs the editor would give
+/// that text. `runs` is filled in by whoever has the file; empty draws plain.
+#[derive(Clone, Debug)]
+struct StopLine {
+    mark: StopMark,
+    no: usize,
+    text: String,
+    runs: Vec<Run>,
+}
+
+/// A stop's own lines with the change still in them, in file order: the lines
+/// that stayed, the lines that went, the lines that arrived. Small on purpose
+/// — this is the handful of lines the stop is about, read on the card, not the
+/// file's diff, which is what the diff window is for. An empty answer means
+/// there is nothing worth drawing: a stop on code nothing touched, a file that
+/// is new all through, or more changed lines than `cap`.
+fn stop_before_after(old: &str, new: &str, line: usize, end: usize, cap: usize) -> Vec<StopLine> {
     if old.trim().is_empty() || new.trim().is_empty() {
         return Vec::new();
     }
-    let mut out: Vec<(bool, String)> = Vec::new();
+    let row = |mark, no, text| StopLine { mark, no, text, runs: Vec::new() };
+    let mut out: Vec<StopLine> = Vec::new();
     let mut last_right = 0usize;
-    for row in diff::compute(old, new) {
+    let mut moved = 0usize;
+    for r in diff::compute(old, new) {
         // a deleted line has no line of its own on the new side: it sits
         // between the one before it and the one after, so it counts as the
         // line it was replaced by
-        let at = row.right_no.unwrap_or(last_right + 1);
-        if let Some(n) = row.right_no {
+        let at = r.right_no.unwrap_or(last_right + 1);
+        if let Some(n) = r.right_no {
             last_right = n;
         }
         if at < line || at > end {
             continue;
         }
-        match row.kind {
-            DiffKind::Equal => {}
-            DiffKind::Del => out.push((false, row.left.unwrap_or_default())),
-            DiffKind::Ins => out.push((true, row.right.unwrap_or_default())),
+        let gone = r.left_no.unwrap_or(0);
+        match r.kind {
+            DiffKind::Equal => out.push(row(StopMark::Same, at, r.right.unwrap_or_default())),
+            DiffKind::Del => {
+                moved += 1;
+                out.push(row(StopMark::Del, gone, r.left.unwrap_or_default()));
+            }
+            DiffKind::Ins => {
+                moved += 1;
+                out.push(row(StopMark::Add, at, r.right.unwrap_or_default()));
+            }
             DiffKind::Replace => {
-                out.push((false, row.left.unwrap_or_default()));
-                out.push((true, row.right.unwrap_or_default()));
+                moved += 2;
+                out.push(row(StopMark::Del, gone, r.left.unwrap_or_default()));
+                out.push(row(StopMark::Add, at, r.right.unwrap_or_default()));
             }
         }
-        if out.len() > cap {
+        // the cap counts what changed, not what is drawn around it: a stop
+        // over twenty untouched lines is still a snippet, a stop over twenty
+        // changed ones is a diff
+        if moved > cap {
             return Vec::new();
         }
+    }
+    // lines that all stayed put are what the editor behind the card is already
+    // showing
+    if moved == 0 {
+        return Vec::new();
     }
     out
 }
@@ -8059,7 +8106,7 @@ struct Storm {
     /// for: file, lines and head. Computed once a stop rather than once a
     /// frame, since it costs two `git show`s.
     stop_diff_key: Option<(PathBuf, usize, usize, String)>,
-    stop_diff: Vec<(bool, String)>,
+    stop_diff: Vec<StopLine>,
     /// The deck's scroll, so the strip along the bottom can say which slide
     /// you are on and jump to another one.
     brief_scroll: gpui::ScrollHandle,
@@ -17284,7 +17331,10 @@ impl Storm {
                     } else {
                         "Nothing serving  ·  click to run `wdev`  ·  ⌘R to re-check"
                     };
-                    d.child(div().w(px(1.)).h(px(16.)).mx_1().bg(rgb(BORDER))) // separator
+                    // no rule in front of the host: this is the first thing in
+                    // the right-hand group, and the spacer that pushes the
+                    // group right is already the gap a rule would be drawing
+                    d
                         // host + ▶ read as one control, so they sit tight
                         // together instead of a container gap apart
                         .child(div().flex().flex_row().items_center().gap(px(2.)).child(
@@ -24295,30 +24345,71 @@ impl Storm {
                             .rounded_sm()
                             .border_1()
                             .border_color(rgb(BORDER))
+                            // the editor's own background, so the block reads
+                            // as a small window on the file rather than a
+                            // quotation of it
+                            .bg(rgb(BG))
+                            .py(px(2.))
                             .font_family("Menlo")
                             .text_size(px(11.))
                             .line_height(px(16.))
-                            .children(changed.into_iter().map(|(added, text)| {
+                            .children(changed.into_iter().map(|row| {
+                                let runs = diff_line_runs(
+                                    &row.text,
+                                    (!row.runs.is_empty()).then_some(&row.runs),
+                                    &[],
+                                );
+                                let plain = row.runs.is_empty();
                                 div()
                                     .w_full()
                                     .flex()
                                     .flex_row()
-                                    .gap_1()
-                                    .px_1()
-                                    .bg(rgb(if added { DIFF_ADD_BG } else { DIFF_REMOVE_BG }))
-                                    .text_color(rgb(if added { TEXT } else { MUTED }))
+                                    .items_center()
+                                    .h(px(16.))
+                                    .when(row.mark == StopMark::Add, |d| d.bg(rgb(DIFF_ADD_BG)))
+                                    .when(row.mark == StopMark::Del, |d| d.bg(rgb(DIFF_REMOVE_BG)))
+                                    // the gutter the editor has, so a line on
+                                    // the card and the same line on screen are
+                                    // the same line
                                     .child(
                                         div()
+                                            .w(px(34.))
                                             .flex_shrink_0()
-                                            .text_color(rgb(if added { GIT_NEW } else { GIT_DELETED }))
-                                            .child(if added { "+" } else { "−" }),
+                                            .pr_1()
+                                            .flex()
+                                            .justify_end()
+                                            .text_color(rgb(LINE_NUMBER))
+                                            .child(row.no.to_string()),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(10.))
+                                            .flex_shrink_0()
+                                            .text_color(rgb(match row.mark {
+                                                StopMark::Add => GIT_NEW,
+                                                StopMark::Del => GIT_DELETED,
+                                                StopMark::Same => LINE_NUMBER,
+                                            }))
+                                            .child(match row.mark {
+                                                StopMark::Add => "+",
+                                                StopMark::Del => "−",
+                                                StopMark::Same => " ",
+                                            }),
                                     )
                                     .child(
                                         div()
                                             .flex_grow(1.0)
                                             .min_w(px(0.))
-                                            .truncate()
-                                            .child(text.replace('\t', "    ")),
+                                            .pr_1()
+                                            .overflow_hidden()
+                                            .when(plain, |d| d.text_color(rgb(TEXT)))
+                                            .child(if plain {
+                                                div().truncate().child(row.text).into_any_element()
+                                            } else {
+                                                StyledText::new(row.text.clone())
+                                                    .with_runs(runs)
+                                                    .into_any_element()
+                                            }),
                                     )
                             })),
                     )
@@ -24631,7 +24722,24 @@ impl Storm {
         } else {
             (git_show_head(&self.root, &rel), std::fs::read_to_string(&abs).unwrap_or_default())
         };
-        self.stop_diff = stop_before_after(&old, &new, line, end, STOP_DIFF_LINES);
+        // tabs widened before the diff and the highlighter see the file, so
+        // the runs, the text and the grid all count the same characters
+        let (old, new) = (old.replace('\t', "    "), new.replace('\t', "    "));
+        let mut rows = stop_before_after(&old, &new, line, end, STOP_DIFF_LINES);
+        // the card draws the lines the way the editor behind it would, so the
+        // colours come from the same highlighter, off whichever side of the
+        // change the line actually belongs to
+        if !rows.is_empty() {
+            let was = highlight_lines(&old, &abs);
+            let now = highlight_lines(&new, &abs);
+            for r in &mut rows {
+                let src = if r.mark == StopMark::Del { &was } else { &now };
+                if let Some(runs) = r.no.checked_sub(1).and_then(|i| src.get(i)) {
+                    r.runs = runs.clone();
+                }
+            }
+        }
+        self.stop_diff = rows;
     }
 
     fn stop_thread(&self, stop: &Stop) -> Option<&ReviewComment> {
@@ -39258,26 +39366,36 @@ mod code_tour_tests {
     /// the rest of the file's diff is what the diff window is for.
     #[test]
     fn a_stop_shows_what_its_own_lines_used_to_say() {
+        fn shape(rows: &[StopLine]) -> Vec<(StopMark, usize, &str)> {
+            rows.iter().map(|r| (r.mark, r.no, r.text.as_str())).collect()
+        }
         let old = "a\nb\nold one\nold two\nz\n";
         let new = "a\nb\nnew one\nnew two\nz\n";
-        // the stop covers the two lines that changed
-        let got = stop_before_after(old, new, 3, 4, 12);
+        // the stop covers the two lines that changed, and each line keeps the
+        // number of the side it came from
         assert_eq!(
-            got,
+            shape(&stop_before_after(old, new, 3, 4, 12)),
             vec![
-                (false, "old one".to_string()),
-                (true, "new one".to_string()),
-                (false, "old two".to_string()),
-                (true, "new two".to_string()),
+                (StopMark::Del, 3, "old one"),
+                (StopMark::Add, 3, "new one"),
+                (StopMark::Del, 4, "old two"),
+                (StopMark::Add, 4, "new two"),
             ]
         );
         // a stop standing somewhere nothing moved has nothing to draw
         assert!(stop_before_after(old, new, 1, 2, 12).is_empty());
-        // a deleted line belongs to the line that replaced it
+        // a deleted line belongs to the line that replaced it, and the line
+        // that is still there comes along as context
         let cut = "a\ngone\nz\n";
-        assert_eq!(stop_before_after(cut, "a\nz\n", 2, 2, 12), vec![(false, "gone".to_string())]);
-        // past the cap it is a diff, not a snippet
+        assert_eq!(
+            shape(&stop_before_after(cut, "a\nz\n", 2, 2, 12)),
+            vec![(StopMark::Del, 2, "gone"), (StopMark::Same, 2, "z")]
+        );
+        // the cap counts what changed, so untouched lines never spend it
         assert!(stop_before_after(old, new, 3, 4, 2).is_empty());
+        // four changed lines and three untouched: a cap of four lets it all
+        // through
+        assert_eq!(shape(&stop_before_after(old, new, 1, 5, 4)).len(), 7);
         // a file that is new all through has no before to show
         assert!(stop_before_after("", new, 1, 5, 12).is_empty());
     }
