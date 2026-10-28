@@ -24608,6 +24608,12 @@ impl Storm {
             Some(n) if !n.is_empty() => format!("Asked for \u{201c}{n}\u{201d} to be built again"),
             _ => "Asked for the tour to be built again".to_string(),
         };
+        // the tour is what comes back, and it opens where it belongs: the pane
+        // gets the one line that says how the rebuild is going
+        self.job_next = Some(match name.as_deref().map(str::trim) {
+            Some(n) if !n.is_empty() => format!("Rebuild \u{201c}{n}\u{201d}"),
+            _ => "Rebuild the tour".to_string(),
+        });
         self.agent_open = true;
         self.send_agent_prompt_as(tour_request(Some(&about), None), Some(label), cx);
         self.agent_list.scroll_to_end();
@@ -24619,6 +24625,10 @@ impl Storm {
             Some(a) => format!("Asked for a code tour of {a}"),
             None => "Asked for a code tour".to_string(),
         };
+        self.job_next = Some(match about.as_deref() {
+            Some(a) => format!("Code tour of {a}"),
+            None => "Code tour".to_string(),
+        });
         self.agent_open = true;
         self.send_agent_prompt_as(tour_request(about.as_deref(), None), Some(label), cx);
         self.agent_list.scroll_to_end();
@@ -27999,7 +28009,12 @@ impl Storm {
     fn job_chip(&self, ix: usize, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let q = self.job_turns.iter().find(|q| q.at == ix)?;
-        let name = q.job.clone();
+        // a job named after what was asked ("Code tour of how sends reach the
+        // browser") can run long; the line is a label, not the question
+        let name = match q.job.char_indices().nth(46) {
+            Some((b, _)) => format!("{}\u{2026}", q.job[..b].trim_end()),
+            None => q.job.clone(),
+        };
         let end = q.end.unwrap_or(self.agent_msgs.len()).min(self.agent_msgs.len());
         let steps = end.saturating_sub(ix + 1);
         let failed = self.agent_msgs[(ix + 1).min(end)..end]
