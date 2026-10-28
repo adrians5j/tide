@@ -27408,16 +27408,15 @@ impl Storm {
                 self.brief_ask_at = None;
                 self.focus_active(window, cx);
             }
-            // ↩ sends, since that is what the box says it does; the other
-            // three ↩s are how a paragraph gets its second line
-            "enter" if ks.modifiers.shift || ks.modifiers.platform || ks.modifiers.alt => {
-                self.brief_ask.newline();
-            }
-            "enter" => {
+            // ⇧↩ sends and a plain ↩ writes a line: this is a box you type a
+            // paragraph into, and the key you reach for without thinking
+            // should be the one that can't send half a question
+            "enter" if ks.modifiers.shift => {
                 if let Some(ix) = self.brief_ask_at {
                     self.ask_about_slide(ix, cx);
                 }
             }
+            "enter" => self.brief_ask.newline(),
             _ => {
                 if !Self::text_comes_via_input_handler(ks) {
                     Self::field_input(&mut self.brief_ask, ks, cx, |_| true);
@@ -32738,7 +32737,7 @@ impl Storm {
                 .into_any_element()
         } else {
             box_.child(
-                div().text_color(rgb(LINE_NUMBER)).child("Ask about this slide…  ↩"),
+                div().text_color(rgb(LINE_NUMBER)).child("Ask about this slide…  ⇧↩"),
             )
             .into_any_element()
         };
