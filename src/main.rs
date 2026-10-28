@@ -16802,31 +16802,6 @@ impl Storm {
                                     .rounded_md()
                                     .text_color(rgb(TEXT))
                                     .text_size(px(12.))
-                                    // the agent's state, as a dot and nothing
-                                    // else: it belongs against the name of the
-                                    // workspace it is the state of, and the
-                                    // word was a chip's worth of bar for a
-                                    // colour you already read
-                                    .when_some(
-                                        self.agent_rollup().filter(|(s, _)| !s.is_idle()),
-                                        |d, (s, _)| {
-                                            d.child(
-                                                div()
-                                                    .id("agent-dot")
-                                                    .w(px(6.))
-                                                    .h(px(6.))
-                                                    .rounded_full()
-                                                    .flex_shrink_0()
-                                                    .bg(rgb(agent_color(s)))
-                                                    .tooltip(tip(match s {
-                                                        AgentState::Working => "The agent is working",
-                                                        AgentState::Blocked => "The agent wants something from you",
-                                                        AgentState::Failed => "The agent stopped on an error",
-                                                        _ => "The agent is done",
-                                                    })),
-                                            )
-                                        },
-                                    )
                                     // the type's emoji is its own element now.
                                     // Inside the title string it set where the
                                     // name began, and the subtitle underneath
@@ -16850,6 +16825,31 @@ impl Storm {
                                                     .gap_1()
                                                     .line_height(px(16.))
                                                     .child(name)
+                                                    // the agent's state, as a
+                                                    // dot and nothing else,
+                                                    // after the name it is the
+                                                    // state of
+                                                    .when_some(
+                                                        self.agent_rollup()
+                                                            .filter(|(s, _)| !s.is_idle()),
+                                                        |d, (s, _)| {
+                                                            d.child(
+                                                                div()
+                                                                    .id("agent-dot")
+                                                                    .w(px(6.))
+                                                                    .h(px(6.))
+                                                                    .rounded_full()
+                                                                    .flex_shrink_0()
+                                                                    .bg(rgb(agent_color(s)))
+                                                                    .tooltip(tip(match s {
+                                                                        AgentState::Working => "The agent is working",
+                                                                        AgentState::Blocked => "The agent wants something from you",
+                                                                        AgentState::Failed => "The agent stopped on an error",
+                                                                        _ => "The agent is done",
+                                                                    })),
+                                                            )
+                                                        },
+                                                    )
                                                     // who this work is for, when
                                                     // it's client work
                                                     .when_some(
