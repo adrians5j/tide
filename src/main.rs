@@ -28073,16 +28073,16 @@ impl Storm {
                 .flex_row()
                 .items_center()
                 .gap_1p5()
-                .px_1p5()
-                .py_0p5()
+                .px_2()
+                .py_1()
                 .rounded_md()
                 .cursor_pointer()
                 .border_1()
                 .border_color(rgb(BORDER))
-                .text_size(px(11.))
+                .text_size(px(12.5))
                 .text_color(rgb(MUTED))
                 .hover(|s| s.bg(rgb(HOVER)))
-                .child(div().text_size(px(9.)).child(if open { "▾" } else { "▸" }))
+                .child(div().text_size(px(10.)).child(if open { "▾" } else { "▸" }))
                 .child(div().flex_shrink_0().text_color(rgb(color)).child(glyph))
                 .child(div().text_color(rgb(TEXT)).child(name))
                 .child(div().text_color(rgb(color)).child(state))
@@ -33166,17 +33166,45 @@ impl Storm {
         // the caret is only real when the box has the keyboard, so a box left
         // open on a slide you have scrolled past doesn't blink at you
         let caret = self.caret_if(self.brief_ask_live);
+        // the buttons sit inside the box, under what is being typed, the way
+        // the composer's do: beside it they were a second column in a deck
+        // that has none, and the one on a grown box floated off on its own
+        let chip = |key: &'static str, label: &'static str| {
+            div()
+                .id((key, ix))
+                .flex_shrink_0()
+                .px_2()
+                .py(px(1.))
+                .rounded_md()
+                .cursor_pointer()
+                .text_size(px(11.))
+                .border_1()
+                .border_color(rgb(BORDER))
+                .text_color(rgb(MUTED))
+                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                .child(label)
+        };
+        let clarify = chip("brief-clarify", "clarify")
+            .tooltip(tip("Ask the agent to say this slide again, more plainly"))
+            .on_click(cx.listener(move |this, _e, _w, cx| {
+                this.brief_ask_at = Some(ix);
+                this.brief_ask.set(SLIDE_CLARIFY_NOTE.to_string());
+                this.ask_about_slide(ix, cx);
+            }));
+        let send = chip("brief-send", "send")
+            .tooltip(tip("Ask the agent about this slide  (⇧↩)"))
+            .on_click(cx.listener(move |this, _e, _w, cx| this.ask_about_slide(ix, cx)));
         let box_ = div()
             .id(("brief-ask", ix))
-            .flex_grow(1.0)
+            .w_full()
             .min_w(px(0.))
             .px_1p5()
             .py(px(3.))
             .rounded_md()
             .bg(rgb(BG))
-            // a question worth asking under a slide is usually a paragraph, so
-            // the box opens as one rather than a line that scrolls sideways
-            .when(here, |d| d.min_h(px(58.)))
+            .flex()
+            .flex_col()
+            .gap_1()
             .border_1()
             .border_color(rgb(if here { ACCENT } else { PANEL_BG }))
             .hover(move |s| s.border_color(rgb(if here { ACCENT } else { BORDER })))
@@ -33203,45 +33231,39 @@ impl Storm {
                 // `insertText:`, and macOS only sends it where an input
                 // handler is registered for the focused element
                 .child(input_sink(self.brief_ask_focus.clone(), cx.entity()))
-                .child(self.brief_ask.render(caret, SELECTION))
-                .into_any_element()
+                // a question worth asking under a slide is usually a
+                // paragraph, so the box opens as one rather than as a line
+                // that scrolls sideways
+                .child(div().min_h(px(44.)).child(self.brief_ask.render(caret, SELECTION)))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1p5()
+                        .child(div().flex_grow(1.0))
+                        .child(send)
+                        .child(clarify),
+                )
         } else {
             box_.child(
-                div().text_color(rgb(LINE_NUMBER)).child("Ask about this slide…  ⇧↩"),
-            )
-            .into_any_element()
-        };
-        div()
-            .pl(px(40.))
-            .max_w(px(680.))
-            .flex()
-            .flex_row()
-            // the clarify button stays on the first line of a box that has
-            // grown to a paragraph
-            .items_start()
-            .gap_1p5()
-            .child(box_)
-            .child(
                 div()
-                    .id(("brief-clarify", ix))
-                    .flex_shrink_0()
-                    .px_2()
-                    .py(px(2.))
-                    .rounded_md()
-                    .cursor_pointer()
-                    .text_size(px(11.))
-                    .border_1()
-                    .border_color(rgb(BORDER))
-                    .text_color(rgb(MUTED))
-                    .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                    .child("clarify")
-                    .tooltip(tip("Ask the agent to say this slide again, more plainly"))
-                    .on_click(cx.listener(move |this, _e, _w, cx| {
-                        this.brief_ask_at = Some(ix);
-                        this.brief_ask.set(SLIDE_CLARIFY_NOTE.to_string());
-                        this.ask_about_slide(ix, cx);
-                    })),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .flex_grow(1.0)
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_color(rgb(LINE_NUMBER))
+                            .child("Ask about this slide…  ⇧↩"),
+                    )
+                    .child(clarify),
             )
+        };
+        div().pl(px(40.)).max_w(px(680.)).flex().flex_col().child(box_)
     }
 
     /// The files a slide is about, as a row of links under its prose. A brief
