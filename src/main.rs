@@ -143,6 +143,11 @@ struct QuietTurn {
     at: usize,
     end: Option<usize>,
     open: bool,
+    /// Set when TIDE started this turn as a named job (Explain PR, a brief, a
+    /// tour). The whole turn then draws as one line that says how the job is
+    /// going, and the prompt behind it — a page of instructions nobody reads
+    /// twice — only comes back when the line is opened.
+    job: Option<String>,
 }
 
 /// Which folded turn a transcript row belongs to. A turn runs from the user
@@ -4710,6 +4715,25 @@ fn pr_body_check(number: u64, base: &str, update: bool) -> String {
     )
 }
 
+/// Explain PR wants both halves, and they are written from the same diff. One
+/// prompt is one turn and one row in the transcript; two were two of each, and
+/// the agent read the change twice to answer them.
+fn pr_explain_request(number: u64, base: &str, brief_read: &str, tour_read: &str) -> String {
+    format!(
+        "{brief}\n\
+         ---\n\n\
+         That is the first half, and \"stop\" above means stop writing, not \
+         stop working: in the same turn, build the code tour of #{number} as \
+         well.\n\n\
+         {tour}\n\
+         ---\n\n\
+         So: read the change once, POST the brief, POST the tour, then one \
+         line saying both are up.\n",
+        brief = brief_request(number, base, brief_read),
+        tour = pr_tour_request(number, base, tour_read),
+    )
+}
+
 /// The PR pane's Tour button: the same tour, built from the change rather
 /// than from the conversation, and ordered the way the change wants to be
 /// read. Reviewing a 26-file PR top to bottom in the files list is reading a
@@ -6423,6 +6447,8 @@ struct Queued {
     imgs: Vec<PastedImage>,
     /// Asked from a slide or a stop: its working folds when it finally goes.
     quiet: bool,
+    /// The job it is part of, if TIDE started it as one.
+    job: Option<String>,
 }
 
 /// One stop on a walk through an answer's code references: the file, the lines,
@@ -8071,6 +8097,9 @@ struct Storm {
     /// lands: a prompt sent while a turn is running waits in the queue, so the
     /// message it will become has no index yet.
     quiet_next: bool,
+    /// The name of the job the next prompt belongs to, taken by the send the
+    /// way `quiet_next` is. `Some` means the turn draws as one line.
+    job_next: Option<String>,
     /// Virtualized transcript state, and the item count it was last told about.
     agent_list: gpui::ListState,
     agent_list_len: usize,
@@ -8647,6 +8676,7 @@ impl Storm {
             agent_queue: Vec::new(),
             quiet_turns: Vec::new(),
             quiet_next: false,
+            job_next: None,
             agent_list: gpui::ListState::new(0, gpui::ListAlignment::Bottom, px(600.)),
             agent_list_len: 0,
             acp_state: None,
@@ -24453,6 +24483,7 @@ impl Storm {
         self.pending_tour_pr = Some(number);
         self.tour_waits = wait;
         let label = format!("Asked for a code tour of #{number}");
+        self.job_next = Some(format!("Code tour of #{number}"));
         // a tour of this pull request already read in part: the stops you have
         // read are the ones a rebuild should leave alone
         let read = self
@@ -25595,6 +25626,14 @@ impl Storm {
         by: Sender,
         cx: &mut Context<Self>,
     ) {
+        // read before anything that can return, so a send that doesn't happen
+        // takes them with it rather than leaving them on the next message, and
+        // before the paths that queue it, so a question asked from a slide
+        // while the agent is busy is still folded when it finally goes
+        let quiet = std::mem::take(&mut self.quiet_next);
+        // a job is folded by definition: the one line it draws is the point
+        let job = std::mem::take(&mut self.job_next);
+        let quiet = quiet || job.is_some();
         // the reviewers' reports are the next thing this thread gets, and a
         // message sent now would land in front of them. `deliver_reviews` is
         // the one send that happens while they exist, and by then they're done.
@@ -25602,9 +25641,6 @@ impl Storm {
             self.show_flash("The reviewers are still reading — hold on", cx);
             return;
         }
-        // read before the paths that queue it, so a question asked from a
-        // slide while the agent is busy is still folded when it goes
-        let quiet = std::mem::take(&mut self.quiet_next);
         self.ensure_acp(cx);
         let Some(acp) = self.acp.clone() else { return };
         // the plan window is spent: a prompt sent now comes back as a
@@ -25613,7 +25649,7 @@ impl Storm {
         // handing over reports nobody can type again
         if let Some(why) = self.usage_block() {
             let imgs = self.agent_imgs.drain(..).collect();
-            self.agent_queue.push(Queued { text, label, imgs, by, quiet });
+            self.agent_queue.push(Queued { text, label, imgs, by, quiet, job });
             self.show_flash(&format!("{why}. Held in the queue — Send anyway in the composer."), cx);
             self.agent_list.scroll_to_end();
             cx.notify();
@@ -25624,7 +25660,7 @@ impl Storm {
         if self.agent_busy {
             // the attachments go with it, not with the next thing you send
             let imgs = self.agent_imgs.drain(..).collect();
-            self.agent_queue.push(Queued { text, label, imgs, by, quiet });
+            self.agent_queue.push(Queued { text, label, imgs, by, quiet, job });
             self.agent_list.scroll_to_end();
             cx.notify();
             return;
@@ -25642,7 +25678,7 @@ impl Storm {
         };
         acp.prompt_with(&sent, &imgs);
         self.agent_msgs.push(AgentMsg::User { text: shown, imgs: kept, by });
-        self.mark_turn_start(quiet);
+        self.mark_turn_start(quiet, job);
         self.agent_turn_start = Some(std::time::Instant::now());
         self.start_agent_spinner(cx);
         // same signal a terminal agent's UserPromptSubmit hook sends
@@ -26897,13 +26933,14 @@ impl Storm {
     fn explain_pr(&mut self, number: u64, base: String, force: bool, cx: &mut Context<Self>) {
         let reading = self.pr_reading(number);
         let (brief, tour) = reading.wanted(force);
-        // the brief first: it is the one you read before the code, and the
-        // second prompt waits in the queue until the first turn ends anyway
-        if brief {
-            self.ask_pr_brief(number, base.clone(), true, cx);
-        }
-        if tour {
-            self.ask_pr_tour(number, base, true, cx);
+        // one button, one turn. Both halves come out of the same diff, so
+        // asking for them separately read the change twice and left two rows
+        // in the transcript for one press
+        match (brief, tour) {
+            (true, true) => self.ask_pr_explain(number, base, cx),
+            (true, false) => self.ask_pr_brief(number, base, true, cx),
+            (false, true) => self.ask_pr_tour(number, base, true, cx),
+            (false, false) => {}
         }
         // nothing to write for the brief means there is one on disk, and a
         // button that explains the change should put it on screen
@@ -26924,6 +26961,32 @@ impl Storm {
         cx.notify();
     }
 
+    /// Both halves of Explain PR in one turn, drawn as one line in the pane.
+    fn ask_pr_explain(&mut self, number: u64, base: String, cx: &mut Context<Self>) {
+        self.pending_tour_pr = Some(number);
+        self.tour_waits = true;
+        let brief_read = brief_cached(number)
+            .map(|b| brief_read_note(&b.slides, &b.read))
+            .unwrap_or_default();
+        let tour_read = self
+            .tours
+            .iter()
+            .filter(|t| t.pr == Some(number))
+            .max_by_key(|t| t.made)
+            .map(|t| tour_read_note(&t.stops, &t.seen.iter().copied().collect()))
+            .unwrap_or_default();
+        let label = format!("Asked for a brief and a code tour of #{number}");
+        self.job_next = Some(format!("Explain #{number}"));
+        self.agent_open = true;
+        self.send_agent_prompt_as(
+            pr_explain_request(number, &base, &brief_read, &tour_read),
+            Some(label),
+            cx,
+        );
+        self.agent_list.scroll_to_end();
+        cx.notify();
+    }
+
     fn ask_pr_brief(&mut self, number: u64, base: String, again: bool, cx: &mut Context<Self>) {
         if !again {
             if let Some(b) = brief_cached(number) {
@@ -26936,6 +26999,7 @@ impl Storm {
             }
         }
         let label = format!("Asked for a brief of #{number}");
+        self.job_next = Some(format!("Brief of #{number}"));
         // the slides already read ride along, so a rewrite isn't eight slides
         // to read from the top again
         let read = brief_cached(number)
@@ -27807,13 +27871,13 @@ impl Storm {
     /// A user message has just landed in the transcript. Whatever turn was
     /// running is over, so a fold that was still growing stops here; and when
     /// this question came from a slide or a stop, its own working folds.
-    fn mark_turn_start(&mut self, quiet: bool) {
+    fn mark_turn_start(&mut self, quiet: bool, job: Option<String>) {
         let at = self.agent_msgs.len().saturating_sub(1);
         if let Some(q) = self.quiet_turns.last_mut().filter(|q| q.end.is_none()) {
             q.end = Some(at);
         }
         if quiet {
-            self.quiet_turns.push(QuietTurn { at, end: None, open: false });
+            self.quiet_turns.push(QuietTurn { at, end: None, open: false, job });
         }
     }
 
@@ -27827,6 +27891,9 @@ impl Storm {
     /// unfolds it. Nothing to show means nothing has come back yet.
     fn quiet_chip(&self, ix: usize, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let q = self.quiet_turns.iter().find(|q| q.at == ix)?;
+        if q.job.is_some() {
+            return None; // the job line says it instead, and says more
+        }
         let end = q.end.unwrap_or(self.agent_msgs.len());
         let steps = end.saturating_sub(ix + 1);
         if steps == 0 {
@@ -27866,6 +27933,66 @@ impl Storm {
         )
     }
 
+    /// How a named job is going, as the one line it draws in the transcript:
+    /// its name, its state, and the arrow that opens the working behind it.
+    /// Failure is an error row inside the turn — that is the shape an adapter
+    /// error takes, and it is the only one that outlives the turn.
+    fn job_chip(&self, ix: usize, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let q = self.quiet_turns.iter().find(|q| q.at == ix)?;
+        let name = q.job.clone()?;
+        let end = q.end.unwrap_or(self.agent_msgs.len()).min(self.agent_msgs.len());
+        let steps = end.saturating_sub(ix + 1);
+        let failed = self.agent_msgs[(ix + 1).min(end)..end]
+            .iter()
+            .any(|m| matches!(m, AgentMsg::Tool { status, .. } if status == "failed"));
+        let running = q.end.is_none() && self.agent_busy;
+        let (glyph, state, color) = if failed {
+            ("✕".to_string(), "failed", GIT_DELETED)
+        } else if running {
+            (SPIN[self.agent_spin % SPIN.len()].to_string(), "working", COMMENT_MARK)
+        } else {
+            ("✓".to_string(), "done", GIT_NEW)
+        };
+        let open = q.open;
+        let count = (steps > 0)
+            .then(|| format!("  ·  {steps} step{}", if steps == 1 { "" } else { "s" }))
+            .unwrap_or_default();
+        Some(
+            div()
+                .id(("job-fold", ix))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1p5()
+                .px_1p5()
+                .py_0p5()
+                .rounded_md()
+                .cursor_pointer()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .text_size(px(11.))
+                .text_color(rgb(MUTED))
+                .hover(|s| s.bg(rgb(HOVER)))
+                .child(div().text_size(px(9.)).child(if open { "▾" } else { "▸" }))
+                .child(div().flex_shrink_0().text_color(rgb(color)).child(glyph))
+                .child(div().text_color(rgb(TEXT)).child(name))
+                .child(div().text_color(rgb(color)).child(state))
+                .child(count)
+                .tooltip(tip(if open {
+                    "Fold the job away again"
+                } else {
+                    "Show what the agent did"
+                }))
+                .on_click(cx.listener(move |this, _e, _w, cx| {
+                    if let Some(q) = this.quiet_turns.iter_mut().find(|q| q.at == ix) {
+                        q.open = !q.open;
+                    }
+                    cx.notify();
+                })),
+        )
+    }
+
     /// Send the next queued prompt, if any. Called when a turn ends.
     fn agent_next_queued(&mut self) {
         // a queued prompt is not a running turn: it waits out the limit in the
@@ -27873,7 +28000,7 @@ impl Storm {
         if self.agent_queue.is_empty() || self.usage_block().is_some() {
             return;
         }
-        let Queued { text, label, imgs, by, quiet } = self.agent_queue.remove(0);
+        let Queued { text, label, imgs, by, quiet, job } = self.agent_queue.remove(0);
         if let Some(acp) = self.acp.clone() {
             let sent = if self.agent_briefed {
                 text.clone()
@@ -27888,7 +28015,7 @@ impl Storm {
                 imgs: kept,
                 by,
             });
-            self.mark_turn_start(quiet);
+            self.mark_turn_start(quiet, job);
             self.agent_turn_start = Some(std::time::Instant::now());
             self.acp_state = Some(AgentState::Working);
             self.agent_cur = None;
@@ -28575,16 +28702,23 @@ impl Storm {
                         // right-click them, copy them
                         if let AgentMsg::User { text, imgs, by } = m {
                             let (text, imgs) = (text.clone(), imgs.clone());
-                            let tide = *by == Sender::Tide;
-                            return div()
-                                .px_3()
-                                .py_1()
+                            let by = *by;
+                            let tide = by == Sender::Tide;
+                            // a job TIDE started is one line until you open it:
+                            // the prompt behind it is a page of instructions
+                            // written for the agent, not for you
+                            let shut = this
+                                .quiet_turns
+                                .iter()
+                                .any(|q| q.at == ix && q.job.is_some() && !q.open);
+                            let body = (!shut).then(|| {
+                                div()
                                 .flex()
                                 .flex_col()
                                 .w_full()
                                 .min_w(px(0.))
                                 .gap_1()
-                                .child(user_head(&text, ix, *by))
+                                .child(user_head(&text, ix, by))
                                 .child(
                                     div()
                                         // a plain block sizes to its content, so
@@ -28614,6 +28748,17 @@ impl Storm {
                                         .child(this.render_agent_md(ix, &text, window, cx)),
                                 )
                                 .children(user_images(&imgs, ix))
+                            });
+                            return div()
+                                .px_3()
+                                .py_1()
+                                .flex()
+                                .flex_col()
+                                .w_full()
+                                .min_w(px(0.))
+                                .gap_1()
+                                .children(this.job_chip(ix, cx))
+                                .children(body)
                                 .children(this.quiet_chip(ix, cx))
                                 .into_any_element();
                         }
@@ -39077,8 +39222,8 @@ mod code_tour_tests {
     #[test]
     fn a_folded_turn_owns_its_own_rows_only() {
         let turns = vec![
-            QuietTurn { at: 2, end: Some(6), open: false },
-            QuietTurn { at: 9, end: None, open: false },
+            QuietTurn { at: 2, end: Some(6), open: false, job: None },
+            QuietTurn { at: 9, end: None, open: false, job: None },
         ];
         // the question itself is part of the fold: that is where the chip goes
         assert!(quiet_at(&turns, 2).is_some());
@@ -39092,6 +39237,21 @@ mod code_tour_tests {
         // and nothing before the first fold
         assert!(quiet_at(&turns, 0).is_none());
         assert!(quiet_at(&[], 3).is_none());
+    }
+
+    /// Explain PR is one prompt: both halves, in the order they are read, and
+    /// the brief's "stop and don't repeat the slides" doesn't end the turn.
+    #[test]
+    fn explain_pr_asks_for_both_halves_at_once() {
+        let q = pr_explain_request(6127, "next", "", "");
+        assert!(q.contains("Write me a brief of #6127"), "{q}");
+        assert!(q.contains("$TIDE_RPC/brief"), "{q}");
+        assert!(q.contains("$TIDE_RPC/tour"), "{q}");
+        assert!(q.contains("stop working"), "{q}");
+        // the brief comes first: it is what is read before the code
+        let brief = q.find("$TIDE_RPC/brief").unwrap();
+        let tour = q.find("$TIDE_RPC/tour").unwrap();
+        assert!(brief < tour, "the brief is asked for first");
     }
 
     /// The card draws what the stop's own lines used to say, and only that:
