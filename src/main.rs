@@ -4557,6 +4557,15 @@ fn brief_request(number: u64, base: &str, read: &str) -> String {
          halfway now get picked up”, never “Recovery” or “Background”. `text` is \
          two or three sentences: what changed, what it was before, and the one \
          thing I would get wrong if nobody told me. Backticks for identifiers.\n\n\
+         A brief is read by somebody who has not read the code, so a word that \
+         only means something inside this repository has to be paid for the \
+         first time it is used: a send, a lease, a connection row, a stale \
+         worker. Say what it is in the same sentence, in a clause, in the \
+         plainest terms that are still true — “a send (the server pushing a \
+         message down a websocket the browser is holding open)”. The test is \
+         whether I could ask “what do you mean by that?” about any noun on the \
+         slide. If I could, the slide isn't written yet, and I have to stop \
+         reading and ask, which is the thing a brief exists to save me.\n\n\
          `files` is the way from a slide into the code: the two or three files \
          that slide is about, as `path/to/File.ts:84`, pointing at the line \
          worth landing on. Put them on every slide that is about code at all — \
@@ -4640,7 +4649,10 @@ fn pr_tour_request(number: u64, base: &str, read: &str) -> String {
          stops the way the change wants to be read — the entry point first, \
          then what it calls, then what it changed underneath, then the tests. \
          Every stop points at the new code, and its text says what changed \
-         there and why it matters, not what the file does in general. Leave out \
+         there and why it matters, not what the file does in general. The first \
+         time a stop leans on a word that only means something inside this \
+         repository — a send, a lease, a connection row — say what it is in the \
+         same sentence, in a clause. Leave out \
          what adds nothing to read: version bumps, renames, generated files. \
          If something in the diff looks wrong to you, make it a stop and say \
          so.\n",
@@ -28033,29 +28045,9 @@ impl Storm {
                                 })),
                         )
                     })
-                    // what TIDE says to the agent before your first word: not a
-                    // secret, just hidden, so there's a way to read it
-                    .child(
-                        div()
-                            .id("agent-brief")
-                            .px_1p5()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .font_family(ICON_FONT)
-                            .text_size(px(12.))
-                            .when(self.agent_brief_open, |d| d.bg(rgb(HOVER)))
-                            .text_color(rgb(MUTED))
-                            .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                            .child(IC_GEAR)
-                            .tooltip(tip("The instructions TIDE gives this agent"))
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.agent_brief_open = !this.agent_brief_open;
-                                if this.agent_brief_open {
-                                    this.agent_brief_text = this.tide_briefing();
-                                }
-                                cx.notify();
-                            })),
-                    )
+                    // the briefing panel is on the palette ("Show the Agent
+                    // Briefing") rather than up here: it is read once in a
+                    // while, and the bar is for what you reach for
                     .child(
                         div()
                             .id("agent-resume")
@@ -39023,6 +39015,23 @@ mod code_tour_tests {
         assert_eq!(tour_read_note(&stops, &HashSet::from([0, 1])), "");
         // an index left over from a shorter tour is not a stop
         assert_eq!(tour_read_note(&stops, &HashSet::from([9])), "");
+    }
+
+    /// A brief is read by somebody who has not read the code, so both halves
+    /// of an explanation are told to pay for the words that only mean
+    /// something in this repository. A slide that says "a send runs in
+    /// whichever process did the work" without saying what a send is costs a
+    /// question, which is the thing a brief exists to save.
+    #[test]
+    fn an_explanation_pays_for_its_own_vocabulary() {
+        let brief = brief_request(6110, "origin/next", "");
+        assert!(brief.contains("only means something inside this repository"), "{brief}");
+        assert!(brief.contains("in the same sentence"), "{brief}");
+        assert!(brief.contains("what do you mean by that?"), "{brief}");
+
+        let tour = pr_tour_request(6110, "next", "");
+        assert!(tour.contains("only means something inside this"), "{tour}");
+        assert!(tour.contains("in a clause"), "{tour}");
     }
 
     /// Tours survive a restart: the stops, their prose, where you had got to,
