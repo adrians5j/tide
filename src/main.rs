@@ -16704,6 +16704,31 @@ impl Storm {
                                     .rounded_md()
                                     .text_color(rgb(TEXT))
                                     .text_size(px(12.))
+                                    // the agent's state, as a dot and nothing
+                                    // else: it belongs against the name of the
+                                    // workspace it is the state of, and the
+                                    // word was a chip's worth of bar for a
+                                    // colour you already read
+                                    .when_some(
+                                        self.agent_rollup().filter(|(s, _)| !s.is_idle()),
+                                        |d, (s, _)| {
+                                            d.child(
+                                                div()
+                                                    .id("agent-dot")
+                                                    .w(px(6.))
+                                                    .h(px(6.))
+                                                    .rounded_full()
+                                                    .flex_shrink_0()
+                                                    .bg(rgb(agent_color(s)))
+                                                    .tooltip(tip(match s {
+                                                        AgentState::Working => "The agent is working",
+                                                        AgentState::Blocked => "The agent wants something from you",
+                                                        AgentState::Failed => "The agent stopped on an error",
+                                                        _ => "The agent is done",
+                                                    })),
+                                            )
+                                        },
+                                    )
                                     // the type's emoji is its own element now.
                                     // Inside the title string it set where the
                                     // name began, and the subtitle underneath
@@ -16772,35 +16797,12 @@ impl Storm {
                                         .child("PAUSED"),
                                 )
                             })
-                            // agent state for this workspace: the loud badge when
-                            // nothing's running, a dot + word otherwise
-                            .when_some(self.agent_rollup(), |d, (s, _)| {
-                                if s.is_idle() {
-                                    d.child(idle_badge(9.))
-                                } else {
-                                    d.child(
-                                        div()
-                                            .flex()
-                                            .flex_row()
-                                            .items_center()
-                                            .gap_1()
-                                            .ml_1()
-                                            .child(
-                                                div()
-                                                    .w(px(6.))
-                                                    .h(px(6.))
-                                                    .rounded_full()
-                                                    .flex_shrink_0()
-                                                    .bg(rgb(agent_color(s))),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(10.))
-                                                    .text_color(rgb(agent_color(s)))
-                                                    .child(agent_label(s)),
-                                            ),
-                                    )
-                                }
+                            // nothing running is the one state worth a word:
+                            // it is a workspace waiting to be given something,
+                            // not a colour to glance at. The rest are the dot
+                            // in front of the name.
+                            .when_some(self.agent_rollup().filter(|(s, _)| s.is_idle()), |d, _| {
+                                d.child(idle_badge(9.))
                             }),
                     )
                     .when(!self.branch.is_empty(), |d| {
@@ -17118,54 +17120,6 @@ impl Storm {
                             )
                         },
                     )
-                    // wby-next* only: the host opens wby{N}.localhost in the
-                    // default browser; the ▶ beside it carries up/down
-                    .when_some(self.app_url(), |d, url| {
-                        // the play button carries the up/down colour now; this is
-                        // just the hover text on the host itself
-                        let up = self.admin_up == Some(true);
-                        let tip = if up {
-                            "The project is up  ·  click to open  ·  ⌘R to re-check"
-                        } else {
-                            "Nothing serving  ·  click to run `wdev`  ·  ⌘R to re-check"
-                        };
-                        d.child(div().w(px(1.)).h(px(16.)).mx_1().bg(rgb(BORDER))) // separator
-                            // host + ▶ read as one control, so they sit tight
-                            // together instead of a container gap apart
-                            .child(div().flex().flex_row().items_center().gap(px(2.)).child(
-                            div()
-                                .id("open-admin")
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .h(px(18.))
-                                .px_1()
-                                .gap_1()
-                                .rounded_md()
-                                .cursor_pointer()
-                                .text_size(px(11.))
-                                // green once it's actually serving
-                                .text_color(rgb(if up { GIT_NEW } else { MUTED }))
-                                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                                .child(div().font_family(ICON_FONT).text_size(px(12.)).child(IC_BROWSER))
-                                .child(url.trim_start_matches("https://").trim_start_matches("http://").to_string())
-                                .tooltip(move |_w, cx| cx.new(|_| TooltipView { text: tip.into() }).into())
-                                // a dead admin has nothing to show: clicking the
-                                // host starts it instead of opening a failed page
-                                .on_click(cx.listener(move |this, _e, window, cx| {
-                                    if up {
-                                        open_browser(&url);
-                                    } else if this.admin_terminal(cx).is_some() {
-                                        this.show_admin_log(window, cx); // already building
-                                    } else {
-                                        this.start_admin(window, cx);
-                                    }
-                                })),
-                        )
-                        .child(self.admin_play_btn("admin-run", cx)))
-                    })
-                    // watch the branch's changed packages (`wwp`), beside admin
-                    .children(self.render_watch_btn(cx)),
             );
         // right: read-only toggle + memory (moved here from the old bottom bar).
         // The flex_1 spacer keeps the left group left-aligned and pushes these right.
@@ -17175,6 +17129,54 @@ impl Storm {
                 .flex_row()
                 .items_center()
                 .gap_3()
+                // wby-next* only: the host opens wby{N}.localhost in the
+                // default browser; the ▶ beside it carries up/down
+                .when_some(self.app_url(), |d, url| {
+                    // the play button carries the up/down colour now; this is
+                    // just the hover text on the host itself
+                    let up = self.admin_up == Some(true);
+                    let tip = if up {
+                        "The project is up  ·  click to open  ·  ⌘R to re-check"
+                    } else {
+                        "Nothing serving  ·  click to run `wdev`  ·  ⌘R to re-check"
+                    };
+                    d.child(div().w(px(1.)).h(px(16.)).mx_1().bg(rgb(BORDER))) // separator
+                        // host + ▶ read as one control, so they sit tight
+                        // together instead of a container gap apart
+                        .child(div().flex().flex_row().items_center().gap(px(2.)).child(
+                        div()
+                            .id("open-admin")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h(px(18.))
+                            .px_1()
+                            .gap_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_size(px(11.))
+                            // green once it's actually serving
+                            .text_color(rgb(if up { GIT_NEW } else { MUTED }))
+                            .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                            .child(div().font_family(ICON_FONT).text_size(px(12.)).child(IC_BROWSER))
+                            .child(url.trim_start_matches("https://").trim_start_matches("http://").to_string())
+                            .tooltip(move |_w, cx| cx.new(|_| TooltipView { text: tip.into() }).into())
+                            // a dead admin has nothing to show: clicking the
+                            // host starts it instead of opening a failed page
+                            .on_click(cx.listener(move |this, _e, window, cx| {
+                                if up {
+                                    open_browser(&url);
+                                } else if this.admin_terminal(cx).is_some() {
+                                    this.show_admin_log(window, cx); // already building
+                                } else {
+                                    this.start_admin(window, cx);
+                                }
+                            })),
+                    )
+                    .child(self.admin_play_btn("admin-run", cx)))
+                })
+                // watch the branch's changed packages (`wwp`), beside admin
+                .children(self.render_watch_btn(cx))
                 .children(self.render_build_chip(cx))
                 // build state and workspace states are different things: keep a
                 // rule between them
