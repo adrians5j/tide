@@ -4324,6 +4324,45 @@ fn merged_note(number: u64, about: Option<&PrDoc>) -> String {
     format!("{what}\n\nWhat's next?")
 }
 
+
+/// What changed inside a stop's own lines, as `(added, text)` in file order.
+/// Small on purpose: this is the two or three lines the stop is about, read on
+/// the card, not the file's diff, which is what the diff window is for. An
+/// empty answer means there is nothing worth drawing — a stop on code nothing
+/// touched, a file that is new all through, or a change too big to read here.
+fn stop_before_after(old: &str, new: &str, line: usize, end: usize, cap: usize) -> Vec<(bool, String)> {
+    if old.trim().is_empty() || new.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<(bool, String)> = Vec::new();
+    let mut last_right = 0usize;
+    for row in diff::compute(old, new) {
+        // a deleted line has no line of its own on the new side: it sits
+        // between the one before it and the one after, so it counts as the
+        // line it was replaced by
+        let at = row.right_no.unwrap_or(last_right + 1);
+        if let Some(n) = row.right_no {
+            last_right = n;
+        }
+        if at < line || at > end {
+            continue;
+        }
+        match row.kind {
+            DiffKind::Equal => {}
+            DiffKind::Del => out.push((false, row.left.unwrap_or_default())),
+            DiffKind::Ins => out.push((true, row.right.unwrap_or_default())),
+            DiffKind::Replace => {
+                out.push((false, row.left.unwrap_or_default()));
+                out.push((true, row.right.unwrap_or_default()));
+            }
+        }
+        if out.len() > cap {
+            return Vec::new();
+        }
+    }
+    out
+}
+
 /// A question asked under a tour stop, with the stop it was asked under. The
 /// answer is told to come back here rather than only into the transcript: the
 /// card is where the question was typed, and reading on means reading the
@@ -6161,6 +6200,11 @@ const TOUR_LINE_H: f32 = 20.0;
 /// Rows before the description scrolls inside the card instead of pushing the
 /// file further apart.
 const TOUR_CARD_ROWS: usize = 8;
+
+/// How much of a change the card will draw before it stops trying. Past this
+/// the before/after is a diff, not a snippet, and the diff window is the thing
+/// that reads diffs.
+const STOP_DIFF_LINES: usize = 12;
 /// Header row, the file line under it, the note box, padding and borders.
 const TOUR_CARD_CHROME: f32 = 87.0;
 /// Air above and below the card, so the code it parts doesn't touch it.
@@ -7952,6 +7996,11 @@ struct Storm {
     /// which stop. Separate from `review`, because a question you asked while
     /// walking is not a note you meant to leave on the pull request.
     stop_asks: HashMap<(String, usize), SlideThread>,
+    /// Before/after for the stop you are standing on, and the stop it was read
+    /// for: file, lines and head. Computed once a stop rather than once a
+    /// frame, since it costs two `git show`s.
+    stop_diff_key: Option<(PathBuf, usize, usize, String)>,
+    stop_diff: Vec<(bool, String)>,
     /// The deck's scroll, so the strip along the bottom can say which slide
     /// you are on and jump to another one.
     brief_scroll: gpui::ScrollHandle,
@@ -8541,6 +8590,8 @@ impl Storm {
             brief_ask_at: None,
             slide_asks: HashMap::new(),
             stop_asks: HashMap::new(),
+            stop_diff_key: None,
+            stop_diff: Vec::new(),
             brief_scroll: gpui::ScrollHandle::new(),
             reading: None,
             reading_key: None,
@@ -23847,6 +23898,8 @@ impl Storm {
     /// what you're meant to see here.
     fn render_tour_card(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let (left, top, width) = self.tour_card_at(cx)?;
+        self.ensure_stop_diff();
+        let changed = self.stop_diff.clone();
         let w = self.walk.as_ref()?;
         let stop = w.stops.get(w.at)?;
         let (at, total) = (w.at + 1, w.stops.len());
@@ -24146,6 +24199,49 @@ impl Storm {
                             .child(md_text(&said, 13., TEXT)),
                     )
                 })
+                // what the stop's own lines used to say, when that is a line
+                // or three: the card is about a change, and half of a change
+                // is the half that is gone from the screen
+                .when(!changed.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .id("card-diff-lines")
+                            .w_full()
+                            .max_h(px(TOUR_CARD_ROWS as f32 * 16.))
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .font_family("Menlo")
+                            .text_size(px(11.))
+                            .line_height(px(16.))
+                            .children(changed.into_iter().map(|(added, text)| {
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .flex_row()
+                                    .gap_1()
+                                    .px_1()
+                                    .bg(rgb(if added { DIFF_ADD_BG } else { DIFF_REMOVE_BG }))
+                                    .text_color(rgb(if added { TEXT } else { MUTED }))
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_color(rgb(if added { GIT_NEW } else { GIT_DELETED }))
+                                            .child(if added { "+" } else { "−" }),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_grow(1.0)
+                                            .min_w(px(0.))
+                                            .truncate()
+                                            .child(text.replace('\t', "    ")),
+                                    )
+                            })),
+                    )
+                })
                 // what has already been said about this stop, so the card is
                 // the whole conversation rather than half of it
                 .when(has_thread, |d| {
@@ -24427,6 +24523,35 @@ impl Storm {
     }
 
     /// The open review thread sitting on a stop, if one is.
+    /// Fill `stop_diff` for the stop you are standing on. Two `git show`s, so
+    /// it runs once when the stop changes rather than once a frame: the key is
+    /// the stop's file and lines plus the head it was read against.
+    fn ensure_stop_diff(&mut self) {
+        let Some(stop) = self.walk.as_ref().and_then(|w| w.stops.get(w.at)).cloned() else {
+            self.stop_diff_key = None;
+            self.stop_diff.clear();
+            return;
+        };
+        let (line, end) = (stop.line, stop.end.max(stop.line));
+        let abs = self.stop_abs(&stop);
+        let key = (abs.clone(), line, end, self.head_oid.clone());
+        if self.stop_diff_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.stop_diff_key = Some(key);
+        let rel = abs.strip_prefix(&self.root).unwrap_or(&abs).to_string_lossy().to_string();
+        // a file in the pull request is read against what the PR merges into,
+        // which is the change a tour of a PR is about; anything else is the
+        // working-tree diff ⌘D would have shown
+        let (old, new) = if self.pr_files.iter().any(|(p, _)| p == &abs) {
+            let base = diff_base_rev(&self.root, &self.pr_base);
+            (git_show(&self.root, &base, &rel), git_show(&self.root, "HEAD", &rel))
+        } else {
+            (git_show_head(&self.root, &rel), std::fs::read_to_string(&abs).unwrap_or_default())
+        };
+        self.stop_diff = stop_before_after(&old, &new, line, end, STOP_DIFF_LINES);
+    }
+
     fn stop_thread(&self, stop: &Stop) -> Option<&ReviewComment> {
         let abs = self.stop_abs(stop);
         self.review
@@ -38719,6 +38844,34 @@ mod code_tour_tests {
         assert!(q.contains("$TIDE_RPC/comment"), "{q}");
         assert!(q.contains("\"id\":\"q7x2b\""), "{q}");
         assert!(q.contains("Don't rebuild the tour"), "{q}");
+    }
+
+    /// The card draws what the stop's own lines used to say, and only that:
+    /// the rest of the file's diff is what the diff window is for.
+    #[test]
+    fn a_stop_shows_what_its_own_lines_used_to_say() {
+        let old = "a\nb\nold one\nold two\nz\n";
+        let new = "a\nb\nnew one\nnew two\nz\n";
+        // the stop covers the two lines that changed
+        let got = stop_before_after(old, new, 3, 4, 12);
+        assert_eq!(
+            got,
+            vec![
+                (false, "old one".to_string()),
+                (true, "new one".to_string()),
+                (false, "old two".to_string()),
+                (true, "new two".to_string()),
+            ]
+        );
+        // a stop standing somewhere nothing moved has nothing to draw
+        assert!(stop_before_after(old, new, 1, 2, 12).is_empty());
+        // a deleted line belongs to the line that replaced it
+        let cut = "a\ngone\nz\n";
+        assert_eq!(stop_before_after(cut, "a\nz\n", 2, 2, 12), vec![(false, "gone".to_string())]);
+        // past the cap it is a diff, not a snippet
+        assert!(stop_before_after(old, new, 3, 4, 2).is_empty());
+        // a file that is new all through has no before to show
+        assert!(stop_before_after("", new, 1, 5, 12).is_empty());
     }
 
     /// One button, and what it would ask for depends only on what is already
