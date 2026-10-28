@@ -4425,6 +4425,97 @@ fn stop_before_after(old: &str, new: &str, line: usize, end: usize, cap: usize) 
     out
 }
 
+/// One side of a stop's before/after: its own 2D scroll and its own
+/// scrollbars, the way `diff_pane` gives each side of the diff window its own.
+/// A row the other file has and this one doesn't is drawn empty, so the two
+/// line up while they are both at the top.
+fn stop_diff_side(
+    rows: &[StopRow],
+    left: bool,
+    col_w: f32,
+    handle: &ScrollHandle,
+    id: &'static str,
+) -> impl IntoElement {
+    let mut area = div()
+        .id(id)
+        .size_full()
+        .overflow_x_scroll()
+        .overflow_y_scroll()
+        .track_scroll(handle)
+        .flex()
+        .flex_col()
+        .items_start()
+        .py(px(2.))
+        .font_family("Menlo")
+        .text_size(px(STOP_DIFF_FONT))
+        .line_height(px(STOP_DIFF_ROW));
+    for row in rows {
+        let side = if left { &row.left } else { &row.right };
+        // a row where both sides carry the same text is one nothing happened
+        // to: it draws plain, and only the halves that moved are tinted
+        let kept = row.left.as_ref().map(|s| &s.text) == row.right.as_ref().map(|s| &s.text);
+        let tint = match (kept, left) {
+            (true, _) => 0,
+            (false, true) => DIFF_REMOVE_BG,
+            (false, false) => DIFF_ADD_BG,
+        };
+        let mut line = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .flex_shrink_0()
+            .h(px(STOP_DIFF_ROW))
+            .w(px(col_w));
+        if let Some(side) = side {
+            if tint != 0 {
+                line = line.bg(rgb(tint));
+            }
+            let plain = side.runs.is_empty();
+            let runs = diff_line_runs(&side.text, (!plain).then_some(&side.runs), &[]);
+            line = line
+                // the gutter the editor has, so a line on the card and the
+                // same line on screen are the same line
+                .child(
+                    div()
+                        .w(px(STOP_DIFF_GUTTER))
+                        .flex_shrink_0()
+                        .pr_1()
+                        .flex()
+                        .justify_end()
+                        .text_color(rgb(LINE_NUMBER))
+                        .child(side.no.to_string()),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .h_full()
+                        .pr_1()
+                        // a real line of code is wider than half a card, and a
+                        // wrapped line in an 18px row paints over the row
+                        // under it: it runs off the edge and you scroll to it
+                        .whitespace_nowrap()
+                        .when(plain, |d| d.text_color(rgb(TEXT)))
+                        .child(if plain {
+                            div().child(side.text.clone()).into_any_element()
+                        } else {
+                            StyledText::new(side.text.clone()).with_runs(runs).into_any_element()
+                        }),
+                );
+        }
+        area = area.child(line);
+    }
+    div()
+        .relative()
+        .h_full()
+        .flex_grow(1.0)
+        .flex_basis(relative(0.))
+        .min_w(px(0.))
+        .overflow_hidden()
+        .child(area)
+        .child(v_scrollbar(handle))
+        .child(h_scrollbar(handle))
+}
+
 /// A question asked under a tour stop, with the stop it was asked under. The
 /// answer is told to come back here rather than only into the transcript: the
 /// card is where the question was typed, and reading on means reading the
@@ -8136,9 +8227,10 @@ struct Storm {
     /// frame, since it costs two `git show`s.
     stop_diff_key: Option<(PathBuf, usize, usize, String)>,
     stop_diff: Vec<StopRow>,
-    /// The block scrolls both ways: a stop can be twenty lines, and a line of
-    /// real code is wider than half a card.
-    stop_diff_scroll: gpui::ScrollHandle,
+    /// Each side of the block scrolls on its own, both ways: a stop can be
+    /// twenty lines, and a line of real code is wider than half a card.
+    stop_diff_left: gpui::ScrollHandle,
+    stop_diff_right: gpui::ScrollHandle,
     /// What each package a tour touches calls itself, by its directory:
     /// `packages/languages` → `@webiny/languages`. Read off disk once, because
     /// the map asks for it per stop and the answer doesn't move.
@@ -8743,7 +8835,8 @@ impl Storm {
             stop_asks: HashMap::new(),
             stop_diff_key: None,
             stop_diff: Vec::new(),
-            stop_diff_scroll: gpui::ScrollHandle::new(),
+            stop_diff_left: gpui::ScrollHandle::new(),
+            stop_diff_right: gpui::ScrollHandle::new(),
             pkg_names: HashMap::new(),
             brief_scroll: gpui::ScrollHandle::new(),
             reading: None,
@@ -24410,27 +24503,22 @@ impl Storm {
                 // or three: the card is about a change, and half of a change
                 // is the half that is gone from the screen
                 .when(!changed.is_empty(), |d| {
-                    // both columns the same width, so the rule between them
-                    // sits where the eye expects it, and both at least their
-                    // longest line so the block scrolls instead of clipping
-                    let widest = changed
-                        .iter()
-                        .map(|r| {
-                            let n = |s: &Option<StopSide>| {
-                                s.as_ref().map(|s| s.text.chars().count()).unwrap_or(0)
-                            };
-                            n(&r.left).max(n(&r.right))
-                        })
-                        .max()
-                        .unwrap_or(0);
-                    let inner_w = (width - 20.0).max(160.0);
-                    let col_w = (STOP_DIFF_GUTTER + 8.0 + widest as f32 * char_w)
-                        .max((inner_w - 1.0) / 2.0);
+                    // each side is sized to its own longest line, and at least
+                    // half the card so a short change still fills the width
+                    let widest = |pick: fn(&StopRow) -> &Option<StopSide>| {
+                        changed
+                            .iter()
+                            .map(|r| pick(r).as_ref().map(|s| s.text.chars().count()).unwrap_or(0))
+                            .max()
+                            .unwrap_or(0)
+                    };
+                    let vis = ((width - 21.0) / 2.0).max(80.0);
+                    let col = |n: usize| (STOP_DIFF_GUTTER + 8.0 + n as f32 * char_w).max(vis);
                     let rows_h = changed.len() as f32 * STOP_DIFF_ROW + 4.0;
-                    let scroll = self.stop_diff_scroll.clone();
+                    let (left_h, right_h) =
+                        (self.stop_diff_left.clone(), self.stop_diff_right.clone());
                     d.child(
                         div()
-                            .relative()
                             .w_full()
                             .flex_shrink_0()
                             // a definite height, not a cap: inside a column
@@ -24446,115 +24534,26 @@ impl Storm {
                             // quotation of it
                             .bg(rgb(BG))
                             .overflow_hidden()
-                            .child(
-                                div()
-                                    .id("card-diff-lines")
-                                    .size_full()
-                                    .overflow_x_scroll()
-                                    .overflow_y_scroll()
-                                    .track_scroll(&scroll)
-                                    .flex()
-                                    .flex_col()
-                                    .items_start()
-                                    .py(px(2.))
-                                    .font_family("Menlo")
-                                    .text_size(px(STOP_DIFF_FONT))
-                                    .line_height(px(STOP_DIFF_ROW))
-                                    .children(changed.into_iter().map(|row| {
-                                        // one column per side, the way the diff
-                                        // window puts them: what the line was,
-                                        // what it is
-                                        let half = |side: Option<StopSide>, tint: u32| {
-                                            let mut col = div()
-                                                .flex()
-                                                .flex_row()
-                                                .items_center()
-                                                .h_full()
-                                                .w(px(col_w))
-                                                .flex_shrink_0()
-                                                .overflow_hidden();
-                                            // no line on this side of the
-                                            // change: the column stays, so the
-                                            // two files line up
-                                            let Some(side) = side else { return col };
-                                            if tint != 0 {
-                                                col = col.bg(rgb(tint));
-                                            }
-                                            let plain = side.runs.is_empty();
-                                            let runs = diff_line_runs(
-                                                &side.text,
-                                                (!plain).then_some(&side.runs),
-                                                &[],
-                                            );
-                                            col
-                                                // the gutter the editor has, so
-                                                // a line on the card and the
-                                                // same line on screen are the
-                                                // same line
-                                                .child(
-                                                    div()
-                                                        .w(px(STOP_DIFF_GUTTER))
-                                                        .flex_shrink_0()
-                                                        .pr_1()
-                                                        .flex()
-                                                        .justify_end()
-                                                        .text_color(rgb(LINE_NUMBER))
-                                                        .child(side.no.to_string()),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .flex_shrink_0()
-                                                        .h_full()
-                                                        .pr_1()
-                                                        // a real line of code is
-                                                        // wider than half a
-                                                        // card, and a wrapped
-                                                        // line in an 18px row
-                                                        // paints over the row
-                                                        // under it
-                                                        .whitespace_nowrap()
-                                                        .when(plain, |d| d.text_color(rgb(TEXT)))
-                                                        .child(if plain {
-                                                            div()
-                                                                .child(side.text)
-                                                                .into_any_element()
-                                                        } else {
-                                                            StyledText::new(side.text.clone())
-                                                                .with_runs(runs)
-                                                                .into_any_element()
-                                                        }),
-                                                )
-                                        };
-                                        // a row where both sides carry the same
-                                        // text is one nothing happened to: it
-                                        // draws plain, and only the halves that
-                                        // moved are tinted
-                                        let kept = row.left.as_ref().map(|s| &s.text)
-                                            == row.right.as_ref().map(|s| &s.text);
-                                        let (lt, rt) = if kept {
-                                            (0, 0)
-                                        } else {
-                                            (DIFF_REMOVE_BG, DIFF_ADD_BG)
-                                        };
-                                        div()
-                                            .flex()
-                                            .flex_row()
-                                            .items_center()
-                                            .flex_shrink_0()
-                                            .h(px(STOP_DIFF_ROW))
-                                            .child(half(row.left, lt))
-                                            .child(
-                                                div()
-                                                    .w(px(1.))
-                                                    .h_full()
-                                                    .flex_shrink_0()
-                                                    .bg(rgb(BORDER)),
-                                            )
-                                            .child(half(row.right, rt))
-                                    })),
-                            )
-                            .child(v_scrollbar(&scroll))
-                            .child(h_scrollbar(&scroll)),
+                            .flex()
+                            .flex_row()
+                            // each side scrolls on its own, the way ⌘D does it:
+                            // the two files are the same length only until one
+                            // of them isn't
+                            .child(stop_diff_side(
+                                &changed,
+                                true,
+                                col(widest(|r| &r.left)),
+                                &left_h,
+                                "card-diff-left",
+                            ))
+                            .child(div().w(px(1.)).h_full().flex_shrink_0().bg(rgb(BORDER)))
+                            .child(stop_diff_side(
+                                &changed,
+                                false,
+                                col(widest(|r| &r.right)),
+                                &right_h,
+                                "card-diff-right",
+                            )),
                     )
                 })
                 // what has already been said about this stop, so the card is
