@@ -4324,16 +4324,11 @@ fn merged_note(number: u64, about: Option<&PrDoc>) -> String {
     format!("{what}\n\nWhat's next?")
 }
 
-/// What TIDE says when you press Tour. The schema is in the briefing too, but
-/// an agent writes a better tour with the shape in front of it, and this is the
-/// one message where the shape is the whole point.
-///
-/// `about` names the subject. `None` means the conversation itself, which is
-/// the usual case: you read an answer, you want to walk the code it describes.
-/// `answer` is one of its own messages, quoted back to it — the references are
-/// already in it, in the right order, and a resumed session may not remember
-/// writing them.
-fn tour_question(tour: &str, at: usize, total: usize, stop: &Stop, q: &str) -> String {
+/// A question asked under a tour stop, with the stop it was asked under. The
+/// answer is told to come back here rather than only into the transcript: the
+/// card is where the question was typed, and reading on means reading the
+/// answer where you are standing.
+fn tour_question(tour: &str, at: usize, total: usize, stop: &Stop, q: &str, id: &str) -> String {
     let named = match tour.trim() {
         "" => String::new(),
         t => format!(" of “{t}”"),
@@ -4349,7 +4344,13 @@ fn tour_question(tour: &str, at: usize, total: usize, stop: &Stop, q: &str) -> S
     format!(
         "{}\n\n\
          (I'm standing on stop {at}/{total}{named}: `{}`{title}{said})\n\
-         Answer the question. Don't rebuild the tour unless I ask for it.\n",
+         Answer the question, then post the answer back to the stop I asked it \
+         on, the way you answer a review comment:\n\
+         \x20 curl -s -X POST \"$TIDE_RPC/comment\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n\
+         \x20   -d '{{\"id\":\"{id}\",\"text\":\"<the answer, in markdown>\"}}'\n\
+         Two or three sentences there, on the card where I am reading; the \
+         working out can stay in the transcript. Don't rebuild the tour unless \
+         I ask for it.\n",
         q.trim(),
         stop_label(stop),
     )
@@ -7947,6 +7948,10 @@ struct Storm {
     /// request and slide. The answers arrive the way a review comment's does:
     /// the agent posts to `/comment` with the id its question carried.
     slide_asks: HashMap<(u64, usize), SlideThread>,
+    /// The same thing under a tour stop, keyed by the tour it was asked on and
+    /// which stop. Separate from `review`, because a question you asked while
+    /// walking is not a note you meant to leave on the pull request.
+    stop_asks: HashMap<(String, usize), SlideThread>,
     /// The deck's scroll, so the strip along the bottom can say which slide
     /// you are on and jump to another one.
     brief_scroll: gpui::ScrollHandle,
@@ -8535,6 +8540,7 @@ impl Storm {
             brief_ask: Field::multiline(),
             brief_ask_at: None,
             slide_asks: HashMap::new(),
+            stop_asks: HashMap::new(),
             brief_scroll: gpui::ScrollHandle::new(),
             reading: None,
             reading_key: None,
@@ -9953,6 +9959,7 @@ impl Storm {
                             if let Some(turn) = this
                                 .slide_asks
                                 .values_mut()
+                                .chain(this.stop_asks.values_mut())
                                 .flat_map(|t| t.turns.iter_mut())
                                 .find(|t| t.id == r.id)
                             {
@@ -9965,7 +9972,8 @@ impl Storm {
                         }
                         if landed + on_slides > 0 {
                             let n = landed + on_slides;
-                            let where_ = if landed == 0 { "under the slide" } else { "in review threads" };
+                            let where_ =
+                                if landed == 0 { "where you asked" } else { "in review threads" };
                             this.show_flash(
                                 &format!("{n} answer{} {where_}", if n == 1 { "" } else { "s" }),
                                 cx,
@@ -23881,7 +23889,7 @@ impl Storm {
         let ask_empty = self.tour_ask.is_empty();
         let asking = self.tour_ask_focus.is_focused(window);
         let caret = self.caret();
-        let thread: Vec<(bool, String)> = self
+        let mut thread: Vec<(bool, String)> = self
             .stop_thread(stop)
             .map(|c| {
                 let mut t = vec![(true, c.text.clone())];
@@ -23889,6 +23897,20 @@ impl Storm {
                 t
             })
             .unwrap_or_default();
+        // a note left at this line is one thread; what you typed in the card's
+        // own box is the other, and on the card they read as one conversation
+        if let Some(asked) = self.stop_asks.get(&(w.id.clone().unwrap_or_default(), w.at)) {
+            for turn in &asked.turns {
+                thread.push((true, turn.q.clone()));
+                thread.push((
+                    false,
+                    match turn.answer.trim() {
+                        "" => "…".to_string(),
+                        a => a.to_string(),
+                    },
+                ));
+            }
+        }
         let has_thread = !thread.is_empty();
         let arrow = |id: &'static str, glyph: &'static str, hint: &'static str, dir: i32, cx: &mut Context<Self>| {
             div()
@@ -24439,14 +24461,25 @@ impl Storm {
         };
         let abs = self.stop_abs(&stop);
         let (line, end) = (stop.line, stop.end.max(stop.line));
-        let Some(c) =
-            self.review.iter_mut().find(|c| c.path == abs && c.line == line && c.end == end)
-        else {
+        // both halves of what the card shows: the note left at this line, and
+        // the questions typed into the card itself
+        let key = self.walk.as_ref().map(|w| (w.id.clone().unwrap_or_default(), w.at));
+        let asked = key.is_some_and(|k| self.stop_asks.remove(&k).is_some());
+        let noted =
+            match self.review.iter_mut().find(|c| c.path == abs && c.line == line && c.end == end) {
+                Some(c) => {
+                    c.resolved = true;
+                    true
+                }
+                None => false,
+            };
+        if !asked && !noted {
             return;
-        };
-        c.resolved = true;
-        self.sync_comment_gutters(cx);
-        self.save_review();
+        }
+        if noted {
+            self.sync_comment_gutters(cx);
+            self.save_review();
+        }
         self.show_flash("Thread resolved", cx);
         cx.notify();
     }
@@ -26894,6 +26927,8 @@ impl Storm {
         self.tours.insert(0, rec);
         self.tours.truncate(30);
         self.save_tours();
+        let live: HashSet<String> = self.tours.iter().map(|t| t.id.clone()).collect();
+        self.stop_asks.retain(|(id, _), _| live.contains(id));
         let note = if dropped > 0 { format!(" · {dropped} skipped") } else { String::new() };
         // a tour that came with a brief waits: it lands while you are still on
         // slide two, and jumping the editor to its first stop takes the screen
@@ -27188,7 +27223,12 @@ impl Storm {
         let Some(w) = self.walk.as_ref() else { return };
         let Some(stop) = w.stops.get(w.at).cloned() else { return };
         let (tour, at, total) = (w.tour.clone().unwrap_or_default(), w.at + 1, w.stops.len());
-        let text = tour_question(&tour, at, total, &stop, &q);
+        let key = (w.id.clone().unwrap_or_default(), w.at);
+        let id = random_id();
+        let text = tour_question(&tour, at, total, &stop, &q, &id);
+        // the question goes up on the card before it has an answer, so the
+        // card shows you asked rather than looking like nothing happened
+        self.stop_asks.entry(key).or_default().ask(id, q.clone(), now_secs());
         self.tour_ask.clear();
         self.agent_open = true;
         self.send_agent_prompt_by(text, Some(q), Sender::You, cx);
@@ -38663,6 +38703,22 @@ mod code_tour_tests {
         let bare = slide_question("", None, 1, 1, &slide, "and this?", "zz001");
         assert!(bare.contains("slide 1/1 of the brief"), "{bare}");
         assert!(!bare.contains("#"), "nothing to cite: {bare}");
+    }
+
+    /// A question typed into the stop card asks for its answer back on the
+    /// card, the same bargain a slide's question makes. Without it the answer
+    /// is in the agent pane only, and the card looks like nothing happened.
+    #[test]
+    fn a_question_under_a_stop_comes_back_to_the_card() {
+        let s = stop("packages/api/src/Transport.ts", 22, 30, "send() collects");
+        let q = tour_question("Who owns a connection", 1, 21, &s, "  what is a send? ", "q7x2b");
+        assert!(q.starts_with("what is a send?"), "your words lead, trimmed: {q}");
+        assert!(q.contains("stop 1/21"), "{q}");
+        assert!(q.contains("Who owns a connection"), "{q}");
+        assert!(q.contains("Transport.ts:22-30"), "{q}");
+        assert!(q.contains("$TIDE_RPC/comment"), "{q}");
+        assert!(q.contains("\"id\":\"q7x2b\""), "{q}");
+        assert!(q.contains("Don't rebuild the tour"), "{q}");
     }
 
     /// One button, and what it would ask for depends only on what is already
