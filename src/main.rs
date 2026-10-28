@@ -7986,6 +7986,10 @@ struct Storm {
     /// The pull request TIDE last asked for a tour of, so the tour that comes
     /// back can be stamped with it.
     pending_tour_pr: Option<u64>,
+    /// A tour asked for as half of an explanation: it is kept when it
+    /// lands, not walked. The brief is what you are reading, and the deck
+    /// links on to the tour at the end of it.
+    tour_waits: bool,
     // ── Git log panel (bottom dock) ────────────────────────────────────────
     git_open: bool,                          // dock visible
     git_height: f32,                         // dock height
@@ -8542,6 +8546,7 @@ impl Storm {
             head_oid: String::new(),
             walk_group: String::new(),
             pending_tour_pr: None,
+            tour_waits: false,
             git_open: false,
             git_height: 320.,
             resizing_git: false,
@@ -24264,8 +24269,9 @@ impl Storm {
     }
 
     /// A tour of the pull request: its changes in the order they should be read.
-    fn ask_pr_tour(&mut self, number: u64, base: String, cx: &mut Context<Self>) {
+    fn ask_pr_tour(&mut self, number: u64, base: String, wait: bool, cx: &mut Context<Self>) {
         self.pending_tour_pr = Some(number);
+        self.tour_waits = wait;
         let label = format!("Asked for a code tour of #{number}");
         // a tour of this pull request already read in part: the stops you have
         // read are the ones a rebuild should leave alone
@@ -26621,7 +26627,7 @@ impl Storm {
             .map(|t| t.id.clone());
         match id {
             Some(id) => self.open_tour(id, false, cx),
-            None => self.ask_pr_tour(number, base, cx),
+            None => self.ask_pr_tour(number, base, false, cx),
         }
     }
 
@@ -26641,7 +26647,7 @@ impl Storm {
             self.ask_pr_brief(number, base.clone(), true, cx);
         }
         if tour {
-            self.ask_pr_tour(number, base, cx);
+            self.ask_pr_tour(number, base, true, cx);
         }
         // nothing to write for the brief means there is one on disk, and a
         // button that explains the change should put it on screen
@@ -26804,6 +26810,7 @@ impl Storm {
     }
 
     fn start_tour(&mut self, tour: rpc::Tour, cx: &mut Context<Self>) {
+        let waits = std::mem::take(&mut self.tour_waits);
         self.reading_key = None; // a tour just landed, stale or not
         self.load_tour_diff(cx); // so the map's file names carry their status
         self.tour_group_open.clear();
@@ -26855,17 +26862,20 @@ impl Storm {
             seen: Vec::new(),
             stops: stops.clone(),
         };
-        self.walk = Some(Walk {
-            stops,
-            at: 0,
-            tour: Some(title),
-            intro: true,
-            done: false,
-            id: Some(rec.id.clone()),
-            list: true,
-            here: None,
-            seen: HashSet::new(),
-        });
+        // a tour that came with a brief is kept, not walked: see below
+        if !waits {
+            self.walk = Some(Walk {
+                stops,
+                at: 0,
+                tour: Some(title),
+                intro: true,
+                done: false,
+                id: Some(rec.id.clone()),
+                list: true,
+                here: None,
+                seen: HashSet::new(),
+            });
+        }
         // newest first, and the rest are put away: one tour is open at a time
         for t in self.tours.iter_mut() {
             t.closed = true;
@@ -26873,10 +26883,18 @@ impl Storm {
         self.tours.insert(0, rec);
         self.tours.truncate(30);
         self.save_tours();
+        let note = if dropped > 0 { format!(" · {dropped} skipped") } else { String::new() };
+        // a tour that came with a brief waits: it lands while you are still on
+        // slide two, and jumping the editor to its first stop takes the screen
+        // out from under what you are reading
+        if waits {
+            self.show_flash(&format!("Code tour ready: {n} steps{note}  ·  it's at the end of the brief"), cx);
+            cx.notify();
+            return;
+        }
         // opening a file needs a Window, and this arrives on the poll where
         // there isn't one; render has one and runs next
         self.tour_jump = Some(0);
-        let note = if dropped > 0 { format!(" · {dropped} skipped") } else { String::new() };
         self.show_flash(&format!("Tour: {n} steps{note}  ·  ⌥] / ⌥[ to step"), cx);
         cx.notify();
     }
