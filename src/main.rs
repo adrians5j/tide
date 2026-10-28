@@ -6296,10 +6296,11 @@ const TOUR_CARD_ROWS: usize = 8;
 /// How much of a change the card will draw before it stops trying. Past this
 /// the before/after is a diff, not a snippet, and the diff window is the thing
 /// that reads diffs.
-const STOP_DIFF_LINES: usize = 12;
-/// How tall the block gets before it scrolls inside itself. Eight rows, the
-/// same as the description above it.
-const STOP_DIFF_H: f32 = TOUR_CARD_ROWS as f32 * 16.0;
+const STOP_DIFF_LINES: usize = 20;
+/// How tall the block gets before it scrolls inside itself. The card floats
+/// over the file rather than pushing it apart, so this can be generous: twenty
+/// rows is most stops whole.
+const STOP_DIFF_H: f32 = 20.0 * 16.0;
 /// Header row, the file line under it, the note box, padding and borders.
 const TOUR_CARD_CHROME: f32 = 87.0;
 /// Air above and below the card, so the code it parts doesn't touch it.
@@ -24445,8 +24446,15 @@ impl Storm {
                                             div()
                                                 .flex_grow(1.0)
                                                 .min_w(px(0.))
+                                                .h_full()
                                                 .pr_1()
                                                 .overflow_hidden()
+                                                // half a card is narrow enough
+                                                // that a real line of code
+                                                // wraps, and a wrapped line in
+                                                // a 16px row paints over the
+                                                // row under it
+                                                .whitespace_nowrap()
                                                 .when(plain, |d| d.text_color(rgb(TEXT)))
                                                 .child(if plain {
                                                     div().truncate().child(side.text).into_any_element()
