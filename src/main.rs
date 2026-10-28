@@ -28272,7 +28272,9 @@ impl Storm {
                         )
                     })
                     // the answer to "did I already send those?", which is
-                    // otherwise a scroll back through the transcript
+                    // otherwise a scroll back through the transcript. It says
+                    // "comments" because it sits next to the reviewers chip,
+                    // and a bare "sent 3h" there reads as the reviewers
                     .when_some(self.review_sent, |d, (when, count)| {
                         let waiting = self
                             .review
@@ -28283,12 +28285,12 @@ impl Storm {
                         let stamp = stamp_of(when);
                         let tip_text = if waiting > 0 {
                             format!(
-                                "{count} comment{} sent {stamp}\n{waiting} written since, not sent yet",
+                                "{count} comment{} went to the agent {stamp}\n{waiting} written since, not sent yet",
                                 if count == 1 { "" } else { "s" }
                             )
                         } else {
                             format!(
-                                "{count} comment{} sent {stamp}\nnothing waiting",
+                                "{count} comment{} went to the agent {stamp}\nnothing waiting",
                                 if count == 1 { "" } else { "s" }
                             )
                         };
@@ -28302,9 +28304,9 @@ impl Storm {
                                 // amber while something written since hasn't gone
                                 .text_color(rgb(if waiting > 0 { FOLDER_ICON } else { MUTED }))
                                 .child(if waiting > 0 {
-                                    format!("sent {ago}  ·  {waiting} waiting")
+                                    format!("comments sent {ago}  ·  {waiting} waiting")
                                 } else {
-                                    format!("sent {ago}")
+                                    format!("comments sent {ago}")
                                 })
                                 .tooltip(move |_w, cx| {
                                     cx.new(|_| TooltipView { text: tip_text.clone().into() }).into()
