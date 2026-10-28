@@ -38,7 +38,7 @@ use rpc::AgentState;
 use diff::{DiffKind, DiffRow};
 use syntax::{Highlighter, Run};
 use lsp::Lsp;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use term::Terminal;
 use editor::{
@@ -7828,6 +7828,11 @@ struct Storm {
     run_dirty: Arc<AtomicBool>,
     run_done: Arc<AtomicBool>,
     run_ok: Arc<AtomicBool>, // exit status (set by the reader thread)
+    /// Process group of the running command, 0 when nothing is running. The
+    /// command runs in its own group, so Stop can take down the whole tree
+    /// (zsh, yarn, every package build it forked) and not just the shell.
+    run_pid: Arc<AtomicU32>,
+    run_stopped: bool, // the last run ended because Stop was pressed
     // transient bottom-right notification (e.g. "Reference copied")
     flash: Option<String>,
     flash_gen: u64,
@@ -8610,6 +8615,8 @@ impl Storm {
             run_dirty: Arc::new(AtomicBool::new(false)),
             run_done: Arc::new(AtomicBool::new(true)),
             run_ok: Arc::new(AtomicBool::new(true)),
+            run_pid: Arc::new(AtomicU32::new(0)),
+            run_stopped: false,
             flash: None,
             flash_gen: 0,
             resizing_term: false,
@@ -11235,6 +11242,7 @@ impl Storm {
         self.run_running = true;
         self.run_active = true; // show the bottom-right toast (not the console)
         self.run_failed = false;
+        self.run_stopped = false;
         self.run_spin = 0;
         self.run_lines.clear();
         self.run_lines.push(format!("$ {}", cmd));
@@ -11246,25 +11254,32 @@ impl Storm {
         let dirty = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
         let ok = Arc::new(AtomicBool::new(true));
+        let pid = Arc::new(AtomicU32::new(0));
         self.run_buf = buf.clone();
         self.run_dirty = dirty.clone();
         self.run_done = done.clone();
         self.run_ok = ok.clone();
+        self.run_pid = pid.clone();
         self.run_gen += 1;
         let gen = self.run_gen;
         let root = self.root.clone();
 
         std::thread::spawn(move || {
             use std::io::{BufRead, BufReader};
+            use std::os::unix::process::CommandExt;
             let child = Command::new("zsh")
                 .arg("-ic")
                 .arg(format!("{} 2>&1", cmd))
                 .current_dir(&root)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
+                // its own process group: Stop signals the group, so the whole
+                // tree under zsh goes down with it
+                .process_group(0)
                 .spawn();
             match child {
                 Ok(mut c) => {
+                    pid.store(c.id(), Ordering::Relaxed);
                     if let Some(out) = c.stdout.take() {
                         for line in BufReader::new(out).lines().map_while(Result::ok) {
                             if let Ok(mut b) = buf.lock() {
@@ -11274,6 +11289,7 @@ impl Storm {
                         }
                     }
                     let status = c.wait();
+                    pid.store(0, Ordering::Relaxed);
                     ok.store(status.map(|s| s.success()).unwrap_or(false), Ordering::Relaxed);
                 }
                 Err(e) => {
@@ -11328,7 +11344,9 @@ impl Storm {
                             this.refresh_build_preview(cx);
                         }
                         let success = this.run_ok.load(Ordering::Relaxed);
-                        this.run_failed = !success;
+                        // a stopped run exits non-zero (SIGTERM), but that is
+                        // the user's own doing, not a failure to report
+                        this.run_failed = !success && !this.run_stopped;
                         // after a merge/pull/rebase, auto-open the conflicts dialog
                         // if it left unresolved conflicts
                         let cl = this.run_cmd.to_lowercase();
@@ -11365,6 +11383,8 @@ impl Storm {
                                 .ok();
                             })
                             .detach();
+                        } else if this.run_stopped {
+                            this.run_active = false;
                         } else {
                             // a push rejected because the remote is ahead → offer
                             // merge/rebase instead of just dumping the error
@@ -11393,6 +11413,31 @@ impl Storm {
             }
         })
         .detach();
+    }
+
+    /// Stop the command running in the Run console. Signals the whole process
+    /// group, so a `yarn build` goes down with the zsh that started it, and
+    /// follows up with KILL for anything that ignores TERM.
+    fn stop_run(&mut self, cx: &mut Context<Self>) {
+        let pid = self.run_pid.load(Ordering::Relaxed);
+        if pid == 0 {
+            return;
+        }
+        self.run_stopped = true;
+        self.run_lines.push(format!("^C  stopped {}", self.run_cmd));
+        let text = self.run_lines.join("\n");
+        self.run_editor.update(cx, |e, cx| e.set_log(text, cx));
+        // zsh's kill takes a negative pid as "the whole group"; /bin/kill's
+        // argument parsing does not
+        std::thread::spawn(move || {
+            let _ = Command::new("zsh")
+                .arg("-c")
+                .arg(format!(
+                    "kill -TERM -{pid} 2>/dev/null; sleep 2; kill -KILL -{pid} 2>/dev/null"
+                ))
+                .status();
+        });
+        cx.notify();
     }
 
     /// Save the tab at `ix` to disk (no-op if clean).
@@ -18148,6 +18193,30 @@ impl Storm {
                     .child(div().text_size(px(14.)).text_color(rgb(TEXT)).truncate().child(msg))
                     .children(self.render_build_bar(color)),
             )
+            // the console is the other place to stop a run; while the toast is
+            // all you can see of it, stop from here
+            .when(self.run_running, |d| {
+                d.child(
+                    div()
+                        .id("run-toast-stop")
+                        .flex_shrink_0()
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_size(px(11.))
+                        .border_1()
+                        .border_color(rgb(GIT_DELETED))
+                        .text_color(rgb(GIT_DELETED))
+                        .hover(|s| s.bg(rgb(HOVER)))
+                        .child("■ Stop")
+                        .tooltip(tip("Stop the command and everything it started"))
+                        .on_click(cx.listener(|this, _e, _w, cx| {
+                            cx.stop_propagation();
+                            this.stop_run(cx);
+                        })),
+                )
+            })
             .on_click(cx.listener(|this, _e, _w, cx| {
                 this.run_open = true;
                 this.run_active = false;
@@ -18549,6 +18618,7 @@ impl Storm {
         let running = self.run_running;
         // last run exited non-zero → tint the console red so failures are obvious
         let failed = self.run_failed && !running;
+        let stopped = self.run_stopped && !running;
         let btn = |id: &'static str, glyph: &'static str| {
             div()
                 .id(id)
@@ -18582,13 +18652,41 @@ impl Storm {
                 div()
                     .text_size(px(11.))
                     .text_color(rgb(if running { ACCENT } else if failed { GIT_DELETED } else { MUTED }))
-                    .child(if running { "running…" } else if failed { "failed" } else { "done" }),
+                    .child(if running {
+                        "running…"
+                    } else if stopped {
+                        "stopped"
+                    } else if failed {
+                        "failed"
+                    } else {
+                        "done"
+                    }),
             )
             // the build's own progress, inline in the header
             .children(self.render_build_bar(if running { ACCENT } else { GIT_NEW }).map(|bar| {
                 div().flex_grow(1.0).min_w(px(120.)).max_w(px(420.)).child(bar)
             }))
             .child(div().flex_1())
+            // Stop is only here while something is running; it is the one
+            // control in the header that changes what the machine is doing
+            .when(running, |d| {
+                d.child(
+                    div()
+                        .id("run-stop")
+                        .flex_shrink_0()
+                        .px_1p5()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_size(px(11.))
+                        .border_1()
+                        .border_color(rgb(GIT_DELETED))
+                        .text_color(rgb(GIT_DELETED))
+                        .hover(|s| s.bg(rgb(HOVER)))
+                        .child("■ Stop")
+                        .tooltip(tip("Stop the command and everything it started"))
+                        .on_click(cx.listener(|this, _e, _w, cx| this.stop_run(cx))),
+                )
+            })
             .child(btn("run-rerun", "↻").tooltip(tip("Re-run")).on_click(cx.listener(|this, _e, _w, cx| {
                 let c = this.run_cmd.clone();
                 if !c.is_empty() {
