@@ -13578,7 +13578,7 @@ impl Storm {
             let branch = c.doc.head.clone();
             self.show_flash(
                 &format!(
-                    "The reviewers haven't read {branch} · ⌘K Send In the Reviewers, or tick \
+                    "The reviewers haven't read {branch} · Send in reviewers, or tick \
                      Skip reviewers"
                 ),
                 cx,
@@ -30974,17 +30974,95 @@ impl Storm {
         // a reviewed branch has nothing to skip, so the tick isn't drawn
         let no_reviewers = self.merge_confirm.as_ref().is_some_and(|c| c.review.is_none());
         let skipping = self.merge_confirm.as_ref().is_some_and(|c| c.skip_reviewers);
-        let hint = if blocked {
-            "the reviewers haven't read this · tick Skip reviewers to merge it".into()
-        } else {
-            // short, because the row it sits in holds two ticks and two
-            // buttons: what it used to say about the review requirement is
-            // now the chip in the header
-            format!(
-                "squash · ↩ merge{} · esc cancel",
-                if has_agent { " · ⌥↩ quietly" } else { "" }
+        // the review question has a row of its own above this one, so the
+        // hint is only ever the keys
+        let hint = format!(
+            "squash · ↩ merge{} · esc cancel",
+            if has_agent { " · ⌥↩ quietly" } else { "" }
+        );
+        // the review question, on a row of its own: whether anyone has read
+        // this, the way to have somebody read it, and the way to say it does
+        // not need reading. It was three things wedged in beside Merge.
+        let reviewers = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .border_t_1()
+            .border_color(rgb(BORDER))
+            .child(
+                div()
+                    .flex_grow(1.0)
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_size(px(11.))
+                    .text_color(rgb(if skipping { LINE_NUMBER } else { FOLDER_ICON }))
+                    .child(if skipping {
+                        "merging without a review".to_string()
+                    } else {
+                        "the reviewers haven't read this".to_string()
+                    }),
             )
-        };
+            // the same two sessions the palette's "Send in reviewers" starts,
+            // from the place you found out you needed them
+            .child(
+                div()
+                    .id("merge-send-reviewers")
+                    .flex_shrink_0()
+                    .px_2()
+                    .py(px(2.))
+                    .rounded_md()
+                    .text_size(px(11.))
+                    .text_color(rgb(ACCENT))
+                    .when(!merging, |d| d.cursor_pointer().hover(|s| s.bg(rgb(HOVER))))
+                    .child("Send in reviewers")
+                    .tooltip(tip(
+                        "Start the two reviewer sessions on this branch  ·  \
+                         the merge waits until they are done",
+                    ))
+                    .on_click(cx.listener(|this, _e, window, cx| {
+                        if this.merge_confirm.as_ref().is_some_and(|c| c.merging) {
+                            return;
+                        }
+                        // reading takes minutes: the dialog closes and the
+                        // merge is asked for again once they have reported
+                        this.merge_confirm = None;
+                        this.run_reviewers(window, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .id("merge-skip-reviewers")
+                    .flex()
+                    .flex_shrink_0()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .mr_2()
+                    .when(!merging, |d| d.cursor_pointer())
+                    .child(check_box(skipping))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(if skipping { FOLDER_ICON } else { MUTED }))
+                            .child("Skip reviewers"),
+                    )
+                    .tooltip(tip(
+                        "Merge without sending it to the reviewers, for a change \
+                         too small to be worth the wait",
+                    ))
+                    .on_click(cx.listener(|this, _e, _w, cx| {
+                        let Some(c) = this.merge_confirm.as_mut() else { return };
+                        if c.merging {
+                            return; // the choice is already on its way
+                        }
+                        c.skip_reviewers = !c.skip_reviewers;
+                        cx.notify();
+                    })),
+            );
+
         let buttons = div()
             .flex()
             .flex_row()
@@ -31007,40 +31085,6 @@ impl Storm {
                     .child(hint),
             )
             .child(div().flex_grow(1.0).flex_shrink_0().min_w(px(0.)))
-            // only drawn when there is something to skip: with reviewers on the
-            // PR this is a tick that does nothing
-            .when(no_reviewers, |d| {
-                d.child(
-                    div()
-                        .id("merge-skip-reviewers")
-                        .flex()
-                        .flex_shrink_0()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .mr_2()
-                        .when(!merging, |d| d.cursor_pointer())
-                        .child(check_box(skipping))
-                        .child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(rgb(if skipping { FOLDER_ICON } else { MUTED }))
-                                .child("Skip reviewers"),
-                        )
-                        .tooltip(tip(
-                            "Merge without sending it to the reviewers, for a change \
-                             too small to be worth the wait",
-                        ))
-                        .on_click(cx.listener(|this, _e, _w, cx| {
-                            let Some(c) = this.merge_confirm.as_mut() else { return };
-                            if c.merging {
-                                return; // the choice is already on its way
-                            }
-                            c.skip_reviewers = !c.skip_reviewers;
-                            cx.notify();
-                        })),
-                )
-            })
             .when(has_agent, |d| {
                 d.child(
                     div()
@@ -31111,8 +31155,8 @@ impl Storm {
                     .child(if merging { "Merging…" } else { verb })
                     .when(blocked, |d| {
                         d.tooltip(tip(
-                            "Nobody has been asked to review this · tick Skip \
-                             reviewers to merge it anyway",
+                            "Nobody has read this yet · Send in reviewers above, \
+                             or tick Skip reviewers to merge it anyway",
                         ))
                     })
                     .on_click(cx.listener(|this, _e, window, cx| {
@@ -31141,6 +31185,7 @@ impl Storm {
             .child(head)
             .child(counts)
             .child(list)
+            .when(no_reviewers, |d| d.child(reviewers))
             .child(buttons)
             .into_any_element()
     }
