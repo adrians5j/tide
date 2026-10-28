@@ -16915,167 +16915,172 @@ impl Storm {
                                 ),
                         )
                     })
-                    // PR link for the current branch, if one exists → opens it
-                    .when_some(self.pr_link.clone(), |d, (num, url, status, _base, _head, state)| {
-                        d.child(
-                            div()
-                                .id("pr-link")
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_1()
-                                .px_1()
-                                .rounded_md()
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(HOVER)))
-                                .text_color(rgb(ACCENT))
-                                .text_size(px(12.))
-                                // status dot: green = checks pass, orange = pending, red = failing
-                                .child(
-                                    div()
-                                        .size(px(8.))
-                                        .rounded_full()
-                                        .bg(rgb(status.color())),
-                                )
-                                .child(div().font_family(ICON_FONT).text_size(px(11.)).child(IC_PR))
-                                .child(format!("#{}", num))
-                                // draft / merged / closed pill (open needs no label)
-                                .when(state != PrState::Open, |d| d.child(pr_state_pill(state, 10.)))
-                                .tooltip(tip("Read the PR body here  ·  ⌘click to open it on GitHub"))
-                                .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, _w, cx| {
-                                    // ⌘click is the browser, the way a link
-                                    // behaves everywhere else
-                                    if ev.modifiers().platform {
-                                        let _ = Command::new("open").arg(&url).spawn();
-                                    } else {
-                                        // by number, so the cached copy opens
-                                        // now and the read happens behind it
-                                        this.open_pr_number(Some(num), cx);
-                                    }
-                                })),
-                        )
-                    })
-                    // refresh the PR link + checks status (otherwise only updates
-                    // on branch change / cmd+R)
-                    .when(!self.branch.is_empty(), |d| {
-                        let tip: &'static str =
-                            if self.pr_link.is_some() { "Refresh PR status" } else { "Check for a PR" };
-                        d.child(
-                            div()
-                                .id("pr-refresh")
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .h(px(18.))
-                                .px_1()
-                                .rounded_md()
-                                .cursor_pointer()
-                                .text_size(px(12.))
-                                .text_color(rgb(MUTED))
-                                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                                // against the number it refreshes, inside the
-                                // row's gap rather than a chip away from it
-                                .when(self.pr_link.is_some(), |d| d.ml(px(-6.)))
-                                .child("↻")
-                                .tooltip(move |_w, cx| {
-                                    cx.new(|_| TooltipView { text: tip.into() }).into()
-                                })
-                                .on_click(cx.listener(|this, _e, _w, cx| this.refresh_pr_link(cx))),
-                        )
-                    })
-                    // the two things worth reading before the diff, as one
-                    // chip: what the change does, and where it does it
-                    .when_some(
-                        self.pr_link.clone().zip(self.reading),
-                        |d, ((num, _url, _status, base, _head, _state), reading)| {
-                            let base = match base.trim() {
-                                "" => self.pr_base.clone(),
-                                b => b.to_string(),
-                            };
-                            let stale = reading.stale();
-                            let (colour, hint) = if stale {
-                                (
-                                    FOLDER_ICON,
-                                    format!(
-                                        "The branch has moved past {}  ·  click to write it \
-                                         again from the code as it stands now",
-                                        match (reading.brief_stale, reading.tour_stale) {
-                                            (true, true) => "the brief and the tour",
-                                            (true, false) => "the brief",
-                                            _ => "the tour",
-                                        }
-                                    ),
-                                )
-                            } else if reading.current() {
-                                (
-                                    MUTED,
-                                    "Read the brief, and the tour at the end of it  ·  ⌥click \
-                                     to write them again"
-                                        .to_string(),
-                                )
-                            } else {
-                                (
-                                    MUTED,
-                                    format!(
-                                        "Ask for {} of #{num}: the brief for what it does, the \
-                                         tour for where",
-                                        match (reading.has_brief, reading.has_tour) {
-                                            (false, false) => "a brief and a code tour",
-                                            (true, false) => "a code tour",
-                                            _ => "a brief",
-                                        }
-                                    ),
-                                )
-                            };
+                    // the number, its refresh, its explanation and the note
+                    // that says there is no pull request yet are one group:
+                    // four children of a gap_3 row read as four unrelated
+                    // things, and they were pulled back together with
+                    // negative margins, which is the row saying one thing
+                    // and the chips another
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(2.))
+                        // PR link for the current branch, if one exists → opens it
+                        .when_some(self.pr_link.clone(), |d, (num, url, status, _base, _head, state)| {
                             d.child(
                                 div()
-                                    .id("pr-explain")
+                                    .id("pr-link")
                                     .flex()
                                     .flex_row()
                                     .items_center()
                                     .gap_1()
                                     .px_1()
-                                    // the number, its refresh and its
-                                    // explanation are one group: the row's
-                                    // gap_3 between them reads as three
-                                    // unrelated things
-                                    .ml(px(-6.))
                                     .rounded_md()
                                     .cursor_pointer()
-                                    .text_size(px(11.))
-                                    .text_color(rgb(colour))
-                                    // an outdated explanation is drawn as the
-                                    // warning it is, in the same amber outline
-                                    // as "2 behind next" beside it
-                                    .when(stale, |d| {
-                                        d.rounded_sm().border_1().border_color(rgb(FOLDER_ICON))
-                                    })
-                                    .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                    .hover(|s| s.bg(rgb(HOVER)))
+                                    .text_color(rgb(ACCENT))
+                                    .text_size(px(12.))
+                                    // status dot: green = checks pass, orange = pending, red = failing
                                     .child(
                                         div()
-                                            .font_family(ICON_FONT)
-                                            .text_size(px(11.))
-                                            .child(if stale { "↻" } else { IC_TOUR }),
+                                            .size(px(8.))
+                                            .rounded_full()
+                                            .bg(rgb(status.color())),
                                     )
-                                    .child(reading.verb())
-                                    .tooltip(tip_owned(hint))
-                                    .on_click(cx.listener(
-                                        move |this, e: &gpui::ClickEvent, _w, cx| {
-                                            this.explain_pr(
-                                                num,
-                                                base.clone(),
-                                                e.modifiers().alt,
-                                                cx,
-                                            )
-                                        },
-                                    )),
+                                    .child(div().font_family(ICON_FONT).text_size(px(11.)).child(IC_PR))
+                                    .child(format!("#{}", num))
+                                    // draft / merged / closed pill (open needs no label)
+                                    .when(state != PrState::Open, |d| d.child(pr_state_pill(state, 10.)))
+                                    .tooltip(tip("Read the PR body here  ·  ⌘click to open it on GitHub"))
+                                    .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, _w, cx| {
+                                        // ⌘click is the browser, the way a link
+                                        // behaves everywhere else
+                                        if ev.modifiers().platform {
+                                            let _ = Command::new("open").arg(&url).spawn();
+                                        } else {
+                                            // by number, so the cached copy opens
+                                            // now and the read happens behind it
+                                            this.open_pr_number(Some(num), cx);
+                                        }
+                                    })),
                             )
-                        },
+                        })
+                        // refresh the PR link + checks status (otherwise only updates
+                        // on branch change / cmd+R)
+                        .when(!self.branch.is_empty(), |d| {
+                            let tip: &'static str =
+                                if self.pr_link.is_some() { "Refresh PR status" } else { "Check for a PR" };
+                            d.child(
+                                div()
+                                    .id("pr-refresh")
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .h(px(18.))
+                                    .px_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(MUTED))
+                                    .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                    .child("↻")
+                                    .tooltip(move |_w, cx| {
+                                        cx.new(|_| TooltipView { text: tip.into() }).into()
+                                    })
+                                    .on_click(cx.listener(|this, _e, _w, cx| this.refresh_pr_link(cx))),
+                            )
+                        })
+                        // the two things worth reading before the diff, as one
+                        // chip: what the change does, and where it does it
+                        .when_some(
+                            self.pr_link.clone().zip(self.reading),
+                            |d, ((num, _url, _status, base, _head, _state), reading)| {
+                                let base = match base.trim() {
+                                    "" => self.pr_base.clone(),
+                                    b => b.to_string(),
+                                };
+                                let stale = reading.stale();
+                                let (colour, hint) = if stale {
+                                    (
+                                        FOLDER_ICON,
+                                        format!(
+                                            "The branch has moved past {}  ·  click to write it \
+                                             again from the code as it stands now",
+                                            match (reading.brief_stale, reading.tour_stale) {
+                                                (true, true) => "the brief and the tour",
+                                                (true, false) => "the brief",
+                                                _ => "the tour",
+                                            }
+                                        ),
+                                    )
+                                } else if reading.current() {
+                                    (
+                                        MUTED,
+                                        "Read the brief, and the tour at the end of it  ·  ⌥click \
+                                         to write them again"
+                                            .to_string(),
+                                    )
+                                } else {
+                                    (
+                                        MUTED,
+                                        format!(
+                                            "Ask for {} of #{num}: the brief for what it does, the \
+                                             tour for where",
+                                            match (reading.has_brief, reading.has_tour) {
+                                                (false, false) => "a brief and a code tour",
+                                                (true, false) => "a code tour",
+                                                _ => "a brief",
+                                            }
+                                        ),
+                                    )
+                                };
+                                d.child(
+                                    div()
+                                        .id("pr-explain")
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_1()
+                                        .px_1()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .text_size(px(11.))
+                                        .text_color(rgb(colour))
+                                        // an outdated explanation is drawn as the
+                                        // warning it is, in the same amber outline
+                                        // as "2 behind next" beside it
+                                        .when(stale, |d| {
+                                            d.rounded_sm().border_1().border_color(rgb(FOLDER_ICON))
+                                        })
+                                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                        .child(
+                                            div()
+                                                .font_family(ICON_FONT)
+                                                .text_size(px(11.))
+                                                .child(if stale { "↻" } else { IC_TOUR }),
+                                        )
+                                        .child(reading.verb())
+                                        .tooltip(tip_owned(hint))
+                                        .on_click(cx.listener(
+                                            move |this, e: &gpui::ClickEvent, _w, cx| {
+                                                this.explain_pr(
+                                                    num,
+                                                    base.clone(),
+                                                    e.modifiers().alt,
+                                                    cx,
+                                                )
+                                            },
+                                        )),
+                                )
+                            },
+                        )
+                        // no PR for this branch yet → say so, so the refresh icon reads clearly
+                        .when(self.pr_link.is_none() && !self.branch.is_empty(), |d| {
+                            d.child(div().text_size(px(12.)).text_color(rgb(MUTED)).child("No PR"))
+                        }),
                     )
-                    // no PR for this branch yet → say so, so the refresh icon reads clearly
-                    .when(self.pr_link.is_none() && !self.branch.is_empty(), |d| {
-                        d.child(div().text_size(px(12.)).text_color(rgb(MUTED)).child("No PR"))
-                    })
                     // out of step with the base: how far behind, and whether
                     // catching up would conflict. Either chip hands the same
                     // merge to the agent.
@@ -17245,6 +17250,11 @@ impl Storm {
                 })
                 // watch the branch's changed packages (`wwp`), beside admin
                 .children(self.render_watch_btn(cx))
+                // what this workspace runs, and what it reports: two groups
+                // that happen to share an edge of the bar
+                .when(self.app_url().is_some() || self.render_watch_btn(cx).is_some(), |d| {
+                    d.child(div().w(px(1.)).h(px(14.)).bg(rgb(BORDER)))
+                })
                 .children(self.render_build_chip(cx))
                 // build state and workspace states are different things: keep a
                 // rule between them
