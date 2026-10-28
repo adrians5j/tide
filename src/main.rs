@@ -7791,6 +7791,12 @@ struct Storm {
     rc_resize: Option<(f32, f32, f32, f32, bool)>,
     /// User-set box width (corner drag); `None` sizes to the pane.
     rc_width: Option<f32>,
+    /// The tour card, dragged the same way the comment box is: a user-set
+    /// width, a user-set height for the before/after block, and the drag in
+    /// flight as `(origin x, origin y, width at grab, height at grab, corner)`.
+    card_width: Option<f32>,
+    card_diff_h: Option<f32>,
+    card_resize: Option<(f32, f32, f32, f32, bool)>,
     /// Slides of the open brief that have come up the window far enough to be
     /// drawn. Cleared when a new brief arrives, so it reveals itself again.
     brief_seen: HashSet<usize>,
@@ -8578,6 +8584,9 @@ impl Storm {
             review_expanded: HashSet::new(),
             rc_thread_h: None,
             rc_resize: None,
+            card_width: None,
+            card_diff_h: None,
+            card_resize: None,
             rc_width: None,
             brief_seen: HashSet::new(),
             ws_idle,
@@ -16120,6 +16129,17 @@ impl Storm {
             }
             self.sync_comment_gutters(cx); // the editor's reserved gap grows with it
             cx.notify();
+        } else if let Some((ox, oy, w0, h0, corner)) = self.card_resize {
+            // bottom edge → a taller before/after; corner → a wider card too
+            let h = (h0 + (f32::from(ev.position.y) - oy)).clamp(STOP_DIFF_ROW * 2.0, 1200.0);
+            self.card_diff_h = Some(h);
+            if corner {
+                let w = (w0 + (f32::from(ev.position.x) - ox))
+                    .clamp(320.0, (self.win_width - 40.0).max(320.0));
+                self.card_width = Some(w);
+            }
+            self.sync_comment_gutters(cx); // the editor's gap grows with it
+            cx.notify();
         } else if let Some(d) = self.pane_drag.clone() {
             // move weight between the two panes the divider separates, keeping
             // their combined share (so the rest of the tab doesn't shift)
@@ -16148,6 +16168,7 @@ impl Storm {
             || self.find_split_dragging
             || self.pane_drag.is_some()
             || self.rc_resize.is_some()
+            || self.card_resize.is_some()
             || self.agent_sel_drag
             || self.md_sel_drag
         {
@@ -16160,6 +16181,7 @@ impl Storm {
             self.find_split_dragging = false;
             self.pane_drag = None;
             self.rc_resize = None;
+            self.card_resize = None;
             if self.agent_sel_drag && !self.agent_sel_moved {
                 // a press that never moved is a click, not a selection
                 self.agent_sel_ch = None;
@@ -24169,7 +24191,9 @@ impl Storm {
             return None;
         }
         let (x, y, avail, h) = tab.editor.read(cx).line_screen_rect(*end)?;
-        let width = (avail - RC_BOX_PAD * 2.0).clamp(280.0, TOUR_CARD_W);
+        // dragged width wins, inside what the pane can actually show
+        let want = self.card_width.unwrap_or(TOUR_CARD_W);
+        let width = (avail - RC_BOX_PAD * 2.0).clamp(280.0, want.max(280.0));
         Some((x + RC_BOX_PAD, y + h + TOUR_CARD_VPAD, width))
     }
 
@@ -24200,6 +24224,11 @@ impl Storm {
                     .width,
             )
         };
+        // the height the before/after is drawn at, which is also what a drag
+        // on the card's bottom edge starts from
+        let diff_h = self.card_diff_h.unwrap_or_else(|| {
+            STOP_DIFF_H.min(changed.len() as f32 * STOP_DIFF_ROW + 4.0)
+        });
         let w = self.walk.as_ref()?;
         let stop = w.stops.get(w.at)?;
         let (at, total) = (w.at + 1, w.stops.len());
@@ -24514,7 +24543,6 @@ impl Storm {
                     };
                     let vis = ((width - 21.0) / 2.0).max(80.0);
                     let col = |n: usize| (STOP_DIFF_GUTTER + 8.0 + n as f32 * char_w).max(vis);
-                    let rows_h = changed.len() as f32 * STOP_DIFF_ROW + 4.0;
                     let (left_h, right_h) =
                         (self.stop_diff_left.clone(), self.stop_diff_right.clone());
                     d.child(
@@ -24525,7 +24553,7 @@ impl Storm {
                             // these rows are shrinkable, and a block left to
                             // size itself came out short and cut its own
                             // first and last lines in half
-                            .h(px(STOP_DIFF_H.min(rows_h) + 10.0))
+                            .h(px(diff_h + 10.0))
                             .rounded_sm()
                             .border_1()
                             .border_color(rgb(BORDER))
@@ -24692,7 +24720,67 @@ impl Storm {
                                     this.ask_about_stop(window, cx);
                                 })),
                         ),
-                ),
+                )
+                // the same grip the comment box has: the bottom edge grows the
+                // before/after, the corner widens the card as well
+                .child({
+                    let grabbed = self.card_resize;
+                    let (w0, h0) = (width, diff_h);
+                    div()
+                        .flex_shrink_0()
+                        .h(px(6.))
+                        .mb(px(-2.))
+                        .flex()
+                        .flex_row()
+                        .child(
+                            div()
+                                .id("card-resize")
+                                .flex_grow(1.0)
+                                .h_full()
+                                .rounded_sm()
+                                .cursor(CursorStyle::ResizeUpDown)
+                                .bg(rgb(if grabbed.is_some() { accent } else { POPUP_BG }))
+                                .hover(|s| s.bg(rgb(accent)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
+                                        this.card_resize = Some((
+                                            f32::from(ev.position.x),
+                                            f32::from(ev.position.y),
+                                            w0,
+                                            h0,
+                                            false,
+                                        ));
+                                        cx.notify();
+                                    }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("card-resize-corner")
+                                .w(px(14.))
+                                .h_full()
+                                .flex_shrink_0()
+                                .rounded_sm()
+                                .cursor(CursorStyle::ResizeUpLeftDownRight)
+                                .bg(rgb(if grabbed.is_some_and(|r| r.4) { accent } else { BORDER }))
+                                .hover(|s| s.bg(rgb(accent)))
+                                .tooltip(tip("Drag to resize"))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
+                                        this.card_resize = Some((
+                                            f32::from(ev.position.x),
+                                            f32::from(ev.position.y),
+                                            w0,
+                                            h0,
+                                            true,
+                                        ));
+                                        cx.notify();
+                                    }),
+                                ),
+                        )
+                }),
         )
     }
 
@@ -24887,8 +24975,9 @@ impl Storm {
             return 0.0;
         }
         // the rows, the block's own padding and border, the horizontal
-        // scrollbar along the bottom, and the gap above it
-        STOP_DIFF_H.min(self.stop_diff.len() as f32 * STOP_DIFF_ROW + 4.0) + 10.0 + 6.0
+        // scrollbar along the bottom, the gap above it, and the resize grip
+        let rows = self.stop_diff.len() as f32 * STOP_DIFF_ROW + 4.0;
+        self.card_diff_h.unwrap_or(STOP_DIFF_H.min(rows)) + 10.0 + 6.0 + 8.0
     }
 
     fn ensure_stop_diff(&mut self) {
