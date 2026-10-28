@@ -4484,6 +4484,17 @@ fn tour_read_note(stops: &[Stop], seen: &HashSet<usize>) -> String {
     )
 }
 
+/// The two messages typed most often, as buttons under the composer. Both ask
+/// for a reading and stop there: a button is pressed without thinking about it,
+/// so neither one may start changing files on its own.
+const CHECK_CI_PROMPT: &str = "Check CI for this pull request. Find the failing \
+job, read its log, and tell me the real error: the file, the line and the \
+message, not the job name. If every check is green, say so in one line. Don't \
+change anything yet.";
+const WHAT_NEXT_PROMPT: &str = "Where does this stand, and what is next? Short: \
+what is done, what is left, and the one thing you would do next and why. Don't \
+start on it until I say.";
+
 fn tour_request(about: Option<&str>, answer: Option<&str>) -> String {
     // the answer is the route: it already has the references, in the order it
     // walked them
@@ -25532,6 +25543,37 @@ impl Storm {
             .to_string()
     }
 
+    /// A one-click message under the composer. The two sentences typed most
+    /// often are a button each: they go the way a typed message goes, so the
+    /// transcript shows them as yours and a running turn queues them.
+    fn quick_prompt(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        color: u32,
+        hint: &'static str,
+        prompt: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .flex_shrink_0()
+            .mr_2()
+            .px_1p5()
+            .rounded_md()
+            .cursor_pointer()
+            .text_size(px(11.))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .text_color(rgb(color))
+            .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+            .child(label)
+            .tooltip(tip(hint))
+            .on_click(cx.listener(move |this, _e, _w, cx| {
+                this.send_agent_prompt_by(prompt.to_string(), None, Sender::You, cx);
+            }))
+    }
+
     /// `label` is what the transcript shows in place of the prompt — a batch of
     /// review comments is a wall of ids and quoted code the agent needs and you
     /// don't.
@@ -28934,72 +28976,91 @@ impl Storm {
                             })
                     }),
             )
-            // bottom row inside the box: Send comments, and Stop while a turn
-            // runs. The key legend that used to live here is gone — eight
-            // shortcuts under the box you type in, every hour of every day,
-            // long after you knew them. The keys are in the palette (⌘K).
-            // Nothing to show means no row at all, and 20px back for the text.
-            .when(pending_comments > 0 || busy, |col| {
-                col.child(
-                    div()
-                        .h(px(20.))
-                        .flex_shrink_0()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .child(div().flex_grow(1.0))
-                        // pending review comments are usually written while reading an
-                        // answer right here — the send button belongs next to the box
-                        // you're already looking at, not only in the review pane
-                        .when(pending_comments > 0, |d| {
-                            d.child(
-                                div()
-                                    .id("agent-send-comments")
-                                    .flex_shrink_0()
-                                    .mr_2()
-                                    .px_1p5()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .text_size(px(11.))
-                                    .border_1()
-                                    .border_color(rgb(COMMENT_MARK))
-                                    .text_color(rgb(COMMENT_MARK))
-                                    .hover(|s| s.bg(rgb(HOVER)))
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_1()
-                                    // the codicon needs its own font family
-                                    .child(div().font_family(ICON_FONT).text_size(px(10.)).child(IC_COMMENT))
-                                    .child(format!(
-                                        "Send {pending_comments} comment{}",
-                                        if pending_comments == 1 { "" } else { "s" }
-                                    ))
-                                    .tooltip(tip("Send the pending review comments  (⌥↩)"))
-                                    .on_click(cx.listener(|this, _e, window, cx| {
-                                        this.send_review(window, cx)
-                                    })),
-                            )
-                        })
-                        .when(busy, |d| {
-                            d.child(
-                                div()
-                                    .id("agent-stop")
-                                    .flex_shrink_0()
-                                    .px_1p5()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .text_size(px(11.))
-                                    .border_1()
-                                    .border_color(rgb(GIT_DELETED))
-                                    .text_color(rgb(GIT_DELETED))
-                                    .hover(|s| s.bg(rgb(HOVER)))
-                                    .child("■ Stop")
-                                    .tooltip(tip("Interrupt the agent  (⌃C, which also clears the box)"))
-                                    .on_click(cx.listener(|this, _e, _w, cx| this.interrupt_agent(cx))),
-                            )
-                        }),
-                )
+            // bottom row inside the box: the two messages typed most often on
+            // the left, Send comments and Stop on the right. The key legend
+            // that used to live here is gone — eight shortcuts under the box
+            // you type in, every hour of every day, long after you knew them.
+            // The keys are in the palette (⌘K).
+            .child({
+                // red while the checks are red: the button is worth pressing
+                // then, and the colour is the same one the #1234 dot uses
+                let ci = self.pr_link.as_ref().map(|(_, _, st, ..)| *st);
+                div()
+                    .h(px(20.))
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .when_some(ci, |d, st| {
+                        d.child(self.quick_prompt(
+                            "quick-ci",
+                            "Check CI",
+                            if st == PrStatus::Failing { GIT_DELETED } else { MUTED },
+                            "Ask what CI is doing on this PR",
+                            CHECK_CI_PROMPT,
+                            cx,
+                        ))
+                    })
+                    .child(self.quick_prompt(
+                        "quick-next",
+                        "What next?",
+                        MUTED,
+                        "Ask where this stands and what to do next",
+                        WHAT_NEXT_PROMPT,
+                        cx,
+                    ))
+                    .child(div().flex_grow(1.0))
+                    // pending review comments are usually written while reading an
+                    // answer right here — the send button belongs next to the box
+                    // you're already looking at, not only in the review pane
+                    .when(pending_comments > 0, |d| {
+                        d.child(
+                            div()
+                                .id("agent-send-comments")
+                                .flex_shrink_0()
+                                .mr_2()
+                                .px_1p5()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .text_size(px(11.))
+                                .border_1()
+                                .border_color(rgb(COMMENT_MARK))
+                                .text_color(rgb(COMMENT_MARK))
+                                .hover(|s| s.bg(rgb(HOVER)))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
+                                // the codicon needs its own font family
+                                .child(div().font_family(ICON_FONT).text_size(px(10.)).child(IC_COMMENT))
+                                .child(format!(
+                                    "Send {pending_comments} comment{}",
+                                    if pending_comments == 1 { "" } else { "s" }
+                                ))
+                                .tooltip(tip("Send the pending review comments  (⌥↩)"))
+                                .on_click(cx.listener(|this, _e, window, cx| {
+                                    this.send_review(window, cx)
+                                })),
+                        )
+                    })
+                    .when(busy, |d| {
+                        d.child(
+                            div()
+                                .id("agent-stop")
+                                .flex_shrink_0()
+                                .px_1p5()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .text_size(px(11.))
+                                .border_1()
+                                .border_color(rgb(GIT_DELETED))
+                                .text_color(rgb(GIT_DELETED))
+                                .hover(|s| s.bg(rgb(HOVER)))
+                                .child("■ Stop")
+                                .tooltip(tip("Interrupt the agent  (⌃C, which also clears the box)"))
+                                .on_click(cx.listener(|this, _e, _w, cx| this.interrupt_agent(cx))),
+                        )
+                    })
             });
 
         // the resume list replaces the transcript while it's open
