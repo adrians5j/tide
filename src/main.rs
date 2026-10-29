@@ -3265,37 +3265,6 @@ fn md_images_in(text: &str) -> Vec<String> {
     md_prepare(text).iter().flat_map(|r| r.images.iter().map(|(_, src)| src.clone())).collect()
 }
 
-/// The `packages/<name>` dirs this branch touches — the same set `wwp` watches:
-/// changed against the base branch, plus the working tree, plus untracked files.
-/// Computed with git rather than read off the PR pane, which is only populated
-/// once that pane has loaded.
-fn changed_packages(root: &Path, base: &str) -> Vec<String> {
-    let run = |args: &[&str]| -> Vec<String> {
-        Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(|l| l.to_string()).collect())
-            .unwrap_or_default()
-    };
-    let base_ref = resolve_base_ref(root, base);
-    let mut names: Vec<String> = run(&["diff", "--name-only", &format!("{base_ref}...HEAD")])
-        .into_iter()
-        .chain(run(&["diff", "--name-only", "HEAD"]))
-        .chain(run(&["ls-files", "--others", "--exclude-standard"]))
-        .filter_map(|p| {
-            let rest = p.strip_prefix("packages/")?;
-            let name = rest.split('/').next()?;
-            (!name.is_empty() && rest.contains('/')).then(|| name.to_string())
-        })
-        .collect();
-    names.sort();
-    names.dedup();
-    names
-}
-
 /// An image pasted into the agent composer: what the adapter needs (mime type
 /// and base64) plus the decoded bytes, so the chip can show it and hovering can
 /// preview it.
@@ -8412,10 +8381,6 @@ struct Storm {
     /// own terminal tab, so the build log is there when it's wanted and out of
     /// the way when it isn't.
     admin_pane: Option<u64>,
-    /// Terminal pane running `wwp` (watch the branch's changed packages).
-    watch_pane: Option<u64>,
-    /// Package names the watch button offers, refreshed by the git poll.
-    watch_pkgs: Vec<String>,
     admin_spin: usize, // spinner frame while an admin build is coming up
     /// Set when ▶ started the admin: the first time it answers, open it in the
     /// default browser. Cleared once used, so a later restart-and-recover of the
@@ -8961,8 +8926,6 @@ impl Storm {
             admin_up: None,
             app_url_live: None,
             admin_pane: None,
-            watch_pane: None,
-            watch_pkgs: Vec::new(),
             admin_spin: 0,
             admin_autoopen: false,
             limits: None,
@@ -9075,64 +9038,6 @@ impl Storm {
         } else {
             ""
         }
-    }
-
-    /// `Watch N packages`: runs `wwp` in its own tab. Absent when the branch
-    /// touches no package. Green while the watch is running — click it for the
-    /// log, ⌥click to stop it.
-    fn render_watch_btn(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let pkgs = self.watch_pkgs.clone();
-        if pkgs.is_empty() {
-            return None;
-        }
-        let running = self.watch_terminal(cx).is_some();
-        let n = pkgs.len();
-        // which packages, and which set: this counts everything the branch
-        // changes, not what is still uncommitted, so it rarely matches the
-        // Commit panel's number and the tooltip has to say why
-        let base = self.review_base();
-        let base = base.strip_prefix("origin/").unwrap_or(&base).to_string();
-        let tip_text = if running {
-            format!(
-                "Watching the {n} package{} this branch changes vs {base}:\n{}\n\nclick for its log, ⌥click to stop",
-                if n == 1 { "" } else { "s" },
-                pkgs.join("\n")
-            )
-        } else {
-            format!(
-                "Run `wwp` to watch the {n} package{} this branch changes vs {base}:\n{}",
-                if n == 1 { "" } else { "s" },
-                pkgs.join("\n")
-            )
-        };
-        Some(
-            div()
-                .id("watch-pkgs")
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_1()
-                .h(px(18.))
-                .px_1()
-                .rounded_md()
-                .cursor_pointer()
-                .text_size(px(11.))
-                .text_color(rgb(if running { GIT_NEW } else { MUTED }))
-                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                .child(div().font_family(ICON_FONT).text_size(px(12.)).child(IC_TOOLS))
-                .child(format!("watch {n} package{}", if n == 1 { "" } else { "s" }))
-                .tooltip(move |_w, cx| {
-                    let text = tip_text.clone();
-                    cx.new(|_| TooltipView { text: text.into() }).into()
-                })
-                .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
-                    match (running, ev.modifiers().alt) {
-                        (true, true) => this.stop_watch(cx),
-                        (true, false) => this.show_watch_log(window, cx),
-                        _ => this.start_watch(window, cx),
-                    }
-                })),
-        )
     }
 
     /// The admin ▶ control: grey means stopped, a spinner means the build we
@@ -9434,52 +9339,6 @@ impl Storm {
         // admin has exited. `pane_cmds` only lists panes with a child process, so
         // an entry at all means something is still running there.
         self.pane_cmds.contains_key(&id).then_some(t)
-    }
-
-    /// Start `admin` in its own terminal tab and leave focus where it was.
-    /// The pane running `wwp`, if it's still alive.
-    fn watch_terminal(&self, _cx: &App) -> Option<Entity<Terminal>> {
-        let id = self.watch_pane?;
-        let t = self.all_terminals().into_iter().find(|t| t.entity_id().as_u64() == id)?;
-        self.pane_cmds.contains_key(&id).then_some(t)
-    }
-
-    /// Run `wwp` in its own terminal tab. It picks the base branch and the
-    /// changed packages itself; we only mirror the list for the label.
-    fn start_watch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(t) = self.watch_terminal(cx) {
-            self.focus_pane(&t, window, cx); // already watching: show me its log
-            return;
-        }
-        let (was_tab, was_terminal) = (self.active_term, self.show_terminal);
-        self.new_terminal(window, cx);
-        let Some(t) = self.focused_pane(window, cx) else { return };
-        t.read(cx).send_text("wwp\n");
-        self.watch_pane = Some(t.entity_id().as_u64());
-        if let Some(tab) = self.term_tabs.get_mut(self.active_term) {
-            tab.title = Some("Watch".into());
-        }
-        // background job: hand focus back where it was
-        if was_tab < self.term_tabs.len() {
-            self.active_term = was_tab;
-        }
-        self.show_terminal = was_terminal;
-        self.focus_active(window, cx);
-        self.show_flash("Watching packages — logs in its own terminal tab", cx);
-        cx.notify();
-    }
-
-    fn show_watch_log(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(t) = self.watch_terminal(cx) {
-            self.focus_pane(&t, window, cx);
-        }
-    }
-
-    fn stop_watch(&mut self, cx: &mut Context<Self>) {
-        let Some(t) = self.watch_terminal(cx) else { return };
-        t.read(cx).send_text("\x03");
-        self.show_flash("Stopped the package watch", cx);
-        cx.notify();
     }
 
     fn start_admin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -10713,11 +10572,9 @@ impl Storm {
                 break;
             };
             let root2 = root.clone();
-            let base = this.update(cx, |this, _| this.pr_base.clone()).unwrap_or_default();
-            let (status, branch, mem, ignored, (idle, paused), pkgs, head_oid) = cx
+            let (status, branch, mem, ignored, (idle, paused), head_oid) = cx
                 .background_executor()
                 .spawn(async move {
-                    let base = if base.is_empty() { git_default_branch(&root2) } else { base };
                     (
                         compute_git(&root2),
                         git_branch(&root2),
@@ -10726,7 +10583,6 @@ impl Storm {
                         // another TIDE instance (or a script) may have marked this
                         // workspace idle or paused since the last tick
                         (load_ws_idle(&root2), load_ws_paused(&root2)),
-                        changed_packages(&root2, &base),
                         git_head_oid(&root2),
                     )
                 })
@@ -10749,7 +10605,6 @@ impl Storm {
                     this.head_oid = head_oid;
                     this.branch = branch.clone();
                     this.mem_mb = mem;
-                    this.watch_pkgs = pkgs;
                     this.ws_idle = idle;
                     this.ws_paused = paused;
                     if let Some(parent) = parent_update {
@@ -17561,62 +17416,6 @@ impl Storm {
                 .flex_row()
                 .items_center()
                 .gap_3()
-                // wby-next* only: the host opens wby{N}.localhost in the
-                // default browser; the ▶ beside it carries up/down
-                .when_some(self.app_url(), |d, url| {
-                    // the play button carries the up/down colour now; this is
-                    // just the hover text on the host itself
-                    let up = self.admin_up == Some(true);
-                    let tip = if up {
-                        "The project is up  ·  click to open  ·  ⌘R to re-check"
-                    } else {
-                        "Nothing serving  ·  click to run `wdev`  ·  ⌘R to re-check"
-                    };
-                    // no rule in front of the host: this is the first thing in
-                    // the right-hand group, and the spacer that pushes the
-                    // group right is already the gap a rule would be drawing
-                    d
-                        // host + ▶ read as one control, so they sit tight
-                        // together instead of a container gap apart
-                        .child(div().flex().flex_row().items_center().gap(px(2.)).child(
-                        div()
-                            .id("open-admin")
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .h(px(18.))
-                            .px_1()
-                            .gap_1()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .text_size(px(11.))
-                            // green once it's actually serving
-                            .text_color(rgb(if up { GIT_NEW } else { MUTED }))
-                            .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                            .child(div().font_family(ICON_FONT).text_size(px(12.)).child(IC_BROWSER))
-                            .child(url.trim_start_matches("https://").trim_start_matches("http://").to_string())
-                            .tooltip(move |_w, cx| cx.new(|_| TooltipView { text: tip.into() }).into())
-                            // a dead admin has nothing to show: clicking the
-                            // host starts it instead of opening a failed page
-                            .on_click(cx.listener(move |this, _e, window, cx| {
-                                if up {
-                                    open_browser(&url);
-                                } else if this.admin_terminal(cx).is_some() {
-                                    this.show_admin_log(window, cx); // already building
-                                } else {
-                                    this.start_admin(window, cx);
-                                }
-                            })),
-                    )
-                    .child(self.admin_play_btn("admin-run", cx)))
-                })
-                // watch the branch's changed packages (`wwp`), beside admin
-                .children(self.render_watch_btn(cx))
-                // what this workspace runs, and what it reports: two groups
-                // that happen to share an edge of the bar
-                .when(self.app_url().is_some() || self.render_watch_btn(cx).is_some(), |d| {
-                    d.child(div().w(px(1.)).h(px(14.)).bg(rgb(SEPARATOR)))
-                })
                 .children(self.render_build_chip(cx))
                 // build state and workspace states are different things: keep a
                 // rule between them
@@ -17647,7 +17446,83 @@ impl Storm {
                         .on_click(cx.listener(|this, _e, _w, cx| this.toggle_read_only(cx)))
                 }),
         );
+        // the host, centred on the bar itself. Laid out absolutely rather than
+        // between the two groups: that way it sits in the middle of the window
+        // whatever the branch name on the left or the chips on the right do.
+        if let Some(host) = self.render_host_chip(cx) {
+            bar = bar.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(host),
+            );
+        }
         bar
+    }
+
+    /// The host this workspace serves and its ▶, as one control. It is drawn
+    /// in the middle of the top bar rather than in either group: what the
+    /// workspace is running belongs to the whole bar, and the centre is the
+    /// one place that stays put as either side grows.
+    fn render_host_chip(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let url = self.app_url()?;
+        // the play button carries the up/down colour now; this is just the
+        // hover text on the host itself
+        let up = self.admin_up == Some(true);
+        let tip = if up {
+            "The project is up  ·  click to open  ·  ⌘R to re-check"
+        } else {
+            "Nothing serving  ·  click to run `wdev`  ·  ⌘R to re-check"
+        };
+        Some(
+            // host + ▶ read as one control, so they sit tight together
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(2.))
+                .child(
+                    div()
+                        .id("open-admin")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .h(px(18.))
+                        .px_1()
+                        .gap_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_size(px(11.))
+                        // green once it's actually serving
+                        .text_color(rgb(if up { GIT_NEW } else { MUTED }))
+                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                        .child(div().font_family(ICON_FONT).text_size(px(12.)).child(IC_BROWSER))
+                        .child(
+                            url.trim_start_matches("https://")
+                                .trim_start_matches("http://")
+                                .to_string(),
+                        )
+                        .tooltip(move |_w, cx| cx.new(|_| TooltipView { text: tip.into() }).into())
+                        // a dead admin has nothing to show: clicking the host
+                        // starts it instead of opening a failed page
+                        .on_click(cx.listener(move |this, _e, window, cx| {
+                            if up {
+                                open_browser(&url);
+                            } else if this.admin_terminal(cx).is_some() {
+                                this.show_admin_log(window, cx); // already building
+                            } else {
+                                this.start_admin(window, cx);
+                            }
+                        })),
+                )
+                .child(self.admin_play_btn("admin-run", cx)),
+        )
     }
 
     /// The project-switcher dropdown — rendered as a top-level overlay so it
