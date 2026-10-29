@@ -20197,8 +20197,9 @@ impl Storm {
                             .flex_grow(1.0)
                             .h_full()
                             .cursor(CursorStyle::ResizeUpDown)
+                            // the pointer says it is a grip; the band stays put
+                            // until it is actually being dragged
                             .bg(rgb(if self.rc_resize.is_some() { ACCENT } else { PANEL_BG }))
-                            .hover(|s| s.bg(rgb(ACCENT)))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
@@ -20221,7 +20222,6 @@ impl Storm {
                             .flex_shrink_0()
                             .cursor(CursorStyle::ResizeUpLeftDownRight)
                             .bg(rgb(if self.rc_resize.is_some_and(|r| r.4) { ACCENT } else { BORDER }))
-                            .hover(|s| s.bg(rgb(ACCENT)))
                             .tooltip(tip("Drag to resize"))
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -24763,7 +24763,10 @@ impl Storm {
                     div()
                         .flex_shrink_0()
                         .h(px(6.))
-                        .mb(px(-2.))
+                        // out past the card's own padding, so the band sits on
+                        // the bottom edge the way the comment box's does
+                        .mx(px(-8.))
+                        .mb(px(-6.))
                         .flex()
                         .flex_row()
                         .child(
@@ -24771,10 +24774,8 @@ impl Storm {
                                 .id("card-resize")
                                 .flex_grow(1.0)
                                 .h_full()
-                                .rounded_sm()
                                 .cursor(CursorStyle::ResizeUpDown)
-                                .bg(rgb(if grabbed.is_some() { accent } else { POPUP_BG }))
-                                .hover(|s| s.bg(rgb(accent)))
+                                .bg(rgb(if grabbed.is_some() { ACCENT } else { PANEL_BG }))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
@@ -24795,10 +24796,8 @@ impl Storm {
                                 .w(px(14.))
                                 .h_full()
                                 .flex_shrink_0()
-                                .rounded_sm()
                                 .cursor(CursorStyle::ResizeUpLeftDownRight)
-                                .bg(rgb(if grabbed.is_some_and(|r| r.4) { accent } else { BORDER }))
-                                .hover(|s| s.bg(rgb(accent)))
+                                .bg(rgb(if grabbed.is_some_and(|r| r.4) { ACCENT } else { BORDER }))
                                 .tooltip(tip("Drag to resize"))
                                 .on_mouse_down(
                                     MouseButton::Left,
