@@ -4433,6 +4433,21 @@ fn stop_before_after(old: &str, new: &str, line: usize, end: usize, cap: usize) 
     out
 }
 
+/// Which halves of a before/after block carry a line the other one doesn't.
+/// A stop that only adds lines leaves the left side showing context, and the
+/// context is already on the right, so there is nothing over there to read.
+fn stop_diff_sides(rows: &[StopRow]) -> (bool, bool) {
+    let context = |r: &StopRow| match (&r.left, &r.right) {
+        (Some(l), Some(rt)) => l.text == rt.text,
+        _ => false,
+    };
+    let left = rows.iter().any(|r| r.left.is_some() && !context(r));
+    let right = rows.iter().any(|r| r.right.is_some() && !context(r));
+    // a block with nothing on either side is not drawn at all; if one ever
+    // gets here, draw it the usual way rather than dropping both halves
+    if !left && !right { (true, true) } else { (left, right) }
+}
+
 /// One side of a stop's before/after: its own 2D scroll and its own
 /// scrollbars, the way `diff_pane` gives each side of the diff window its own.
 /// A row the other file has and this one doesn't is drawn empty, so the two
@@ -24575,7 +24590,17 @@ impl Storm {
                             .max()
                             .unwrap_or(0)
                     };
-                    let vis = ((width - 21.0) / 2.0).max(80.0);
+                    // a stop that only adds lines has nothing to read on the
+                    // left, and an empty half is width nobody can use: the
+                    // side carrying the change takes the whole block
+                    let (has_left, has_right) = stop_diff_sides(&changed);
+                    let (only_left, only_right) = (!has_right, !has_left);
+                    let one_side = only_left || only_right;
+                    let vis = if one_side {
+                        (width - 20.0).max(80.0)
+                    } else {
+                        ((width - 21.0) / 2.0).max(80.0)
+                    };
                     let col = |n: usize| (STOP_DIFF_GUTTER + 8.0 + n as f32 * char_w).max(vis);
                     let (left_h, right_h) =
                         (self.stop_diff_left.clone(), self.stop_diff_right.clone());
@@ -24601,21 +24626,29 @@ impl Storm {
                             // each side scrolls on its own, the way ⌘D does it:
                             // the two files are the same length only until one
                             // of them isn't
-                            .child(stop_diff_side(
-                                &changed,
-                                true,
-                                col(widest(|r| &r.left)),
-                                &left_h,
-                                "card-diff-left",
-                            ))
-                            .child(div().w(px(1.)).h_full().flex_shrink_0().bg(rgb(SEPARATOR)))
-                            .child(stop_diff_side(
-                                &changed,
-                                false,
-                                col(widest(|r| &r.right)),
-                                &right_h,
-                                "card-diff-right",
-                            )),
+                            .when(!only_right, |d| {
+                                d.child(stop_diff_side(
+                                    &changed,
+                                    true,
+                                    col(widest(|r| &r.left)),
+                                    &left_h,
+                                    "card-diff-left",
+                                ))
+                            })
+                            .when(!one_side, |d| {
+                                d.child(
+                                    div().w(px(1.)).h_full().flex_shrink_0().bg(rgb(SEPARATOR)),
+                                )
+                            })
+                            .when(!only_left, |d| {
+                                d.child(stop_diff_side(
+                                    &changed,
+                                    false,
+                                    col(widest(|r| &r.right)),
+                                    &right_h,
+                                    "card-diff-right",
+                                ))
+                            }),
                     )
                 })
                 // what has already been said about this stop, so the card is
@@ -40450,5 +40483,39 @@ mod md_marker_tests {
         let w: Vec<f32> = rows.iter().filter(|r| !r.marker.is_empty()).map(md_marker_w).collect();
         assert_eq!(w.len(), 2);
         assert!(w[1] > w[0], "a `10.` column has to hold three characters: {w:?}");
+    }
+}
+
+#[cfg(test)]
+mod stop_diff_side_tests {
+    use super::*;
+
+    fn side(no: usize, text: &str) -> Option<StopSide> {
+        Some(StopSide { no, text: text.to_string(), runs: Vec::new() })
+    }
+
+    #[test]
+    fn an_added_block_is_drawn_on_one_side() {
+        let rows = vec![
+            StopRow { left: side(23, "/*"), right: side(23, "/*") }, // context
+            StopRow { left: None, right: side(24, " * why") },
+            StopRow { left: None, right: side(25, " */") },
+        ];
+        assert_eq!(stop_diff_sides(&rows), (false, true));
+    }
+
+    #[test]
+    fn a_deleted_block_is_drawn_on_the_other() {
+        let rows = vec![
+            StopRow { left: side(10, "a"), right: side(10, "a") },
+            StopRow { left: side(11, "b"), right: None },
+        ];
+        assert_eq!(stop_diff_sides(&rows), (true, false));
+    }
+
+    #[test]
+    fn a_rewritten_line_keeps_both_halves() {
+        let rows = vec![StopRow { left: side(4, "old"), right: side(4, "new") }];
+        assert_eq!(stop_diff_sides(&rows), (true, true));
     }
 }
