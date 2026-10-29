@@ -18841,6 +18841,7 @@ impl Storm {
                         div()
                             .id("changes-chevron")
                             .w(px(16.))
+                            .flex_shrink_0()
                             .flex()
                             .justify_center()
                             .text_size(px(13.))
@@ -18855,6 +18856,7 @@ impl Storm {
                     .child(
                         div()
                             .id("changes-check")
+                            .flex_shrink_0()
                             .on_click(cx.listener(move |this, _e, _w, cx| {
                                 this.toggle_checked_all(&group_files);
                                 cx.notify();
@@ -18912,6 +18914,7 @@ impl Storm {
                                 div()
                                     .id(("cdir-chev", i))
                                     .w(px(16.))
+                                    .flex_shrink_0()
                                     .flex()
                                     .justify_center()
                                     .text_size(px(13.))
@@ -18926,6 +18929,7 @@ impl Storm {
                             .child(
                                 div()
                                     .id(("cdir-check", i))
+                                    .flex_shrink_0()
                                     .on_click(cx.listener(move |this, _e, _w, cx| {
                                         this.toggle_checked_all(&files_toggle);
                                         cx.notify();
@@ -18936,6 +18940,11 @@ impl Storm {
                                 div()
                                     .id(("cdir-label", i))
                                     .flex_grow(1.0)
+                                    // a long name clips; it never squeezes the
+                                    // columns in front of it, which would slide
+                                    // the row out of line with its siblings
+                                    .min_w(px(0.))
+                                    .truncate()
                                     .cursor_pointer()
                                     .text_color(rgb(if is_dir_sel { SEL_TEXT } else { DIR }))
                                     .child(label)
@@ -18947,6 +18956,7 @@ impl Storm {
                             )
                             .child(
                                 div()
+                                    .flex_shrink_0()
                                     .text_color(rgb(MUTED))
                                     .text_size(px(11.))
                                     .child(format!("{}", n)),
@@ -18991,10 +19001,11 @@ impl Storm {
                                     cx.notify();
                                 }),
                             )
-                            .child(div().w(px(16.))) // chevron spacer
+                            .child(div().w(px(16.)).flex_shrink_0()) // chevron spacer
                             .child(
                                 div()
                                     .id(("cfile-check", i))
+                                    .flex_shrink_0()
                                     .on_click(cx.listener(move |this, _e, _w, cx| {
                                         this.toggle_checked(path_check.clone());
                                         cx.notify();
@@ -19004,6 +19015,7 @@ impl Storm {
                             .child(
                                 div()
                                     .w(px(16.))
+                                    .flex_shrink_0()
                                     .flex()
                                     .justify_center()
                                     .text_size(px(9.))
@@ -19014,6 +19026,10 @@ impl Storm {
                                 div()
                                     .id(("cfile", i))
                                     .flex_grow(1.0)
+                                    // same here: the name gives way, the columns
+                                    // in front of it do not
+                                    .min_w(px(0.))
+                                    .truncate()
                                     .cursor_pointer()
                                     .text_color(rgb(if is_open { SEL_TEXT } else { color }))
                                     .child(name)
@@ -33032,6 +33048,7 @@ impl Storm {
                                     .child(
                                         div()
                                             .w(px(12.))
+                                            .flex_shrink_0()
                                             .flex()
                                             .justify_center()
                                             .text_size(px(11.))
@@ -33041,6 +33058,7 @@ impl Storm {
                                     .child(
                                         div()
                                             .w(px(16.))
+                                            .flex_shrink_0()
                                             .flex()
                                             .justify_center()
                                             .text_size(px(icon_size))
@@ -33048,7 +33066,7 @@ impl Storm {
                                             .text_color(rgb(icon_color))
                                             .child(icon),
                                     )
-                                    .child(div().flex_grow(1.0).truncate().text_color(fg).child(name))
+                                    .child(div().flex_grow(1.0).min_w(px(0.)).truncate().text_color(fg).child(name))
                                     // review comments pinned in this file
                                     .when(comments > 0, |d| d.child(comment_marker(comments, 11.)))
                                     .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
