@@ -24342,6 +24342,12 @@ impl Storm {
             div()
                 .id("tour-card")
                 .occlude()
+                // `occlude` hides the root's drag handlers from anything over
+                // the card, which left a resize drag stuck on mouse-up: the
+                // grip grows the card under the pointer, so the release lands
+                // inside it. Re-dispatch both, the way the comment box does.
+                .on_mouse_move(cx.listener(Self::on_mouse_move))
+                .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                 .absolute()
                 .left(px(left))
                 .top(px(top))
