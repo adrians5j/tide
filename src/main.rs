@@ -2290,7 +2290,7 @@ fn md_links(
             let hover_targets = targets.clone();
             let hover_me = me.clone();
             let me = me.clone();
-            gpui::InteractiveText::new(("thread-link", id * 1_000 + i), styled)
+            let linked = gpui::InteractiveText::new(("thread-link", id * 1_000 + i), styled)
                 .tooltip(move |at, _w, cx| {
                     // `at` is a character index; find which link covers it
                     let hit = hover_ranges.iter().position(|r| r.contains(&at))?;
@@ -2309,7 +2309,8 @@ fn md_links(
                     }
                     None => {}
                 })
-                .into_any_element()
+                .into_any_element();
+            md_hang(row, linked)
         }));
     }
     col
@@ -2480,6 +2481,10 @@ struct MdRow {
     /// A fenced code block: drawn in its own bordered, scrollable slab.
     fence: bool,
     indent: f32,
+    /// A list row's marker (`•`, `3.`), drawn in a column of its own so a line
+    /// that wraps hangs under the text rather than under the marker. Empty for
+    /// everything else.
+    marker: SharedString,
     /// A table's cells (each already flattened the same way).
     cells: Option<Vec<MdRow>>,
     table_header: bool,
@@ -2550,6 +2555,7 @@ fn md_row_blank() -> MdRow {
         heading: false,
         fence: false,
         indent: 0.0,
+        marker: SharedString::default(),
         cells: None,
         table_header: false,
         cols: Vec::new(),
@@ -2585,6 +2591,7 @@ fn md_flatten_at(spans: &[md::Span], at: &[usize], size: f32, prefix: &str) -> M
         heading: false,
         fence: false,
         indent: 0.0,
+        marker: SharedString::default(),
         cells: None,
         table_header: false,
         cols: Vec::new(),
@@ -2758,6 +2765,7 @@ fn md_prepare(text: &str) -> Arc<Vec<MdRow>> {
             heading: false,
             fence: true,
             indent: 0.0,
+            marker: SharedString::default(),
             cells: None,
             table_header: false,
             cols: Vec::new(),
@@ -2819,8 +2827,8 @@ fn md_prepare(text: &str) -> Arc<Vec<MdRow>> {
             rows.push(blank);
             continue;
         }
-        let prefix = line.bullet.map(|b| format!("{b}  ")).unwrap_or_default();
-        let mut row = md_flatten_at(&line.spans, &at_of(line.line, &line.at), size, &prefix);
+        let mut row = md_flatten_at(&line.spans, &at_of(line.line, &line.at), size, "");
+        row.marker = line.bullet.map(SharedString::from).unwrap_or_default();
         row.heading = line.heading > 0;
         row.indent = line.indent as f32 * 16.0;
         row.src_line = line.line;
@@ -2914,6 +2922,38 @@ fn md_src_to_rc(rows: &[MdRow], src: usize) -> Option<(usize, usize)> {
 /// A plain row as one `StyledText`, so the caller can keep its layout and turn
 /// a pointer position into a byte offset. `None` for the rows that aren't a
 /// single run of text: spacers, tables, and fenced blocks.
+/// Width of the column a list marker sits in. Wide enough for `10.`, so a
+/// list that runs into double figures keeps its text on one left edge.
+fn md_marker_w(row: &MdRow) -> f32 {
+    let chars = if row.marker.ends_with('.') { 3.6 } else { 2.6 };
+    row.size.max(1.0) * 0.62 * chars
+}
+
+/// Put a row's drawn text beside its marker, and under its nesting indent. The
+/// marker has a column to itself, which is what makes a wrapped line hang:
+/// drawn inline, the second line started back under the bullet.
+fn md_hang(row: &MdRow, inner: AnyElement) -> AnyElement {
+    if row.marker.is_empty() && row.indent <= 0.0 {
+        return inner;
+    }
+    div()
+        .flex()
+        .flex_row()
+        .items_start()
+        .when(row.indent > 0.0, |d| d.pl(px(row.indent)))
+        .when(!row.marker.is_empty(), |d| {
+            d.child(
+                div()
+                    .flex_shrink_0()
+                    .w(px(md_marker_w(row)))
+                    .text_size(px(row.size.max(1.0)))
+                    .child(row.marker.clone()),
+            )
+        })
+        .child(div().flex_grow(1.0).min_w(px(0.)).child(inner))
+        .into_any_element()
+}
+
 fn md_row_text(row: &MdRow, selected: Sel) -> Option<gpui::StyledText> {
     if row.gap || row.cells.is_some() || row.fence {
         return None;
@@ -2966,9 +3006,8 @@ fn md_row_el(row: &MdRow, selected: Sel) -> AnyElement {
             .into_any_element();
     }
     div()
-        .when(row.indent > 0.0, |d| d.pl(px(row.indent)))
         .when(row.heading, |d| d.mt_2())
-        .child(md_styled_sel(row, row.heading, selected))
+        .child(md_hang(row, md_styled_sel(row, row.heading, selected).into_any_element()))
         .into_any_element()
 }
 
@@ -26424,7 +26463,7 @@ impl Storm {
                             match styled {
                                 Some(t) => {
                                     row_layout = Some(t.layout().clone());
-                                    t.into_any_element()
+                                    md_hang(row, t.into_any_element())
                                 }
                                 None => md_row_el(row, selected(i)),
                             }
@@ -26436,7 +26475,10 @@ impl Storm {
                             let styled = md_styled_links(row, row.heading, selected(i), &ranges);
                             row_layout = Some(styled.layout().clone());
                             let me = cx.entity().downgrade();
-                            gpui::InteractiveText::new(("md-link", msg * 10_000 + i), styled)
+                            let linked = gpui::InteractiveText::new(
+                                ("md-link", msg * 10_000 + i),
+                                styled,
+                            )
                                 .on_click(ranges, move |ix, window, cx| {
                                     match targets.get(ix) {
                                         Some(LinkTarget::Url(u)) => open_browser(u),
@@ -26469,7 +26511,8 @@ impl Storm {
                                         None => {}
                                     }
                                 })
-                                .into_any_element()
+                                .into_any_element();
+                            md_hang(row, linked)
                         }),
                 )
                 .into_any_element();
@@ -26623,7 +26666,7 @@ impl Storm {
                 let inner = match md_row_text(row, selected(i)) {
                     Some(t) => {
                         layout = Some(t.layout().clone());
-                        t.into_any_element()
+                        md_hang(row, t.into_any_element())
                     }
                     None => md_row_el(row, selected(i)),
                 };
@@ -40490,3 +40533,24 @@ mod pr_check_attempt_tests {
     }
 }
 
+
+#[cfg(test)]
+mod md_marker_tests {
+    use super::*;
+
+    #[test]
+    fn a_list_row_keeps_its_marker_out_of_the_text() {
+        let rows = md_prepare("- one\n\n2. two\n\nplain\n");
+        let listed: Vec<(&str, &str)> =
+            rows.iter().filter(|r| !r.gap).map(|r| (r.marker.as_ref(), r.text.as_ref())).collect();
+        assert_eq!(listed, vec![("•", "one"), ("2.", "two"), ("", "plain")]);
+    }
+
+    #[test]
+    fn a_number_gets_a_wider_column_than_a_bullet() {
+        let rows = md_prepare("- one\n\n10. ten\n");
+        let w: Vec<f32> = rows.iter().filter(|r| !r.marker.is_empty()).map(md_marker_w).collect();
+        assert_eq!(w.len(), 2);
+        assert!(w[1] > w[0], "a `10.` column has to hold three characters: {w:?}");
+    }
+}
