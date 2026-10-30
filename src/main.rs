@@ -2541,6 +2541,9 @@ fn md_verdict(text: &str) -> Option<u32> {
     match word.as_str() {
         "took" | "taken" | "yes" | "done" | "fixed" | "agreed" | "pass" => Some(GIT_NEW),
         "turned down" | "no" | "declined" | "skipped" | "wontfix" => Some(MUTED),
+        // the point stood, the code already did it: nothing was edited, so it
+        // reads like the other verdicts that left the diff alone
+        "no change" | "already so" | "already true" | "nothing to do" => Some(MUTED),
         "partly" | "partial" | "later" | "deferred" | "todo" => Some(FOLDER_ICON),
         _ => None,
     }
@@ -9761,12 +9764,16 @@ impl Storm {
              |---|---|---|\n\
              | Stale lease never re-queued | Took | `recover()` re-queues on a lease older than 60s |\n\
              | Wait for the whole run | Turned down | a long list of overdue actions would use the \
-             whole shutdown window |\n\n\
+             whole shutdown window |\n\
+             | Lease length | No change | 60s is already what `LEASE_MS` is set to |\n\n\
              One row per thing that reviewer raised, in the order they raised it. `Point` is a few \
-             words, not their sentence. The verdict cell is exactly Took or Turned down, no \
-             backticks and nothing else, so the column reads straight down the page. If you only \
-             half took something, that is Took, and the last column says what you left. The last \
-             column is one sentence: what \
+             words, not their sentence. The verdict cell is exactly Took, Turned down or No \
+             change, no backticks and nothing else, so the column reads straight down the page. \
+             Took means you edited something for it; if you only half took it, that is still Took, \
+             and the last column says what you left. Turned down means you disagree. No change is \
+             for a point that was fair but needed no edit — the code already did it, or it was a \
+             remark rather than a request. Never write Took on a row that changed nothing. The \
+             last column is one sentence: what \
              changed, or why it didn't. Anything that wasn't either reviewer's point goes under \
              `## Other`, as prose rather than a table. Title it \"Reviewers\"."
         );
@@ -37942,6 +37949,8 @@ mod md_flatten_tests {
         assert_eq!(md_verdict("Took"), Some(GIT_NEW));
         assert_eq!(md_verdict("turned down"), Some(MUTED));
         assert_eq!(md_verdict(" Partly."), Some(FOLDER_ICON));
+        // a point that was fair but needed no edit is not a point that was taken
+        assert_eq!(md_verdict("No change"), Some(MUTED));
         // a sentence keeps the colour of the prose around it, however it starts
         assert_eq!(md_verdict("No, the lease is already checked"), None);
         assert_eq!(md_verdict("took the first half of it"), None);
