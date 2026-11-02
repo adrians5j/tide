@@ -2016,8 +2016,6 @@ enum CtxKind {
     MdPreview,
     /// One turn inside a review thread — the agent's answer to a note.
     ThreadReply,
-    /// A row in the code-tour library.
-    Tour,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -2029,8 +2027,6 @@ enum LeftView {
     Review,
     /// The scratch todo list, shared by every workspace.
     Todos,
-    /// Code tours the agent has built for this workspace.
-    Tours,
 }
 
 /// PR review file filter by viewed-state.
@@ -5642,8 +5638,6 @@ enum Cmd {
     ReleasePrs,
     CopyBranch,
     CopyRenameSession,
-    AskForTour,
-    ShowTours,
     HandOff,
     AgentBriefing,
     PhoneLink,
@@ -5696,8 +5690,6 @@ const PALETTE: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::GoToLine, "Go to Line", IC_HOME, "⌘L"),
     (Cmd::CopyBranch, "Copy Branch Name", IC_BRANCH, ""),
     (Cmd::CopyRenameSession, "Copy Claude /rename Command", IC_COPY, ""),
-    (Cmd::AskForTour, "Ask the Agent for a Code Tour", IC_AGENT, ""),
-    (Cmd::ShowTours, "Code Tours", IC_TOUR, ""),
     (Cmd::HandOff, "Send to Another Workspace  (⌥⇧↩)", IC_AGENT, ""),
     (Cmd::AgentBriefing, "Show the Agent Briefing", IC_GEAR, ""),
     (Cmd::PhoneLink, "Copy the Phone Link", IC_BROWSER, ""),
@@ -6945,22 +6937,16 @@ fn stop_label(s: &Stop) -> String {
     }
 }
 
-/// A tour as it is kept between sessions: the stops, where you had got to, and
-/// when it arrived. The list of these is the tour pane.
+/// The one tour this workspace is holding: the stops, where you had got to,
+/// and what it is a tour of. It lives for as long as the app does — a tour is
+/// of a pull request, and a pull request is read once.
 #[derive(Clone)]
 struct TourRec {
     id: String,
     title: String,
     /// The stop you were standing on when you last looked.
     at: usize,
-    /// Unix seconds it was posted, for "2h ago" in the list.
-    made: u64,
-    /// Put away with ✕. It stays in the list, it just doesn't reopen itself
-    /// next launch.
-    closed: bool,
-    /// The pull request this tour is of, when it is of one. A tour of a change
-    /// goes stale the moment the change moves; a tour of how something works
-    /// does not, which is why only one of them is worth rebuilding.
+    /// The pull request this tour is of, when it is of one.
     pr: Option<u64>,
     /// The commit the tour was built against, so TIDE can tell the code has
     /// moved out from under its stops.
@@ -7368,121 +7354,6 @@ fn review_path(root: &Path) -> Option<PathBuf> {
     )
 }
 
-/// Where this workspace's open code tour is kept. One per checkout: a tour is
-/// about this branch's code, and two workspaces on the same repo are usually
-/// two different pieces of work.
-fn tours_path(root: &Path) -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(
-        PathBuf::from(home)
-            .join(".config/tide/tours")
-            .join(format!("{}.json", usage::project_slug(root))),
-    )
-}
-
-/// Every tour this workspace has been given, newest first. One file: a tour is
-/// a few kilobytes of text, and the list is read once at launch.
-fn tours_to_json(list: &[TourRec]) -> String {
-    let items: Vec<serde_json::Value> = list
-        .iter()
-        .map(|t| {
-            let steps: Vec<serde_json::Value> = t
-                .stops
-                .iter()
-                .map(|s| {
-                    serde_json::json!({
-                        "file": s.path,
-                        "line": s.line,
-                        "end": s.end,
-                        "title": s.title,
-                        "group": s.group,
-                        "text": s.said,
-                    })
-                })
-                .collect();
-            serde_json::json!({
-                "id": t.id,
-                "title": t.title,
-                "at": t.at,
-                "made": t.made,
-                "closed": t.closed,
-                "pr": t.pr,
-                "oid": t.oid,
-                "seen": t.seen,
-                "steps": steps,
-            })
-        })
-        .collect();
-    serde_json::json!({ "tours": items }).to_string()
-}
-
-/// One stored tour. Separate from `tours_from_json` so the single-tour file
-/// the first version wrote still loads.
-fn tour_rec_from_json(v: &serde_json::Value) -> Option<TourRec> {
-    let stops: Vec<Stop> = v
-        .get("steps")?
-        .as_array()?
-        .iter()
-        .filter_map(|s| {
-            let path = s.get("file")?.as_str()?.to_string();
-            let line = s.get("line").and_then(|l| l.as_u64()).unwrap_or(0) as usize;
-            Some(Stop {
-                path,
-                line,
-                end: s.get("end").and_then(|e| e.as_u64()).unwrap_or(line as u64) as usize,
-                title: s.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string(),
-                group: s.get("group").and_then(|g| g.as_str()).unwrap_or("").to_string(),
-                said: s.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string(),
-            })
-        })
-        .collect();
-    if stops.is_empty() {
-        return None;
-    }
-    let at = v.get("at").and_then(|a| a.as_u64()).unwrap_or(0) as usize;
-    Some(TourRec {
-        id: v.get("id").and_then(|i| i.as_str()).map(|i| i.to_string()).unwrap_or_else(random_id),
-        title: v.get("title").and_then(|t| t.as_str()).unwrap_or("Code tour").to_string(),
-        at: at.min(stops.len() - 1),
-        made: v.get("made").and_then(|m| m.as_u64()).unwrap_or(0),
-        closed: v.get("closed").and_then(|c| c.as_bool()).unwrap_or(false),
-        pr: v.get("pr").and_then(|n| n.as_u64()),
-        oid: v.get("oid").and_then(|o| o.as_str()).unwrap_or("").to_string(),
-        seen: v
-            .get("seen")
-            .and_then(|s| s.as_array())
-            .map(|a| {
-                let mut v: Vec<usize> = a
-                    .iter()
-                    .filter_map(|i| i.as_u64())
-                    .map(|i| i as usize)
-                    .filter(|i| *i < stops.len())
-                    .collect();
-                v.sort_unstable();
-                v.dedup();
-                v
-            })
-            .unwrap_or_default(),
-        stops,
-    })
-}
-
-fn tours_from_json(body: &str) -> Vec<TourRec> {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else { return Vec::new() };
-    match v.get("tours").and_then(|t| t.as_array()) {
-        Some(items) => items.iter().filter_map(tour_rec_from_json).collect(),
-        // the shape the first version wrote: one tour, no list around it
-        None => tour_rec_from_json(&v).into_iter().collect(),
-    }
-}
-
-fn load_tours(root: &Path) -> Vec<TourRec> {
-    tours_path(root)
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|b| tours_from_json(&b))
-        .unwrap_or_default()
-}
-
 /// Stand a stored tour up as something to walk. It comes back pointing at
 /// nothing: the first step (or a click in the list) is what opens a file, so a
 /// restart never hijacks the editor on its own.
@@ -7878,8 +7749,6 @@ struct Storm {
     /// Which action list the open context menu shows — the dir tree's, or the
     /// short one a file row in Changes / PR Review gets.
     tree_ctx_kind: CtxKind,
-    /// The tour a right-click in the library landed on.
-    ctx_tour: Option<String>,
     tree_ctx_focus: FocusHandle,
     git_status: HashMap<PathBuf, GitState>,
     // pull-request review
@@ -8229,8 +8098,10 @@ struct Storm {
     at_items: Vec<Mention>,
     /// The screenshot a right-click menu is open on.
     ctx_shot: Option<Arc<gpui::Image>>,
-    /// Every tour this workspace has been given, newest first.
-    tours: Vec<TourRec>,
+    /// The tour this workspace is holding, if the agent has built one. One
+    /// at a time, and only for as long as the app runs: a tour is of a pull
+    /// request, and a new one replaces the last.
+    tour: Option<TourRec>,
     /// ⌘F over the rendered document: the query, where in the matches you are,
     /// and the scroll handle that puts each one on screen.
     md_find: Field,
@@ -8661,7 +8532,6 @@ impl Storm {
             tree_ctx: None,
             tree_ctx_path: None,
             tree_ctx_kind: CtxKind::Tree,
-            ctx_tour: None,
             tree_ctx_focus: cx.focus_handle(),
             git_status: HashMap::new(),
             finder_open: false,
@@ -8867,7 +8737,7 @@ impl Storm {
             at_sel: 0,
             at_items: Vec::new(),
             ctx_shot: None,
-            tours: Vec::new(),
+            tour: None,
             md_find: Field::default(),
             md_find_focus: cx.focus_handle(),
             md_find_open: false,
@@ -9025,14 +8895,7 @@ impl Storm {
         // No shell at startup. The agent pane is the surface you land on, and a
         // terminal that nobody asked for is a tab in the way: ⌘T, ⌥F12, or
         // anything that runs a command (wdev, wwp, a build) opens its own.
-        // every tour this workspace has been given; the one left open comes
-        // back, standing where it was
         s.reviewed = reviewed_all(&s.root);
-        s.tours = load_tours(&s.root);
-        s.walk = s.tours.iter().find(|t| !t.closed).map(|t| walk_from_rec(t, false));
-        if s.walk.is_some() {
-            s.load_tour_diff(cx); // a restored tour draws in the same colours
-        }
         s.sync_comment_gutters(cx); // markers for comments restored from disk
         s
     }
@@ -14970,8 +14833,6 @@ impl Storm {
                 cx.write_to_clipboard(ClipboardItem::new_string(format!("/rename ⭐ {branch}")));
                 self.show_flash("/rename command copied", cx);
             }
-            Cmd::AskForTour => self.ask_for_tour(None, cx),
-            Cmd::ShowTours => self.open_tours_pane(cx),
             Cmd::HandOff => {
                 self.open_handoff(cx);
                 if self.hand_open {
@@ -16561,7 +16422,6 @@ impl Render for Storm {
                 LeftView::PullRequest => self.render_pr(window, cx).into_any_element(),
                 LeftView::Review => self.render_review_pane(window, cx).into_any_element(),
                 LeftView::Todos => self.render_todo_pane(window, cx).into_any_element(),
-                LeftView::Tours => self.render_tours_pane(cx).into_any_element(),
             })
         } else {
             None
@@ -17676,7 +17536,6 @@ impl Storm {
         let pr_active = self.show_left && self.left_view == LeftView::PullRequest;
         let review_active = self.show_left && self.left_view == LeftView::Review;
         let todos_active = self.show_left && self.left_view == LeftView::Todos;
-        let tours_active = self.show_left && self.left_view == LeftView::Tours;
         div()
             .w(px(44.))
             .flex_shrink_0()
@@ -17722,15 +17581,6 @@ impl Storm {
                     this.show_left = false;
                 } else {
                     this.left_view = LeftView::Review;
-                    this.show_left = true;
-                }
-                cx.notify();
-            })))
-            .child(activity_icon("act-tours", IC_TOUR, "Code Tours", tours_active, self.tours.len(), cx.listener(|this, _ev, _w, cx| {
-                if this.show_left && this.left_view == LeftView::Tours {
-                    this.show_left = false;
-                } else {
-                    this.left_view = LeftView::Tours;
                     this.show_left = true;
                 }
                 cx.notify();
@@ -22298,28 +22148,8 @@ impl Storm {
                 }),
             ];
         }
-        if kind == CtxKind::Tour {
-            return vec![
-                ("Delete", |this, _w, cx| {
-                    if let Some(id) = this.ctx_tour.clone() {
-                        this.delete_tour(id, cx);
-                    }
-                }),
-                ("Delete All Except This", |this, _w, cx| {
-                    let Some(id) = this.ctx_tour.clone() else { return };
-                    this.delete_tours(|t| t.id != id, cx);
-                }),
-                ("Delete All", |this, _w, cx| this.delete_tours(|_| true, cx)),
-            ];
-        }
         if kind == CtxKind::ThreadReply {
             return vec![
-                // the answer in a thread is the one most worth touring: it is
-                // where the agent laid the whole flow out
-                ("Tour This Answer", |this, window, cx| {
-                    let answer = this.ctx_reply.clone();
-                    this.ask_tour_from_comment(answer, window, cx)
-                }),
                 ("Copy", |this, _w, cx| {
                     let Some(t) = this.ctx_reply.clone() else { return };
                     cx.write_to_clipboard(ClipboardItem::new_string(t));
@@ -22536,7 +22366,6 @@ impl Storm {
             CtxKind::MdPreview => 210.0_f32,
             CtxKind::ThreadReply => 210.0_f32,
             CtxKind::Tree => 200.0_f32,
-            CtxKind::Tour => 230.0_f32,
         };
         let row_h = 28.0_f32;
         let menu_h = actions.len() as f32 * row_h + 10.0;
@@ -23759,10 +23588,11 @@ impl Storm {
     /// from `☰ N steps` in the strip. It stands beside the code rather than
     /// under it: a 38-stop tour is a table of contents, and reading one four
     /// rows at a time through a strip is reading it through a letterbox.
-    /// The stored tour the open walk came from, if it came from one.
+    /// The tour the open walk came from, if it came from one. A walk through
+    /// the references in a plain answer has no id, and no record behind it.
     fn open_tour_rec(&self) -> Option<&TourRec> {
         let id = self.walk.as_ref()?.id.as_ref()?;
-        self.tours.iter().find(|t| &t.id == id)
+        self.tour.as_ref().filter(|t| &t.id == id)
     }
 
     fn render_tour_steps(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -23955,26 +23785,33 @@ impl Storm {
                                             .child("the branch moved"),
                                     )
                                 })
-                                .child(
-                                    div()
-                                        .id("tour-steps-regen")
-                                        .flex_shrink_0()
-                                        .px_2()
-                                        .py(px(2.))
-                                        .rounded_md()
-                                        .cursor_pointer()
-                                        .border_1()
-                                        .border_color(rgb(if stale { TOUR_MARK } else { BORDER }))
-                                        .text_color(rgb(if stale { TOUR_MARK } else { MUTED }))
-                                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TOUR_MARK)))
-                                        .child("⟲ Rebuild")
-                                        .tooltip(tip(if stale {
-                                            "The branch has moved since this tour was built"
-                                        } else {
-                                            "Ask for this tour again, from the code as it stands now"
-                                        }))
-                                        .on_click(cx.listener(|this, _e, _w, cx| this.regen_tour(cx))),
-                                ),
+                                // only a tour of a pull request can be asked
+                                // for again: a rebuild is the same request with
+                                // the number in it
+                                .when(pr.is_some(), |d| {
+                                    d.child(
+                                        div()
+                                            .id("tour-steps-regen")
+                                            .flex_shrink_0()
+                                            .px_2()
+                                            .py(px(2.))
+                                            .rounded_md()
+                                            .cursor_pointer()
+                                            .border_1()
+                                            .border_color(rgb(if stale { TOUR_MARK } else { BORDER }))
+                                            .text_color(rgb(if stale { TOUR_MARK } else { MUTED }))
+                                            .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TOUR_MARK)))
+                                            .child("⟲ Rebuild")
+                                            .tooltip(tip(if stale {
+                                                "The branch has moved since this tour was built"
+                                            } else {
+                                                "Ask for this tour again, from the code as it stands now"
+                                            }))
+                                            .on_click(
+                                                cx.listener(|this, _e, _w, cx| this.regen_tour(cx)),
+                                            ),
+                                    )
+                                }),
                         )
                         // how far along you are. The header sits on BG, which
                         // HOVER vanishes into, so the unlit cells take the
@@ -24182,11 +24019,7 @@ impl Storm {
                                     .child("Delete tour")
                                     .tooltip(tip("Throw this tour away for good"))
                                     .on_click(cx.listener(|this, _e, _w, cx| {
-                                        let Some(id) = this.walk.as_ref().and_then(|w| w.id.clone())
-                                        else {
-                                            return;
-                                        };
-                                        this.delete_tour(id, cx);
+                                        this.discard_tour(cx);
                                     })),
                             )
                         }),
@@ -24198,56 +24031,6 @@ impl Storm {
 }
 
 impl Storm {
-
-    /// The Tour button in a review thread: the subject is the code the thread
-    /// is pinned to, and the note itself, since that is the question the tour
-    /// has to answer.
-    fn ask_tour_from_comment(
-        &mut self,
-        answer: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((path, line, end)) = self.rc_target.clone() else {
-            self.ask_for_tour(None, cx);
-            return;
-        };
-        let where_ = if is_agent_src(&path) {
-            "your earlier answer".to_string()
-        } else if line == 0 {
-            self.rel(&path)
-        } else if end > line {
-            format!("{}:{}-{}", self.rel(&path), line, end)
-        } else {
-            format!("{}:{}", self.rel(&path), line)
-        };
-        // what the thread actually asks, so the tour answers that rather than
-        // explaining the file in general
-        let said = self
-            .review
-            .iter()
-            .find(|c| c.path == path && c.line == line && c.end == end)
-            .map(|c| c.text.trim().to_string())
-            .filter(|t| !t.is_empty())
-            .or_else(|| {
-                let typed = self.rc_query.text.trim().to_string();
-                (!typed.is_empty()).then_some(typed)
-            });
-        let label = format!("Asked for a code tour of {where_}");
-        let about = match said {
-            Some(q) => format!("{where_} and what I asked about it: “{q}”"),
-            None => where_,
-        };
-        self.cancel_comment(window, cx);
-        self.agent_open = true;
-        self.send_agent_prompt_as(
-            tour_request(Some(&about), answer.as_deref()),
-            Some(label),
-            cx,
-        );
-        self.agent_list.scroll_to_end();
-        cx.notify();
-    }
 
     /// Where the tour card sits: `(left, top, width)` in window space, directly
     /// under the stop's last line. `None` when the stop's file isn't the one on
@@ -24896,17 +24679,22 @@ impl Storm {
     fn ask_pr_tour(&mut self, number: u64, base: String, wait: bool, cx: &mut Context<Self>) {
         self.pending_tour_pr = Some(number);
         self.tour_waits = wait;
-        let label = format!("Asked for a code tour of #{number}");
-        self.job_next = Some(format!("Code tour of #{number}"));
         // a tour of this pull request already read in part: the stops you have
-        // read are the ones a rebuild should leave alone
-        let read = self
-            .tours
-            .iter()
-            .filter(|t| t.pr == Some(number))
-            .max_by_key(|t| t.made)
+        // read are the ones a rebuild should leave alone, and having one in
+        // hand is what makes this a rebuild
+        let had = self.tour_of(number);
+        let again = had.is_some();
+        let read = had
             .map(|t| tour_read_note(&t.stops, &t.seen.iter().copied().collect()))
             .unwrap_or_default();
+        let label = match again {
+            true => format!("Asked for the code tour of #{number} to be built again"),
+            false => format!("Asked for a code tour of #{number}"),
+        };
+        self.job_next = Some(match again {
+            true => format!("Rebuild the tour of #{number}"),
+            false => format!("Code tour of #{number}"),
+        });
         self.agent_open = true;
         self.send_agent_prompt_as(pr_tour_request(number, &base, &read), Some(label), cx);
         self.agent_list.scroll_to_end();
@@ -24914,54 +24702,13 @@ impl Storm {
     }
 
     /// Build this tour again. A tour is a snapshot: once the code under it has
-    /// moved, the stops drift off their lines and the prose stops matching.
+    /// moved, the stops drift off their lines and the prose stops matching. A
+    /// tour is of a pull request, so a rebuild is the same request again —
+    /// `ask_pr_tour` carries the stops you have already read along with it.
     fn regen_tour(&mut self, cx: &mut Context<Self>) {
-        let Some(name) = self.walk.as_ref().map(|w| w.tour.clone()) else { return };
-        self.pending_tour_pr = self.open_tour_rec().and_then(|t| t.pr);
-        // what is already read rides along: a rebuild that hands back twenty
-        // unread stops is a rebuild that costs the reading twice
-        let read = self
-            .walk
-            .as_ref()
-            .map(|w| tour_read_note(&w.stops, &w.seen))
-            .unwrap_or_default();
-        let about = match name.as_deref().map(str::trim) {
-            Some(n) if !n.is_empty() => format!(
-                "\u{201c}{n}\u{201d}. There is already a tour by that name, but the code has \
-                 moved under it. Build it again from the code as it stands now, \
-                 and keep the name.{read}"
-            ),
-            _ => format!("this answer, again, from the code as it stands now{read}"),
-        };
-        let label = match name.as_deref().map(str::trim) {
-            Some(n) if !n.is_empty() => format!("Asked for \u{201c}{n}\u{201d} to be built again"),
-            _ => "Asked for the tour to be built again".to_string(),
-        };
-        // the tour is what comes back, and it opens where it belongs: the pane
-        // gets the one line that says how the rebuild is going
-        self.job_next = Some(match name.as_deref().map(str::trim) {
-            Some(n) if !n.is_empty() => format!("Rebuild \u{201c}{n}\u{201d}"),
-            _ => "Rebuild the tour".to_string(),
-        });
-        self.agent_open = true;
-        self.send_agent_prompt_as(tour_request(Some(&about), None), Some(label), cx);
-        self.agent_list.scroll_to_end();
-        cx.notify();
-    }
-
-    fn ask_for_tour(&mut self, about: Option<String>, cx: &mut Context<Self>) {
-        let label = match about.as_deref() {
-            Some(a) => format!("Asked for a code tour of {a}"),
-            None => "Asked for a code tour".to_string(),
-        };
-        self.job_next = Some(match about.as_deref() {
-            Some(a) => format!("Code tour of {a}"),
-            None => "Code tour".to_string(),
-        });
-        self.agent_open = true;
-        self.send_agent_prompt_as(tour_request(about.as_deref(), None), Some(label), cx);
-        self.agent_list.scroll_to_end();
-        cx.notify();
+        let Some(number) = self.open_tour_rec().and_then(|t| t.pr) else { return };
+        let base = self.pr_base.clone();
+        self.ask_pr_tour(number, base, false, cx);
     }
 
     /// The colour a file's name takes everywhere else in TIDE: green when the
@@ -27305,14 +27052,13 @@ impl Storm {
     fn end_walk(&mut self, cx: &mut Context<Self>) {
         self.walk_group.clear();
         let Some(w) = self.walk.take() else { return };
-        // closing a tour means you're done with it for now: it doesn't come
-        // back next launch, but it stays in the list to be opened again
+        // closing a tour takes it off the screen, not out of the workspace:
+        // the PR header still says there is one, and opening it again picks up
+        // where this left off
         if let Some(id) = w.id.clone() {
-            if let Some(rec) = self.tours.iter_mut().find(|t| t.id == id) {
+            if let Some(rec) = self.tour.as_mut().filter(|t| t.id == id) {
                 rec.at = w.at;
-                rec.closed = true;
             }
-            self.save_tours();
         }
         self.sync_comment_gutters(cx);
         cx.notify();
@@ -27387,9 +27133,9 @@ impl Storm {
         let head = self.head_oid.trim();
         let moved = |oid: &str| !oid.is_empty() && !head.is_empty() && oid != head;
         let brief = brief_cached(number);
-        // the newest tour of this pull request is the one a click would
-        // replace, and the only one worth asking about
-        let tour = self.tours.iter().filter(|t| t.pr == Some(number)).max_by_key(|t| t.made);
+        // the tour in hand, when it is of this pull request: anything else is
+        // a tour a click would replace
+        let tour = self.tour_of(number);
         PrReading {
             has_brief: brief.is_some(),
             brief_stale: brief.as_ref().is_some_and(|b| moved(&b.oid)),
@@ -27402,15 +27148,9 @@ impl Storm {
     /// one, otherwise ask for it. The brief ends with this, which is the only
     /// place the two halves of an explanation meet.
     fn walk_pr_tour(&mut self, number: u64, base: String, cx: &mut Context<Self>) {
-        let id = self
-            .tours
-            .iter()
-            .filter(|t| t.pr == Some(number))
-            .max_by_key(|t| t.made)
-            .map(|t| t.id.clone());
-        match id {
-            Some(id) => self.open_tour(id, false, cx),
-            None => self.ask_pr_tour(number, base, false, cx),
+        match self.tour_of(number).is_some() {
+            true => self.open_tour(false, cx),
+            false => self.ask_pr_tour(number, base, false, cx),
         }
     }
 
@@ -27460,10 +27200,7 @@ impl Storm {
             .map(|b| brief_read_note(&b.slides, &b.read))
             .unwrap_or_default();
         let tour_read = self
-            .tours
-            .iter()
-            .filter(|t| t.pr == Some(number))
-            .max_by_key(|t| t.made)
+            .tour_of(number)
             .map(|t| tour_read_note(&t.stops, &t.seen.iter().copied().collect()))
             .unwrap_or_default();
         let label = format!("Asked for a brief and a code tour of #{number}");
@@ -27666,8 +27403,6 @@ impl Storm {
             id: random_id(),
             title: title.clone(),
             at: 0,
-            made: now_secs(),
-            closed: false,
             pr,
             oid: self.head_oid.clone(),
             seen: Vec::new(),
@@ -27687,15 +27422,11 @@ impl Storm {
                 seen: HashSet::new(),
             });
         }
-        // newest first, and the rest are put away: one tour is open at a time
-        for t in self.tours.iter_mut() {
-            t.closed = true;
-        }
-        self.tours.insert(0, rec);
-        self.tours.truncate(30);
-        self.save_tours();
-        let live: HashSet<String> = self.tours.iter().map(|t| t.id.clone()).collect();
-        self.stop_asks.retain(|(id, _), _| live.contains(id));
+        // one tour at a time: this one replaces whatever came before, and the
+        // questions asked at the old tour's stops go with it
+        let live = rec.id.clone();
+        self.tour = Some(rec);
+        self.stop_asks.retain(|(id, _), _| *id == live);
         let note = if dropped > 0 { format!(" · {dropped} skipped") } else { String::new() };
         // a tour that came with a brief waits: it lands while you are still on
         // slide two, and jumping the editor to its first stop takes the screen
@@ -27712,209 +27443,6 @@ impl Storm {
         cx.notify();
     }
 
-    /// Show the tour list in the left dock.
-    fn open_tours_pane(&mut self, cx: &mut Context<Self>) {
-        self.left_view = LeftView::Tours;
-        self.show_left = true;
-        cx.notify();
-    }
-
-    /// Every tour this workspace has been given: open one, start it over, or
-    /// throw it away. A tour is worth keeping — it costs the agent a turn to
-    /// build and it stays true until the code moves — so this is a shelf, not
-    /// a queue.
-    fn render_tours_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let width = px(self.tree_width);
-        let open_id = self.walk.as_ref().and_then(|w| w.id.clone());
-        let n = self.tours.len();
-        let mut list = div().flex().flex_col().min_h(px(0.)).id("tours-list").overflow_y_scroll();
-        for (i, t) in self.tours.iter().enumerate() {
-            let on = open_id.as_deref() == Some(t.id.as_str());
-            let id = t.id.clone();
-            let (restart_id, delete_id, ctx_id) = (id.clone(), id.clone(), id.clone());
-            let steps = t.stops.len();
-            let where_ = t
-                .stops
-                .get(t.at)
-                .map(|s| stop_label(s))
-                .unwrap_or_else(|| "nowhere yet".to_string());
-            let made = if t.made > 0 { todo::age(t.made) } else { String::new() };
-            let mut sub = format!("{steps} steps");
-            if t.at > 0 || on {
-                sub.push_str(&format!("  ·  on {}", t.at + 1));
-            }
-            if !made.is_empty() {
-                sub.push_str(&format!("  ·  {made}"));
-            }
-            let icon_btn = |id: &'static str,
-                            key: String,
-                            glyph: &'static str,
-                            hint: &'static str,
-                            restart: bool,
-                            cx: &mut Context<Self>| {
-                div()
-                    .id((id, i))
-                    .px_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .flex_shrink_0()
-                    .text_size(px(12.))
-                    .text_color(rgb(MUTED))
-                    .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(if restart { TEXT } else { GIT_DELETED })))
-                    .child(glyph)
-                    .tooltip(tip(hint))
-                    // the row behind it opens the tour: don't do both
-                    .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
-                    .on_click(cx.listener(move |this, _e, _w, cx| {
-                        if restart {
-                            this.open_tour(key.clone(), true, cx);
-                        } else {
-                            this.delete_tour(key.clone(), cx);
-                        }
-                    }))
-            };
-            list = list.child(
-                div()
-                    .id(("tour-row", i))
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.))
-                    .px_3()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(rgb(BORDER))
-                    .cursor_pointer()
-                    .when(on, |d| d.bg(rgba(TOUR_TINT)))
-                    .hover(|s| s.bg(rgb(HOVER)))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .font_family(ICON_FONT)
-                                    .text_size(px(11.))
-                                    .text_color(rgb(if on { TOUR_MARK } else { MUTED }))
-                                    .child(IC_TOUR),
-                            )
-                            .child(
-                                div()
-                                    .flex_grow(1.0)
-                                    .min_w(px(0.))
-                                    .truncate()
-                                    .text_size(px(12.))
-                                    .text_color(rgb(if on { TOUR_MARK } else { TEXT }))
-                                    .child(t.title.clone()),
-                            )
-                            .child(icon_btn("tour-restart", restart_id, "⟲", "Start it over", true, cx))
-                            .child(icon_btn("tour-del", delete_id, "✕", "Delete this tour", false, cx)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.5))
-                            .text_color(rgb(MUTED))
-                            .child(sub),
-                    )
-                    .child(
-                        div()
-                            .truncate()
-                            .font_family("Menlo")
-                            .text_size(px(10.))
-                            .text_color(rgb(LINE_NUMBER))
-                            .child(where_),
-                    )
-                    .on_click(cx.listener(move |this, _e, _w, cx| {
-                        this.open_tour(id.clone(), false, cx)
-                    }))
-                    // they pile up: one per rebuild, one per PR, and the ✕ on
-                    // each row is a long way to go to clear a dozen
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                            this.ctx_tour = Some(ctx_id.clone());
-                            this.tree_ctx_kind = CtxKind::Tour;
-                            this.tree_ctx = Some((
-                                f32::from(ev.position.x),
-                                f32::from(ev.position.y),
-                            ));
-                            window.focus(&this.tree_ctx_focus, cx);
-                            cx.notify();
-                        }),
-                    ),
-            );
-        }
-        div()
-            .flex()
-            .flex_col()
-            .w(width)
-            .h_full()
-            .bg(rgb(BG))
-            .child(
-                div()
-                    .h(px(32.))
-                    .px_3()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .text_size(px(12.))
-                    .text_color(rgb(MUTED))
-                    .child(if n == 0 { "CODE TOURS".to_string() } else { format!("CODE TOURS  ·  {n}") })
-                    .child(div().flex_grow(1.0))
-                    .child(self.collapse_left_btn(cx)),
-            )
-            .child(
-                div()
-                    .id("tours-ask")
-                    .mx_3()
-                    .mb_2()
-                    .py_1()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(TOUR_MARK))
-                    .cursor_pointer()
-                    .text_size(px(11.))
-                    .text_color(rgb(TOUR_MARK))
-                    .hover(|s| s.bg(rgba(TOUR_TINT)))
-                    .child("Ask the agent for a tour")
-                    .on_click(cx.listener(|this, _e, _w, cx| this.ask_for_tour(None, cx))),
-            )
-            .child(if self.tours.is_empty() {
-                div()
-                    .px_3()
-                    .py_2()
-                    .text_size(px(11.))
-                    .text_color(rgb(MUTED))
-                    .child(
-                        "No tours yet. Ask for one here, from the agent pane, or by \
-                         right-clicking an answer — the agent posts the stops and you \
-                         step through them with ⌥] and ⌥[.",
-                    )
-                    .into_any_element()
-            } else {
-                list.into_any_element()
-            })
-    }
-
-    /// Write the library out. Called on anything that changes it: a tour
-    /// arriving, a step taken, one closed or deleted.
-    fn save_tours(&self) {
-        let Some(path) = tours_path(&self.root) else { return };
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if self.tours.is_empty() {
-            let _ = std::fs::remove_file(&path);
-            return;
-        }
-        let _ = std::fs::write(path, tours_to_json(&self.tours));
-    }
-
     /// Copy where you've got to back into the stored tour. The stop you're on
     /// is part of a tour the way the scroll position is part of a book.
     fn tour_touched(&mut self) {
@@ -27925,14 +27453,9 @@ impl Storm {
         }) else {
             return;
         };
-        let Some(rec) = self.tours.iter_mut().find(|t| t.id == id) else { return };
-        if rec.at == at && rec.seen == seen && !rec.closed {
-            return; // nothing moved
-        }
+        let Some(rec) = self.tour.as_mut().filter(|t| t.id == id) else { return };
         rec.at = at;
         rec.seen = seen;
-        rec.closed = false;
-        self.save_tours();
     }
 
     /// Mark stops read, or unread, without walking to them. `on` is what they
@@ -27954,65 +27477,43 @@ impl Storm {
         cx.notify();
     }
 
-    /// Open a stored tour. `restart` takes it from the top; otherwise it picks
-    /// up where it was left.
-    fn open_tour(&mut self, id: String, restart: bool, cx: &mut Context<Self>) {
+    /// Open the tour in hand. `restart` takes it from the top; otherwise it
+    /// picks up where it was left.
+    fn open_tour(&mut self, restart: bool, cx: &mut Context<Self>) {
         self.load_tour_diff(cx);
         self.tour_group_open.clear();
         self.tour_group_at = String::new();
-        let Some(rec) = self.tours.iter().find(|t| t.id == id) else {
-            self.show_flash("That tour is gone", cx);
+        let Some(rec) = self.tour.as_ref() else {
+            self.show_flash("There is no tour to open", cx);
             return;
         };
         let n = rec.stops.len();
         let walk = walk_from_rec(rec, restart);
         let at = walk.at;
         self.walk = Some(walk);
-        // only one tour is open at a time: the others are put away
-        for t in self.tours.iter_mut() {
-            t.closed = t.id != id;
-        }
-        if let Some(rec) = self.tours.iter_mut().find(|t| t.id == id) {
+        if let Some(rec) = self.tour.as_mut() {
             rec.at = at;
         }
-        self.save_tours();
         self.tour_jump = Some(at); // render has the Window to open a file with
         self.show_flash(&format!("Tour: {n} steps  ·  ⌥] / ⌥[ to step"), cx);
         cx.notify();
     }
 
-    /// Drop every tour `gone` picks out. The open one goes off screen with
-    /// them, and nothing is written until the whole pass is done.
-    fn delete_tours(&mut self, keep: impl Fn(&TourRec) -> bool, cx: &mut Context<Self>) {
-        let before = self.tours.len();
-        let open = self.walk.as_ref().and_then(|w| w.id.clone());
-        self.tours.retain(&keep);
-        let n = before - self.tours.len();
-        if n == 0 {
-            return;
-        }
-        if open.is_some_and(|id| !self.tours.iter().any(|t| t.id == id)) {
-            self.walk = None;
-            self.sync_comment_gutters(cx);
-        }
-        self.save_tours();
-        self.show_flash(&format!("{n} tour{} deleted", if n == 1 { "" } else { "s" }), cx);
-        cx.notify();
+    /// The tour in hand, when it is a tour of this pull request.
+    fn tour_of(&self, number: u64) -> Option<&TourRec> {
+        self.tour.as_ref().filter(|t| t.pr == Some(number))
     }
 
-    /// Drop a tour for good. The open one goes off screen with it.
-    fn delete_tour(&mut self, id: String, cx: &mut Context<Self>) {
-        let open_here = self.walk.as_ref().and_then(|w| w.id.clone()) == Some(id.clone());
-        self.tours.retain(|t| t.id != id);
-        if open_here {
-            self.walk = None;
-            self.sync_comment_gutters(cx);
+    /// Throw the tour away. The open one goes off the screen with it.
+    fn discard_tour(&mut self, cx: &mut Context<Self>) {
+        if self.tour.take().is_none() {
+            return;
         }
-        self.save_tours();
+        self.walk = None;
+        self.sync_comment_gutters(cx);
         self.show_flash("Tour deleted", cx);
         cx.notify();
     }
-
 
     /// Send what's in the tour card's question box, with the stop it was asked
     /// at. It goes as yours, not as TIDE's: you typed it.
@@ -33432,7 +32933,7 @@ impl Storm {
         let base = self.pr_base.clone();
         // there is a tour of this change already, so the button walks it
         // rather than asking for another one
-        let has_tour = pr.is_some_and(|p| self.tours.iter().any(|t| t.pr == Some(p)));
+        let has_tour = pr.is_some_and(|p| self.tour_of(p).is_some());
         let button = |key: &'static str, label: &'static str, lit: u32| {
             div()
                 .id(key)
@@ -40057,16 +39558,23 @@ mod code_tour_tests {
         assert_eq!(tour_pr_from_title("fixes #6092"), None); // the number leads, or it isn't one
         assert_eq!(tour_pr_from_title("#notanumber"), None);
 
-        let mut t = rec("t1", "#6092 installer password rules", 0, false);
+        // the commit it was built at is what "the branch moved" is read off,
+        // and a walk stood up from it keeps the title and the stops you read
+        let mut t = rec("t1", "#6092 installer password rules", 1);
         t.pr = Some(6092);
         t.oid = "80c32ef7b1".into();
-        let back = tours_from_json(&tours_to_json(&[t]));
-        assert_eq!(back[0].pr, Some(6092));
-        assert_eq!(back[0].oid, "80c32ef7b1");
-        // a tour of the code in general has neither, and never goes stale
-        let plain = tours_from_json(&tours_to_json(&[rec("t2", "How dispatch works", 0, false)]));
-        assert_eq!(plain[0].pr, None);
-        assert!(plain[0].oid.is_empty());
+        let w = walk_from_rec(&t, false);
+        assert_eq!(w.at, 1);
+        assert_eq!(w.tour.as_deref(), Some("#6092 installer password rules"));
+        assert_eq!(w.id.as_deref(), Some("t1"));
+        assert!(w.here.is_none(), "it opens no file on its own");
+        assert!(w.list, "a tour comes up with its map up, the way it arrives");
+        assert_eq!(w.seen.iter().copied().collect::<Vec<_>>(), vec![1]);
+        assert_eq!(walk_from_rec(&t, true).at, 0, "restart goes back to the top");
+        // `at` can't dangle past a tour that came back shorter
+        let mut short = t.clone();
+        short.stops.truncate(1);
+        assert_eq!(walk_from_rec(&short, false).at, 0);
     }
 
     /// The map labels each file with its package, so a tour full of `index.ts`
@@ -40097,13 +39605,11 @@ mod code_tour_tests {
         assert_eq!(stop_label(&stop("src/a.ts", 0, 0, "t")), "src/a.ts");
     }
 
-    fn rec(id: &str, title: &str, at: usize, closed: bool) -> TourRec {
+    fn rec(id: &str, title: &str, at: usize) -> TourRec {
         TourRec {
             id: id.into(),
             title: title.into(),
             at,
-            made: 1_760_000_000,
-            closed,
             pr: None,
             oid: String::new(),
             seen: vec![at],
@@ -40214,57 +39720,6 @@ mod code_tour_tests {
         assert!(tour.contains("say how many and where"), "{tour}");
         assert!(brief.contains("a list you waved at rather than wrote"), "{brief}");
     }
-
-    /// Tours survive a restart: the stops, their prose, where you had got to,
-    /// and which one was open.
-    #[test]
-    fn the_library_round_trips_through_json() {
-        let list = vec![rec("t1", "Task dispatch", 1, false), rec("t2", "Uploads", 0, true)];
-        let back = tours_from_json(&tours_to_json(&list));
-        assert_eq!(back.len(), 2);
-        // what you have read comes back with it: a tour reopened as all-unread
-        // is a tour you have to walk twice
-        assert_eq!(back[0].seen, vec![1]);
-        assert_eq!(back[1].seen, vec![0]);
-        assert_eq!(back[0].id, "t1");
-        assert_eq!(back[0].title, "Task dispatch");
-        assert_eq!(back[0].at, 1);
-        assert_eq!(back[0].made, 1_760_000_000);
-        assert!(!back[0].closed);
-        assert!(back[1].closed, "the one you put away stays put away");
-        assert_eq!(stop_label(&back[0].stops[0]), "src/a.ts:67-72");
-        assert_eq!(back[0].stops[1].said, "because");
-        // a tour comes back pointing at nothing, so a restart opens no file on
-        // its own, and `at` can't dangle past a shortened tour
-        let w = walk_from_rec(&back[0], false);
-        assert_eq!(w.at, 1);
-        assert!(w.here.is_none());
-        assert!(w.list, "a tour comes back with its map up, the way it arrives");
-        assert_eq!(w.id.as_deref(), Some("t1"));
-        assert_eq!(walk_from_rec(&back[0], true).at, 0, "restart goes back to the top");
-        let mut short = back[0].clone();
-        short.stops.truncate(1);
-        assert_eq!(walk_from_rec(&short, false).at, 0);
-    }
-
-    /// The file the first version wrote held one tour with no list around it.
-    /// It still loads, and gets an id so the list can act on it.
-    #[test]
-    fn a_single_tour_file_still_loads() {
-        let old = "{\"title\":\"Task dispatch\",\"at\":1,\"closed\":true,\"steps\":[\
-            {\"file\":\"src/a.ts\",\"line\":67,\"end\":72,\"title\":\"trigger()\",\"text\":\"saves it\"}]}";
-        let back = tours_from_json(old);
-        assert_eq!(back.len(), 1);
-        assert_eq!(back[0].title, "Task dispatch");
-        assert!(back[0].closed);
-        assert_eq!(back[0].at, 0, "one stop left, so `at` clamps to it");
-        assert!(!back[0].id.is_empty());
-        // nothing to walk is no tour
-        assert!(tours_from_json("{\"tours\":[{\"title\":\"x\",\"steps\":[]}]}").is_empty());
-        assert!(tours_from_json("not json").is_empty());
-    }
-
-
 
     /// The ask carries the shape the answer has to come back in, and says what
     /// the tour is about when there is something to say.
