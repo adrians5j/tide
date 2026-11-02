@@ -3988,10 +3988,6 @@ fn reviewed_path(root: &Path) -> Option<PathBuf> {
 }
 
 /// Every branch of this repo the reviewers have read, by branch name.
-fn reviewed_for(root: &Path, branch: &str) -> Option<Reviewed> {
-    reviewed_all(root).remove(branch.trim())
-}
-
 fn reviewed_all(root: &Path) -> HashMap<String, Reviewed> {
     let Some(raw) = reviewed_path(root).and_then(|p| std::fs::read_to_string(p).ok()) else {
         return HashMap::new();
@@ -8435,6 +8431,11 @@ struct Storm {
     /// against the full list of files it would land rather than a second click.
     merge_confirm: Option<MergeConfirm>,
     merge_focus: FocusHandle,
+    /// Which branches of this repo the reviewers have read, by branch name.
+    /// Kept in memory because the merge button asks it on every frame it
+    /// draws; written to disk by `mark_reviewed` and re-read whenever the
+    /// merge dialog opens.
+    reviewed: HashMap<String, Reviewed>,
     /// When review comments last went to the agent, and how many — the answer
     /// to "did I send those?" without scrolling the transcript back.
     review_sent: Option<(u64, usize)>,
@@ -8965,6 +8966,7 @@ impl Storm {
             ws_title,
             ws_subtitle,
             merge_confirm: None,
+            reviewed: HashMap::new(),
             merge_focus: cx.focus_handle(),
             review_sent: sent_at,
             prnum_open: false,
@@ -9029,6 +9031,7 @@ impl Storm {
         // anything that runs a command (wdev, wwp, a build) opens its own.
         // every tour this workspace has been given; the one left open comes
         // back, standing where it was
+        s.reviewed = reviewed_all(&s.root);
         s.tours = load_tours(&s.root);
         s.walk = s.tours.iter().find(|t| !t.closed).map(|t| walk_from_rec(t, false));
         if s.walk.is_some() {
@@ -9794,6 +9797,7 @@ impl Storm {
         self.agent_msgs.retain(|m| !matches!(m, AgentMsg::Reviewing));
         // this branch has now been read, which is what the merge button asks
         mark_reviewed(&self.root, &self.branch, &self.head_oid, &names.join(" + "));
+        self.reviewed = reviewed_all(&self.root);
         self.send_agent_prompt_as(
             prompt,
             Some(format!("Reviewers · {}", names.join(" + "))),
@@ -13704,6 +13708,12 @@ impl Storm {
     /// Open the merge confirmation: everything the header says, plus every file
     /// the merge would land. A merge can't be taken back, so the question is
     /// worth asking against the actual contents rather than a second click.
+    /// What the reviewers left on a branch, out of the copy held in memory.
+    /// The merge button asks this every frame, so it must not touch disk.
+    fn reviewed_branch(&self, branch: &str) -> Option<&Reviewed> {
+        self.reviewed.get(branch.trim())
+    }
+
     fn open_merge_confirm(&mut self, number: u64, window: &mut Window, cx: &mut Context<Self>) {
         // the tab for *this* PR. `find_map` took the first tab holding any PR
         // and then checked its number, so with two PR tabs open the merge
@@ -13717,7 +13727,8 @@ impl Storm {
         // whether the branch has moved since the reviewers read it is only
         // answerable here, where the branch you are standing on is known: the
         // PR being merged is not always the one checked out
-        let review = reviewed_for(&self.root, &doc.head);
+        self.reviewed = reviewed_all(&self.root);
+        let review = self.reviewed_branch(&doc.head).cloned();
         let moved = review.as_ref().is_some_and(|r| {
             doc.head == self.branch
                 && !r.oid.is_empty()
@@ -34321,6 +34332,10 @@ impl Storm {
             // merging is not undoable, so the first click only arms it
             .when(pr.state == PrState::Open || pr.state == PrState::Draft, |d| {
                 let busy = self.pr_merging == Some(pr.number);
+                // the dialog refuses an unreviewed branch anyway; saying so out
+                // here saves the click that only goes there to be told no
+                let unread = self.reviewed_branch(&pr.head).is_none();
+                let off = busy || unread;
                 let label = if busy { "Merging…" } else { "Merge" };
                 let number = pr.number;
                 d.child(
@@ -34331,22 +34346,31 @@ impl Storm {
                         .rounded_md()
                         .text_size(px(11.))
                         .border_1()
-                        // while GitHub is merging there is nothing to click, so
-                        // it stops looking clickable: dimmed, no pointer, no
+                        // while GitHub is merging, or while the reviewers
+                        // haven't read the branch, there is nothing to click,
+                        // so it stops looking clickable: dimmed, no pointer, no
                         // hover — the early return below is then a backstop
                         // rather than the only thing saying no
-                        .border_color(rgb(if busy { BG } else { BORDER }))
-                        .text_color(rgb(if busy { LINE_NUMBER } else { MUTED }))
-                        .when(!busy, |d| {
+                        .border_color(rgb(if off { BG } else { BORDER }))
+                        .text_color(rgb(if off { LINE_NUMBER } else { MUTED }))
+                        .when(!off, |d| {
                             d.cursor_pointer().hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
                         })
                         .child(label)
-                        .tooltip(tip(
-                            "Squash-merge this pull request, after a look at what it would land",
-                        ))
-                        .on_click(cx.listener(move |this, _e, window, cx| {
+                        .tooltip(tip(if unread {
+                            "The reviewers haven't read this branch  ·  ⌘K Send In the Reviewers                               ·  ⌥-click to merge it anyway"
+                        } else {
+                            "Squash-merge this pull request, after a look at what it would land"
+                        }))
+                        .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
                             if this.pr_merging.is_some() {
                                 return; // GitHub is already working on it
+                            }
+                            // the escape hatch the dialog keeps — merging
+                            // unreviewed — is still reachable, but it has to be
+                            // reached for, which is the point of the gate
+                            if unread && !e.modifiers().alt {
+                                return;
                             }
                             this.open_merge_confirm(number, window, cx);
                         })),
