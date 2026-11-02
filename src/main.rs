@@ -764,6 +764,10 @@ fn human_secs(secs: u64) -> String {
     }
 }
 
+/// Width of the activity bar down the left edge. The agent dock sits behind it,
+/// so its resize drag has to subtract this from the pointer's x.
+const ACT_BAR_W: f32 = 44.;
+
 /// Unix seconds, for timestamps that outlive the process.
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -16035,10 +16039,11 @@ impl Storm {
             self.tree_width = f32::from(ev.position.x).clamp(150., 750.);
             cx.notify();
         } else if self.resizing_term {
-            // allow the terminal/browser dock to grow up to ~90% of the window
-            // (so the browser can go nearly full-screen)
+            // allow the agent dock to grow up to ~90% of the window
             let max_w = (self.win_width * 0.92).max(200.);
-            self.term_width = (self.win_width - f32::from(ev.position.x)).clamp(200., max_w);
+            // the dock is on the left, behind the activity bar: the pointer's x
+            // is its right edge, so the width is x minus the bar
+            self.term_width = (f32::from(ev.position.x) - ACT_BAR_W).clamp(200., max_w);
             cx.notify();
         } else if self.resizing_term_h {
             // the terminal sits at the bottom of the centre column: drag up to
@@ -16559,8 +16564,40 @@ impl Render for Storm {
         // center: editor pane (which now also hosts the diff as a tab)
         let center = self.render_editor(cx).into_any_element();
 
-        // middle row: [activity-left] [panel] [divider] [center] [term] [activity-right]
+        // middle row: [activity-left] [agent] [divider] [panel] [divider] [center] [activity-right]
         let mut middle = div().flex().flex_row().flex_grow(1.0).min_h(px(0.)).child(act_left);
+        // The agent docks down the left edge, behind the activity bar and in
+        // front of the tree: it is read top to bottom like the rest of the
+        // window, and the editor keeps the side the eye lands on.
+        if AGENT_PANEL && self.agent_open {
+            let agent = self.render_agent(window, cx);
+            middle = middle
+                .child(
+                    div()
+                        .w(px(self.term_width))
+                        .h_full()
+                        .flex_shrink_0()
+                        .flex()
+                        .flex_col()
+                        .bg(rgb(PANEL_BG))
+                        .child(agent),
+                )
+                .child(
+                    div()
+                        .w(px(4.))
+                        .h_full()
+                        .flex_shrink_0()
+                        .bg(rgb(if self.resizing_term { ACCENT } else { BORDER }))
+                        .cursor(CursorStyle::ResizeLeftRight)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev, _window, cx| {
+                                this.resizing_term = true;
+                                cx.notify();
+                            }),
+                        ),
+                );
+        }
         if let Some(panel) = left_panel {
             // flex_shrink_0 wrapper → the tree keeps its dragged width regardless
             // of how wide the editor tab bar gets
@@ -16635,36 +16672,6 @@ impl Render for Storm {
         }
         middle = middle.child(centre);
 
-        // The right dock is the agent's, full height, always.
-        if AGENT_PANEL && self.agent_open {
-            let agent = self.render_agent(window, cx);
-            middle = middle
-                .child(
-                    div()
-                        .w(px(4.))
-                        .h_full()
-                        .flex_shrink_0()
-                        .bg(rgb(if self.resizing_term { ACCENT } else { BORDER }))
-                        .cursor(CursorStyle::ResizeLeftRight)
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _ev, _window, cx| {
-                                this.resizing_term = true;
-                                cx.notify();
-                            }),
-                        ),
-                )
-                .child(
-                    div()
-                        .w(px(self.term_width))
-                        .h_full()
-                        .flex_shrink_0()
-                        .flex()
-                        .flex_col()
-                        .bg(rgb(PANEL_BG))
-                        .child(agent),
-                );
-        }
         let mut root = div()
             .flex()
             .flex_col()
@@ -17667,7 +17674,7 @@ impl Storm {
         let todos_active = self.show_left && self.left_view == LeftView::Todos;
         let tours_active = self.show_left && self.left_view == LeftView::Tours;
         div()
-            .w(px(44.))
+            .w(px(ACT_BAR_W))
             .flex_shrink_0()
             .h_full()
             .flex()
