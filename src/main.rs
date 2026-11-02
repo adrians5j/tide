@@ -4647,9 +4647,9 @@ fn tour_read_note(stops: &[Stop], seen: &HashSet<usize>) -> String {
     )
 }
 
-/// The two messages typed most often, as buttons under the composer. Both ask
+/// The messages typed most often, as buttons under the composer. They all ask
 /// for a reading and stop there: a button is pressed without thinking about it,
-/// so neither one may start changing files on its own.
+/// so none of them may start changing files on its own.
 const CHECK_CI_PROMPT: &str = "Check CI for this pull request. Find the failing \
 job, read its log, and tell me the real error: the file, the line and the \
 message, not the job name. If every check is green, say so in one line. Don't \
@@ -4657,6 +4657,11 @@ change anything yet.";
 const WHAT_NEXT_PROMPT: &str = "Where does this stand, and what is next? Short: \
 what is done, what is left, and the one thing you would do next and why. Don't \
 start on it until I say.";
+const STATUS_PROMPT: &str = "What's the status? Three lines at most: what you \
+are on right now, what is already finished, and what is left of what I asked. \
+Name the file or the command you are in, not the plan. If you are waiting on \
+something — a build, a check, an answer from me — say what. Don't change \
+anything for this.";
 
 fn tour_request(about: Option<&str>, answer: Option<&str>) -> String {
     // the answer is the route: it already has the references, in the order it
@@ -26048,8 +26053,8 @@ impl Storm {
             .to_string()
     }
 
-    /// A one-click message under the composer. The two sentences typed most
-    /// often are a button each: they go the way a typed message goes, so the
+    /// A one-click message under the composer. The sentences typed most often
+    /// are a button each: they go the way a typed message goes, so the
     /// transcript shows them as yours and a running turn queues them.
     fn quick_prompt(
         &self,
@@ -29627,8 +29632,8 @@ impl Storm {
                             })
                     }),
             )
-            // bottom row inside the box: the two messages typed most often on
-            // the left, Send comments and Stop on the right. The key legend
+            // bottom row inside the box: the messages typed most often on the
+            // left, Send comments and Stop on the right. The key legend
             // that used to live here is gone — eight shortcuts under the box
             // you type in, every hour of every day, long after you knew them.
             // The keys are in the palette (⌘K).
@@ -29652,6 +29657,14 @@ impl Storm {
                             cx,
                         ))
                     })
+                    .child(self.quick_prompt(
+                        "quick-status",
+                        "Status",
+                        MUTED,
+                        "Ask what the agent is on right now",
+                        STATUS_PROMPT,
+                        cx,
+                    ))
                     .child(self.quick_prompt(
                         "quick-next",
                         "What next?",
