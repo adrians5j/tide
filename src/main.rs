@@ -138,13 +138,17 @@ enum AgentMsg {
 /// slide, into the deck — and the prompt behind it is a page of instructions
 /// written for the agent. `at` is the user message that started it, `end` the
 /// user message that ended it (`None` while it is still the last turn), and
-/// `job` the name on the line.
+/// `job` the name on the line. `began` is unix seconds at the prompt and
+/// `took` the seconds the turn ran, filled in when the agent stops; until then
+/// the line counts up from `began`.
 #[derive(Clone)]
 struct JobTurn {
     at: usize,
     end: Option<usize>,
     open: bool,
     job: String,
+    began: u64,
+    took: Option<u64>,
 }
 
 /// Which folded turn a transcript row belongs to. A turn runs from the user
@@ -25453,6 +25457,7 @@ impl Storm {
             TurnEnd => {
                 self.agent_busy = false;
                 self.agent_turn_start = None;
+                self.end_job_clock();
                 self.acp_state = Some(AgentState::Done);
                 self.agent_cur = None;
                 self.agent_cur_thought = None;
@@ -25463,6 +25468,7 @@ impl Storm {
                 // they were typed behind actually happened
                 self.agent_queue.clear();
                 self.agent_busy = false;
+                self.end_job_clock();
                 self.acp_state = Some(AgentState::Failed);
                 self.agent_cur = None;
                 self.agent_cur_thought = None;
@@ -25738,6 +25744,7 @@ impl Storm {
         }
         self.agent_busy = false;
         self.agent_turn_start = None;
+        self.end_job_clock();
         self.acp_state = None;
         self.agent_cur = None;
         self.agent_cur_thought = None;
@@ -28383,9 +28390,28 @@ impl Storm {
         let at = self.agent_msgs.len().saturating_sub(1);
         if let Some(q) = self.job_turns.last_mut().filter(|q| q.end.is_none()) {
             q.end = Some(at);
+            // a turn that ended without a TurnEnd (the adapter dropped it, the
+            // app was restarted mid-turn) stops counting here rather than
+            // ticking on forever
+            q.took.get_or_insert(now_secs().saturating_sub(q.began));
         }
         if let Some(job) = job {
-            self.job_turns.push(JobTurn { at, end: None, open: false, job });
+            self.job_turns.push(JobTurn {
+                at,
+                end: None,
+                open: false,
+                job,
+                began: now_secs(),
+                took: None,
+            });
+        }
+    }
+
+    /// The agent stopped: the job line's clock stops with it, whether the turn
+    /// ended, failed or was interrupted.
+    fn end_job_clock(&mut self) {
+        if let Some(q) = self.job_turns.last_mut().filter(|q| q.end.is_none() && q.took.is_none()) {
+            q.took = Some(now_secs().saturating_sub(q.began));
         }
     }
 
@@ -28425,6 +28451,10 @@ impl Storm {
         let count = (steps > 0)
             .then(|| format!("  ·  {steps} step{}", if steps == 1 { "" } else { "s" }))
             .unwrap_or_default();
+        // a job line is the only thing a folded turn shows, so it carries the
+        // clock too: counting up while it runs, the total once it stops
+        let took = q.took.unwrap_or_else(|| now_secs().saturating_sub(q.began));
+        let elapsed = (q.began > 0).then(|| human_secs(took)).unwrap_or_default();
         Some(
             div()
                 .id(("job-fold", ix))
@@ -28446,6 +28476,14 @@ impl Storm {
                 .child(div().text_color(rgb(TEXT)).child(name))
                 .child(div().text_color(rgb(color)).child(state))
                 .child(count)
+                .child(
+                    div()
+                        .ml_auto()
+                        .flex_shrink_0()
+                        .pl_2()
+                        .text_color(rgb(LINE_NUMBER))
+                        .child(elapsed),
+                )
                 .tooltip(tip(if open {
                     "Fold the job away again"
                 } else {
@@ -39716,8 +39754,8 @@ mod code_tour_tests {
     #[test]
     fn a_folded_turn_owns_its_own_rows_only() {
         let turns = vec![
-            JobTurn { at: 2, end: Some(6), open: false, job: "a".into() },
-            JobTurn { at: 9, end: None, open: false, job: "b".into() },
+            JobTurn { at: 2, end: Some(6), open: false, job: "a".into(), began: 0, took: None },
+            JobTurn { at: 9, end: None, open: false, job: "b".into(), began: 0, took: None },
         ];
         // the question itself is part of the fold: that is where the chip goes
         assert!(job_at(&turns, 2).is_some());
