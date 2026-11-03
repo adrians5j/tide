@@ -16452,6 +16452,16 @@ impl Render for Storm {
         }
         window.set_window_title(&title);
 
+        // a brief is watched in its own tab, so leaving that tab stops the
+        // voice: audio still playing over a file you have gone back to editing
+        // has no way of being turned off from there
+        if let Some(pr) = self.watch.as_ref().map(|w| w.pr) {
+            let here = self.tabs.get(self.active).and_then(|t| t.brief.as_ref()).and_then(|b| b.pr);
+            if here != Some(pr) {
+                self.end_watch(cx);
+            }
+        }
+
         // Build pieces as locals first (each borrows self/cx sequentially).
         let topbar = self.render_topbar(project.clone(), cx);
         let act_left = self.render_activity_left(cx);
@@ -27559,13 +27569,16 @@ impl Storm {
     /// Skip a slide either way. It starts the slide it lands on from its first
     /// line, playing or paused as it was.
     fn narr_skip(&mut self, dir: i32, cx: &mut Context<Self>) {
-        self.narr_cut();
-        let Some(w) = self.watch.as_mut() else { return };
+        let Some(w) = self.watch.as_ref() else { return };
         let n = w.lines.len() as i32;
         let to = (w.slide as i32 + dir).clamp(0, n - 1) as usize;
+        // ⏭ on the last slide changes nothing, and must not cut the clip that
+        // is playing: that would leave the player silent with nothing queued
         if to == w.slide && w.at == 0 {
             return;
         }
+        self.narr_cut();
+        let Some(w) = self.watch.as_mut() else { return };
         w.slide = to;
         w.at = 0;
         self.narr_play(cx);
