@@ -33642,7 +33642,13 @@ impl Storm {
                     ),
             )
             .when(!slide.text.trim().is_empty(), |d| {
-                d.child(div().pl(px(40.)).max_w(px(680.)).child(md_text(&slide.text, 15., TEXT)))
+                // the padding and the wrap width go on separate nodes: on one
+                // node the text is measured against the 680 and painted into
+                // the 640 left after the padding, which costs a line, and
+                // whatever follows is drawn over that line
+                d.child(div().pl(px(40.)).child(
+                    div().max_w(px(680.)).min_w(px(0.)).child(md_text(&slide.text, 15., TEXT)),
+                ))
             })
             .when(!slide.files.is_empty(), |d| {
                 d.child(div().pl(px(40.)).child(self.brief_files(ix, &slide.files, cx)))
@@ -33813,7 +33819,7 @@ impl Storm {
                 cx.notify();
             }));
 
-        let mut body = div().flex().flex_col().gap_3();
+        let mut body = div().flex().flex_col().gap_3().min_w(px(0.));
         for turn in &thread.turns {
             let answered = !turn.answer.trim().is_empty();
             body = body.child(
@@ -33821,9 +33827,16 @@ impl Storm {
                     .flex()
                     .flex_col()
                     .gap_1p5()
+                    .min_w(px(0.))
                     // the question reads as the quieter half: it is the part
                     // you already know, having just typed it
-                    .child(div().text_size(px(13.)).text_color(rgb(MUTED)).child(turn.q.clone()))
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .text_size(px(13.))
+                            .text_color(rgb(MUTED))
+                            .child(turn.q.clone()),
+                    )
                     .child(if answered {
                         md_text(&turn.answer, 14., TEXT).into_any_element()
                     } else {
@@ -33837,18 +33850,19 @@ impl Storm {
         }
 
         Some(
-            div()
-                .ml(px(40.))
-                .max_w(px(680.))
-                .pl_3()
-                .py_2()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .border_l_2()
-                .border_color(rgb(if waiting { BORDER } else { ACCENT }))
-                .child(head)
-                .when(!folded, |d| d.child(body)),
+            div().ml(px(40.)).max_w(px(680.)).child(
+                div()
+                    .pl_3()
+                    .py_2()
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .border_l_2()
+                    .border_color(rgb(if waiting { BORDER } else { ACCENT }))
+                    .child(head)
+                    .when(!folded, |d| d.child(body)),
+            ),
         )
     }
 
@@ -33936,7 +33950,17 @@ impl Storm {
                 // a question worth asking under a slide is usually a
                 // paragraph, so the box opens as one rather than as a line
                 // that scrolls sideways
-                .child(div().min_h(px(44.)).child(self.brief_ask.render(caret, SELECTION)))
+                // `min_w` of zero, or taffy sizes the field by asking the
+                // text what it is like at its narrowest — which for a long
+                // word with nowhere to break is one character a line
+                .child(
+                    div()
+                        .min_h(px(44.))
+                        .w_full()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .child(self.brief_ask.render(caret, SELECTION)),
+                )
                 .child(
                     div()
                         .flex()
@@ -33965,7 +33989,9 @@ impl Storm {
                     .child(clarify),
             )
         };
-        div().pl(px(40.)).max_w(px(680.)).flex().flex_col().child(box_)
+        div().pl(px(40.)).flex().flex_col().child(
+            div().max_w(px(680.)).min_w(px(0.)).flex().flex_col().child(box_),
+        )
     }
 
     /// The files a slide is about, as a row of links under its prose. A brief
