@@ -176,6 +176,11 @@ pub struct BriefSlide {
     pub title: String,
     /// Two or three sentences under it.
     pub text: String,
+    /// The same slide as it is read out loud, when the brief is watched rather
+    /// than read. Its own register: no paths, no identifiers, nothing that
+    /// only works on a page. Empty when the agent didn't write one, and the
+    /// player then falls back to `text`.
+    pub say: String,
     pub diagram: Option<BriefDiagram>,
     /// The files this slide is about, as `path` or `path:line`. The prose of a
     /// brief deliberately carries no line numbers; this is where they go, so
@@ -997,6 +1002,7 @@ pub fn parse_brief(body: &str) -> Option<Brief> {
         slides.push(BriefSlide {
             title,
             text,
+            say: str_at(item, &["say", "narration", "spoken"], 1200),
             diagram: parse_diagram(item.get("diagram")),
             files: parse_slide_files(item.get("files").or_else(|| item.get("refs"))),
         });
