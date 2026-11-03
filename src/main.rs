@@ -9568,6 +9568,24 @@ impl Storm {
         cx.notify();
     }
 
+    /// Stop a review in flight: kill both adapters, drop the card, and keep
+    /// nothing. A half-read branch has no report worth handing over, and the
+    /// branch stays unreviewed, which is what the merge button asks about.
+    fn stop_reviewers(&mut self, cx: &mut Context<Self>) {
+        if self.reviewers.is_empty() {
+            return;
+        }
+        let n = self.reviewers.len();
+        for r in self.reviewers.drain(..) {
+            r.acp.shutdown();
+        }
+        // the poll loop ends itself on an empty list
+        self.agent_tab = 0;
+        self.agent_msgs.retain(|m| !matches!(m, AgentMsg::Reviewing));
+        self.show_flash(&format!("Stopped {n} reviewer{}", if n == 1 { "" } else { "s" }), cx);
+        cx.notify();
+    }
+
     /// Drive the reviewer sessions: send each its brief once its adapter is up,
     /// collect what it says, and hand everything to the main thread when the
     /// last one is done.
@@ -28932,7 +28950,7 @@ impl Storm {
                     if let Some(m) = this.agent_msgs.get(ix) {
                         // the closing summary, in its own card
                         if matches!(m, AgentMsg::Reviewing) {
-                            let card = reviewing_card(&this.reviewers);
+                            let card = reviewing_card(&this.reviewers, cx);
                             return div().px_3().py_1().child(card).into_any_element();
                         }
                         if let AgentMsg::Summary { title, text } = m {
@@ -29778,9 +29796,10 @@ fn user_head(text: &str, ix: usize, by: Sender) -> impl IntoElement {
 /// The "reviewers are reading" card: who is reading, how long each has been at
 /// it, and the last thing each one did. Built from the live list every frame,
 /// so it never claims a reviewer is still working after it has finished.
-fn reviewing_card(reviewers: &[Reviewer]) -> Div {
+fn reviewing_card(reviewers: &[Reviewer], cx: &mut Context<Storm>) -> Div {
     let done = reviewers.iter().filter(|r| r.done).count();
     let n = reviewers.len();
+    let running = done < n;
     let mut card = div()
         .w_full()
         .min_w(px(0.))
@@ -29796,9 +29815,41 @@ fn reviewing_card(reviewers: &[Reviewer]) -> Div {
         .border_color(rgb(COMMENT_MARK))
         .child(
             div()
-                .text_size(px(10.))
-                .text_color(rgb(COMMENT_MARK))
-                .child(format!("REVIEWERS READING  ·  {done}/{n} DONE")),
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(10.))
+                        .text_color(rgb(COMMENT_MARK))
+                        .child(format!("REVIEWERS READING  ·  {done}/{n} DONE")),
+                )
+                .child(div().flex_grow(1.0))
+                // two adapter processes reading a branch is the most expensive
+                // thing on the menu, and the usual reason to want out of it is
+                // having started it by accident
+                .when(running, |d| {
+                    d.child(
+                        div()
+                            .id("reviewers-stop")
+                            .flex_shrink_0()
+                            .px_1p5()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_size(px(10.))
+                            .border_1()
+                            .border_color(rgb(GIT_DELETED))
+                            .text_color(rgb(GIT_DELETED))
+                            .hover(|s| s.bg(rgb(HOVER)))
+                            .child("■ Stop")
+                            .tooltip(tip(
+                                "Stop both reviewers. Nothing they have found is kept",
+                            ))
+                            .on_click(cx.listener(|this, _e, _w, cx| this.stop_reviewers(cx))),
+                    )
+                }),
         );
     for r in reviewers {
         let secs = match r.finished {
