@@ -30938,7 +30938,7 @@ impl Storm {
                 d.child(div().text_size(px(10.)).text_color(rgb(ACCENT)).child("reading…"))
             })
             .when(!loading && !age.is_empty(), |d| {
-                d.child(div().text_size(px(10.)).text_color(rgb(LINE_NUMBER)).child(format!("read {age} ago")))
+                d.child(div().text_size(px(10.)).text_color(rgb(LINE_NUMBER)).child(format!("read {age}")))
             })
             .child(div().flex_grow(1.0))
             // the filter: no label, because a box you can type into next to a
@@ -31193,7 +31193,7 @@ impl Storm {
                     .child(
                         div()
                             .flex_shrink_0()
-                            .w(px(30.))
+                            .w(px(56.))
                             .text_size(px(10.))
                             .text_color(rgb(LINE_NUMBER))
                             .child(age),

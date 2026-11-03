@@ -315,7 +315,10 @@ pub fn grouped(list: &[Todo], query: &str, origin: Option<&str>) -> Vec<(String,
     out
 }
 
-/// "just now", "3h", "2d" — enough to tell a fresh note from a stale one.
+/// "just now", "3h ago", "2d ago" — how long ago something happened, for a
+/// label a person reads. The "ago" is the whole point: a bare "42m" beside a
+/// word like "written" reads as a duration, and leaves you working out which
+/// of the two it means.
 pub fn age(created: u64) -> String {
     if created == 0 {
         return String::new();
@@ -323,9 +326,9 @@ pub fn age(created: u64) -> String {
     let secs = now().saturating_sub(created);
     match secs {
         0..=90 => "just now".into(),
-        s if s < 3600 => format!("{}m", s / 60),
-        s if s < 86_400 => format!("{}h", s / 3600),
-        s => format!("{}d", s / 86_400),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86_400),
     }
 }
 
@@ -511,10 +514,11 @@ mod tests {
     #[test]
     fn age_reads_at_a_glance() {
         let t = now();
+        // "just now" is already in the past tense; the rest have to say so
         assert_eq!(age(t), "just now");
-        assert_eq!(age(t - 600), "10m");
-        assert_eq!(age(t - 7200), "2h");
-        assert_eq!(age(t - 3 * 86_400), "3d");
+        assert_eq!(age(t - 600), "10m ago");
+        assert_eq!(age(t - 7200), "2h ago");
+        assert_eq!(age(t - 3 * 86_400), "3d ago");
         assert!(age(0).is_empty(), "no timestamp, nothing to say");
     }
 }
