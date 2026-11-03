@@ -31,6 +31,7 @@ mod diff;
 mod build;
 mod lsp;
 mod md;
+mod narr;
 mod rpc;
 mod todo;
 mod usage;
@@ -4780,6 +4781,11 @@ fn brief_request(number: u64, base: &str, read: &str) -> String {
          \"text\":\"A task whose worker crashed mid-run used to sit as `running` \
          for ever, because nothing ever looked at it again. The loop now treats \
          a stale lease as a failure and re-queues it.\",\
+         \"say\":\"A task used to be able to die halfway through and sit \
+         there marked as running for ever, because nothing ever went back to \
+         look at it. Now the loop checks how long each one has held its claim, \
+         and anything that has held one for more than a minute goes back on \
+         the queue to be run again.\",\
          \"files\":[\"packages/api-tasks/src/TaskService.ts:84\",\
          \"packages/api-tasks/src/recover.ts:17\"],\
          \"diagram\":{{\"kind\":\"flow\",\"caption\":\"one task, start to finish\",\
@@ -4794,6 +4800,18 @@ fn brief_request(number: u64, base: &str, read: &str) -> String {
          halfway now get picked up”, never “Recovery” or “Background”. `text` is \
          two or three sentences: what changed, what it was before, and the one \
          thing I would get wrong if nobody told me. Backticks for identifiers.\n\n\
+         `say` is the same slide spoken, because I can watch the brief \
+         instead of reading it: a voice reads `say` out while the slide is up. \
+         Write it for the ear, which is a different register, not the same \
+         sentences again. Three to five of them, thirty to sixty seconds, \
+         plain words, no backticks, no paths, no file names, no line numbers, \
+         nothing I would have to see to follow — `TaskService` is spoken as \
+         “the task service”, and an abbreviation is spelled out the \
+         first time. Keep each sentence short enough to say in one breath: a \
+         clause stack that reads fine on a page is unfollowable out loud. Let \
+         it run on from the slide before it, since I hear them in order. The \
+         voice is you explaining the change; the slide behind it is what I am \
+         looking at while you do.\n\n\
          A brief is read by somebody who has not read the code, so a word that \
          only means something inside this repository has to be paid for the \
          first time it is used: a send, a lease, a connection row, a stale \
@@ -7076,6 +7094,10 @@ struct Diagram {
 struct Slide {
     title: String,
     text: String,
+    /// The slide as it is spoken when the brief is watched. Its own register:
+    /// the written text is full of identifiers and paths, which read fine and
+    /// listen terribly. Empty falls back to `text`.
+    say: String,
     dia: Option<Diagram>,
     /// The files this slide is about: the quick way into the code it talks
     /// about, since the prose itself carries no line numbers.
@@ -7100,6 +7122,38 @@ struct Brief {
     /// read a description of code that isn't there any more.
     oid: String,
     slides: Vec<Slide>,
+}
+
+/// A brief being watched instead of read: a voice reads each slide out while
+/// the slide is up, and the deck moves on by itself when the voice is done.
+struct Watch {
+    pr: u64,
+    slide: usize,
+    /// Every slide's narration, cut into the clips it is spoken as.
+    lines: Vec<Vec<String>>,
+    /// The line of the current slide being spoken.
+    at: usize,
+    playing: bool,
+    /// Where the clips are, and which voice is reading them.
+    dir: PathBuf,
+    voice: String,
+    /// Bumped whenever playback is cut short. A clip that ends after you have
+    /// skipped on reports its own generation, and an old one is ignored.
+    gen: u64,
+    /// The clip playing now, so a pause can stop it.
+    pid: Arc<AtomicU32>,
+    /// The synthesiser hasn't reached this clip yet. It is drawn, because a
+    /// player that has gone quiet should say why.
+    waiting: bool,
+    /// Raised to tell the synthesis threads to stop.
+    stop: Arc<AtomicBool>,
+}
+
+impl Watch {
+    /// The clips of the slide that is up.
+    fn here(&self) -> &[String] {
+        self.lines.get(self.slide).map(|v| v.as_slice()).unwrap_or(&[])
+    }
 }
 
 /// The files a diagram's boxes stand for, in the order they are drawn. The
@@ -7135,6 +7189,7 @@ fn brief_from(b: rpc::Brief) -> Brief {
                 },
                 title: s.title,
                 text: s.text,
+                say: s.say,
                 dia: s.diagram.map(|d| Diagram {
                     kind: match d.kind.as_str() {
                         "flow" => DiaKind::Flow,
@@ -8294,6 +8349,8 @@ struct Storm {
     /// The checkpoint inside the titled work — "UI auto syncing" under "AI
     /// Chat". Short-lived by design: the agent moves it as the work moves.
     ws_subtitle: Option<String>,
+    /// The brief being watched, when one is playing.
+    watch: Option<Watch>,
     /// The open merge confirmation: merging is not undoable, so it is shown
     /// against the full list of files it would land rather than a second click.
     merge_confirm: Option<MergeConfirm>,
@@ -8831,6 +8888,7 @@ impl Storm {
             limits_open: false,
             ws_title,
             ws_subtitle,
+            watch: None,
             merge_confirm: None,
             reviewed: HashMap::new(),
             merge_focus: cx.focus_handle(),
@@ -33116,7 +33174,15 @@ impl Storm {
                 this.brief_ask.set(SLIDE_CLARIFY_NOTE.to_string());
                 this.ask_about_slide(ix, cx);
             }));
+        // the key is on the button, not only in the tooltip: ⌘↩ is what you
+        // press after typing, and a hint you have to hover to find is one you
+        // read once and then forget
         let send = chip("brief-send", "send")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .child(div().flex_shrink_0().text_size(px(10.)).text_color(rgb(LINE_NUMBER)).child("⌘↩"))
             .tooltip(tip("Ask the agent about this slide  (⌘↩ or ⇧↩)"))
             .on_click(cx.listener(move |this, _e, _w, cx| this.ask_about_slide(ix, cx)));
         let box_ = div()
@@ -39224,6 +39290,7 @@ mod code_tour_tests {
         let slide = |kind: &str| rpc::BriefSlide {
             title: "A".into(),
             text: "B".into(),
+            say: String::new(),
             diagram: Some(dia(kind)),
             files: Vec::new(),
         };
@@ -39251,6 +39318,7 @@ mod code_tour_tests {
         let slide = Slide {
             title: "A failing action is retried once a day".into(),
             text: "A failed run leaves the action stored with its error.".into(),
+            say: String::new(),
             dia: None,
             files: Vec::new(),
         };
@@ -39647,7 +39715,13 @@ mod code_tour_tests {
     #[test]
     fn a_brief_is_rewritten_around_what_is_unread() {
         let slide =
-            |t: &str, x: &str| Slide { title: t.into(), text: x.into(), dia: None, files: Vec::new() };
+            |t: &str, x: &str| Slide {
+                title: t.into(),
+                text: x.into(),
+                say: String::new(),
+                dia: None,
+                files: Vec::new(),
+            };
         let slides = vec![
             slide("Secrets come from env now", "The build no longer holds them."),
             slide("A missing secret stops the boot", "It fails at startup, not on login."),
