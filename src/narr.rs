@@ -136,16 +136,19 @@ pub fn spoken(text: &str) -> String {
     out.trim().to_string()
 }
 
-/// Where a brief's clips live. Keyed by the commit it was written against and
-/// by the voice, so a rewritten brief or a changed voice gets its own set and
-/// a second viewing of the same one is instant.
-pub fn clip_dir(pr: u64, oid: &str, voice: &str) -> Option<PathBuf> {
+/// Where a brief's clips live. Keyed by the brief, by the commit it was
+/// written against and by the voice, so a rewritten brief or a changed voice
+/// gets its own set and a second viewing of the same one is instant.
+pub fn clip_dir(key: &str, oid: &str, voice: &str) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
-    let tag: String = oid.chars().filter(|c| c.is_ascii_alphanumeric()).take(10).collect();
-    let v: String = voice.chars().filter(|c| c.is_ascii_alphanumeric()).take(16).collect();
-    let v = if v.is_empty() { "default".to_string() } else { v };
-    let tag = if tag.is_empty() { "head".to_string() } else { tag };
-    Some(PathBuf::from(home).join(format!(".config/tide/narration/{pr}-{tag}-{v}")))
+    let part = |s: &str, n: usize, fallback: &str| -> String {
+        let out: String = s.chars().filter(|c| c.is_ascii_alphanumeric()).take(n).collect();
+        if out.is_empty() { fallback.to_string() } else { out }
+    };
+    let k = part(key, 24, "brief");
+    let tag = part(oid, 10, "head");
+    let v = part(voice, 16, "default");
+    Some(PathBuf::from(home).join(format!(".config/tide/narration/{k}-{tag}-{v}")))
 }
 
 /// The clip for one line of one slide.
@@ -261,12 +264,17 @@ mod tests {
     /// written again doesn't play the old narration.
     #[test]
     fn clips_are_filed_by_commit_and_voice() {
-        let Some(a) = clip_dir(6164, "80c32ef7b1", "Ava (Premium)") else { return };
-        let Some(b) = clip_dir(6164, "ff0011aa22", "Ava (Premium)") else { return };
-        let Some(c) = clip_dir(6164, "80c32ef7b1", "Evan (Enhanced)") else { return };
+        let Some(a) = clip_dir("pr6164", "80c32ef7b1", "Ava (Premium)") else { return };
+        let Some(b) = clip_dir("pr6164", "ff0011aa22", "Ava (Premium)") else { return };
+        let Some(c) = clip_dir("pr6164", "80c32ef7b1", "Evan (Enhanced)") else { return };
+        let Some(d) = clip_dir("How the cache keys entries", "80c32ef7b1", "Ava (Premium)")
+        else {
+            return;
+        };
         assert_ne!(a, b);
         assert_ne!(a, c);
-        assert!(a.to_string_lossy().contains("6164-80c32ef7b1-AvaPremium"));
+        assert_ne!(a, d, "a brief with no pull request behind it is still its own");
+        assert!(a.to_string_lossy().contains("pr6164-80c32ef7b1-AvaPremium"));
         assert_eq!(clip_path(&a, 3, 1).file_name().unwrap(), "03-01.aiff");
     }
 }

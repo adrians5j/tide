@@ -4763,16 +4763,13 @@ fn brief_read_carried(old: &Brief, fresh: &[Slide]) -> HashSet<usize> {
         .collect()
 }
 
-fn brief_request(number: u64, base: &str, read: &str) -> String {
-    let base = match base.trim().strip_prefix("origin/").unwrap_or(base.trim()) {
-        "" => "the base branch".to_string(),
-        b => b.to_string(),
-    };
-    format!(
-        "Write me a brief of #{number} — what it does and why, as slides I read \
-         before I read the code.\n\n{read}\
-         I already have the pull request body and a code tour. The body is the \
-         problem: by the time I have read it I am holding too much at once. A \
+/// How a brief is written and posted. Shared by the brief of a pull request
+/// and the one made out of a conversation, so a slide is described in one
+/// place rather than in two that drift apart.
+fn brief_spec(pr: Option<u64>) -> String {
+    match pr {
+        Some(number) => format!(
+            "A \
          brief is five to eight slides, each one idea, each one standing on its \
          own. Post the whole thing in one call:\n\
          \x20 curl -s -X POST \"$TIDE_RPC/brief\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n\
@@ -4848,11 +4845,131 @@ fn brief_request(number: u64, base: &str, read: &str) -> String {
          it as `path/to/File.ts:84`, pointing at the line the box is named \
          after, and put one on every box that is really a place in the code — \
          seeing where a box lives is half of what the picture is for. Leave it \
-         off boxes that are ideas rather than code.\n\n\
-         Read the diff against {base} before you write any of it. No line \
+         off boxes that are ideas rather than code.\n\n"
+        ),
+        None => "A \
+         brief is five to eight slides, each one idea, each one standing on its \
+         own. Post the whole thing in one call:\n\
+         \x20 curl -s -X POST \"$TIDE_RPC/brief\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n\
+         \x20   -d '{\"title\":\"Background task recovery\",\"slides\":[\
+         {\"title\":\"Tasks that die halfway now get picked up\",\
+         \"text\":\"A task whose worker crashed mid-run used to sit as `running` \
+         for ever, because nothing ever looked at it again. The loop now treats \
+         a stale lease as a failure and re-queues it.\",\
+         \"say\":\"A task used to be able to die halfway through and sit \
+         there marked as running for ever, because nothing ever went back to \
+         look at it. Now the loop checks how long each one has held its claim, \
+         and anything that has held one for more than a minute goes back on \
+         the queue to be run again.\",\
+         \"files\":[\"packages/api-tasks/src/TaskService.ts:84\",\
+         \"packages/api-tasks/src/recover.ts:17\"],\
+         \"diagram\":{\"kind\":\"flow\",\"caption\":\"one task, start to finish\",\
+         \"nodes\":[\
+         {\"label\":\"trigger()\",\"note\":\"api-tasks\",\
+\"file\":\"packages/api-tasks/src/TaskService.ts:84\"},\
+         {\"label\":\"TaskStore\",\"note\":\"DynamoDB\"},\
+         {\"label\":\"Recover\",\"note\":\"every 60s\",\"mark\":\"new\",\
+\"file\":\"packages/api-tasks/src/recover.ts:17\"}],\
+         \"edges\":[\"writes pending\",\"on a stale lease\"]}}]}'\n\n\
+         `title` on a slide is a sentence that says something — “Tasks that die \
+         halfway now get picked up”, never “Recovery” or “Background”. `text` is \
+         two or three sentences: what changed, what it was before, and the one \
+         thing I would get wrong if nobody told me. Backticks for identifiers.\n\n\
+         `say` is the same slide spoken, because I can watch the brief \
+         instead of reading it: a voice reads `say` out while the slide is up. \
+         Write it for the ear, which is a different register, not the same \
+         sentences again. Three to five of them, thirty to sixty seconds, \
+         plain words, no backticks, no paths, no file names, no line numbers, \
+         nothing I would have to see to follow — `TaskService` is spoken as \
+         “the task service”, and an abbreviation is spelled out the \
+         first time. Keep each sentence short enough to say in one breath: a \
+         clause stack that reads fine on a page is unfollowable out loud. Let \
+         it run on from the slide before it, since I hear them in order. The \
+         voice is you explaining the change; the slide behind it is what I am \
+         looking at while you do.\n\n\
+         A brief is read by somebody who has not read the code, so a word that \
+         only means something inside this repository has to be paid for the \
+         first time it is used: a send, a lease, a connection row, a stale \
+         worker. Say what it is in the same sentence, in a clause, in the \
+         plainest terms that are still true — “a send (the server pushing a \
+         message down a websocket the browser is holding open)”. The test is \
+         whether I could ask “what do you mean by that?” about any noun on the \
+         slide. If I could, the slide isn't written yet, and I have to stop \
+         reading and ask, which is the thing a brief exists to save me. The same \
+         goes for a list you waved at rather than wrote: \"and friends\", \
+         \"and so on\", \"a few places\". Name them, or say how many there \
+         are and where they live.\n\n\
+         `files` is the way from a slide into the code: the two or three files \
+         that slide is about, as `path/to/File.ts:84`, pointing at the line \
+         worth landing on. Put them on every slide that is about code at all — \
+         they draw as links under the prose, and they are the only line numbers \
+         in a brief.\n\n\
+         The first slide is what the change is for, in the terms of whoever asked \
+         for it. The last is what to watch now that it has landed — what could \
+         still bite, what is deliberately left undone. The ones in between are \
+         the moving parts, in the order they would happen.\n\n\
+         `diagram` is optional and most slides are better without one; put one on \
+         the two or three where a picture genuinely carries the idea. Three \
+         shapes, and no others:\n\
+         \x20 • `flow` — a chain, left to right, an arrow between each pair. \
+         `edges` writes on the arrows, one entry fewer than there are nodes.\n\
+         \x20 • `split` — the first node on top, the rest fanning out underneath.\n\
+         \x20 • `parts` — a grid of boxes with no arrows: the pieces of a thing \
+         rather than a path through it.\n\
+         Up to six boxes. `label` is a few words, `note` the smaller line under \
+         it. `mark` is `new`, `changed` or `gone` and goes only on the boxes this \
+         change actually touched — a diagram where every box is lit says nothing. \
+         `file` is printed on the box and opens the file when I click it. Write \
+         it as `path/to/File.ts:84`, pointing at the line the box is named \
+         after, and put one on every box that is really a place in the code — \
+         seeing where a box lives is half of what the picture is for. Leave it \
+         off boxes that are ideas rather than code.\n\n"
+            .to_string(),
+    }
+}
+
+/// The last word of either brief: where line numbers are allowed, and not to
+/// repeat the deck in the reply.
+const BRIEF_TAIL: &str = "         No line \
          numbers anywhere in the prose — `file` is where a line number goes; a \
          slide that needs one in its text wants a code tour instead. Then say in one line that it is up, and stop — don't \
-         repeat the slides in your reply, I'm about to read them.\n"
+         repeat the slides in your reply, I'm about to read them.\n";
+
+fn brief_request(number: u64, base: &str, read: &str) -> String {
+    let base = match base.trim().strip_prefix("origin/").unwrap_or(base.trim()) {
+        "" => "the base branch".to_string(),
+        b => b.to_string(),
+    };
+    format!(
+        "Write me a brief of #{number} — what it does and why, as slides I read \
+         before I read the code.\n\n{read}\
+         I already have the pull request body and a code tour. The body is the \
+         problem: by the time I have read it I am holding too much at once. \
+         {spec}\
+         Read the diff against {base} before you write any of it. {tail}",
+        spec = brief_spec(Some(number)),
+        tail = BRIEF_TAIL,
+    )
+}
+
+/// A presentation of the conversation itself: the question we have been on and
+/// what we worked out, as a deck rather than a wall of answers to scroll back
+/// through. The same slides a pull request's brief is made of, about whatever
+/// we were talking about.
+fn talk_brief_request() -> String {
+    format!(
+        "Turn what we have been talking about into a presentation: slides I can \
+         look through, instead of scrolling back through your answers. The \
+         subject is this conversation — the question I came in with, what we \
+         found, and how the thing actually works. \
+         {spec}\
+         Build it out of what we have already worked out here, in the order it \
+         makes sense to somebody who wasn't in the conversation rather than the \
+         order we happened to find it in. Where you are not sure a detail is \
+         still right, read the code again instead of writing it from memory. \
+         {tail}",
+        spec = brief_spec(None),
+        tail = BRIEF_TAIL,
     )
 }
 
@@ -7127,7 +7244,11 @@ struct Brief {
 /// A brief being watched instead of read: a voice reads each slide out while
 /// the slide is up, and the deck moves on by itself when the voice is done.
 struct Watch {
-    pr: u64,
+    /// Which brief this is a showing of, by the same key its clips are filed
+    /// under. A brief of a conversation has no pull request to be known by.
+    key: String,
+    /// What the header falls back to when the brief has no title.
+    label: String,
     slide: usize,
     /// Every slide's narration, cut into the clips it is spoken as.
     lines: Vec<Vec<String>>,
@@ -7153,6 +7274,16 @@ impl Watch {
     /// The clips of the slide that is up.
     fn here(&self) -> &[String] {
         self.lines.get(self.slide).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+}
+
+/// What tells one brief from another: its pull request when it has one, its
+/// title when it doesn't. A brief of a conversation is only ever the current
+/// one, so its title is enough to tell it from the last.
+fn brief_key(b: &Brief) -> String {
+    match b.pr {
+        Some(p) => format!("pr{p}"),
+        None => format!("talk {}", b.title.trim()),
     }
 }
 
@@ -16473,9 +16604,9 @@ impl Render for Storm {
         // a brief is watched in its own tab, so leaving that tab stops the
         // voice: audio still playing over a file you have gone back to editing
         // has no way of being turned off from there
-        if let Some(pr) = self.watch.as_ref().map(|w| w.pr) {
-            let here = self.tabs.get(self.active).and_then(|t| t.brief.as_ref()).and_then(|b| b.pr);
-            if here != Some(pr) {
+        if let Some(key) = self.watch.as_ref().map(|w| w.key.clone()) {
+            let here = self.tabs.get(self.active).and_then(|t| t.brief.as_ref()).map(brief_key);
+            if here.as_deref() != Some(key.as_str()) {
                 self.end_watch(cx);
             }
         }
@@ -25899,16 +26030,26 @@ impl Storm {
             .to_string()
     }
 
-    /// A one-click message under the composer. The sentences typed most often
+    /// A one-click message under the composer. The things asked for most often
     /// are a button each: they go the way a typed message goes, so the
     /// transcript shows them as yours and a running turn queues them.
+    ///
+    /// `prompt` is built when the button is pressed rather than held as a
+    /// constant, because one of them is a page of instructions assembled from
+    /// pieces. `shown` is what the transcript prints in its place when the
+    /// prompt is too long to read as a message you typed, and `job` folds the
+    /// whole turn to one line when what it produces goes somewhere else — a
+    /// deck, a tour — rather than into the answer.
+    #[allow(clippy::too_many_arguments)]
     fn quick_prompt(
         &self,
         id: &'static str,
         label: &'static str,
         color: u32,
         hint: &'static str,
-        prompt: &'static str,
+        prompt: fn() -> String,
+        shown: Option<&'static str>,
+        job: Option<&'static str>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         div()
@@ -25926,7 +26067,13 @@ impl Storm {
             .child(label)
             .tooltip(tip(hint))
             .on_click(cx.listener(move |this, _e, _w, cx| {
-                this.send_agent_prompt_by(prompt.to_string(), None, Sender::You, cx);
+                this.job_next = job.map(str::to_string);
+                this.send_agent_prompt_by(
+                    prompt(),
+                    shown.map(str::to_string),
+                    Sender::You,
+                    cx,
+                );
             }))
     }
 
@@ -27413,12 +27560,9 @@ impl Storm {
     /// rest are on disk before they are wanted.
     fn watch_brief(&mut self, cx: &mut Context<Self>) {
         let Some(brief) = self.tabs.get(self.active).and_then(|t| t.brief.clone()) else { return };
-        let Some(pr) = brief.pr else {
-            self.show_flash("A brief is watched by pull request, and this one has no number", cx);
-            return;
-        };
+        let key = brief_key(&brief);
         let voice = narr::best_voice();
-        let Some(dir) = narr::clip_dir(pr, &brief.oid, &voice) else { return };
+        let Some(dir) = narr::clip_dir(&key, &brief.oid, &voice) else { return };
         // a slide with no spoken version falls back to its written text, which
         // listens worse than a written-for-the-ear `say` but still carries the
         // slide — an older brief has no `say` at all
@@ -27443,7 +27587,11 @@ impl Storm {
         let stop = Arc::new(AtomicBool::new(false));
         narr::spawn_synth(voice.clone(), jobs, stop.clone());
         self.watch = Some(Watch {
-            pr,
+            key,
+            label: match brief.pr {
+                Some(p) => format!("#{p}"),
+                None => "this conversation".to_string(),
+            },
             slide: 0,
             lines,
             at: 0,
@@ -29477,7 +29625,9 @@ impl Storm {
                             "Check CI",
                             if st == PrStatus::Failing { GIT_DELETED } else { MUTED },
                             "Ask what CI is doing on this PR",
-                            CHECK_CI_PROMPT,
+                            || CHECK_CI_PROMPT.to_string(),
+                            None,
+                            None,
                             cx,
                         ))
                     })
@@ -29486,7 +29636,9 @@ impl Storm {
                         "Status",
                         MUTED,
                         "Ask what the agent is on right now",
-                        STATUS_PROMPT,
+                        || STATUS_PROMPT.to_string(),
+                        None,
+                        None,
                         cx,
                     ))
                     .child(self.quick_prompt(
@@ -29494,7 +29646,21 @@ impl Storm {
                         "What next?",
                         MUTED,
                         "Ask where this stands and what to do next",
-                        WHAT_NEXT_PROMPT,
+                        || WHAT_NEXT_PROMPT.to_string(),
+                        None,
+                        None,
+                        cx,
+                    ))
+                    // the deck it builds opens in its own tab, so the turn
+                    // behind it is one line in the pane rather than a wall
+                    .child(self.quick_prompt(
+                        "quick-deck",
+                        "Presentation",
+                        MUTED,
+                        "Ask for this conversation as slides you can read or watch",
+                        talk_brief_request,
+                        Some("Asked for a presentation of this conversation"),
+                        Some("Presentation of this conversation"),
                         cx,
                     ))
                     .child(div().flex_grow(1.0))
@@ -32962,7 +33128,7 @@ impl Storm {
                     .text_size(px(12.))
                     .text_color(rgb(TEXT))
                     .child(match brief.title.trim() {
-                        "" => format!("#{}", w.pr),
+                        "" => w.label.clone(),
                         t => t.to_string(),
                     }),
             )
@@ -33140,7 +33306,7 @@ impl Storm {
             return div().into_any_element();
         };
         // the same brief, being watched rather than read
-        if self.watch.as_ref().is_some_and(|w| Some(w.pr) == brief.pr) {
+        if self.watch.as_ref().is_some_and(|w| w.key == brief_key(&brief)) {
             return self.render_watch(&brief, cx);
         }
         let me = cx.entity().downgrade();
@@ -33215,31 +33381,30 @@ impl Storm {
                 )
             })
             // watching it is the same deck read out loud, so the button to do
-            // that belongs beside the one that writes it again
-            .when_some(pr, |d, _p| {
-                d.child(
-                    div()
-                        .id("brief-watch")
-                        .flex_shrink_0()
-                        .px_1p5()
-                        .py(px(1.))
-                        .rounded_md()
-                        .cursor_pointer()
-                        .text_size(px(11.))
-                        .border_1()
-                        .border_color(rgb(BORDER))
-                        .text_color(rgb(MUTED))
-                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                        .child("▶ Watch")
-                        .tooltip(tip("Play the brief: a voice reads each slide while it is up"))
-                        .on_click(cx.listener(move |this, _e, window, cx| {
-                            this.watch_brief(cx);
-                            if this.watch.is_some() {
-                                window.focus(&this.watch_focus, cx);
-                            }
-                        })),
-                )
-            })
+            // that belongs beside the one that writes it again. Every deck can
+            // be watched, including one made out of a conversation
+            .child(
+                div()
+                    .id("brief-watch")
+                    .flex_shrink_0()
+                    .px_1p5()
+                    .py(px(1.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_size(px(11.))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .text_color(rgb(MUTED))
+                    .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                    .child("▶ Watch")
+                    .tooltip(tip("Play the brief: a voice reads each slide while it is up"))
+                    .on_click(cx.listener(move |this, _e, window, cx| {
+                        this.watch_brief(cx);
+                        if this.watch.is_some() {
+                            window.focus(&this.watch_focus, cx);
+                        }
+                    })),
+            )
             // a brief is a snapshot of a branch the same way a tour is, and goes
             // out of date the same way
             .when_some(pr, |d, p| {
@@ -40479,6 +40644,30 @@ mod pr_auto_open_tests {
     fn nothing_to_open_is_not_an_error() {
         assert_eq!(pr_tab_to_open(true, None, None), None);
         assert_eq!(pr_tab_to_open(true, Some(5996), None), None);
+    }
+}
+
+#[cfg(test)]
+mod brief_spec_tests {
+    use super::*;
+
+    /// Both briefs are written to the same spec, and only the pull request's
+    /// carries a number in the call it is posted with.
+    #[test]
+    fn one_spec_two_subjects() {
+        let pr = brief_request(6164, "origin/next", "");
+        let talk = talk_brief_request();
+        for q in ["five to eight slides", "$TIDE_RPC/brief", "`say` is the same slide spoken"] {
+            assert!(pr.contains(q), "{q} missing from the pull request's brief");
+            assert!(talk.contains(q), "{q} missing from the conversation's brief");
+        }
+        assert!(pr.contains("\"pr\":6164"), "{pr}");
+        assert!(!talk.contains("\"pr\":"), "a conversation has no number to post");
+        assert!(pr.contains("Read the diff against next"), "{pr}");
+        assert!(talk.contains("this conversation"), "{talk}");
+        // neither repeats the deck back at me
+        assert!(pr.contains("I'm about to read them"));
+        assert!(talk.contains("I'm about to read them"));
     }
 }
 
