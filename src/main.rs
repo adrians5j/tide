@@ -8351,6 +8351,7 @@ struct Storm {
     ws_subtitle: Option<String>,
     /// The brief being watched, when one is playing.
     watch: Option<Watch>,
+    watch_focus: FocusHandle,
     /// The open merge confirmation: merging is not undoable, so it is shown
     /// against the full list of files it would land rather than a second click.
     merge_confirm: Option<MergeConfirm>,
@@ -8889,6 +8890,7 @@ impl Storm {
             ws_title,
             ws_subtitle,
             watch: None,
+            watch_focus: cx.focus_handle(),
             merge_confirm: None,
             reviewed: HashMap::new(),
             merge_focus: cx.focus_handle(),
@@ -27375,6 +27377,227 @@ impl Storm {
         cx.notify();
     }
 
+
+    /// Watch the brief instead of reading it: a voice reads each slide out
+    /// while the slide is up, and the deck moves on by itself when the voice
+    /// is done. The clips are synthesised in the background in the order they
+    /// will be heard, so the first one starts in a couple of seconds and the
+    /// rest are on disk before they are wanted.
+    fn watch_brief(&mut self, cx: &mut Context<Self>) {
+        let Some(brief) = self.tabs.get(self.active).and_then(|t| t.brief.clone()) else { return };
+        let Some(pr) = brief.pr else {
+            self.show_flash("A brief is watched by pull request, and this one has no number", cx);
+            return;
+        };
+        let voice = narr::best_voice();
+        let Some(dir) = narr::clip_dir(pr, &brief.oid, &voice) else { return };
+        // a slide with no spoken version falls back to its written text, which
+        // listens worse than a written-for-the-ear `say` but still carries the
+        // slide — an older brief has no `say` at all
+        let lines: Vec<Vec<String>> = brief
+            .slides
+            .iter()
+            .map(|s| narr::lines_of(match s.say.trim().is_empty() {
+                false => &s.say,
+                true => &s.text,
+            }))
+            .collect();
+        if lines.iter().all(|l| l.is_empty()) {
+            self.show_flash("There is nothing to read out in this brief", cx);
+            return;
+        }
+        let mut jobs: Vec<(PathBuf, String)> = Vec::new();
+        for (si, ls) in lines.iter().enumerate() {
+            for (li, text) in ls.iter().enumerate() {
+                jobs.push((narr::clip_path(&dir, si, li), text.clone()));
+            }
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        narr::spawn_synth(voice.clone(), jobs, stop.clone());
+        self.watch = Some(Watch {
+            pr,
+            slide: 0,
+            lines,
+            at: 0,
+            playing: true,
+            dir,
+            voice,
+            gen: 0,
+            pid: Arc::new(AtomicU32::new(0)),
+            waiting: true,
+            stop,
+        });
+        self.narr_play(cx);
+        cx.notify();
+    }
+
+    /// Play the clip the player is standing on, or wait for the synthesiser to
+    /// write it. Every path through here ends in `narr_done` with the
+    /// generation it started under, so a clip that finishes after you have
+    /// skipped on is ignored rather than advancing the deck twice.
+    fn narr_play(&mut self, cx: &mut Context<Self>) {
+        let Some(w) = self.watch.as_mut() else { return };
+        if !w.playing {
+            return;
+        }
+        // past the last line of the last slide: the brief is over
+        if w.slide >= w.lines.len() {
+            self.end_watch(cx);
+            return;
+        }
+        if w.at >= w.here().len() {
+            self.narr_next_slide(cx);
+            return;
+        }
+        let (gen, path) = (w.gen, narr::clip_path(&w.dir, w.slide, w.at));
+        if !path.exists() {
+            w.waiting = true;
+            cx.notify();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(Duration::from_millis(200)).await;
+                this.update(cx, |this, cx| {
+                    if this.watch.as_ref().is_some_and(|w| w.gen == gen) {
+                        this.narr_play(cx);
+                    }
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
+        w.waiting = false;
+        let pid = w.pid.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .spawn(async move {
+                    let Ok(mut child) = Command::new("afplay").arg(&path).spawn() else { return };
+                    pid.store(child.id(), Ordering::Relaxed);
+                    let _ = child.wait();
+                    pid.store(0, Ordering::Relaxed);
+                })
+                .await;
+            this.update(cx, |this, cx| this.narr_done(gen, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// A clip has finished playing. Move to the next line, and to the next
+    /// slide when there are no lines left on this one.
+    fn narr_done(&mut self, gen: u64, cx: &mut Context<Self>) {
+        let Some(w) = self.watch.as_mut() else { return };
+        if w.gen != gen || !w.playing {
+            return; // answered an older question, or we were paused meanwhile
+        }
+        w.at += 1;
+        if w.at < w.here().len() {
+            self.narr_play(cx);
+            return;
+        }
+        self.narr_next_slide(cx);
+    }
+
+    /// On to the next slide, marking the one just heard as read. The last one
+    /// ends the showing rather than looping.
+    fn narr_next_slide(&mut self, cx: &mut Context<Self>) {
+        let Some(w) = self.watch.as_mut() else { return };
+        let heard = w.slide;
+        if w.slide + 1 >= w.lines.len() {
+            self.mark_slide_read(heard, true, cx);
+            self.narr_cut();
+            if let Some(w) = self.watch.as_mut() {
+                w.playing = false;
+                w.at = w.here().len(); // the deck is over, and says so
+            }
+            cx.notify();
+            return;
+        }
+        w.slide += 1;
+        w.at = 0;
+        self.mark_slide_read(heard, true, cx);
+        self.narr_play(cx);
+    }
+
+    /// Stop the clip playing now and invalidate whatever it was going to do
+    /// next. Used by everything that interrupts: pause, skip, leave.
+    fn narr_cut(&mut self) {
+        let Some(w) = self.watch.as_mut() else { return };
+        w.gen += 1;
+        let pid = w.pid.swap(0, Ordering::Relaxed);
+        if pid != 0 {
+            // `afplay` has no stop of its own, and it is a leaf process, so
+            // there is nothing under it to take down with it
+            let _ = Command::new("kill").arg("-TERM").arg(pid.to_string()).status();
+        }
+    }
+
+    /// Space: stop where you are, or pick the same line up again. A pause
+    /// lands on a sentence rather than mid-word because a clip is a sentence.
+    fn narr_toggle(&mut self, cx: &mut Context<Self>) {
+        let Some(w) = self.watch.as_ref() else { return };
+        if w.playing {
+            self.narr_cut();
+            if let Some(w) = self.watch.as_mut() {
+                w.playing = false;
+                w.waiting = false;
+            }
+            cx.notify();
+            return;
+        }
+        // the deck ran to the end: play restarts it rather than doing nothing
+        let over = w.slide + 1 >= w.lines.len() && w.at >= w.here().len();
+        if let Some(w) = self.watch.as_mut() {
+            w.playing = true;
+            if over {
+                w.slide = 0;
+                w.at = 0;
+            }
+        }
+        self.narr_play(cx);
+    }
+
+    /// Skip a slide either way. It starts the slide it lands on from its first
+    /// line, playing or paused as it was.
+    fn narr_skip(&mut self, dir: i32, cx: &mut Context<Self>) {
+        self.narr_cut();
+        let Some(w) = self.watch.as_mut() else { return };
+        let n = w.lines.len() as i32;
+        let to = (w.slide as i32 + dir).clamp(0, n - 1) as usize;
+        if to == w.slide && w.at == 0 {
+            return;
+        }
+        w.slide = to;
+        w.at = 0;
+        self.narr_play(cx);
+        cx.notify();
+    }
+
+    /// Leave the showing and go back to the deck, where the slides you heard
+    /// are ticked.
+    fn end_watch(&mut self, cx: &mut Context<Self>) {
+        self.narr_cut();
+        if let Some(w) = self.watch.take() {
+            w.stop.store(true, Ordering::Relaxed);
+        }
+        cx.notify();
+    }
+
+    /// Keys while a brief is playing. The same four a video player has.
+    fn watch_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        match ks.key.as_str() {
+            "escape" => {
+                self.end_watch(cx);
+                self.focus_active(window, cx);
+            }
+            "space" => self.narr_toggle(cx),
+            "right" | "down" => self.narr_skip(1, cx),
+            "left" | "up" => self.narr_skip(-1, cx),
+            _ => {}
+        }
+        cx.notify();
+    }
+
     /// Click a box that names a file: open it, at its line when it gave one.
     /// Mark a slide read, or put it back. Kept with the brief on disk: a deck
     /// you have worked through once should say so when you open it again.
@@ -32643,10 +32866,219 @@ impl Storm {
     /// the real one — but draws at nothing until you have scrolled to it, and
     /// then fades up into place. The reveal is the point: a page that arrives
     /// all at once is the pull request body again.
+    /// The brief as a showing: one slide at a time, its narration under the
+    /// title with the sentence being spoken lit, and the deck moving on by
+    /// itself. The reading deck is still there behind it — esc goes back to it
+    /// with the slides you heard ticked.
+    fn render_watch(&mut self, brief: &Brief, cx: &mut Context<Self>) -> AnyElement {
+        let Some(w) = self.watch.as_ref() else { return div().into_any_element() };
+        let n = brief.slides.len();
+        let at = w.slide.min(n.saturating_sub(1));
+        let Some(slide) = brief.slides.get(at) else { return div().into_any_element() };
+        let (playing, waiting, line, voice) = (w.playing, w.waiting, w.at, w.voice.clone());
+        let lines = w.here().to_vec();
+        let over = !playing && at + 1 >= n && line >= lines.len();
+
+        let head = div()
+            .h(px(34.))
+            .flex_shrink_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .bg(rgb(BG))
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .child(div().flex_shrink_0().text_size(px(11.)).text_color(rgb(MUTED)).child("Watching"))
+            .child(
+                div()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_size(px(12.))
+                    .text_color(rgb(TEXT))
+                    .child(match brief.title.trim() {
+                        "" => format!("#{}", w.pr),
+                        t => t.to_string(),
+                    }),
+            )
+            .child(div().flex_grow(1.0))
+            .when(!voice.is_empty(), |d| {
+                d.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(10.5))
+                        .text_color(rgb(LINE_NUMBER))
+                        .child(voice),
+                )
+            })
+            .child(
+                div()
+                    .id("watch-close")
+                    .flex_shrink_0()
+                    .px_1p5()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                    .child("✕")
+                    .tooltip(tip("Back to reading it  (esc)"))
+                    .on_click(cx.listener(|this, _e, window, cx| {
+                        this.end_watch(cx);
+                        this.focus_active(window, cx);
+                    })),
+            );
+
+        // the narration, a sentence a line: the one being said is lit, what
+        // has been said is dimmed, what is coming is barely there. It is a
+        // transcript running alongside the voice, not a slide full of bullets
+        let mut script = div().flex().flex_col().gap_3().max_w(px(760.));
+        for (i, text) in lines.iter().enumerate() {
+            let colour = match i.cmp(&line) {
+                std::cmp::Ordering::Less => MUTED,
+                std::cmp::Ordering::Equal => TEXT,
+                std::cmp::Ordering::Greater => LINE_NUMBER,
+            };
+            script = script.child(
+                div()
+                    .text_size(px(if i == line { 19. } else { 17. }))
+                    .text_color(rgb(colour))
+                    .child(text.clone()),
+            );
+        }
+
+        let body = div()
+            .id("watch-body")
+            .flex()
+            .flex_col()
+            .flex_grow(1.0)
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .px(px(64.))
+            .pt(px(48.))
+            .pb(px(32.))
+            .gap(px(28.))
+            .child(
+                div()
+                    .max_w(px(760.))
+                    .text_size(px(28.))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgb(TEXT))
+                    .child(slide.title.clone()),
+            )
+            .child(script)
+            .when_some(slide.dia.as_ref(), |d, dia| {
+                d.child(div().max_w(px(760.)).child(self.brief_diagram(at, dia, cx)))
+            });
+
+        let btn = |id: &'static str, glyph: &'static str, hint: &'static str, lit: bool| {
+            div()
+                .id(id)
+                .flex_shrink_0()
+                .px_2()
+                .py(px(2.))
+                .rounded_md()
+                .cursor_pointer()
+                .text_size(px(12.))
+                .border_1()
+                .border_color(rgb(if lit { ACCENT } else { BORDER }))
+                .text_color(rgb(if lit { ACCENT } else { MUTED }))
+                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                .child(glyph)
+                .tooltip(tip(hint))
+        };
+        let pct = ((at + 1) * 100 / n.max(1)).min(100);
+        let foot = div()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px(px(64.))
+            .py_3()
+            .bg(rgb(BG))
+            .border_t_1()
+            .border_color(rgb(BORDER))
+            .child(segmented_bar_on(pct, ACCENT, 4., BORDER))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        btn("watch-prev", "⏮", "The slide before  (←)", false).on_click(
+                            cx.listener(|this, _e, _w, cx| this.narr_skip(-1, cx)),
+                        ),
+                    )
+                    .child(
+                        btn(
+                            "watch-play",
+                            if playing { "⏸" } else { "▶" },
+                            if playing { "Pause  (space)" } else { "Play  (space)" },
+                            playing,
+                        )
+                        .on_click(cx.listener(|this, _e, _w, cx| this.narr_toggle(cx))),
+                    )
+                    .child(
+                        btn("watch-next", "⏭", "The next slide  (→)", false).on_click(
+                            cx.listener(|this, _e, _w, cx| this.narr_skip(1, cx)),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .font_family("Menlo")
+                            .text_size(px(10.))
+                            .text_color(rgb(LINE_NUMBER))
+                            .child(format!("{:02} / {:02}", at + 1, n)),
+                    )
+                    // the player going quiet has a reason, and it says which
+                    .when(waiting, |d| {
+                        d.child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(rgb(MUTED))
+                                .child("writing the narration…"),
+                        )
+                    })
+                    .when(over, |d| {
+                        d.child(
+                            div().text_size(px(10.5)).text_color(rgb(MUTED)).child("end of the brief"),
+                        )
+                    })
+                    .child(div().flex_grow(1.0))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(10.))
+                            .text_color(rgb(LINE_NUMBER))
+                            .child("space pause  ·  ← → slide  ·  esc read it instead"),
+                    ),
+            );
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_grow(1.0)
+            .h_full()
+            .bg(rgb(BG))
+            .track_focus(&self.watch_focus)
+            .on_key_down(cx.listener(Self::watch_key))
+            .child(head)
+            .child(body)
+            .child(foot)
+            .into_any_element()
+    }
+
     fn render_brief(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(brief) = self.tabs.get(self.active).and_then(|t| t.brief.clone()) else {
             return div().into_any_element();
         };
+        // the same brief, being watched rather than read
+        if self.watch.as_ref().is_some_and(|w| Some(w.pr) == brief.pr) {
+            return self.render_watch(&brief, cx);
+        }
         let me = cx.entity().downgrade();
         let n = brief.slides.len();
         let pr = brief.pr;
@@ -32718,16 +33150,32 @@ impl Storm {
                         .child(format!("written {made}")),
                 )
             })
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(px(11.))
-                    .text_color(rgb(LINE_NUMBER))
-                    .child(match brief.read.len().min(n) {
-                        0 => format!("{n} slide{}", if n == 1 { "" } else { "s" }),
-                        r => format!("{r}/{n} read"),
-                    }),
-            )
+            // watching it is the same deck read out loud, so the button to do
+            // that belongs beside the one that writes it again
+            .when_some(pr, |d, _p| {
+                d.child(
+                    div()
+                        .id("brief-watch")
+                        .flex_shrink_0()
+                        .px_1p5()
+                        .py(px(1.))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_size(px(11.))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .text_color(rgb(MUTED))
+                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                        .child("▶ Watch")
+                        .tooltip(tip("Play the brief: a voice reads each slide while it is up"))
+                        .on_click(cx.listener(move |this, _e, window, cx| {
+                            this.watch_brief(cx);
+                            if this.watch.is_some() {
+                                window.focus(&this.watch_focus, cx);
+                            }
+                        })),
+                )
+            })
             // a brief is a snapshot of a branch the same way a tour is, and goes
             // out of date the same way
             .when_some(pr, |d, p| {
@@ -32752,6 +33200,39 @@ impl Storm {
                         })),
                 )
             });
+
+        // how much of the deck you have read, as its own row under the header:
+        // the same bar the PR review pane draws over "4/11 viewed", red while
+        // most of it is ahead of you and green when there is none left
+        let read = brief.read.len().min(n);
+        let pct = read * 100 / n.max(1);
+        let progress = div()
+            .flex_shrink_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .px_3()
+            .py(px(5.))
+            .bg(rgb(BG))
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .child(div().flex_grow(1.0).min_w(px(0.)).child(segmented_bar_on(
+                pct,
+                progress_color(pct),
+                8.,
+                BORDER,
+            )))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(11.))
+                    .text_color(rgb(LINE_NUMBER))
+                    .child(match read {
+                        0 => format!("{n} slide{}", if n == 1 { "" } else { "s" }),
+                        r => format!("{r}/{n} read"),
+                    }),
+            );
 
         let mut deck = div()
             .id("brief-deck")
@@ -32790,6 +33271,7 @@ impl Storm {
                 }),
             )
             .child(head)
+            .child(progress)
             // the deck scrolls, so it says so: the same thumb the diff pane
             // draws, over a column that is otherwise eight slides of prose
             // with nothing to say how much of it there is
