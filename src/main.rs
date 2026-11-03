@@ -4650,6 +4650,20 @@ change anything yet.";
 const WHAT_NEXT_PROMPT: &str = "Where does this stand, and what is next? Short: \
 what is done, what is left, and the one thing you would do next and why. Don't \
 start on it until I say.";
+const PROVE_IT_PROMPT: &str = "Prove it. For every claim you made in this \
+turn that something works, is fixed or is faster, give me the evidence or say \
+you don't have any.\n\n\
+Evidence is: the command and the output it actually printed, pasted; the same \
+command run before the change and after, so I can watch the failure turn into \
+a pass; a test that fails on the old code and passes on the new, with both \
+runs shown; a screenshot of the app doing the thing; a number with its units \
+and how you measured it.\n\n\
+Not evidence: a description of what you changed, the diff, \u{201c}the tests \
+pass\u{201d} without the output, or a test that would have passed before the \
+change as well.\n\n\
+Go and get it — run the commands again now and show what they print. Don't \
+change any code for this. Where a claim can't be proved, say which one in a \
+line and say what would prove it.";
 const STATUS_PROMPT: &str = "What's the status? Three lines at most: what you \
 are on right now, what is already finished, and what is left of what I asked. \
 Name the file or the command you are in, not the plan. If you are waiting on \
@@ -25978,6 +25992,23 @@ impl Storm {
          reproduced, a layout that looks wrong. `agent-browser console` and \
          `agent-browser errors` are worth reading before you say a page works. \
          The local sign-in details are above.\n\n\
+         Evidence, not a description. When you tell me something works, is \
+         fixed, or is faster, what you owe me is the thing that would \
+         convince somebody who does not trust you. These are not evidence: \
+         “the tests pass” without the output, “this should work now”, a \
+         summary of the change you made, or the diff — a diff says what you \
+         intended, not what happens. Nor is a test you wrote and ran once: if \
+         it would have passed before the change as well, it proves nothing.\n\n\
+         These are: the command and the output it actually printed, pasted; \
+         the same command run before the fix and after, so I can watch the \
+         failure turn into a pass; a test that fails on the old code and \
+         passes on the new, with both runs shown; a screenshot of the app \
+         doing the thing; a number with its units and how you measured it. \
+         Three lines of real output beat a paragraph about them.\n\n\
+         When you cannot prove something, name the claim instead of writing \
+         a description that reads like a result. “The suite is green, but I \
+         never reproduced the original bug” is worth more to me than a \
+         confident sentence.\n\n\
          Run the admin app locally with `wdev`, one word, no arguments. That \
          is the command here: don't reach for a yarn script or invent a dev \
          command of your own.\n\n\
@@ -29647,6 +29678,16 @@ impl Storm {
                         MUTED,
                         "Ask where this stands and what to do next",
                         || WHAT_NEXT_PROMPT.to_string(),
+                        None,
+                        None,
+                        cx,
+                    ))
+                    .child(self.quick_prompt(
+                        "quick-proof",
+                        "Prove it",
+                        MUTED,
+                        "Ask for the evidence behind what it just told you",
+                        || PROVE_IT_PROMPT.to_string(),
                         None,
                         None,
                         cx,
@@ -40670,6 +40711,29 @@ mod pr_auto_open_tests {
     fn nothing_to_open_is_not_an_error() {
         assert_eq!(pr_tab_to_open(true, None, None), None);
         assert_eq!(pr_tab_to_open(true, Some(5996), None), None);
+    }
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::*;
+
+    /// Both halves say the same thing about what counts: the standing briefing
+    /// so it holds for every turn, and the button for when it didn't.
+    #[test]
+    fn the_briefing_and_the_button_agree_on_what_evidence_is() {
+        let brief = Storm::tide_briefing_body();
+        for text in [brief.as_str(), PROVE_IT_PROMPT] {
+            assert!(text.contains("output"), "evidence is output, not a summary");
+            assert!(text.contains("before"), "before and after is the shape of a proof");
+            assert!(
+                text.contains("would have passed before"),
+                "a test that proved nothing is the one worth naming"
+            );
+        }
+        // and both say what to do when there is no proof to be had
+        assert!(brief.contains("cannot prove"), "{brief}");
+        assert!(PROVE_IT_PROMPT.contains("can't be proved"));
     }
 }
 
