@@ -15518,8 +15518,11 @@ impl Storm {
         }
         match ks.key.as_str() {
             "escape" => self.cancel_comment(window, cx),
-            // ⌘↩ commits; a bare ↩ is a newline (handled by the field below)
-            "enter" if ks.modifiers.platform => self.commit_comment(window, cx),
+            // ⌘↩ commits; ⇧⌘↩ commits and sends it on to the agent without
+            // the stop in the queue. A bare ↩ is a newline (the field below).
+            "enter" if ks.modifiers.platform => {
+                self.commit_comment(ks.modifiers.shift, window, cx)
+            }
             _ => {
                 if Self::text_comes_via_input_handler(ks) {
                     return; // the input handler inserts it
@@ -15572,7 +15575,14 @@ impl Storm {
     /// Save the box and close it (⌘↩ / the primary button). In reply mode the
     /// text becomes your turn in the thread and the comment goes back into the
     /// send queue, so ⌥↩ carries the follow-up to the agent.
-    fn commit_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    ///
+    /// `send` is ⇧⌘↩: the same thing, followed by the send, so a question you
+    /// want answered now doesn't sit in the queue waiting for a second
+    /// keystroke. It takes the rest of the queue with it, because that is what
+    /// the send does and leaving half of it behind would be the surprise.
+    fn commit_comment(&mut self, send: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // an empty box writes nothing, so there is nothing to hurry along
+        let send = send && !self.rc_query.text.trim().is_empty();
         self.rc_open = false;
         if self.rc_reply_mode {
             let text = self.rc_query.text.trim().to_string();
@@ -15588,7 +15598,9 @@ impl Storm {
                     c.resolved = false; // replying reopens what you'd filed away
                 }
                 self.save_review();
-                self.show_flash("Reply queued — ⌥↩ sends it", cx);
+                if !send {
+                    self.show_flash("Reply queued — ⌥↩ sends it", cx);
+                }
             }
             self.rc_reply_mode = false;
             self.sync_comment_gutters(cx);
@@ -15596,6 +15608,11 @@ impl Storm {
             self.save_comment(cx); // also re-syncs gaps + gutter markers
         }
         self.focus_active(window, cx);
+        if send {
+            // its own flash says how much went, and the answer comes back into
+            // this thread the way a sent comment's always does
+            self.send_review(window, cx);
+        }
         cx.notify();
     }
 
@@ -20388,7 +20405,7 @@ impl Storm {
                         div()
                             .text_size(px(10.))
                             .text_color(rgb(LINE_NUMBER))
-                            .child("⌘↩ save · ↩ newline · ⌘V image · esc cancel"),
+                            .child("⌘↩ save · ⇧⌘↩ send it now · ↩ newline · ⌘V image · esc cancel"),
                     ),
             )
             // the answers, read here rather than in the terminal transcript
@@ -20529,7 +20546,10 @@ impl Storm {
                             true,
                             false,
                         )
-                        .on_click(cx.listener(|this, _e, window, cx| this.commit_comment(window, cx))),
+                        .tooltip(tip("⌘↩  ·  ⇧⌘↩ sends it to the agent now"))
+                        .on_click(cx.listener(|this, e: &gpui::ClickEvent, window, cx| {
+                            this.commit_comment(e.modifiers().shift, window, cx)
+                        })),
                     )
                     // a thread that's been talked through is resolved, not deleted —
                     // last in the row, since it's what ends the conversation
