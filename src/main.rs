@@ -6056,7 +6056,7 @@ const PALETTE: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::ShowComments, "Review Comments…", IC_COMMIT, "⌥⇧C"),
     (Cmd::SendComments, "Send Comments to Agent", IC_PUSH, "⌥↩ / ⌘F12"),
     (Cmd::LocalReview, "Review This Branch (CodeRabbit CLI → the agent)", IC_PR, ""),
-    (Cmd::Reviewers, "Send In the Reviewers (slop cop + code rabbit)", IC_PR, ""),
+    (Cmd::Reviewers, "Send In the Reviewers (slop cop, style, architecture, CodeRabbit)", IC_PR, ""),
     (Cmd::Todo, "New Task…", IC_CHECK, "⌘⇧L"),
     (Cmd::OpenRepository, "Open Repository or Project…  (clones a GitHub URL into ~/dev)", IC_FILES, "⌘O"),
     (Cmd::InstallUsageBars, "Install Plan Usage Bars (statusline shim)", IC_GRAPH, ""),
@@ -9855,7 +9855,7 @@ impl Storm {
         }
         self.agent_tab = 0;
         let base = self.review_base();
-        let briefs: [(&'static str, String); 2] = [
+        let briefs: [(&'static str, String); 4] = [
             (
                 "slop cop",
                 format!(
@@ -9863,18 +9863,72 @@ impl Storm {
                      Slop Cop check does in CI. Run `git fetch origin --quiet` first: the \
                      local base branch is often days behind, and diffing against it reports \
                      hundreds of files that aren't in this branch at all.\n\n\
-                     Two questions, nothing else.\n\n\
-                     1. Integrity. Read the diff (`git diff {base}...HEAD`) and the commits \
-                     against what the branch says it does (its PR title and body if it has a \
-                     PR, `gh pr view` — otherwise the commit messages). Does the footprint \
-                     match the stated intent? Flag anything that looks like it shouldn't be \
-                     here: files from a bad rebase or merge, wiped commits, leaked secrets, \
-                     committed debug code, conflict markers.\n\n\
-                     2. House style. Read every rule in `ai-context/code-style/*.md` and check \
-                     the diff's ADDED lines against them. Cite the rule file you're applying.\n\n\
+                     One question: does the footprint match the stated intent? Read the diff \
+                     (`git diff {base}...HEAD`) and the commits against what the branch says \
+                     it does — its PR title and body if it has a PR, `gh pr view`, otherwise \
+                     the commit messages. Flag anything that has no business being here: \
+                     files from a bad rebase or merge, wiped commits, leaked secrets, \
+                     committed debug code, conflict markers, a change nothing in the stated \
+                     intent accounts for.\n\n\
+                     House style and the shape of the design are not yours. Two other \
+                     reviewers are reading the same diff for those, and the same point made \
+                     three times is worth less than once.\n\n\
                      Report findings only. Don't change code, don't commit, don't push. Be \
                      specific: file, line, what's wrong, and why it matters. If there is \
                      nothing to report, say so in one line."
+                ),
+            ),
+            (
+                "code style",
+                format!(
+                    "You are reviewing the branch in this repo against `{base}` for house \
+                     style. Run `git fetch origin --quiet` first: the local base branch is \
+                     often days behind, and diffing against it reports hundreds of files \
+                     that aren't in this branch at all.\n\n\
+                     Read every rule in `ai-context/code-style/*.md`, then check the ADDED \
+                     lines of `git diff {base}...HEAD` against the ones about how a line is \
+                     written: naming, imports, comments, ternaries, casts, one thing per \
+                     file, `console` in backend code, how a class or an implementation is \
+                     declared. The test is whether a lint rule looking at one file on its \
+                     own could enforce it. If it could, it is yours.\n\n\
+                     Leave the rest. A rule you can only apply by knowing what else is in \
+                     the codebase — layers, dependency injection, use cases, repositories, \
+                     routes, presenters, container scope, caching — belongs to the \
+                     architecture reviewer reading the same diff, and so does the design of \
+                     the change itself.\n\n\
+                     Report findings only. Don't change code, don't commit, don't push. \
+                     File, line, the rule file you are applying by name, and the line that \
+                     breaks it. If there is nothing to report, say so in one line."
+                ),
+            ),
+            (
+                "architecture",
+                format!(
+                    "You are reviewing the branch in this repo against `{base}` for how it \
+                     is put together. Run `git fetch origin --quiet` first: the local base \
+                     branch is often days behind, and diffing against it reports hundreds of \
+                     files that aren't in this branch at all.\n\n\
+                     Two things.\n\n\
+                     1. The architecture rules. Read every rule in \
+                     `ai-context/code-style/*.md` and apply the ones you can only judge by \
+                     knowing what else is in the codebase: which layer may depend on which, \
+                     dependency injection, use cases and repositories, what a route is \
+                     allowed to do, where component state lives, container scope, caching, \
+                     reaching an abstraction through its namespace. The test is whether \
+                     enforcing the rule needs more than the file in front of you. Cite the \
+                     rule file by name.\n\n\
+                     2. The design, past what the rules say. Is this the right place for the \
+                     code? Does a new abstraction earn its keep, or does it wrap one call? \
+                     Is this already done somewhere else? Does a change in one package reach \
+                     into another's internals? Would the next person adding a feature here \
+                     have to repeat all of this? Read the code around the diff, not only the \
+                     diff: a change can be right line by line and still be in the wrong \
+                     package.\n\n\
+                     Formatting, naming, imports and comments are not yours — another \
+                     reviewer is reading the same diff for those.\n\n\
+                     Report findings only. Don't change code, don't commit, don't push. Be \
+                     specific: file, line, what is wrong, and what it costs later. If there \
+                     is nothing to report, say so in one line."
                 ),
             ),
             (
@@ -9917,7 +9971,8 @@ impl Storm {
         self.agent_cur = None;
         self.agent_list.scroll_to_end();
         self.start_reviewer_poll(cx);
-        self.show_flash("Two reviewers reading the branch…", cx);
+        let n = self.reviewers.len();
+        self.show_flash(&format!("{n} reviewers reading the branch…"), cx);
         cx.notify();
         true
     }
@@ -10081,7 +10136,7 @@ impl Storm {
              for a point that was fair but needed no edit — the code already did it, or it was a \
              remark rather than a request. Never write Took on a row that changed nothing. The \
              last column is one sentence: what \
-             changed, or why it didn't. Anything that wasn't either reviewer's point goes under \
+             changed, or why it didn't. Anything that was no reviewer's point goes under \
              `## Other`, as prose rather than a table. Title it \"Reviewers\"."
         );
         // the reports replace the waiting card
@@ -26154,8 +26209,10 @@ impl Storm {
          and carry on.\n\n\
          Have the branch read before you open it:\n\
          \x20 curl -s -X POST \"$TIDE_RPC/reviewers\" -H \"X-Tide-Token: $TIDE_TOKEN\"\n\
-         Those are the two reviewers ⌘K sends in, a slop cop and CodeRabbit, \
-         reading this branch against its base. They take a few minutes and \
+         Those are the four reviewers ⌘K sends in — a slop cop on the diff's \
+         footprint, one on house style, one on the architecture, and \
+         CodeRabbit — each reading this branch against its base in a session \
+         of its own. They take a few minutes and \
          their reports come back as your next message, so end the turn there \
          rather than waiting in a loop. Deal with what they found, then open \
          the pull request.\n\
@@ -26245,7 +26302,7 @@ impl Storm {
          Paths are repo-relative, as `git diff --name-only` prints them; add \
          `\"viewed\":false` to untick. TIDE mirrors it onto GitHub, so the PR page \
          agrees. Only when asked — never tick off files on your own.\n\n\
-         Two reviewers can run here, not only in CI.\n\
+         The review bots can run here, not only in CI.\n\
          CodeRabbit's CLI reviews the working tree:\n\
          \x20 coderabbit review --agent --base <base branch>\n\
          `--agent` prints structured findings; `--uncommitted` covers work in \

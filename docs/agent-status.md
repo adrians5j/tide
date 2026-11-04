@@ -158,10 +158,12 @@ Have the branch read before you open it:
 POST $TIDE_RPC/reviewers
 ```
 
-Those are the two reviewers ⌘K sends in, a slop cop and CodeRabbit, reading the
-branch against its base in sessions of their own. They take a few minutes and
-their reports arrive as your next message, so end the turn there rather than
-waiting in a loop. Deal with what they found, then open the PR.
+That is the four reviewers ⌘K sends in, each in a session of its own, reading
+the branch against its base: a slop cop on whether the diff's footprint matches
+what the branch says it does, one on house style, one on the architecture, and
+CodeRabbit. They take a few minutes and their reports arrive as your next
+message, so end the turn there rather than waiting in a loop. Deal with what
+they found, then open the PR.
 
 If you'd rather not wait, open it anyway. A PR turning up on a branch the
 reviewers haven't read sends them in by itself, and asks for the brief and the
