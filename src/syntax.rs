@@ -46,6 +46,15 @@ impl Highlighter {
             .collect()
     }
 
+    /// Highlight a file unless colouring it costs more than the colour is
+    /// worth: a big one, or one with a line long enough that syntect crawls
+    /// over it. No runs means the text draws in the default colour, which is
+    /// the right answer for a minified bundle.
+    pub fn highlight_guarded(&self, text: &str, path: &Path) -> Vec<Vec<Run>> {
+        let big = text.len() > 512 * 1024 || text.split('\n').take(4000).any(|l| l.len() > 2000);
+        if big { Vec::new() } else { self.highlight(text, path) }
+    }
+
     /// Highlight a whole file. Returns one Vec<Run> per line, parallel to the
     /// file's lines. Run byte-lengths sum to each line's byte length.
     pub fn highlight(&self, text: &str, path: &Path) -> Vec<Vec<Run>> {

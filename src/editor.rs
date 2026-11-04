@@ -2237,13 +2237,7 @@ fn resolve_import(dir: &Path, spec: &str) -> Option<PathBuf> {
 /// (multi-MB, or any line over ~2000 chars) — running syntect over a bundle in
 /// the load path would freeze the UI. Such files render unhighlighted.
 fn highlight_guarded(hl: &Highlighter, content: &str, path: &Path) -> Vec<Vec<(usize, u32)>> {
-    let big = content.len() > 512 * 1024
-        || content.split('\n').take(4000).any(|l| l.len() > 2000);
-    if big {
-        Vec::new()
-    } else {
-        hl.highlight(content, path)
-    }
+    hl.highlight_guarded(content, path)
 }
 
 /// Is `t` a single identifier token (non-empty, only word chars)? Gates the
@@ -2960,3 +2954,4 @@ mod comment_token_tests {
         assert_eq!(comment_token(None), "//"); // scratch buffer: assume code
     }
 }
+

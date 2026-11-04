@@ -1416,13 +1416,41 @@ fn check_box(checked: bool) -> Div {
 /// `old` Some → committed diff of `old` rev vs `new_rev` (defaulting to HEAD);
 /// `old` None → working-tree diff (HEAD vs the file on disk). Callers resolve
 /// the actual revs (merge-base, commit^, …) so this stays a plain git show.
+/// Why a file isn't drawn side by side, when it isn't.
+struct DiffBlocked {
+    /// The measurement that disqualified it.
+    why: String,
+    /// Whether the two sides differ at all, which is the one thing still worth
+    /// knowing about a file nobody is going to read line by line.
+    changed: bool,
+}
+
+/// The most characters of one line the diff draws. A pane sizes itself to its
+/// longest line and shapes that line as a single text run, so one long enough
+/// means a div wider than any screen and a run that takes seconds to lay out:
+/// `packages/cli-core/files/references.json` in webiny-js is 189,865
+/// characters on one line, and opening it stopped the window responding.
+const DIFF_MAX_COLS: usize = 2000;
+
+/// Whether this file is one to draw side by side at all. Generated files, lock
+/// files and minified bundles are written as one enormous line, and nobody
+/// reads them in a diff; what a reviewer wants from one is whether it changed.
+fn diff_blocked(old: &str, new: &str) -> Option<DiffBlocked> {
+    let widest = |s: &str| s.split('\n').map(|l| l.chars().count()).max().unwrap_or(0);
+    let cols = widest(old).max(widest(new));
+    (cols > DIFF_MAX_COLS).then(|| DiffBlocked {
+        why: format!("one line of {cols} characters"),
+        changed: old != new,
+    })
+}
+
 fn compute_diff(
     root: &Path,
     path: &Path,
     old: &Option<String>,
     new_rev: &Option<String>,
     hl: &Highlighter,
-) -> (Vec<DiffRow>, Vec<Vec<Run>>, Vec<Vec<Run>>) {
+) -> (Vec<DiffRow>, Vec<Vec<Run>>, Vec<Vec<Run>>, Option<DiffBlocked>) {
     let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
     let (old, new) = match old {
         Some(o) => (
@@ -1435,10 +1463,15 @@ fn compute_diff(
     // share the same character positions
     let old = old.replace('\t', "    ");
     let new = new.replace('\t', "    ");
+    // before any of the work: diffing and highlighting a file like this costs
+    // as much as drawing it, and all of it is wasted
+    if let Some(blocked) = diff_blocked(&old, &new) {
+        return (Vec::new(), Vec::new(), Vec::new(), Some(blocked));
+    }
     let rows = diff::compute(&old, &new);
-    let left_styles = hl.highlight(&old, path);
-    let right_styles = hl.highlight(&new, path);
-    (rows, left_styles, right_styles)
+    let left_styles = hl.highlight_guarded(&old, path);
+    let right_styles = hl.highlight_guarded(&new, path);
+    (rows, left_styles, right_styles, None)
 }
 
 /// The scrollable side-by-side diff body. Columns are sized to the longest line
@@ -1594,7 +1627,12 @@ fn diff_row_sel(sel: Option<&DiffSel>, side: DiffSide, r: usize, len: usize) -> 
 /// half of `avail_w` (so they read 50/50 when content fits).
 /// Display width (px) of one diff side: longest line, plus gutter + padding.
 fn diff_side_w(rows: &[DiffRow], char_w: f32, side: DiffSide) -> f32 {
-    let max = rows.iter().map(|r| diff_side_text(r, side).chars().count()).max().unwrap_or(0);
+    let max = rows
+        .iter()
+        .map(|r| diff_side_text(r, side).chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(DIFF_MAX_COLS);
     44.0 + 16.0 + max as f32 * char_w
 }
 
@@ -1694,8 +1732,16 @@ fn diff_pane(
             DiffSide::Left => row.left_no,
             DiffSide::Right => row.right_no,
         };
-        let text = diff_side_text(row, side);
-        let nchars = text.chars().count();
+        // `diff_blocked` keeps a file of long lines out of this window
+        // altogether; this is what stops one that got past it freezing the
+        // frame. Styles are empty at this length (the highlighter has the same
+        // ceiling), so there are no runs left pointing past the cut.
+        let mut text = diff_side_text(row, side);
+        let mut nchars = text.chars().count();
+        if nchars > DIFF_MAX_COLS {
+            text = text.chars().take(DIFF_MAX_COLS).collect();
+            nchars = DIFF_MAX_COLS;
+        }
         // background spans: search matches first, selection last (so it wins)
         let mut spans: Vec<(usize, usize, u32)> = Vec::new();
         for (mi, (ms, mr, cs, ce)) in matches.iter().enumerate() {
@@ -36459,6 +36505,9 @@ struct DiffWindow {
     old: Option<String>,
     new_rev: Option<String>,
     rows: Vec<DiffRow>,
+    /// Set when the file is one the diff refuses to draw; the body becomes a
+    /// card saying so instead of two panes.
+    blocked: Option<DiffBlocked>,
     focus: FocusHandle,
     focused: bool,
     left_scroll: ScrollHandle,
@@ -36541,7 +36590,8 @@ impl DiffWindow {
         if !filter_text.trim().is_empty() {
             filter.set(filter_text);
         }
-        let (rows, left_styles, right_styles) = compute_diff(&root, &files[idx], &old, &new_rev, &hl);
+        let (rows, left_styles, right_styles, blocked) =
+            compute_diff(&root, &files[idx], &old, &new_rev, &hl);
         // blink the text caret
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_millis(530)).await;
@@ -36572,6 +36622,7 @@ impl DiffWindow {
             old,
             new_rev,
             rows,
+            blocked,
             focus: cx.focus_handle(),
             focused: false,
             left_scroll: ScrollHandle::new(),
@@ -37003,10 +37054,12 @@ impl DiffWindow {
     fn goto(&mut self, idx: usize, cx: &mut Context<Self>) {
         if idx < self.files.len() {
             self.idx = idx;
-            let (rows, ls, rs) = compute_diff(&self.root, &self.files[idx], &self.old, &self.new_rev, &self.hl);
+            let (rows, ls, rs, blocked) =
+                compute_diff(&self.root, &self.files[idx], &self.old, &self.new_rev, &self.hl);
             self.rows = rows;
             self.left_styles = ls;
             self.right_styles = rs;
+            self.blocked = blocked;
             self.sel = None;
             self.caret = None;
             self.pending_scroll = true; // jump to the first change in the new file
@@ -37403,12 +37456,16 @@ impl Render for DiffWindow {
                     .on_click(cx.listener(|this, _e, _w, cx| this.goto_step(true, cx))),
             )
             .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(pos))
-            .child(div().flex_grow(1.0).text_color(rgb(TEXT)).text_size(px(12.)).child(rel))
+            .child(div().flex_grow(1.0).text_color(rgb(TEXT)).text_size(px(12.)).child(rel.clone()))
             .child(
                 div()
                     .text_size(px(11.))
                     .text_color(rgb(MUTED))
-                    .child(format!("{} difference{}", diffs, if diffs == 1 { "" } else { "s" })),
+                    .child(match &self.blocked {
+                        Some(b) if b.changed => "changed · not drawn".to_string(),
+                        Some(_) => "identical · not drawn".to_string(),
+                        None => format!("{} difference{}", diffs, if diffs == 1 { "" } else { "s" }),
+                    }),
             )
             .child(
                 // the review-comment affordance isn't discoverable otherwise
@@ -37556,14 +37613,58 @@ impl Render for DiffWindow {
             );
         // explicit pixel widths (flex_grow split was unreliable — a pane's content
         // min-width leaked through and skewed the ratio); `lw`/`rw` above.
-        let body = div()
-            .flex()
-            .flex_row()
-            .flex_grow(1.0)
-            .min_h(px(0.))
-            .child(div().w(px(lw)).h_full().flex_shrink_0().overflow_hidden().child(left_pane))
-            .child(divider)
-            .child(div().w(px(rw)).h_full().flex_shrink_0().overflow_hidden().child(right_pane));
+        let body = match &self.blocked {
+            // a card in place of the panes: the file is still walked past with
+            // the arrows and still ticked off as viewed, it just isn't drawn
+            Some(b) => div()
+                .flex()
+                .flex_grow(1.0)
+                .min_h(px(0.))
+                .items_center()
+                .justify_center()
+                .bg(rgb(BG))
+                .child(
+                    div()
+                        .max_w(px(520.))
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .px_4()
+                        .py_3()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(PANEL_BG))
+                        .child(div().text_size(px(13.)).text_color(rgb(TEXT)).child(rel))
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(rgb(MUTED))
+                                .child(format!("Not drawn: {}.", b.why)),
+                        )
+                        .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(
+                            "Generated, minified or a lock file. A diff pane is as wide as its \
+                             longest line, so drawing this one takes the window with it.",
+                        ))
+                        .child(div().text_size(px(12.)).text_color(rgb(TEXT)).child(
+                            if b.changed { "It changed in this diff." } else { "Both sides are identical." },
+                        ))
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(LINE_NUMBER))
+                                .child("F4 opens it in the editor, which wraps the line and draws only what fits."),
+                        ),
+                ),
+            None => div()
+                .flex()
+                .flex_row()
+                .flex_grow(1.0)
+                .min_h(px(0.))
+                .child(div().w(px(lw)).h_full().flex_shrink_0().overflow_hidden().child(left_pane))
+                .child(divider)
+                .child(div().w(px(rw)).h_full().flex_shrink_0().overflow_hidden().child(right_pane)),
+        };
 
         // file-tree sidebar (only for a multi-file diff): collapsible directories,
         // click a file to jump to it, current file highlighted
@@ -39543,6 +39644,51 @@ mod review_persist_tests {
 
 
 
+
+#[cfg(test)]
+mod diff_guard_tests {
+    use super::*;
+
+    /// A generated file is written as one enormous line, and a diff pane sizes
+    /// itself to its longest line. `packages/cli-core/files/references.json` in
+    /// webiny-js is 189,865 characters on one line, and opening it stopped the
+    /// window responding.
+    #[test]
+    fn one_enormous_line_is_not_drawn() {
+        let minified = format!("{{\"a\":\"{}\"}}", "x".repeat(DIFF_MAX_COLS));
+        let same = diff_blocked(&minified, &minified).expect("not drawn");
+        assert!(same.why.starts_with("one line of"), "{}", same.why);
+        assert!(!same.changed, "the same text on both sides has not changed");
+        // the one thing still worth knowing about a file nobody will read
+        assert!(diff_blocked(&minified, "{}").expect("not drawn").changed);
+    }
+
+    /// Ordinary source is drawn, however many lines of it there are: the cap is
+    /// on the length of a line, not on the size of a file.
+    #[test]
+    fn ordinary_source_still_draws() {
+        let file = "fn main() {\n    println!(\"hello\");\n}\n".repeat(20_000);
+        assert!(file.len() > 512 * 1024);
+        assert!(diff_blocked(&file, &file).is_none());
+        assert!(diff_blocked("", "").is_none());
+    }
+
+    /// Whatever gets past the guard, the pane is never sized to it. 189,865
+    /// characters at 8px each is a div 1.5 million pixels across.
+    #[test]
+    fn a_pane_is_never_wider_than_the_cap() {
+        let row = DiffRow {
+            left_no: Some(1),
+            right_no: Some(1),
+            left: Some("y".repeat(189_865)),
+            right: Some(String::new()),
+            kind: DiffKind::Equal,
+        };
+        let wide = diff_side_w(std::slice::from_ref(&row), 8.0, DiffSide::Left);
+        assert_eq!(wide, 44.0 + 16.0 + DIFF_MAX_COLS as f32 * 8.0);
+        assert!(wide < 17_000.0, "{wide}");
+    }
+}
 
 #[cfg(test)]
 mod md_image_tests {
