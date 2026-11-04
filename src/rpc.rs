@@ -252,6 +252,8 @@ pub struct Server {
     /// Set by `/refresh`: something changed that TIDE should re-read (a PR was
     /// opened, a branch switched).
     refresh: Arc<AtomicBool>,
+    /// Set by `/reviewers`: send the reviewers in, the same as ⌘K does.
+    reviewers: Arc<AtomicBool>,
     /// Workspace titles posted to `/title`; TIDE decides whether to take one.
     titles: Arc<Mutex<Vec<Title>>>,
     /// Viewed-state batches posted to `/viewed`, applied to the PR pane.
@@ -282,6 +284,7 @@ impl Server {
         let replies: Arc<Mutex<Vec<Reply>>> = Arc::new(Mutex::new(Vec::new()));
         let dirty = Arc::new(AtomicBool::new(false));
         let refresh = Arc::new(AtomicBool::new(false));
+        let reviewers = Arc::new(AtomicBool::new(false));
         let titles = Arc::new(Mutex::new(Vec::new()));
         let viewed = Arc::new(Mutex::new(Vec::new()));
         let info = Arc::new(Mutex::new("{}".to_string()));
@@ -293,8 +296,9 @@ impl Server {
         {
             let (queue, replies, dirty, token) =
                 (queue.clone(), replies.clone(), dirty.clone(), token.clone());
-            let (refresh, titles, viewed, info, todos, shots, summaries, tours, briefs) = (
+            let (refresh, reviewers, titles, viewed, info, todos, shots, summaries, tours, briefs) = (
                 refresh.clone(),
+                reviewers.clone(),
                 titles.clone(),
                 viewed.clone(),
                 info.clone(),
@@ -310,8 +314,8 @@ impl Server {
                     // can't block the next one for more than the read timeout
                     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
                     handle(
-                        stream, &token, &queue, &replies, &dirty, &refresh, &titles, &viewed,
-                        &info, &todos, &shots, &summaries, &tours, &briefs,
+                        stream, &token, &queue, &replies, &dirty, &refresh, &reviewers, &titles,
+                        &viewed, &info, &todos, &shots, &summaries, &tours, &briefs,
                     );
                 }
             });
@@ -323,6 +327,7 @@ impl Server {
             replies,
             dirty,
             refresh,
+            reviewers,
             titles,
             viewed,
             info,
@@ -398,6 +403,11 @@ impl Server {
         self.refresh.swap(false, Ordering::Relaxed)
     }
 
+    /// True once since the last call if an agent asked for the reviewers.
+    pub fn take_reviewers(&self) -> bool {
+        self.reviewers.swap(false, Ordering::Relaxed)
+    }
+
     pub fn url(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
     }
@@ -410,6 +420,7 @@ fn handle(
     replies: &Mutex<Vec<Reply>>,
     dirty: &AtomicBool,
     refresh: &AtomicBool,
+    reviewers: &AtomicBool,
     titles: &Mutex<Vec<Title>>,
     viewed: &Mutex<Vec<Viewed>>,
     info: &Mutex<String>,
@@ -675,6 +686,14 @@ fn handle(
     // TIDE re-reads its own state rather than waiting for the next poll or ⌘R.
     if path == "/refresh" {
         refresh.store(true, Ordering::Relaxed);
+        dirty.store(true, Ordering::Relaxed);
+        respond(&mut stream, 200, "{\"ok\":true}");
+        return;
+    }
+    // "read this branch before I open a PR for it" — the same two reviewers
+    // ⌘K sends in, started from the session rather than from the menu.
+    if path == "/reviewers" {
+        reviewers.store(true, Ordering::Relaxed);
         dirty.store(true, Ordering::Relaxed);
         respond(&mut stream, 200, "{\"ok\":true}");
         return;
@@ -2664,6 +2683,13 @@ mod tests {
         // /refresh is a bare signal: it carries no body and latches once
         assert!(!s.take_refresh());
         assert!(post(s.port, "/refresh", Some("tok"), "").starts_with("HTTP/1.1 200"));
+        // /reviewers is the other one: a session asking for the two reviewers
+        // before it opens a pull request
+        assert!(!s.take_reviewers());
+        assert!(post(s.port, "/reviewers", Some("tok"), "").starts_with("HTTP/1.1 200"));
+        assert!(s.take_reviewers());
+        assert!(!s.take_reviewers(), "the flag is consumed by the first read");
+        assert!(post(s.port, "/reviewers", None, "").starts_with("HTTP/1.1 403"));
         // a title is queued for TIDE to accept or ignore
         assert!(post(s.port, "/title", Some("tok"), "{\"title\":\"  SQL date bug \"}")
             .starts_with("HTTP/1.1 200"));

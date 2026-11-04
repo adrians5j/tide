@@ -4425,16 +4425,23 @@ fn pr_body_from(v: &serde_json::Value) -> Option<(String, String, PrDoc)> {
     Some((format!("PR #{number}.md"), doc, meta))
 }
 
-/// Which pull request, if any, to put on screen after a read of the branch's
-/// link. `asked` is set only by an agent's own `/refresh`; `had` and `now` are
-/// the PR numbers before and after that read.
+/// A pull request this branch didn't have a moment ago, or `None`. `had` and
+/// `now` are the numbers before and after a read of the branch's link.
 ///
-/// The number has to have changed. A branch's PR is read again on every
-/// refresh, and an agent in a long turn refreshes repeatedly, so opening on
-/// "there is a PR" would drag the reader onto that tab over and over and
-/// reopen one they had closed on purpose.
-fn pr_tab_to_open(asked: bool, had: Option<u64>, now: Option<u64>) -> Option<u64> {
-    now.filter(|_| asked).filter(|n| Some(*n) != had)
+/// `asked` is an agent's own `/refresh` saying it just did something
+/// git-visible, which is almost always `gh pr create`. `knew_none` is TIDE
+/// having looked this branch up before and been told it had no pull request,
+/// which is what separates one opened by hand a moment ago from one that has
+/// been there all along and is only being read for the first time this
+/// session. Without either, finding a pull request is not news.
+///
+/// The number has to have changed, too. A branch's pull request is read again
+/// on every refresh, and an agent in a long turn refreshes repeatedly, so
+/// acting on "there is a pull request" would drag the reader onto that tab over
+/// and over, reopen one they closed on purpose, and ask for a second brief and
+/// a second review each time.
+fn pr_just_opened(asked: bool, knew_none: bool, had: Option<u64>, now: Option<u64>) -> Option<u64> {
+    now.filter(|_| asked || knew_none).filter(|n| Some(*n) != had)
 }
 
 /// What TIDE says to the agent after a merge. The title and base are there so
@@ -9717,15 +9724,25 @@ impl Storm {
     /// Start the reviewers: one session per reviewer, in parallel, each with its
     /// own brief. They report into the main thread when the last one finishes.
     fn run_reviewers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.start_reviewers(cx) {
+            self.focus_agent(window, cx);
+        }
+    }
+
+    /// Send the reviewers in. `true` when they actually started: the menu
+    /// follows that with the agent pane, and the automatic paths (an agent
+    /// asking through `/reviewers`, a pull request appearing) have no window to
+    /// focus and just want to know whether it took.
+    fn start_reviewers(&mut self, cx: &mut Context<Self>) -> bool {
         if self.reviewers.iter().any(|r| !r.done) {
             self.show_flash("The reviewers are still working", cx);
-            return;
+            return false;
         }
         // two more sessions is the most expensive thing on this menu, so it
         // waits out a spent window like anything else
         if let Some(why) = self.usage_block() {
             self.show_flash(&format!("{why}. Send anyway from the composer."), cx);
-            return;
+            return false;
         }
         // last round's tabs go when a new one starts
         for r in self.reviewers.drain(..) {
@@ -9775,7 +9792,7 @@ impl Storm {
             let Some(acp) = acp::Acp::new(&self.root, self.rpc_env()) else {
                 self.show_flash("Can't start a reviewer — is `npx` (Node 22+) on PATH?", cx);
                 self.reviewers.clear();
-                return;
+                return false;
             };
             self.reviewers.push(Reviewer {
                 name,
@@ -9796,8 +9813,8 @@ impl Storm {
         self.agent_list.scroll_to_end();
         self.start_reviewer_poll(cx);
         self.show_flash("Two reviewers reading the branch…", cx);
-        self.focus_agent(window, cx);
         cx.notify();
+        true
     }
 
     /// Stop a review in flight: kill both adapters, drop the card, and keep
@@ -10349,15 +10366,21 @@ impl Storm {
                             cx.notify();
                         }
                     }
+                    if this.agent_rpc.as_ref().is_some_and(|s| s.take_reviewers()) {
+                        this.start_reviewers(cx);
+                    }
                     if refresh {
                         // an agent opened a PR or switched branch: re-read now
                         // instead of waiting for ⌘R
-                        this.pr_link_branch.clear(); // forces the git poll to re-query
                         // the usual reason an agent calls this is that it just
                         // opened the PR, and the body is what you'd go looking
                         // for next
                         this.pr_show_new = true;
                         this.refresh_pr_link(cx);
+                        // after it, not before: `refresh_pr_link` reads this to
+                        // tell a pull request that has just been opened from one
+                        // it is seeing for the first time
+                        this.pr_link_branch.clear(); // forces the git poll to re-query
                         this.load_pr(cx);
                         // and any PR body open in a tab — an agent that rewrites
                         // the description is the common case for this call, and
@@ -13517,6 +13540,10 @@ impl Storm {
     fn refresh_pr_link(&mut self, cx: &mut Context<Self>) {
         let root = self.root.clone();
         let branch = self.branch.clone();
+        // read before the lookup replaces it: a branch TIDE has already asked
+        // about and been told has no pull request
+        let knew_none =
+            !branch.is_empty() && self.pr_link.is_none() && self.pr_link_branch == branch;
         cx.spawn(async move |this, cx| {
             let fetch_branch = branch.clone();
             let link = cx
@@ -13532,8 +13559,10 @@ impl Storm {
                 // repeat refreshes during a long turn don't keep dragging you
                 // back onto a tab you read once, or reopen one you closed.
                 let now = this.pr_link.as_ref().map(|l| l.0);
-                if let Some(n) = pr_tab_to_open(std::mem::take(&mut this.pr_show_new), had, now) {
+                let asked = std::mem::take(&mut this.pr_show_new);
+                if let Some(n) = pr_just_opened(asked, knew_none, had, now) {
                     this.open_pr_number(Some(n), cx);
+                    this.on_pr_opened(n, cx);
                 }
                 // the base only becomes knowable once the PR answers, so this
                 // rides behind it rather than running in parallel
@@ -14248,6 +14277,32 @@ impl Storm {
             self.md_focus_pending = true;
         }
         cx.notify();
+    }
+
+    /// A pull request that has just been opened for this branch. The two
+    /// things that otherwise wait for a button happen by themselves: the brief
+    /// and the code tour are written, and the reviewers are sent in.
+    ///
+    /// Both halves are skipped when they have already been done, so a session
+    /// that asked for the reviewers before opening the pull request (the
+    /// `/reviewers` call) doesn't get a second round, and a pull request whose
+    /// brief is already on disk isn't written again.
+    ///
+    /// Order matters: the explanation is queued behind whatever turn opened the
+    /// pull request, and `send_agent_prompt_by` refuses to send while the
+    /// reviewers are reading, so it has to go first.
+    fn on_pr_opened(&mut self, number: u64, cx: &mut Context<Self>) {
+        // `review_base` and not `pr_base`: the PR's own file list is still
+        // loading at this point, and the link that just answered already knows
+        // which branch it is against
+        let base = self.review_base();
+        if brief_cached(number).is_none() {
+            self.explain_pr(number, base, false, cx);
+        }
+        self.reviewed = reviewed_all(&self.root);
+        if self.reviewed_branch(&self.branch.clone()).is_none() {
+            self.start_reviewers(cx);
+        }
     }
 
     /// Load the PR's changed files (base..HEAD) off the main thread.
@@ -25972,6 +26027,17 @@ impl Storm {
          happy to have reviewed. Don't stop to ask whether I want a PR; I'd \
          rather close one than wait for it. Push the branch and open it, say so, \
          and carry on.\n\n\
+         Have the branch read before you open it:\n\
+         \x20 curl -s -X POST \"$TIDE_RPC/reviewers\" -H \"X-Tide-Token: $TIDE_TOKEN\"\n\
+         Those are the two reviewers ⌘K sends in, a slop cop and CodeRabbit, \
+         reading this branch against its base. They take a few minutes and \
+         their reports come back as your next message, so end the turn there \
+         rather than waiting in a loop. Deal with what they found, then open \
+         the pull request.\n\
+         If you'd rather not wait, open it anyway. A pull request turning up \
+         on a branch the reviewers haven't read sends them in by itself, and \
+         asks for the brief and the code tour at the same time, so none of \
+         the three is something to ask me about.\n\n\
          Never merge a pull request into its base. Push your work to the PR's \
          own branch, say it is ready, and leave the merge button to me — \
          however green the checks are, that press is mine and I ask for it in \
@@ -40904,31 +40970,40 @@ mod pr_auto_open_tests {
     /// The case this exists for: an agent pushed a branch and opened a PR, and
     /// the refresh it sends afterwards is the first TIDE hears of #5996.
     #[test]
-    fn a_pr_that_just_appeared_opens() {
-        assert_eq!(pr_tab_to_open(true, None, Some(5996)), Some(5996));
+    fn a_pr_that_just_appeared_counts() {
+        assert_eq!(pr_just_opened(true, false, None, Some(5996)), Some(5996));
         // ...and a different PR on a branch that had one before
-        assert_eq!(pr_tab_to_open(true, Some(5981), Some(5996)), Some(5996));
+        assert_eq!(pr_just_opened(true, false, Some(5981), Some(5996)), Some(5996));
     }
 
     /// Refreshing again mid-turn must not keep yanking the reader onto the tab,
-    /// or reopen one they closed.
+    /// reopen one they closed, or ask for a second brief and a second review.
     #[test]
-    fn the_same_pr_twice_opens_nothing() {
-        assert_eq!(pr_tab_to_open(true, Some(5996), Some(5996)), None);
+    fn the_same_pr_twice_counts_once() {
+        assert_eq!(pr_just_opened(true, false, Some(5996), Some(5996)), None);
+        assert_eq!(pr_just_opened(true, true, Some(5996), Some(5996)), None);
     }
 
-    /// ⌘R and the git poll read the same link; neither is a request to open
-    /// anything.
+    /// A pull request read for the first time this session is not news. TIDE
+    /// had never asked about this branch, so it has nothing to say about when
+    /// the pull request was opened — opening a workspace is not opening a PR.
     #[test]
-    fn only_an_agents_refresh_opens_a_tab() {
-        assert_eq!(pr_tab_to_open(false, None, Some(5996)), None);
+    fn one_that_was_already_there_is_not_news() {
+        assert_eq!(pr_just_opened(false, false, None, Some(5996)), None);
     }
 
-    /// A branch with no PR, and a PR that went away, both open nothing.
+    /// One opened by hand, in a terminal: TIDE asked about this branch, was
+    /// told it had no pull request, and now it has one.
     #[test]
-    fn nothing_to_open_is_not_an_error() {
-        assert_eq!(pr_tab_to_open(true, None, None), None);
-        assert_eq!(pr_tab_to_open(true, Some(5996), None), None);
+    fn one_opened_by_hand_counts_too() {
+        assert_eq!(pr_just_opened(false, true, None, Some(5996)), Some(5996));
+    }
+
+    /// A branch with no PR, and a PR that went away, are both nothing.
+    #[test]
+    fn nothing_there_is_not_an_error() {
+        assert_eq!(pr_just_opened(true, true, None, None), None);
+        assert_eq!(pr_just_opened(true, true, Some(5996), None), None);
     }
 }
 

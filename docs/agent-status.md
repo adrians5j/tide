@@ -152,6 +152,21 @@ Open the PR yourself when the work is worth one — a feature that holds togethe
 a fix with its tests, a round of changes worth reviewing. Don't stop to ask
 first: a PR is cheaper to close than to wait for.
 
+Have the branch read before you open it:
+
+```
+POST $TIDE_RPC/reviewers
+```
+
+Those are the two reviewers ⌘K sends in, a slop cop and CodeRabbit, reading the
+branch against its base in sessions of their own. They take a few minutes and
+their reports arrive as your next message, so end the turn there rather than
+waiting in a loop. Deal with what they found, then open the PR.
+
+If you'd rather not wait, open it anyway. A PR turning up on a branch the
+reviewers haven't read sends them in by itself, and asks for the brief and the
+code tour at the same time.
+
 A PR body is about the code, not about who said what. No names, no "the client",
 no "as discussed", nothing about who noticed or reported it. Say what was wrong,
 what it affected and what changed: "Sven noticed the dropdown closes on scroll"
