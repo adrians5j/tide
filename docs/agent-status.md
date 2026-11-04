@@ -158,15 +158,22 @@ what it affected and what changed: "Sven noticed the dropdown closes on scroll"
 is "the dropdown closed on scroll". The conversation that led to the work is
 private to it; the PR outlives it and is read by people who weren't there.
 
-Pictures in a PR body live in the repo: commit them under
-`.github/pr-assets/<pr number>/` and link the raw URL pinned to the commit that
-added them, `raw.githubusercontent.com/<owner>/<repo>/<sha>/...`. A link through
-the branch name dies when the branch is deleted after the merge, which is when
-someone is most likely reading the PR again.
+Pictures and video in a PR body are uploaded rather than committed:
 
-GitHub's own uploader is for comments. A body you rewrite loses its images every
-time, and `gh` has no way to upload to one: that endpoint belongs to the web UI,
-not the API.
+```
+gh pr edit <n> --body-file body.md --attach './before.png#The dead override'
+```
+
+`--attach` uploads the file and rewrites the body's `![alt](./before.png)` to
+the uploaded URL, so the body is written against local paths and the upload
+sorts the links out. A file the body never references is appended to the end.
+The flag repeats, up to 50 files, and paths inside a `--body-file` resolve
+against that file's folder. It needs `gh` 2.99 or newer.
+
+The uploaded URL lives on GitHub, not in the repo, and is permanent, so a later
+rewrite of the body is safe as long as the new body still carries it. Nothing
+goes under `.github/pr-assets/` any more; the pinned-sha links in PRs that
+already have them still work.
 
 Never use git worktrees. Each TIDE workspace is already its own checkout, and a
 worktree inside one puts the work somewhere nothing in TIDE is looking — not the

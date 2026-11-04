@@ -2323,6 +2323,9 @@ enum MdImg {
     /// when the bytes land.
     Loading,
     Ready(Arc<gpui::Image>, Option<(f32, f32)>),
+    /// A video rather than a picture. GitHub draws a player for an attached
+    /// MP4 in a PR body, so one turns up wherever screenshots do.
+    Video,
     /// Gone, unreachable, or not an image. The alt text stands in, which is
     /// what alt text is for.
     Failed,
@@ -2391,6 +2394,28 @@ fn img_format(b: &[u8]) -> Option<gpui::ImageFormat> {
     })
 }
 
+/// Whether a URL serves a video. Asked before the bytes are fetched, because
+/// a GitHub attachment carries no extension to go on
+/// (`github.com/user-attachments/assets/<uuid>`) and a 100 MB MP4 is not
+/// worth downloading to find out what it is.
+fn remote_is_video(src: &str) -> bool {
+    Command::new("curl")
+        .args(["-sIL", "--max-time", "10", src])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase())
+        .is_some_and(|h| {
+            h.lines().any(|l| l.starts_with("content-type:") && l.contains("video/"))
+        })
+}
+
+/// Whether these bytes are a video container: the `ftyp` box an MP4 or a MOV
+/// opens with, or Matroska's EBML header, which WebM is.
+fn is_video_bytes(b: &[u8]) -> bool {
+    b.get(4..8) == Some(b"ftyp") || b.starts_with(&[0x1a, 0x45, 0xdf, 0xa3])
+}
+
 /// Files TIDE opens as a picture rather than trying to read as text. The list
 /// is what `img_format` can actually decode: anything else still opens in the
 /// editor, which is right for an SVG and honest for the rest.
@@ -2434,6 +2459,9 @@ fn md_img_load(src: &str, base: Option<&Path>) -> MdImg {
         match cached {
             Some(b) => b,
             None => {
+                if remote_is_video(src) {
+                    return MdImg::Video;
+                }
                 let out = Command::new("curl")
                     .args(["-sL", "--max-time", "20", "--max-filesize", "12000000", src])
                     .output()
@@ -2463,7 +2491,9 @@ fn md_img_load(src: &str, base: Option<&Path>) -> MdImg {
     if bytes.is_empty() || bytes.len() > MAX {
         return MdImg::Failed;
     }
-    let Some(format) = img_format(&bytes) else { return MdImg::Failed };
+    let Some(format) = img_format(&bytes) else {
+        return if is_video_bytes(&bytes) { MdImg::Video } else { MdImg::Failed };
+    };
     let dims = image_size(&bytes).map(|(w, h)| (w as f32, h as f32));
     MdImg::Ready(Arc::new(gpui::Image::from_bytes(format, bytes)), dims)
 }
@@ -3223,8 +3253,9 @@ fn md_doc_w(text: &str, width: f32) -> Div {
 fn md_img_el(alt: &str, src: &str, max_w: f32, base: Option<PathBuf>) -> AnyElement {
     let state = md_img_cache().lock().ok().and_then(|c| match c.get(src) {
         Some(MdImg::Ready(img, dims)) => Some(Ok((img.clone(), *dims))),
-        Some(MdImg::Failed) => Some(Err(true)),
-        Some(MdImg::Loading) => Some(Err(false)),
+        Some(MdImg::Video) => Some(Err(MdImg::Video)),
+        Some(MdImg::Failed) => Some(Err(MdImg::Failed)),
+        Some(MdImg::Loading) => Some(Err(MdImg::Loading)),
         None => None,
     });
     let note = |text: String, colour: u32| {
@@ -3254,7 +3285,17 @@ fn md_img_el(alt: &str, src: &str, max_w: f32, base: Option<PathBuf>) -> AnyElem
                 .on_click(move |_e, _w, _cx| open_img(&want, base.as_deref()))
                 .into_any_element()
         }
-        Some(Err(true)) => note(
+        // nothing here plays video, so the chip hands it to whatever does
+        Some(Err(MdImg::Video)) => {
+            let want = src.to_string();
+            note(if alt.is_empty() { "video".into() } else { alt.to_string() }, TEXT)
+                .id(SharedString::from(format!("md-vid-{src}")))
+                .cursor_pointer()
+                .tooltip(tip("Click to play it"))
+                .on_click(move |_e, _w, _cx| open_browser(&want))
+                .into_any_element()
+        }
+        Some(Err(MdImg::Failed)) => note(
             if alt.is_empty() { format!("couldn't load {src}") } else { format!("{alt} (couldn't load)") },
             MUTED,
         )
@@ -25896,37 +25937,50 @@ impl Storm {
          checkout, and a worktree inside one puts work somewhere nothing here \
          is looking — not the tree, not the PR pane, not the reviewers. Branch \
          in place instead.\n\n\
-         Pictures in a PR body live in the repo: commit them under \
-         `.github/pr-assets/<pr number>/` and link the raw URL, pinned to the \
-         commit that added them:\n\
-         \x20 https://raw.githubusercontent.com/<owner>/<repo>/<sha>/.github/\
-         pr-assets/<n>/<file>.png\n\
-         The `<sha>` matters. A link through the branch name dies when the \
-         branch is deleted after the merge, which is exactly when someone reads \
-         the PR again; a commit sha is permanent. `git rev-parse HEAD` after \
-         committing the picture gives you the one to use.\n\
-         GitHub's own uploader is for comments: a body you will rewrite loses \
-         the images every time it is rewritten, and `gh` can't upload to one \
-         anyway — that endpoint is the web UI's, not the API's.\n\n\
+         Pictures and video in a PR body are uploaded, not committed. `gh` \
+         does the upload:\n\
+         \x20 gh pr edit <n> --body-file body.md --attach \
+         './before.png#The dead override'\n\
+         `--attach` uploads the file and rewrites the body's own \
+         `![alt](./before.png)` to the uploaded URL, so write the body \
+         against the local paths and let the upload sort the links out. A \
+         file the body never references is appended to the end instead. \
+         Repeat the flag once per file, up to 50 of them, and remember that \
+         paths inside a `--body-file` resolve against that file's folder. \
+         With no body flag at all the PR keeps the body it has and the \
+         attachment goes on the end, which is how you add a picture to a PR \
+         that is already open. `gh pr comment` and `gh issue \
+         create|edit|comment` take the same flag. It wants `gh` 2.99 or \
+         newer; if the flag isn't there, say the version is too old \
+         rather than quietly committing the file instead.\n\
+         The uploaded URL is permanent and lives on GitHub rather than in \
+         the repo, so rewriting the body later is safe as long as the new \
+         body still carries the URL: read what is there \
+         (`gh pr view <n> --json body`), edit that text, write it back. \
+         Don't commit screenshots or demo videos under `.github/pr-assets/` \
+         any more; the pinned-sha links already in merged PRs still work and \
+         are not yours to tidy up. GitHub's limits are 10 MB an image, 10 MB \
+         a video on a free plan and 100 MB on a paid one, and it takes PNG, \
+         GIF, JPEG, SVG, MP4, MOV and WebM.\n\n\
          Film anything a person can see or use: an admin screen, a form, a \
          flow, a component — if the change shows up in a browser, the PR gets \
          a video of it as well as the stills. The `demo-video` skill makes \
          one: a storyboard, agent-browser driving the real app, an MP4 with \
          the cursor, the zoom and the captions drawn on. Backend, infra, \
          refactors, CI and tests don't get one; there is nothing to watch.\n\
-         A PR body plays nothing but a GIF, so make one from the video and \
-         embed that:\n\
+         Attach the MP4 and embed a GIF of it above: the GIF plays by itself \
+         in the body, the video is there at full quality for anyone who \
+         wants a closer look.\n\
          \x20 ffmpeg -i out.mp4 -vf \"fps=12,scale=900:-1:flags=lanczos,\
          split[a][b];[a]palettegen=max_colors=160[p];[b][p]paletteuse=\
          dither=bayer\" -loop 0 demo.gif\n\
-         Commit the GIF and the MP4 under `.github/pr-assets/<pr number>/` \
-         with the pictures, embed the GIF the same way (`![demo](<raw url \
-         pinned to the sha>)`), and link the MP4 under it as the \
-         full-quality version. Keep the GIF under about 8 MB: drop to \
-         `fps=10,scale=800` or shorten the storyboard if it goes over. Don't \
-         write a `<video>` tag — GitHub strips it out of a body — and don't \
-         paste a bare `.mp4` URL expecting a player; it renders as a link \
-         that looks broken.\n\
+         Attach both (`--attach ./demo.gif --attach ./out.mp4`) and reference \
+         the GIF in the body with `![demo](./demo.gif)`. Keep the GIF under \
+         about 8 MB: drop to `fps=10,scale=800` or shorten the storyboard if \
+         it goes over. A video reference has to sit alone in its own \
+         paragraph for GitHub to draw a player; inside a sentence it comes \
+         out as a link. Don't write a `<video>` tag, which GitHub strips out \
+         of a body.\n\
          If you can't bring the app up to film it, say so in the PR rather \
          than quietly leaving the video out.\n\n\
          A PR body is about the code, not about who said what. Never write that \
@@ -26954,7 +27008,7 @@ impl Storm {
         self.prefetch_image(&key, path, cx);
         let state = md_img_cache().lock().ok().and_then(|c| match c.get(&key) {
             Some(MdImg::Ready(img, dims)) => Some(Ok((img.clone(), *dims))),
-            Some(MdImg::Failed) => Some(Err(true)),
+            Some(MdImg::Video) | Some(MdImg::Failed) => Some(Err(true)),
             Some(MdImg::Loading) => Some(Err(false)),
             None => None,
         });
@@ -39499,16 +39553,17 @@ mod md_image_tests {
     #[test]
     fn an_image_line_parses_as_an_image() {
         let body = "Before, with an override pointing at a dead localhost:3000:\n\n\
-                    ![before](https://raw.githubusercontent.com/webiny/webiny-js/abc123/.github/pr-assets/5966/before-override.png)\n";
+                    ![before](https://github.com/user-attachments/assets/af1d5a16-8556-4bd3-8d5b-079f77f86d33)\n";
         let rows = md_prepare(body);
         let imgs: Vec<_> = rows.iter().flat_map(|r| r.images.clone()).collect();
         assert_eq!(imgs.len(), 1);
         assert_eq!(imgs[0].0, "before");
-        assert!(imgs[0].1.ends_with("before-override.png"), "{}", imgs[0].1);
+        // an uploaded attachment's url ends in a uuid, with no extension on it
+        assert!(imgs[0].1.ends_with("079f77f86d33"), "{}", imgs[0].1);
         // and the markup is gone from the text rather than printed
         let text: String = rows.iter().map(|r| r.text.to_string()).collect::<Vec<_>>().join("\n");
         assert!(!text.contains("!["), "the literal markup survived: {text}");
-        assert!(!text.contains("raw.githubusercontent"), "the url survived: {text}");
+        assert!(!text.contains("user-attachments"), "the url survived: {text}");
     }
 
     /// A `*` inside a URL must not start a run of italics, and a title after
@@ -39552,6 +39607,23 @@ mod md_image_tests {
         // not an image at all
         std::fs::write(dir.join("a.png"), b"<!doctype html>").unwrap();
         assert!(matches!(md_img_load("a.png", Some(&dir)), MdImg::Failed));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A video attached to a PR body is not a broken picture. An MP4 and a
+    /// MOV open with an `ftyp` box four bytes in, a WebM with Matroska's EBML
+    /// header, and the loader says video rather than failing to decode one.
+    #[test]
+    fn a_video_is_told_apart_from_a_picture() {
+        assert!(is_video_bytes(b"\0\0\0\x20ftypisom\0\0\x02\0"));
+        assert!(is_video_bytes(&[0x1a, 0x45, 0xdf, 0xa3, 1, 0, 0, 0]));
+        assert!(!is_video_bytes(b"\x89PNG\r\n\x1a\n"));
+        assert!(!is_video_bytes(b"tiny"));
+
+        let dir = std::env::temp_dir().join(format!("tide-md-vid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("demo.mp4"), b"\0\0\0\x20ftypisom\0\0\x02\0mp41").unwrap();
+        assert!(matches!(md_img_load("./demo.mp4", Some(&dir)), MdImg::Video));
         std::fs::remove_dir_all(&dir).ok();
     }
 }
