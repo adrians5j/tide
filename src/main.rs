@@ -3034,6 +3034,108 @@ fn md_hang(row: &MdRow, inner: AnyElement) -> AnyElement {
         .into_any_element()
 }
 
+/// A fenced block that is a before/after reading, as its labelled lines.
+///
+/// The briefing asks for evidence rather than a description, and the shape that
+/// comes back is a fence of `before:` and `after:` lines. As a code block it is
+/// grey text in a grey box, which is the one thing in a reply nobody should
+/// have to hunt for. Both labels have to be there: one reading on its own is
+/// not a comparison, and a block of `key: value` lines is usually config.
+fn before_after(body: &str) -> Option<Vec<(String, String)>> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let (mut before, mut after) = (false, false);
+    for line in body.split('\n') {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (label, value) = line.split_once(':')?;
+        let label = label.trim();
+        // a label is a few words; past that it is a sentence that happens to
+        // have a colon in it, and this is the wrong shape for it
+        if label.is_empty() || label.chars().count() > 48 || label.contains('`') {
+            return None;
+        }
+        before |= label.eq_ignore_ascii_case("before");
+        after |= label.eq_ignore_ascii_case("after");
+        out.push((label.to_string(), value.trim().to_string()));
+    }
+    (before && after && out.len() <= 8).then_some(out)
+}
+
+/// A before/after block drawn as its own thing: the old reading tinted the way
+/// a removed line is in the diff, the new one the way an added line is, and any
+/// other labelled line under them as a plain note. Clicking copies the block,
+/// which is what the fence's own text selection was good for.
+fn md_before_after_el(lines: &[(String, String)], ix: usize, raw: &str) -> AnyElement {
+    let text = raw.to_string();
+    let n = lines.len();
+    let mut card = div()
+        .id(SharedString::from(format!("md-ba-{ix}")))
+        .my_2()
+        .flex()
+        .flex_col()
+        .rounded_md()
+        .overflow_hidden()
+        .border_1()
+        .border_color(rgb(BORDER))
+        .bg(rgb(PANEL_BG))
+        .cursor_pointer()
+        .tooltip(tip("Click to copy"))
+        .on_click(move |_e, _w, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
+        });
+    for (i, (label, value)) in lines.iter().enumerate() {
+        let side = match label.to_lowercase().as_str() {
+            "before" => Some((DIFF_REMOVE_BG, GIT_DELETED)),
+            "after" => Some((DIFF_ADD_BG, GIT_NEW)),
+            _ => None,
+        };
+        let value = div()
+            .flex_grow(1.0)
+            .min_w(px(0.))
+            .font_family("Menlo")
+            .text_size(px(12.5))
+            .text_color(rgb(TEXT))
+            .child(value.clone());
+        let row = div()
+            .flex()
+            .flex_row()
+            .items_start()
+            .gap_3()
+            .px_3()
+            .py_1p5()
+            .when(i + 1 < n, |d| d.border_b_1().border_color(rgb(BORDER)));
+        card = card.child(match side {
+            // the two readings line up, so the eye can run down one column
+            Some((bg, fg)) => row
+                .bg(rgb(bg))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .w(px(52.))
+                        .pt(px(1.))
+                        .text_size(px(10.))
+                        .text_color(rgb(fg))
+                        .child(label.to_lowercase()),
+                )
+                .child(value),
+            // a third line is a different kind of statement, not a third
+            // reading: it takes the whole width and no tint
+            None => row.child(
+                div()
+                    .flex_shrink_0()
+                    .pt(px(1.))
+                    .text_size(px(10.))
+                    .text_color(rgb(LINE_NUMBER))
+                    .child(format!("{label}:")),
+            )
+            .child(value),
+        });
+    }
+    card.into_any_element()
+}
+
 fn md_row_text(row: &MdRow, selected: Sel) -> Option<gpui::StyledText> {
     if row.gap || row.cells.is_some() || row.fence {
         return None;
@@ -3072,6 +3174,9 @@ fn md_row_el(row: &MdRow, selected: Sel) -> AnyElement {
         return el.into_any_element();
     }
     if row.fence {
+        if let Some(lines) = before_after(&row.text) {
+            return md_before_after_el(&lines, row.ix, &row.text);
+        }
         return div()
             .id(SharedString::from(format!("md-fence-{}-{}", row.ix, row.text.len())))
             .my_1()
@@ -26175,6 +26280,17 @@ impl Storm {
          a description that reads like a result. “The suite is green, but I \
          never reproduced the original bug” is worth more to me than a \
          confident sentence.\n\n\
+         A before and after goes in a fenced block, one reading a line, \
+         labelled:\n\
+         \x20 ```\n\
+         \x20 before: \"2 of 13 answered | rows shown: 13\"\n\
+         \x20 after:  \"2 of 13 answered | rows shown: 11\"\n\
+         \x20 ```\n\
+         TIDE draws that as a card, the old reading tinted like a removed \
+         line and the new one like an added line, so the two are read \
+         against each other instead of hunted for in a grey box. Keep the \
+         labels to `before` and `after`; a further line explaining what you \
+         did in between is fine and gets a row of its own.\n\n\
          Run the admin app locally with `wdev`, one word, no arguments. That \
          is the command here: don't reach for a yarn script or invent a dev \
          command of your own.\n\n\
@@ -39753,6 +39869,54 @@ mod diff_guard_tests {
         let wide = diff_side_w(std::slice::from_ref(&row), 8.0, DiffSide::Left);
         assert_eq!(wide, 44.0 + 16.0 + DIFF_MAX_COLS as f32 * 8.0);
         assert!(wide < 17_000.0, "{wide}");
+    }
+}
+
+#[cfg(test)]
+mod before_after_tests {
+    use super::*;
+
+    /// The shape the briefing asks for, as it arrives in a reply.
+    #[test]
+    fn two_readings_become_a_card() {
+        let got = before_after(
+            "before: \"2 of 13 answered | rows shown: 13\"\n\
+             after:  \"2 of 13 answered | rows shown: 11\"",
+        )
+        .expect("a before and an after");
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], ("before".into(), "\"2 of 13 answered | rows shown: 13\"".into()));
+        assert_eq!(got[1].0, "after");
+    }
+
+    /// The first colon splits the line, so a reading full of them is still one
+    /// value, and a line saying what happened in between gets a row of its own.
+    #[test]
+    fn a_reading_may_carry_colons_of_its_own() {
+        let got = before_after(
+            "before: \"0 of 13 answered | first item: At time of inspection\"\n\
+             after: \"5.3 | first: Date of last inspection\"\n\
+             answered one N/A, left and came back: \"3 of 13 answered\"",
+        )
+        .expect("a third line is allowed");
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].1, "\"0 of 13 answered | first item: At time of inspection\"");
+        assert_eq!(got[2].0, "answered one N/A, left and came back");
+    }
+
+    /// Everything else stays a code block. One reading is not a comparison, and
+    /// config, code and prose all carry colons.
+    #[test]
+    fn everything_else_stays_a_code_block() {
+        assert!(before_after("before: 13").is_none(), "one side is not a comparison");
+        assert!(before_after("port: 3000\nhost: localhost").is_none());
+        assert!(before_after("fn main() {\n    todo!()\n}").is_none());
+        assert!(before_after("").is_none());
+        // a sentence that happens to carry a colon is not a label
+        assert!(before_after(
+            "before: 1\nafter: 2\nI ran it again on a second machine to be sure of it: 3"
+        )
+        .is_none());
     }
 }
 
