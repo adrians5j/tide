@@ -15676,7 +15676,7 @@ impl Storm {
             self.rc_snippet = None;
         }
         self.rc_target = Some((path, a, b));
-        self.rc_query.multiline = true; // ↩ adds a line, ⌘↩ saves
+        self.rc_query.multiline = true; // ↩ adds a line, ⌘↩ asks
         self.rc_query.set(text);
         self.rc_open = true;
         self.sync_comment_gutters(cx); // reserve the space the box will sit in
@@ -15724,10 +15724,10 @@ impl Storm {
         }
         match ks.key.as_str() {
             "escape" => self.cancel_comment(window, cx),
-            // ⌘↩ commits; ⇧⌘↩ commits and sends it on to the agent without
-            // the stop in the queue. A bare ↩ is a newline (the field below).
+            // ⌘↩ sends it on to the agent now; ⇧⌘↩ writes it down and leaves
+            // it in the queue. A bare ↩ is a newline (the field below).
             "enter" if ks.modifiers.platform => {
-                self.commit_comment(ks.modifiers.shift, window, cx)
+                self.commit_comment(!ks.modifiers.shift, window, cx)
             }
             _ => {
                 if Self::text_comes_via_input_handler(ks) {
@@ -15778,14 +15778,16 @@ impl Storm {
         self.show_flash("Comment kept as draft", cx);
     }
 
-    /// Save the box and close it (⌘↩ / the primary button). In reply mode the
-    /// text becomes your turn in the thread and the comment goes back into the
-    /// send queue, so ⌥↩ carries the follow-up to the agent.
+    /// Write the box down and hand it to the agent (⌘↩ / the primary button),
+    /// so a question you want answered doesn't sit in the queue waiting for a
+    /// second keystroke. It takes the rest of the queue with it, because that
+    /// is what the send does and leaving half of it behind would be the
+    /// surprise.
     ///
-    /// `send` is ⇧⌘↩: the same thing, followed by the send, so a question you
-    /// want answered now doesn't sit in the queue waiting for a second
-    /// keystroke. It takes the rest of the queue with it, because that is what
-    /// the send does and leaving half of it behind would be the surprise.
+    /// Without `send` — ⇧⌘↩ — the box is written down and closed, and the
+    /// comment waits in the queue. In reply mode the text becomes your turn in
+    /// the thread and the comment goes back into the queue, so ⌥↩ carries the
+    /// follow-up to the agent.
     ///
     /// A send keeps the box open, cleared and back in thread mode. The answer
     /// is coming back into this thread, and closing the box means finding the
@@ -20648,7 +20650,7 @@ impl Storm {
                         div()
                             .text_size(px(10.))
                             .text_color(rgb(LINE_NUMBER))
-                            .child("⌘↩ save · ⇧⌘↩ ask now, answer lands here · ↩ newline · ⌘V image · esc close"),
+                            .child("⌘↩ ask now, answer lands here · ⇧⌘↩ queue it · ↩ newline · ⌘V image · esc close"),
                     ),
             )
             // the answers, read here rather than in the terminal transcript
@@ -20801,9 +20803,9 @@ impl Storm {
                             true,
                             false,
                         )
-                        .tooltip(tip("⌘↩  ·  ⇧⌘↩ asks the agent now and keeps this open"))
+                        .tooltip(tip("⌘↩ asks the agent now and keeps this open  ·  ⇧⌘↩ queues it"))
                         .on_click(cx.listener(|this, e: &gpui::ClickEvent, window, cx| {
-                            this.commit_comment(e.modifiers().shift, window, cx)
+                            this.commit_comment(!e.modifiers().shift, window, cx)
                         })),
                     )
                     // a thread that's been talked through is resolved, not deleted —
@@ -42046,7 +42048,7 @@ mod job_guess_tests {
     }
 }
 
-/// ⇧⌘↩ in a comment box asks the agent and keeps the box open, so the box has
+/// ⌘↩ in a comment box asks the agent and keeps the box open, so the box has
 /// to say which of three states the thread is in: still yours to edit, gone
 /// out and waiting, or answered.
 #[cfg(test)]
