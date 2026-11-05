@@ -35,6 +35,7 @@ mod narr;
 mod rpc;
 mod todo;
 mod usage;
+mod jobs;
 mod wshist;
 use rpc::AgentState;
 use diff::{DiffKind, DiffRow};
@@ -26032,7 +26033,20 @@ impl Storm {
                 }
                 self.agent_cur = None;
                 self.agent_cur_thought = None;
-                self.agent_msgs.push(AgentMsg::User { text, imgs: Vec::new(), by: Sender::You });
+                // the wire carries the page of instructions TIDE sent; the pane
+                // showed one line and folded the rest away, and that is only
+                // still true if TIDE wrote it down when it went out
+                let (text, job, by) = match jobs::recall(&text) {
+                    Some(s) => {
+                        let by = if s.by_tide { Sender::Tide } else { Sender::You };
+                        (s.label, (!s.job.is_empty()).then_some(s.job), by)
+                    }
+                    None => (text, None, Sender::You),
+                };
+                self.agent_msgs.push(AgentMsg::User { text, imgs: Vec::new(), by });
+                // a replayed job has no clock: nothing here knows how long it
+                // took, and `began: 0` is how the chip says so
+                self.mark_turn_at(job, 0);
             }
             Sessions(list) => {
                 self.agent_sessions = list;
@@ -26869,6 +26883,9 @@ impl Storm {
         let (imgs, kept) = split_images(self.agent_imgs.drain(..).collect());
         // the transcript shows your words; the wire carries the briefing too
         let shown = label.unwrap_or_else(|| text.clone());
+        // …and the adapter replays the wire, so how this reads in the pane is
+        // written down now or lost at the next restart
+        jobs::remember(&text, &shown, job.as_deref().unwrap_or_default(), by == Sender::Tide);
         let sent = if self.agent_briefed {
             text
         } else {
@@ -29094,6 +29111,12 @@ impl Storm {
     /// running is over, so a fold that was still growing stops here; and when
     /// this question came from a slide or a stop, its own working folds.
     fn mark_turn_start(&mut self, job: Option<String>) {
+        self.mark_turn_at(job, now_secs());
+    }
+
+    /// The same, for a turn being replayed rather than sent: `began` is 0,
+    /// which is how the job line knows it has no clock to show.
+    fn mark_turn_at(&mut self, job: Option<String>, began: u64) {
         let at = self.agent_msgs.len().saturating_sub(1);
         if let Some(q) = self.job_turns.last_mut().filter(|q| q.end.is_none()) {
             q.end = Some(at);
@@ -29108,8 +29131,10 @@ impl Storm {
                 end: None,
                 open: false,
                 job,
-                began: now_secs(),
-                took: None,
+                began,
+                // a replayed turn is over: it must not start counting up from
+                // the epoch the moment it lands
+                took: (began == 0).then_some(0),
             });
         }
     }
@@ -29214,6 +29239,8 @@ impl Storm {
         }
         let Queued { text, label, imgs, by, job } = self.agent_queue.remove(0);
         if let Some(acp) = self.acp.clone() {
+            let shown = label.unwrap_or_else(|| text.clone());
+            jobs::remember(&text, &shown, job.as_deref().unwrap_or_default(), by == Sender::Tide);
             let sent = if self.agent_briefed {
                 text.clone()
             } else {
@@ -29222,11 +29249,7 @@ impl Storm {
             };
             let (wire, kept) = split_images(imgs);
             acp.prompt_with(&sent, &wire);
-            self.agent_msgs.push(AgentMsg::User {
-                text: label.unwrap_or(text),
-                imgs: kept,
-                by,
-            });
+            self.agent_msgs.push(AgentMsg::User { text: shown, imgs: kept, by });
             self.mark_turn_start(job);
             self.agent_turn_start = Some(std::time::Instant::now());
             self.acp_state = Some(AgentState::Working);
@@ -41834,5 +41857,36 @@ mod stop_diff_side_tests {
     fn a_rewritten_line_keeps_both_halves() {
         let rows = vec![StopRow { left: side(4, "old"), right: side(4, "new") }];
         assert_eq!(stop_diff_sides(&rows), (true, true));
+    }
+}
+
+/// The fallback in `jobs::guess` reads a replayed prompt off its opening line.
+/// It can only do that while the openings are what these generators actually
+/// write, so the generators themselves are fed through it here: change one of
+/// those prompts and this fails rather than the pane quietly going back to
+/// printing the whole page.
+#[cfg(test)]
+mod job_guess_tests {
+    use super::*;
+
+    #[test]
+    fn the_pr_prompts_are_still_recognisable() {
+        let brief = jobs::guess(&brief_request(6176, "origin/next", "")).unwrap();
+        assert_eq!(brief.job, "Brief of #6176");
+        assert_eq!(brief.label, "Asked for a brief of #6176");
+
+        let explain = jobs::guess(&pr_explain_request(6176, "next", "", "")).unwrap();
+        assert_eq!(explain.job, "Explain #6176");
+
+        let tour = jobs::guess(&pr_tour_request(6176, "next", "")).unwrap();
+        assert_eq!(tour.job, "Code tour of #6176");
+
+        let body = jobs::guess(&pr_body_check(6176, "next", false)).unwrap();
+        assert_eq!(body.label, "Asked whether #6176's description is still true");
+
+        // the slides already read ride along in `read`, and must not throw the
+        // opening off
+        let with_read = brief_request(6176, "next", "I have read slides 1 and 2.\n\n");
+        assert_eq!(jobs::guess(&with_read).unwrap().job, "Brief of #6176");
     }
 }
