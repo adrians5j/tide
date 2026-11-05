@@ -36,6 +36,7 @@ mod rpc;
 mod todo;
 mod usage;
 mod jobs;
+mod sess;
 mod wshist;
 use rpc::AgentState;
 use diff::{DiffKind, DiffRow};
@@ -8454,6 +8455,12 @@ struct Storm {
     agent_focus: FocusHandle,        // focus for the dock (routes typing)
     agent_ctx: Option<(u64, u64)>,   // ACP usage_update: (context used, window)
     agent_sessions: Vec<(String, String)>, // resumable sessions: (id, title)
+    /// The sessions TIDE opened for itself, read when the picker opens. Four
+    /// reviewers a round pile up fast, and they are not what you came to the
+    /// resume list for.
+    agent_spawned: Vec<sess::Spawned>,
+    /// Whether the picker is showing those rows as well as yours.
+    agent_show_spawned: bool,
     /// A `session/list` answer we asked for in order to resume the newest
     /// session, rather than to populate the picker.
     agent_autoresume: bool,
@@ -9143,6 +9150,8 @@ impl Storm {
             agent_focus: cx.focus_handle(),
             agent_ctx: None,
             agent_sessions: Vec::new(),
+            agent_spawned: Vec::new(),
+            agent_show_spawned: false,
             agent_autoresume: false,
             agent_resumed: false,
             agent_fresh,
@@ -10061,6 +10070,11 @@ impl Storm {
                             let brief = std::mem::take(&mut r.text);
                             r.acp.prompt(&brief);
                             r.sent = true;
+                            // this session will show up in the resume list
+                            // beside yours; write down whose it is
+                            if let Some(id) = r.acp.session_id() {
+                                sess::remember(&id, r.name);
+                            }
                         } else if r.started.elapsed().as_secs() > 90 {
                             r.text = "(this reviewer's adapter never came up)".into();
                             r.done = true;
@@ -25986,6 +26000,8 @@ impl Storm {
         if let Some(acp) = self.acp.clone() {
             acp.list_sessions(&self.root);
         }
+        // read once per open: the reviewers write to this file while they run
+        self.agent_spawned = sess::load();
         self.agent_picker = true;
         cx.notify();
     }
@@ -26118,7 +26134,16 @@ impl Storm {
                 // this answer was for the auto-resume, not the picker
                 if std::mem::take(&mut self.agent_autoresume) {
                     self.agent_resumed = true;
-                    if let Some((id, _)) = self.agent_sessions.first().cloned() {
+                    let spawned = sess::load();
+                    // the newest session here is often a reviewer TIDE opened
+                    // minutes ago; resuming into one of those drops you into a
+                    // conversation you never had
+                    let newest = self
+                        .agent_sessions
+                        .iter()
+                        .find(|(id, title)| sess::why(&spawned, id, title).is_none())
+                        .cloned();
+                    if let Some((id, _)) = newest {
                         self.reset_agent_transcript();
                         if let Some(acp) = self.acp.clone() {
                             acp.load_session(&self.root, &id);
@@ -30547,6 +30572,16 @@ impl Storm {
 
         // the resume list replaces the transcript while it's open
         let picker = self.agent_picker.then(|| {
+            // every row with the job that opened it, when TIDE opened it
+            let rows: Vec<(usize, &String, &String, Option<String>)> = self
+                .agent_sessions
+                .iter()
+                .enumerate()
+                .map(|(i, (id, title))| (i, id, title, sess::why(&self.agent_spawned, id, title)))
+                .collect();
+            let theirs = rows.iter().filter(|(.., why)| why.is_some()).count();
+            let mine = rows.len() - theirs;
+            let show = self.agent_show_spawned;
             let mut col = div()
                 .id("agent-sessions")
                 .flex_grow(1.0)
@@ -30554,19 +30589,51 @@ impl Storm {
                 .overflow_y_scroll()
                 .flex()
                 .flex_col();
+            let count = if self.agent_sessions.is_empty() {
+                "Loading sessions…".to_string()
+            } else if theirs == 0 {
+                format!("{mine} session(s) in this project")
+            } else {
+                format!("{mine} of your session(s) in this project")
+            };
             col = col.child(
                 div()
                     .px_3()
                     .py_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
                     .text_size(px(11.))
                     .text_color(rgb(MUTED))
-                    .child(if self.agent_sessions.is_empty() {
-                        "Loading sessions…".to_string()
-                    } else {
-                        format!("{} session(s) in this project", self.agent_sessions.len())
+                    .child(div().flex_grow(1.0).min_w(px(0.)).truncate().child(count))
+                    .when(theirs > 0, |d| {
+                        d.child(
+                            div()
+                                .id("agent-sessions-theirs")
+                                .flex_shrink_0()
+                                .px_1p5()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(HOVER)))
+                                .text_color(rgb(if show { TEXT } else { MUTED }))
+                                .child(match show {
+                                    true => format!("hide the {theirs} TIDE opened"),
+                                    false => format!("show the {theirs} TIDE opened"),
+                                })
+                                .tooltip(tip(
+                                    "The reviewers each run in their own session; these are theirs",
+                                ))
+                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                    this.agent_show_spawned = !this.agent_show_spawned;
+                                    cx.notify();
+                                })),
+                        )
                     }),
             );
-            for (i, (id, title)) in self.agent_sessions.iter().enumerate() {
+            for (i, id, title, why) in rows {
+                if why.is_some() && !show {
+                    continue;
+                }
                 let sid = id.clone();
                 col = col.child(
                     div()
@@ -30579,10 +30646,33 @@ impl Storm {
                         .flex_col()
                         .child(
                             div()
-                                .text_size(px(12.))
-                                .text_color(rgb(TEXT))
-                                .truncate()
-                                .child(title.clone()),
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .child(
+                                    div()
+                                        .min_w(px(0.))
+                                        .text_size(px(12.))
+                                        // a reviewer's row is there to be
+                                        // walked past, not read
+                                        .text_color(rgb(match why.is_some() {
+                                            true => MUTED,
+                                            false => TEXT,
+                                        }))
+                                        .truncate()
+                                        .child(title.clone()),
+                                )
+                                .children(why.map(|w| {
+                                    div()
+                                        .flex_shrink_0()
+                                        .px_1()
+                                        .rounded_sm()
+                                        .border_1()
+                                        .border_color(rgb(BORDER))
+                                        .text_size(px(9.))
+                                        .text_color(rgb(LINE_NUMBER))
+                                        .child(w)
+                                })),
                         )
                         .child(
                             div()

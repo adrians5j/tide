@@ -291,6 +291,13 @@ impl Acp {
         self.ready.load(Ordering::Relaxed)
     }
 
+    /// The adapter's id for this session, once there is one. The same id
+    /// `session/list` hands back, so a session TIDE opened can be recognised
+    /// in the resume list later.
+    pub fn session_id(&self) -> Option<String> {
+        self.session.lock().ok().and_then(|s| s.clone())
+    }
+
     /// Take all queued events (clears the dirty flag).
     pub fn drain(&self) -> Vec<AcpEvent> {
         self.dirty.store(false, Ordering::Relaxed);
