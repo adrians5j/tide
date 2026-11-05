@@ -35,6 +35,7 @@ mod narr;
 mod rpc;
 mod todo;
 mod usage;
+mod wshist;
 use rpc::AgentState;
 use diff::{DiffKind, DiffRow};
 use syntax::{Highlighter, Run};
@@ -74,6 +75,7 @@ const IC_AGENT: &str = "\u{ec4f}"; // codicon "chat-sparkle" — the agent pane
 const IC_GRAPH: &str = "\u{ebe2}"; // codicon "graph-line" — plan usage
 const IC_GEAR: &str = "\u{eb51}"; // codicon "gear" — the agent's own settings
 const IC_TOUR: &str = "\u{ebd5}"; // codicon "compass" — code tours
+const IC_HISTORY: &str = "\u{ea82}"; // codicon "history" — past workspaces
 // The codicon font is renamed to "Segoe Fluent Icons" because GPUI refuses to
 // load any font lacking an 'm' glyph — except that one specially-cased name.
 const ICON_FONT: &str = "Segoe Fluent Icons";
@@ -96,7 +98,7 @@ actions!(
         ShowProjects, PushDialog, RunCommand, NewProject, FetchRemotes, PullRemote, WipPush, RunBuild,
         NewScratch, ToggleAgent, GitLog, SetWsTitle, TodoList, WalkNext, WalkPrev, RefreshPr, AddComment, ShowComments, SendComments,
         QuitApp, ToggleMdPreview, QuoteAgentSel, PrScreen,
-        MdFind, SendElsewhere
+        MdFind, SendElsewhere, WsHistory
     ]
 );
 
@@ -5999,6 +6001,7 @@ enum Cmd {
     ResetWorkspaceClose,
     CloseWorkspace,
     ResetWorkspacePause,
+    WorkspaceHistory,
     TogglePause,
     AddComment,
     ShowComments,
@@ -6051,6 +6054,7 @@ const PALETTE: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::CloseWorkspace, "Close Workspace  (leaves the checkout as it is)", IC_HOME, ""),
     (Cmd::ResetWorkspaceClose, "Reset Workspace & Close", IC_HOME, ""),
     (Cmd::ResetWorkspacePause, "Reset Workspace & Pause", IC_HOME, ""),
+    (Cmd::WorkspaceHistory, "Workspace History…  (every folder, and what it was for)", IC_HISTORY, "⌘⇧E"),
     (Cmd::TogglePause, "Pause / Resume Workspace  (⌥Tab skips paused)", IC_HOME, ""),
     (Cmd::AddComment, "Comment on This Line…", IC_COMMIT, "⌥C"),
     (Cmd::ShowComments, "Review Comments…", IC_COMMIT, "⌥⇧C"),
@@ -8289,6 +8293,12 @@ struct Storm {
     newproj_titles: HashMap<String, String>, // their custom titles, same load
     newproj_last_titles: HashMap<String, String>, // titles those folders used to have
     newproj_sel: usize,            // highlighted row in the filtered recents list
+    // ── workspace history (⌘⇧E): every folder and what it has been used for ──
+    hist_open: bool,
+    hist_focus: FocusHandle,
+    hist_query: Field, // type-to-filter across title, subtitle, branch and folder
+    hist_rows: Vec<wshist::Stint>, // read off disk when the dialog opens, not per frame
+    hist_sel: usize,               // highlighted row in the filtered list
     // commit message
     commit_msg: Field,
     commit_focus: FocusHandle,
@@ -9004,6 +9014,11 @@ impl Storm {
             newproj_titles: HashMap::new(),
             newproj_last_titles: HashMap::new(),
             newproj_sel: 0,
+            hist_open: false,
+            hist_focus: cx.focus_handle(),
+            hist_query: Field::default(),
+            hist_rows: Vec::new(),
+            hist_sel: 0,
             commit_msg: Field::default(),
             commit_focus: cx.focus_handle(),
             wip_id: random_id(),
@@ -9316,6 +9331,7 @@ impl Storm {
             || self.prc_open
             || self.runc_open
             || self.newproj_open
+            || self.hist_open
             || self.find_open
             || self.gitp_open
             || self.palette_open
@@ -10525,6 +10541,7 @@ impl Storm {
                             this.show_flash(&format!("Workspace {what} “{t}”"), cx);
                             cx.notify();
                         }
+                        this.note_history();
                     }
                     if this.agent_rpc.as_ref().is_some_and(|s| s.take_reviewers()) {
                         this.start_reviewers(cx);
@@ -10994,7 +11011,14 @@ impl Storm {
                 .update(cx, |this, cx| {
                     this.git_status = status;
                     this.head_oid = head_oid;
+                    // the history row wants the branch this work is on, and a
+                    // branch rarely changes: note it when it does, not on every
+                    // poll, so the file isn't rewritten once a second
+                    let moved = this.branch != branch;
                     this.branch = branch.clone();
+                    if moved {
+                        this.note_history();
+                    }
                     this.mem_mb = mem;
                     this.ws_idle = idle;
                     this.ws_paused = paused;
@@ -11150,6 +11174,7 @@ impl Storm {
             || self.prc_open
             || self.runc_open
             || self.newproj_open
+            || self.hist_open
             || self.find_open
             || self.gitp_open
             || self.mc_open
@@ -11168,6 +11193,7 @@ impl Storm {
             self.prc_open = false;
             self.runc_open = false;
             self.newproj_open = false;
+            self.hist_open = false;
             self.find_open = false;
             self.gitp_open = false;
             self.ws_open = false;
@@ -12504,6 +12530,7 @@ impl Storm {
                         save_ws_idle(&self.root, false);
                     }
                 }
+                self.note_history();
                 self.title_open = false;
                 self.focus_active(window, cx);
             }
@@ -13339,6 +13366,78 @@ impl Storm {
     }
 
     /// cmd+shift+n: open the "New Project" dialog (type a folder path or pick one).    /// cmd+shift+n: open the "New Project" dialog (type a folder path or pick one).
+    /// Every folder TIDE has worked in, and what it was working on. The list
+    /// a workspace title alone can't give you: the topbar says what `wby-next8`
+    /// is for today, this says what it was for in September and that the branch
+    /// is still sitting there.
+    fn act_ws_history(&mut self, _: &WsHistory, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_ws_history(window, cx);
+    }
+
+    fn open_ws_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.hist_open = true;
+        self.hist_query.clear();
+        // off disk once, on open — the list doesn't change while you read it
+        self.hist_rows = wshist::listed();
+        self.hist_sel = 0;
+        window.focus(&self.hist_focus, cx);
+        cx.notify();
+    }
+
+    fn hist_filtered(&self) -> Vec<&wshist::Stint> {
+        let q = self.hist_query.text.trim();
+        self.hist_rows.iter().filter(|s| wshist::matches(s, q)).collect()
+    }
+
+    fn hist_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        match ks.key.as_str() {
+            "escape" => {
+                self.hist_open = false;
+                self.focus_active(window, cx);
+            }
+            "down" => {
+                let n = self.hist_filtered().len();
+                self.hist_sel = (self.hist_sel + 1).min(n.saturating_sub(1));
+            }
+            "up" => self.hist_sel = self.hist_sel.saturating_sub(1),
+            // ⌘⌫ drops the highlighted row. The folder and its checkout are
+            // untouched: this forgets the note, not the work.
+            "backspace" if ks.modifiers.platform => {
+                let Some(gone) = self.hist_filtered().get(self.hist_sel).map(|s| (*s).clone())
+                else {
+                    return;
+                };
+                wshist::forget(&gone);
+                self.hist_rows = wshist::listed();
+                let n = self.hist_filtered().len();
+                self.hist_sel = self.hist_sel.min(n.saturating_sub(1));
+                self.show_flash(&format!("Forgot “{}”", gone.title), cx);
+            }
+            "enter" => {
+                let Some(root) = self.hist_filtered().get(self.hist_sel).map(|s| s.root.clone())
+                else {
+                    return;
+                };
+                let path = PathBuf::from(&root);
+                if !path.is_dir() {
+                    self.show_flash(&format!("{} is gone", tilde_path(&path)), cx);
+                    cx.notify();
+                    return;
+                }
+                self.hist_open = false;
+                // the same event the Open Project list emits: an already-open
+                // folder switches to it rather than opening a second copy
+                cx.emit(ProjectNav::OpenPath(path));
+            }
+            _ => {
+                Self::field_input(&mut self.hist_query, ks, cx, |_| true);
+                self.hist_sel = 0; // filter changed → highlight the top again
+            }
+        }
+        cx.notify();
+    }
+
     fn act_new_project(&mut self, _: &NewProject, window: &mut Window, cx: &mut Context<Self>) {
         self.newproj_open = true;
         self.newproj_path.clear();
@@ -15403,6 +15502,7 @@ impl Storm {
             Cmd::Reviewers => self.run_reviewers(window, cx),
             Cmd::Todo => self.open_todo(window, cx),
             Cmd::OpenRepository => self.act_new_project(&NewProject, window, cx),
+            Cmd::WorkspaceHistory => self.open_ws_history(window, cx),
             Cmd::OpenPrNumber => self.open_prnum_prompt(window, cx),
             Cmd::InstallUsageBars => self.install_usage_bars(cx),
             Cmd::TogglePause => self.toggle_pause(cx),
@@ -15440,11 +15540,27 @@ impl Storm {
         cx.notify();
     }
 
+    /// Tell the workspace history where this workspace stands. Called wherever
+    /// the title or the subtitle is written to disk, which is the same thing as
+    /// "every moment the answer to what is this folder for changes". An empty
+    /// title is a reset, and closes the folder's stint.
+    fn note_history(&self) {
+        wshist::note(&self.root, wshist::Note {
+            title: self.ws_title.as_deref().unwrap_or_default(),
+            subtitle: self.ws_subtitle.as_deref().unwrap_or_default(),
+            client: self.ws_client.as_deref().unwrap_or_default(),
+            branch: &self.branch,
+        });
+    }
+
     fn reset_workspace(&mut self, cx: &mut Context<Self>) {
         self.ws_title = None;
         save_ws_title(&self.root, None);
         self.ws_subtitle = None;
         save_ws_subtitle(&self.root, None);
+        // the title has gone: that closes this folder's stint in the history,
+        // which is what makes ⌘⇧E able to find the work again afterwards
+        self.note_history();
         self.agent_titled = false;
         save_agent_titled(&self.root, false);
         self.ws_client = None;
@@ -17141,6 +17257,7 @@ impl Render for Storm {
             .on_action(cx.listener(Self::act_md_preview))
             .on_action(cx.listener(Self::act_quote_agent_sel))
             .on_action(cx.listener(Self::act_new_project))
+            .on_action(cx.listener(Self::act_ws_history))
             .on_action(cx.listener(Self::act_new_scratch))
             .on_action(cx.listener(Self::act_fetch))
             .on_action(cx.listener(Self::act_wip_push))
@@ -17225,6 +17342,9 @@ impl Render for Storm {
         }
         if self.newproj_open {
             root = root.child(self.render_new_project(cx));
+        }
+        if self.hist_open {
+            root = root.child(self.render_ws_history(cx));
         }
         if self.find_open {
             root = root.child(self.render_find(cx));
@@ -23369,6 +23489,220 @@ impl Storm {
             )
     }
 
+    /// The workspace history: one row per stint of work, newest first. What it
+    /// has to answer is "which folder was that in, and is it still there" —
+    /// so every row carries the folder and the branch, not only the name of the
+    /// work.
+    fn render_ws_history(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let w = 760.0_f32;
+        let left = ((self.win_width - w) / 2.0).max(0.);
+        // compare canonicalised, so ~/dev/x and a symlinked path match
+        let canon = |q: &Path| std::fs::canonicalize(q).unwrap_or_else(|_| q.to_path_buf());
+        let open_now: Vec<PathBuf> = self.ws_roots.iter().map(|r| canon(r)).collect();
+        let filtered: Vec<wshist::Stint> = self.hist_filtered().into_iter().cloned().collect();
+        let total = self.hist_rows.len();
+        let typed = !self.hist_query.text.trim().is_empty();
+
+        let mut rows = div()
+            .id("ws-history-rows")
+            .flex()
+            .flex_col()
+            .max_h(px(520.))
+            .overflow_y_scroll()
+            .pb_2();
+        for (i, st) in filtered.iter().enumerate() {
+            let sel = i == self.hist_sel;
+            let path = PathBuf::from(&st.root);
+            let folder =
+                path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let here = open_now.iter().any(|r| *r == canon(&path));
+            let gone = !path.is_dir();
+            // three states worth telling apart: loaded right now, still the
+            // folder's work but not on screen, and finished and reset
+            let title_color = match (sel, st.is_open(), gone) {
+                (true, _, _) => SEL_TEXT,
+                (false, _, true) => MUTED,
+                (false, true, _) => ACCENT,
+                (false, false, _) => TEXT,
+            };
+            let dim = if sel { SEL_TEXT } else { MUTED };
+            let age = todo::age(st.touched);
+            let open_path = path.clone();
+            rows = rows.child(
+                div()
+                    .id(("ws-history-row", i))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .h(px(28.))
+                    .px_3()
+                    .cursor_pointer()
+                    .when(sel, |d| d.bg(rgb(SELECTED_BG)))
+                    .when(!sel, |d| d.hover(|s| s.bg(rgb(HOVER))))
+                    .child(
+                        div()
+                            .w(px(14.))
+                            .flex_shrink_0()
+                            .font_family(ICON_FONT)
+                            .text_size(px(12.))
+                            .text_color(rgb(if sel { SEL_TEXT } else if st.is_open() { FOLDER_ICON } else { MUTED }))
+                            .child(if st.is_open() { IC_FOLDER } else { IC_HISTORY }),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .max_w(px(260.))
+                            .truncate()
+                            .text_size(px(12.))
+                            .text_color(rgb(title_color))
+                            .child(st.title.clone()),
+                    )
+                    // where the work had got to: the line that turns "AI chat"
+                    // into something you recognise months later
+                    .when(!st.subtitle.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .flex_grow(1.0)
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_size(px(11.))
+                                .text_color(rgb(dim))
+                                .child(st.subtitle.clone()),
+                        )
+                    })
+                    .when(st.subtitle.is_empty(), |d| d.child(div().flex_grow(1.0).min_w(px(0.))))
+                    .when(!st.branch.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .flex_shrink_0()
+                                .max_w(px(170.))
+                                .truncate()
+                                .text_size(px(11.))
+                                .text_color(rgb(dim))
+                                .child(format!("⎇ {}", st.branch)),
+                        )
+                    })
+                    // the answer to "which project was that in"
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .max_w(px(160.))
+                            .truncate()
+                            .text_size(px(11.))
+                            .text_color(rgb(if sel { SEL_TEXT } else { TEXT }))
+                            .child(folder),
+                    )
+                    .when(here || gone, |d| {
+                        let (label, color) = match gone {
+                            true => ("folder gone", GIT_DELETED),
+                            false => ("open", ACCENT),
+                        };
+                        d.child(
+                            div()
+                                .flex_shrink_0()
+                                .px_1p5()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(if sel { SEL_TEXT } else { color }))
+                                .text_size(px(9.))
+                                .text_color(rgb(if sel { SEL_TEXT } else { color }))
+                                .child(label),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .w(px(60.))
+                            .text_size(px(10.))
+                            .text_color(rgb(dim))
+                            .child(age),
+                    )
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                        if !open_path.is_dir() {
+                            this.show_flash(&format!("{} is gone", tilde_path(&open_path)), cx);
+                            return;
+                        }
+                        this.hist_open = false;
+                        cx.emit(ProjectNav::OpenPath(open_path.clone()));
+                        cx.notify();
+                    })),
+            );
+        }
+        if filtered.is_empty() {
+            rows = rows.child(
+                div()
+                    .px_3()
+                    .py_3()
+                    .text_size(px(12.))
+                    .text_color(rgb(MUTED))
+                    .child(match total {
+                        0 => "Nothing here yet — a workspace joins the list when it gets a title."
+                            .to_string(),
+                        _ => "No workspace matches that.".to_string(),
+                    }),
+            );
+        }
+
+        div()
+            .absolute()
+            .top(px(100.))
+            .left(px(left))
+            .w(px(w))
+            .bg(rgb(PANEL_BG))
+            .border_1()
+            .border_color(rgb(ACCENT))
+            .rounded_md()
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .track_focus(&self.hist_focus)
+            .on_key_down(cx.listener(Self::hist_key))
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .child(match typed {
+                        true => format!("Workspace History — {} of {total}", filtered.len()),
+                        false => format!("Workspace History — {total} in all"),
+                    }),
+            )
+            .child(
+                div()
+                    .mx_3()
+                    .px_2()
+                    .py_1()
+                    .bg(rgb(BG))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .rounded_md()
+                    .font_family("Menlo")
+                    .text_size(px(12.))
+                    .text_color(rgb(TEXT))
+                    .child(if self.hist_query.is_empty() {
+                        div()
+                            .text_color(rgb(MUTED))
+                            .child(format!("{}title, branch or folder", self.caret()))
+                    } else {
+                        div().child(self.hist_query.render(self.caret(), SELECTION))
+                    }),
+            )
+            .child(div().h(px(6.)))
+            .child(rows)
+            .child(
+                div()
+                    .px_3()
+                    .py_1p5()
+                    .border_t_1()
+                    .border_color(rgb(BORDER))
+                    .text_size(px(10.))
+                    .text_color(rgb(MUTED))
+                    .child("↩ open it · ⌘⌫ forget the row · esc close"),
+            )
+    }
+
     fn render_new_project(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let w = 560.0_f32;
         let left = ((self.win_width - w) / 2.0).max(0.);
@@ -26137,7 +26471,13 @@ impl Storm {
          work moves — after a merge, when you pick up the next piece — and send \
          an empty one to clear it when the stretch is done. The human reads it \
          in the topbar as `AI Chat (UI auto syncing)`, which is how they tell at \
-         a glance where a workspace was left.\n\n\
+         a glance where a workspace was left.\n\
+         Both outlive this workspace. TIDE keeps a history of every folder it \
+         has worked in and what the work was called, and the human opens it with \
+         ⌘⇧E months later to find where something happened. So write the title \
+         and the subtitle for someone with no memory of this session: \
+         \"fix: identity leak in resolvers\" is findable, \"fix: the bug\" is \
+         not.\n\n\
          \"todo it\", \"note that down\", \"park it\", \"backlog this\", \"add it to \
          the list\" — all mean one thing: put it on TIDE's todo list, not in a \
          file and not in your answer:\n\
@@ -38548,6 +38888,10 @@ fn main() {
         v
     };
 
+    // the first run after this landed has no history file: build one out of the
+    // titles TIDE has been keeping all along, so ⌘⇧E opens onto something
+    wshist::ensure_seeded(&load_ws_titles(), &load_ws_last_titles(), &load_ws_subtitles());
+
     application().run(move |cx: &mut App| {
         set_dock_icon();
         // bundle the Codicon icon font + Inter (UI font)
@@ -38657,6 +39001,7 @@ fn main() {
             KeyBinding::new("cmd-o", NewProject, None),
             KeyBinding::new("cmd-shift-n", NewScratch, None),
             KeyBinding::new("cmd-e", ShowProjects, None),
+            KeyBinding::new("cmd-shift-e", WsHistory, None),
             // review comments: pin one to a line, list them, send the batch
             KeyBinding::new("alt-c", AddComment, None),
             // the agent pane's ⌥C quotes the selected answer text instead of

@@ -245,6 +245,19 @@ is picked up. The human reads it in the topbar as `AI Chat (UI auto syncing)`,
 which is how they tell at a glance where a workspace was left. `GET
 $TIDE_RPC/workspace` reports it back under `subtitle`.
 
+### Both outlive the workspace
+
+TIDE keeps a history of every folder it has worked in and what each stint of
+work was called, in `~/.config/tide/workspace-history.json`. A stint opens when
+a folder takes a title, follows the renames, records the branch, and closes when
+the workspace is reset. ⌘⇧E opens the list, and it is how the human finds, weeks
+later, which of a dozen interchangeable checkouts a piece of work happened in.
+
+Nothing needs to be sent for this: it is written from the same calls above. What
+it does change is how a title should be written. The reader is someone with no
+memory of this session, looking for one row among fifty. `fix: identity leak in
+resolvers` is findable. `fix: the bug` is not.
+
 ## Your own standing instructions
 
 Anything in `~/.config/tide/agent-notes.md` is appended to the briefing verbatim,
