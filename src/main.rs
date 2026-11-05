@@ -6827,7 +6827,10 @@ fn rc_thread_rows(turns: &[ReviewReply]) -> usize {
             r.text.lines().map(|l| 1 + l.chars().count() / 80).sum::<usize>().max(1) + 1
         })
         .sum();
-    lines.min(10)
+    // a thread ending on your own turn has a line under it — "waiting for the
+    // answer…" once it has gone out — so leave it somewhere to sit
+    let tail = usize::from(turns.last().is_some_and(|r| r.who != "agent"));
+    (lines + tail).min(11)
 }
 
 /// Height of the comment box itself (excludes the padding around it).
@@ -7948,6 +7951,23 @@ struct ReviewComment {
     /// Done with: hidden from the open list and from everything that counts
     /// comments, but kept, so a thread resolved too early can be reopened.
     resolved: bool,
+}
+
+impl ReviewComment {
+    /// A thread rather than a box. Replies make one, and so does a question
+    /// that has gone out and is waiting for its first answer: either way your
+    /// own words belong above the input as the opening turn, not back inside
+    /// the input as something to edit.
+    fn threaded(&self) -> bool {
+        !self.replies.is_empty() || (self.sent && !self.text.trim().is_empty())
+    }
+
+    /// Handed to the agent, with nothing back since. The box draws a line
+    /// saying so, the way a question asked under a slide does: a thread that
+    /// shows your words and then stops reads as though the send failed.
+    fn waiting(&self) -> bool {
+        self.sent && !self.resolved && self.replies.last().is_none_or(|r| r.who != "agent")
+    }
 }
 
 /// An in-flight drag of the divider between `kids[ix]` and `kids[ix + 1]` of the
@@ -15634,7 +15654,7 @@ impl Storm {
         cx: &mut Context<Self>,
     ) {
         let found = self.review.iter().find(|c| c.path == path && c.line == a && c.end == b);
-        let has_thread = found.is_some_and(|c| !c.replies.is_empty());
+        let has_thread = found.is_some_and(ReviewComment::threaded);
         let text = if has_thread { String::new() } else { found.map(|c| c.text.clone()).unwrap_or_default() };
         self.rc_reply_mode = has_thread;
         // an existing comment keeps the snippet it was saved with
@@ -15752,10 +15772,15 @@ impl Storm {
     /// want answered now doesn't sit in the queue waiting for a second
     /// keystroke. It takes the rest of the queue with it, because that is what
     /// the send does and leaving half of it behind would be the surprise.
+    ///
+    /// A send keeps the box open, cleared and back in thread mode. The answer
+    /// is coming back into this thread, and closing the box means finding the
+    /// line again to read it — the same bargain as a question asked under a
+    /// slide, where the question stays on the card and the answer lands on it.
     fn commit_comment(&mut self, send: bool, window: &mut Window, cx: &mut Context<Self>) {
         // an empty box writes nothing, so there is nothing to hurry along
         let send = send && !self.rc_query.text.trim().is_empty();
-        self.rc_open = false;
+        self.rc_open = send;
         if self.rc_reply_mode {
             let text = self.rc_query.text.trim().to_string();
             if let (Some((path, a, b)), false) = (self.rc_target.clone(), text.is_empty()) {
@@ -15779,11 +15804,18 @@ impl Storm {
         } else {
             self.save_comment(cx); // also re-syncs gaps + gutter markers
         }
-        self.focus_active(window, cx);
         if send {
-            // its own flash says how much went, and the answer comes back into
-            // this thread the way a sent comment's always does
-            self.send_review(window, cx);
+            // the box stays: empty, in thread mode, with what you just asked
+            // now the last turn in the thread above it. The next thing typed is
+            // a follow-up, and the answer arrives between the two.
+            self.rc_query.clear();
+            self.rc_reply_mode = true;
+            // `false`: the agent pane doesn't take the focus, because you are
+            // still reading the line this question is about
+            self.send_review_to(false, window, cx);
+            window.focus(&self.rc_focus, cx);
+        } else {
+            self.focus_active(window, cx);
         }
         cx.notify();
     }
@@ -16040,6 +16072,15 @@ impl Storm {
 
     /// Type the comments into the agent's pane and submit them.
     fn send_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.send_review_to(true, window, cx);
+    }
+
+    /// The same, saying where the focus lands. Sending from the review pane or
+    /// the palette means going where the answer appears, so the agent takes it.
+    /// Sending from a comment box doesn't: you are still reading the line the
+    /// question is about, and the answer is coming back into the box in front
+    /// of you.
+    fn send_review_to(&mut self, take_focus: bool, window: &mut Window, cx: &mut Context<Self>) {
         let ready = self.review.iter().filter(|c| !c.draft && !c.sent && !c.resolved).count();
         let note = self.review_note.text.trim().to_string();
         if ready == 0 && note.is_empty() {
@@ -16103,12 +16144,23 @@ impl Storm {
         let when = now_secs();
         self.review_sent = Some((when, n));
         save_review_sent(&self.root, when, n);
-        match pane {
-            Some(pane) => self.focus_pane(&pane, window, cx),
-            None => self.focus_agent(window, cx),
+        if take_focus {
+            match pane {
+                Some(pane) => self.focus_pane(&pane, window, cx),
+                None => self.focus_agent(window, cx),
+            }
         }
         let note = if drafts > 0 { format!(" · {drafts} draft(s) kept") } else { String::new() };
-        self.show_flash(&format!("Sent {n} comment{}{note}", if n == 1 { "" } else { "s" }), cx);
+        let sent = format!("Sent {n} comment{}{note}", if n == 1 { "" } else { "s" });
+        // the box is still open and the answer is coming back into it: say so,
+        // or it reads as though nothing happened
+        self.show_flash(
+            &match take_focus {
+                true => sent,
+                false => format!("{sent} — the answer comes back here"),
+            },
+            cx,
+        );
         cx.notify();
     }
 
@@ -20503,7 +20555,8 @@ impl Storm {
         let comment = self.rc_target.as_ref().and_then(|(p, a, b)| {
             self.review.iter().find(|c| &c.path == p && c.line == *a && c.end == *b)
         });
-        let has_thread = comment.is_some_and(|c| !c.replies.is_empty());
+        let has_thread = comment.is_some_and(ReviewComment::threaded);
+        let waiting = comment.is_some_and(ReviewComment::waiting);
         let mut replies: Vec<ReviewReply> = Vec::new();
         if has_thread {
             if let Some(c) = comment {
@@ -20581,7 +20634,7 @@ impl Storm {
                         div()
                             .text_size(px(10.))
                             .text_color(rgb(LINE_NUMBER))
-                            .child("⌘↩ save · ⇧⌘↩ send it now · ↩ newline · ⌘V image · esc cancel"),
+                            .child("⌘↩ save · ⇧⌘↩ ask now, answer lands here · ↩ newline · ⌘V image · esc close"),
                     ),
             )
             // the answers, read here rather than in the terminal transcript
@@ -20645,7 +20698,19 @@ impl Storm {
                                     )
                                         .min_w(px(0.))
                                 })
-                        })),
+                        }))
+                        // the thread ends on your words until the agent
+                        // answers; without this the box looks like it swallowed
+                        // the question
+                        .when(waiting, |d| {
+                            d.child(
+                                div()
+                                    .pl_2()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(LINE_NUMBER))
+                                    .child("waiting for the answer…"),
+                            )
+                        }),
                 )
             })
             .child(
@@ -20722,7 +20787,7 @@ impl Storm {
                             true,
                             false,
                         )
-                        .tooltip(tip("⌘↩  ·  ⇧⌘↩ sends it to the agent now"))
+                        .tooltip(tip("⌘↩  ·  ⇧⌘↩ asks the agent now and keeps this open"))
                         .on_click(cx.listener(|this, e: &gpui::ClickEvent, window, cx| {
                             this.commit_comment(e.modifiers().shift, window, cx)
                         })),
@@ -41888,5 +41953,75 @@ mod job_guess_tests {
         // opening off
         let with_read = brief_request(6176, "next", "I have read slides 1 and 2.\n\n");
         assert_eq!(jobs::guess(&with_read).unwrap().job, "Brief of #6176");
+    }
+}
+
+/// ⇧⌘↩ in a comment box asks the agent and keeps the box open, so the box has
+/// to say which of three states the thread is in: still yours to edit, gone
+/// out and waiting, or answered.
+#[cfg(test)]
+mod comment_thread_tests {
+    use super::*;
+
+    fn comment(sent: bool, replies: Vec<(&str, &str)>) -> ReviewComment {
+        ReviewComment {
+            id: "ab12c".into(),
+            path: PathBuf::from("src/foo.rs"),
+            line: 42,
+            end: 42,
+            snippet: "let x = thing();".into(),
+            text: "why is this not memoized?".into(),
+            draft: false,
+            sent,
+            replies: replies
+                .into_iter()
+                .map(|(who, text)| ReviewReply { who: who.into(), text: text.into() })
+                .collect(),
+            resolved: false,
+        }
+    }
+
+    #[test]
+    fn a_question_that_has_gone_out_is_a_thread() {
+        // written but not sent: the box still owns the words
+        let draft = comment(false, vec![]);
+        assert!(!draft.threaded());
+        assert!(!draft.waiting());
+
+        // sent: your words are the opening turn, and the answer is pending
+        let asked = comment(true, vec![]);
+        assert!(asked.threaded());
+        assert!(asked.waiting());
+
+        // answered: a thread, and nothing is pending
+        let answered = comment(true, vec![("agent", "it is memoized upstream")]);
+        assert!(answered.threaded());
+        assert!(!answered.waiting());
+
+        // a follow-up you added but haven't sent yet is still waiting on the
+        // agent as far as the box is concerned
+        let followed = comment(true, vec![("agent", "it is"), ("you", "where?")]);
+        assert!(followed.waiting());
+
+        // a resolved thread has stopped waiting for anything
+        let mut done = comment(true, vec![]);
+        done.resolved = true;
+        assert!(!done.waiting());
+    }
+
+    /// A thread ending on your own turn gets a line under it, so the waiting
+    /// message has somewhere to sit instead of being scrolled out of the box.
+    #[test]
+    fn the_thread_leaves_room_for_the_waiting_line() {
+        let you = vec![ReviewReply { who: "you".into(), text: "why?".into() }];
+        let answered = vec![
+            ReviewReply { who: "you".into(), text: "why?".into() },
+            ReviewReply { who: "agent".into(), text: "because".into() },
+        ];
+        assert_eq!(rc_thread_rows(&you), rc_thread_rows(&answered[..1]));
+        assert!(rc_thread_rows(&you) > rc_thread_rows(&[]));
+        // the answered thread is two turns, and neither of them is waiting
+        assert_eq!(rc_thread_rows(&answered), 4);
+        assert_eq!(rc_thread_rows(&you), 3);
     }
 }
