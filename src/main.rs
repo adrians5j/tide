@@ -34845,7 +34845,11 @@ impl Storm {
             .on_click(cx.listener(move |this, _e, _w, cx| this.ask_about_slide(ix, cx)));
         let box_ = div()
             .id(("brief-ask", ix))
-            .w_full()
+            // width by stretch, never by percentage. Every box above this one
+            // is a flex column whose own width comes from being stretched, and
+            // a `w_full` against a parent whose width isn't settled yet
+            // resolves to nothing. That is how the field came to be handed a
+            // wrap width of zero, and typing "th" came out as two lines.
             .min_w(px(0.))
             .px_1p5()
             .py(px(3.))
@@ -34883,15 +34887,13 @@ impl Storm {
                 // a question worth asking under a slide is usually a
                 // paragraph, so the box opens as one rather than as a line
                 // that scrolls sideways
-                // `min_w` of zero, or taffy sizes the field by asking the
-                // text what it is like at its narrowest — which for a long
-                // word with nowhere to break is one character a line
+                // `min_w` of zero, or the row is widened to the longest line
+                // the text could make and the box scrolls sideways. The same
+                // shape the slide's own prose is drawn in, two nodes above.
                 .child(
                     div()
                         .min_h(px(44.))
-                        .w_full()
                         .min_w(px(0.))
-                        .overflow_hidden()
                         .child(self.brief_ask.render(caret, SELECTION)),
                 )
                 .child(
