@@ -8314,6 +8314,10 @@ struct Storm {
     newproj_recents: Vec<PathBuf>, // recent projects, loaded when the dialog opens
     newproj_titles: HashMap<String, String>, // their custom titles, same load
     newproj_last_titles: HashMap<String, String>, // titles those folders used to have
+    /// Folders nobody is working in, off the same file the ⌘E switcher reads.
+    /// A folder is picked out of this list to put work in, so which ones are
+    /// free is the question being asked.
+    newproj_idle: HashSet<String>,
     newproj_sel: usize,            // highlighted row in the filtered recents list
     // ── workspace history (⌘⇧E): every folder and what it has been used for ──
     hist_open: bool,
@@ -9041,6 +9045,7 @@ impl Storm {
             newproj_recents: Vec::new(),
             newproj_titles: HashMap::new(),
             newproj_last_titles: HashMap::new(),
+            newproj_idle: HashSet::new(),
             newproj_sel: 0,
             hist_open: false,
             hist_focus: cx.focus_handle(),
@@ -13480,6 +13485,7 @@ impl Storm {
         // titles come off disk once, on open — not per frame
         self.newproj_titles = load_ws_titles();
         self.newproj_last_titles = load_ws_last_titles();
+        self.newproj_idle = load_ws_idle_set();
         self.newproj_sel = 0;
         window.focus(&self.newproj_focus, cx);
         cx.notify();
@@ -23888,6 +23894,7 @@ impl Storm {
                 let canon = |q: &Path| std::fs::canonicalize(q).unwrap_or_else(|_| q.to_path_buf());
                 let already_open = self.ws_roots.iter().any(|r| canon(r) == canon(p));
                 let key = p.to_string_lossy().to_string();
+                let free = self.newproj_idle.contains(&key);
                 let live = self
                     .newproj_titles
                     .get(&key)
@@ -23914,6 +23921,9 @@ impl Storm {
                         .h(px(26.))
                         .px_3()
                         .cursor_pointer()
+                        // a free folder is what this list is usually being read
+                        // for, so it gets the same wash the ⌘E switcher gives it
+                        .when(free && !sel, |d| d.bg(rgba(FREE_TINT)))
                         .when(sel, |d| d.bg(rgb(SELECTED_BG)))
                         .when(!sel, |d| d.hover(|s| s.bg(rgb(HOVER))))
                         .child(div().font_family(ICON_FONT).text_size(px(12.)).text_color(rgb(FOLDER_ICON)).child(IC_FOLDER))
@@ -23937,6 +23947,9 @@ impl Storm {
                             )
                         })
                         .child(div().flex_grow(1.0).text_size(px(11.)).text_color(rgb(MUTED)).truncate().child(dir))
+                        // nobody is working in it: the same badge, and the same
+                        // word, the switcher uses
+                        .when(free, |d| d.child(idle_badge(9.)))
                         // already one of the open workspaces → picking it just
                         // switches to it rather than opening a second copy
                         .when(already_open, |d| {
@@ -36910,7 +36923,7 @@ impl Render for Workspace {
             for (pos, &i) in filtered.iter().enumerate() {
                 let paused = self.projects[i].read(cx).ws_paused;
                 let client = self.projects[i].read(cx).ws_client.clone();
-                let (name, branch, root, agent, target) = {
+                let (name, branch, root, agent, target, pr) = {
                     let s = self.projects[i].read(cx);
                     // same target as the topbar: the PR's base branch, else the
                     // reflog's best guess at what this branch came off
@@ -36920,7 +36933,11 @@ impl Render for Workspace {
                         .map(|(_, _, _, b, _, _)| b.clone())
                         .filter(|b| !b.is_empty())
                         .or_else(|| s.branch_parent.clone());
-                    (s.project_name(), s.branch.clone(), s.root.clone(), s.agent_rollup(), target)
+                    // the pull request this workspace is on, already fetched for
+                    // the topbar: number, how its checks are doing, and whether
+                    // it is still a draft or has gone in
+                    let pr = s.pr_link.as_ref().map(|(n, _, st, _, _, state)| (*n, *st, *state));
+                    (s.project_name(), s.branch.clone(), s.root.clone(), s.agent_rollup(), target, pr)
                 };
                 let sel = pos == self.switcher_sel;
                 let multi = self.projects.len() > 1;
@@ -37063,6 +37080,23 @@ impl Render for Workspace {
                                             .min_w(px(0.))
                                             .overflow_hidden()
                                             .text_size(px(10.))
+                                            // which pull request this workspace is
+                                            // on, coloured by its checks. The state
+                                            // pill only shows when it isn't a plain
+                                            // open PR: draft, merged and closed are
+                                            // the ones worth saying out loud
+                                            .when_some(pr, |d, (num, st, state)| {
+                                                d.child(
+                                                    div()
+                                                        .flex_shrink_0()
+                                                        .text_color(rgb(st.color()))
+                                                        .child(format!("#{num}")),
+                                                )
+                                                .when(
+                                                    state != PrState::Open,
+                                                    |d| d.child(pr_state_pill(state, 9.).flex_shrink_0()),
+                                                )
+                                            })
                                             // base ← head, GitHub's order, same as
                                             // the topbar shows for the open project
                                             .when_some(target, |d, t| {
