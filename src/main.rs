@@ -8127,6 +8127,12 @@ struct Storm {
     /// Slides of the open brief that have come up the window far enough to be
     /// drawn. Cleared when a new brief arrives, so it reveals itself again.
     brief_seen: HashSet<usize>,
+    /// How wide a slide is actually painted, measured rather than derived. The
+    /// question box takes its width from this instead of from the layout: a
+    /// field whose wrap width is settled can't break after every character,
+    /// and working out why the layout wouldn't settle it costs more than
+    /// reading the number off the slide that was just drawn.
+    brief_w: f32,
     ws_idle: bool,   // persisted "nobody is on this workspace" marker
     ws_paused: bool, // persisted "skip me in ⌥Tab" marker
     show_terminal: bool,
@@ -8941,6 +8947,7 @@ impl Storm {
             card_resize: None,
             rc_width: None,
             brief_seen: HashSet::new(),
+            brief_w: 0.,
             ws_idle,
             ws_paused,
             active_term: 0,
@@ -16869,13 +16876,18 @@ fn brief_probe(ix: usize, me: WeakEntity<Storm>) -> impl IntoElement {
     gpui::canvas(
         |_, _, _| (),
         move |bounds, _, window, cx| {
+            let w = f32::from(bounds.size.width);
             let fold = f32::from(window.viewport_size().height) - 80.;
-            if f32::from(bounds.origin.y) > fold {
-                return;
-            }
+            let shown = f32::from(bounds.origin.y) <= fold;
             if let Some(me) = me.upgrade() {
                 me.update(cx, |s, cx| {
-                    if s.brief_seen.insert(ix) {
+                    // a pane that has been dragged wider moves every slide, so
+                    // the question box follows on the next frame
+                    let grew = (s.brief_w - w).abs() > 0.5;
+                    if grew {
+                        s.brief_w = w;
+                    }
+                    if (shown && s.brief_seen.insert(ix)) || grew {
                         cx.notify();
                     }
                 });
@@ -34804,6 +34816,13 @@ impl Storm {
     /// in use: a deck with an outlined input under every slide reads as a form.
     fn brief_ask_row(&self, ix: usize, cx: &mut Context<Self>) -> Div {
         let here = self.brief_ask_at == Some(ix);
+        // 40 is the indent, 680 the cap the prose uses, 14 the box's own
+        // padding and border. Zero until a slide has been painted once, and
+        // the box falls back to being sized by the layout for that one frame.
+        let ask_w = match self.brief_w {
+            w if w > 60. => (w - 40.).min(680.) - 14.,
+            _ => 0.,
+        };
         // the caret is only real when the box has the keyboard, so a box left
         // open on a slide you have scrolled past doesn't blink at you
         let caret = self.caret_if(self.brief_ask_live);
@@ -34894,6 +34913,11 @@ impl Storm {
                     div()
                         .min_h(px(44.))
                         .min_w(px(0.))
+                        // the wrap width, said outright. Left to the layout it
+                        // came out at a character a line; `brief_w` is the
+                        // slide as it was painted, less the indent, the cap,
+                        // the box's padding and its border
+                        .when(ask_w > 0., |d| d.w(px(ask_w)))
                         .child(self.brief_ask.render(caret, SELECTION)),
                 )
                 .child(
@@ -34924,9 +34948,13 @@ impl Storm {
                     .child(clarify),
             )
         };
-        div().pl(px(40.)).flex().flex_col().child(
-            div().max_w(px(680.)).min_w(px(0.)).flex().flex_col().child(box_),
-        )
+        // The shape the slide's prose and `brief_thread` are both drawn in:
+        // plain blocks down to the width cap, and only then a column. A block
+        // child fills its parent, so the width is settled before the field is
+        // measured. Flex columns here gave their children a width by stretch,
+        // which the field never saw, so it was measured against nothing and
+        // broke after every character.
+        div().pl(px(40.)).child(div().max_w(px(680.)).min_w(px(0.)).child(box_))
     }
 
     /// The files a slide is about, as a row of links under its prose. A brief
