@@ -9917,8 +9917,9 @@ impl Storm {
             (
                 "slop cop",
                 format!(
-                    "You are reviewing the branch in this repo against `{base}`, the way the \
-                     Slop Cop check does in CI. Run `git fetch origin --quiet` first: the \
+                    "You are reviewing the branch in this repo against `{base}` for the \
+                     footprint half of the Slop Cop check in CI; the code style half is \
+                     another reviewer's. Run `git fetch origin --quiet` first: the \
                      local base branch is often days behind, and diffing against it reports \
                      hundreds of files that aren't in this branch at all.\n\n\
                      One question: does the footprint match the stated intent? Read the diff \
