@@ -928,26 +928,91 @@ fn save_agent_titled(root: &Path, theirs: bool) {
     }
 }
 
-/// Whether a paste into the agent composer sends straight away.
+/// Whether a paste into the agent composer sends straight away, and on what.
 ///
 /// Dictation pastes its transcript into whatever has focus, so the ↩ after it is
-/// the last keystroke left in the loop. With this on, ⌘V into an empty composer
-/// sends what it pasted.
+/// the last keystroke left in the loop. One line in this file says what ⌘V does:
+///
+/// * missing, empty or `off` — nothing changes, ↩ still sends.
+/// * `on` — every paste into an empty composer sends.
+/// * anything else — that is a marker. Only a paste carrying it sends, and the
+///   marker comes off before the agent sees the text. For when the dictation app
+///   can be told to stamp its transcripts, so a paste of your own stays a paste.
 ///
 /// Process-global and read off disk once: the preference is about how you
-/// dictate rather than about one folder, so every workspace in the window
-/// shares it and a toggle in one takes in all of them. The file's existence is
-/// the whole setting.
+/// dictate rather than about one folder, so every workspace in the window shares
+/// it.
 fn send_on_paste_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     Some(PathBuf::from(home).join(".config/tide/send-on-paste"))
 }
 
-fn send_on_paste() -> &'static AtomicBool {
-    static ON: std::sync::OnceLock<AtomicBool> = std::sync::OnceLock::new();
-    ON.get_or_init(|| {
-        AtomicBool::new(send_on_paste_path().is_some_and(|p| p.exists()))
+fn send_on_paste() -> &'static Mutex<String> {
+    static S: std::sync::OnceLock<Mutex<String>> = std::sync::OnceLock::new();
+    S.get_or_init(|| {
+        Mutex::new(
+            send_on_paste_path()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|body| body.trim().to_string())
+                .unwrap_or_default(),
+        )
     })
+}
+
+fn send_on_paste_setting() -> String {
+    send_on_paste().lock().map(|s| s.clone()).unwrap_or_default()
+}
+
+/// Is a paste a send at all, under this setting? What the composer's placeholder
+/// asks, so it can say so before you find out.
+fn sends_on_paste(setting: &str) -> bool {
+    let s = setting.trim();
+    !s.is_empty() && !s.eq_ignore_ascii_case("off")
+}
+
+/// The text a paste should send, or `None` when this paste is an ordinary one.
+///
+/// With a marker set, it is matched at either end, since a dictation app may
+/// only be able to stamp one of them, and case is ignored because a transcript
+/// goes through a model that capitalises sentences. A sentence-ending `.`, `!`
+/// or `?` after a trailing marker is ignored for the same reason: a model told
+/// to end with "go" will write "go." about half the time.
+fn paste_to_send(setting: &str, pasted: &str) -> Option<String> {
+    let text = pasted.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let marker = setting.trim();
+    if !sends_on_paste(marker) {
+        return None;
+    }
+    if marker.eq_ignore_ascii_case("on") {
+        return Some(text.to_string());
+    }
+    let rest = strip_marker(text, marker)?;
+    (!rest.is_empty()).then_some(rest)
+}
+
+/// `text` with `marker` taken off whichever end carries it.
+///
+/// Compared byte by byte rather than through a lowercased copy: lowercasing can
+/// change a string's length, and the answer is used to slice the original. A
+/// match means those bytes were either ASCII or identical, so the cut always
+/// lands on a character boundary. The caller has already ruled out an empty
+/// marker, which would otherwise match everything.
+fn strip_marker(text: &str, marker: &str) -> Option<String> {
+    let m = marker.as_bytes();
+    let t = text.as_bytes();
+    if t.len() >= m.len() && t[..m.len()].eq_ignore_ascii_case(m) {
+        return Some(text[m.len()..].trim().to_string());
+    }
+    // the tail, past whatever the model punctuated the end with
+    let end = text.trim_end_matches(['.', '!', '?', ' ']);
+    let t = end.as_bytes();
+    if t.len() >= m.len() && t[t.len() - m.len()..].eq_ignore_ascii_case(m) {
+        return Some(end[..t.len() - m.len()].trim().to_string());
+    }
+    None
 }
 
 /// A workspace whose agent was deliberately started over (a reset, or ⌃N).
@@ -15733,21 +15798,30 @@ impl Storm {
     /// Turn send-on-paste on or off. The file is the setting, so it survives a
     /// restart, and the flash says which way it went: a preference that changes
     /// what ⌘V does should never be something you have to test for.
+    ///
+    /// A marker is left alone. Writing `on` over it would throw away a line
+    /// that was typed into the file by hand and can't be got back from here, and
+    /// with a marker set there is nothing to turn off anyway: a paste of your
+    /// own doesn't carry it.
     fn toggle_send_on_paste(&mut self, cx: &mut Context<Self>) {
-        let on = !send_on_paste().load(Ordering::Relaxed);
-        send_on_paste().store(on, Ordering::Relaxed);
+        let now = send_on_paste_setting();
+        if sends_on_paste(&now) && !now.eq_ignore_ascii_case("on") {
+            self.show_flash(
+                &format!("⌘V sends on \"{now}\" — edit ~/.config/tide/send-on-paste to change it"),
+                cx,
+            );
+            return;
+        }
+        let on = !sends_on_paste(&now);
+        let next = if on { "on" } else { "off" };
+        if let Ok(mut s) = send_on_paste().lock() {
+            *s = next.to_string();
+        }
         if let Some(p) = send_on_paste_path() {
             if let Some(dir) = p.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            match on {
-                true => {
-                    let _ = std::fs::write(p, "on\n");
-                }
-                false => {
-                    let _ = std::fs::remove_file(p);
-                }
-            }
+            let _ = std::fs::write(p, format!("{next}\n"));
         }
         let msg = match on {
             true => "⌘V into an empty composer now sends straight away",
@@ -26629,10 +26703,9 @@ impl Storm {
             // Only into an empty composer: a paste into something you were
             // already writing is an edit, not a transcript. Ahead of the
             // collapse, since a long transcript is still the message.
-            if send_on_paste().load(Ordering::Relaxed) && self.agent_input.text.trim().is_empty() {
-                let clip = cx.read_from_clipboard().and_then(|i| i.text());
-                let text = clip.unwrap_or_default().trim().to_string();
-                if !text.is_empty() {
+            if self.agent_input.text.trim().is_empty() {
+                let clip = cx.read_from_clipboard().and_then(|i| i.text()).unwrap_or_default();
+                if let Some(text) = paste_to_send(&send_on_paste_setting(), &clip) {
                     self.agent_input.clear();
                     self.agent_input.insert_text(&text);
                     self.send_composer(cx);
@@ -30743,7 +30816,7 @@ impl Storm {
                             format!("Waiting for the reviewers…{}", self.caret_if(focused))
                         } else if blocked.is_some() {
                             format!("Waiting for the plan window…{}", self.caret_if(focused))
-                        } else if send_on_paste().load(Ordering::Relaxed) {
+                        } else if sends_on_paste(&send_on_paste_setting()) {
                             // the empty box is exactly the state the setting
                             // applies to, so it is where it says so
                             format!("Message the agent… ⌘V sends{}", self.caret_if(focused))
@@ -39833,6 +39906,74 @@ mod img_id_tests {
         assert_eq!(out.parse::<u64>().unwrap(), id);
         // what a double would have done to it
         assert_ne!(id as f64 as u64, id);
+    }
+}
+
+#[cfg(test)]
+mod send_on_paste_tests {
+    use super::*;
+
+    /// Off is the default, and `off` in the file is off too.
+    #[test]
+    fn nothing_is_sent_until_it_is_turned_on() {
+        assert!(!sends_on_paste(""));
+        assert!(!sends_on_paste("  "));
+        assert!(!sends_on_paste("off"));
+        assert!(paste_to_send("", "hello").is_none());
+        assert!(paste_to_send("off", "hello").is_none());
+    }
+
+    /// `on` sends every paste, trimmed. The whole point is that there is no
+    /// keystroke after it.
+    #[test]
+    fn on_sends_every_paste() {
+        assert_eq!(paste_to_send("on", "  what broke the lease?\n"), Some("what broke the lease?".into()));
+        assert_eq!(paste_to_send("ON", "hello"), Some("hello".into()));
+        // an empty clipboard is not a prompt
+        assert!(paste_to_send("on", "   ").is_none());
+    }
+
+    /// A marker is matched at either end, since a dictation app may only be
+    /// able to stamp one of them, and it comes off before the agent sees it.
+    #[test]
+    fn a_marker_is_matched_at_either_end() {
+        let m = "hexsend";
+        assert_eq!(paste_to_send(m, "hexsend what broke the lease?"), Some("what broke the lease?".into()));
+        assert_eq!(paste_to_send(m, "what broke the lease? hexsend"), Some("what broke the lease?".into()));
+        // a paste of your own stays a paste
+        assert!(paste_to_send(m, "what broke the lease?").is_none());
+        assert!(paste_to_send(m, "fn main() {}").is_none());
+        // and the marker on its own has nothing to send
+        assert!(paste_to_send(m, "hexsend").is_none());
+    }
+
+    /// The transcript goes through a model that capitalises sentences and
+    /// punctuates the end of them, so neither breaks the match.
+    #[test]
+    fn case_and_a_full_stop_dont_break_the_marker() {
+        let m = "hexsend";
+        assert_eq!(paste_to_send(m, "Hexsend what broke the lease?"), Some("what broke the lease?".into()));
+        assert_eq!(paste_to_send(m, "What broke the lease? Hexsend."), Some("What broke the lease?".into()));
+        assert_eq!(paste_to_send(m, "What broke the lease? HEXSEND!"), Some("What broke the lease?".into()));
+        // the setting itself is read off a file, so it arrives with a newline
+        assert_eq!(paste_to_send("hexsend\n", "hexsend go"), Some("go".into()));
+    }
+
+    /// A marker is cut by bytes, not by a lowercased copy, so a transcript with
+    /// accents in it is sliced on a character boundary rather than panicking.
+    #[test]
+    fn a_marker_survives_a_transcript_that_isnt_ascii() {
+        assert_eq!(
+            paste_to_send("hexsend", "hexsend qué pasó con el café?"),
+            Some("qué pasó con el café?".into())
+        );
+        assert_eq!(
+            paste_to_send("hexsend", "qué pasó con el café? hexsend"),
+            Some("qué pasó con el café?".into())
+        );
+        // a marker that isn't ASCII either
+        assert_eq!(paste_to_send("»", "» send this"), Some("send this".into()));
+        assert!(paste_to_send("»", "café").is_none());
     }
 }
 
