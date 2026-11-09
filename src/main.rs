@@ -4158,7 +4158,7 @@ impl MergeConfirm {
 }
 
 /// What the reviewers left behind: the commit they read, when they read it,
-/// and who read it. "Reviewers" here means TIDE's own — the two sessions
+/// and who read it. "Reviewers" here means TIDE's own — the four sessions
 /// `Send in reviewers` starts — not whoever GitHub has been asked for.
 #[derive(Clone, PartialEq, Debug)]
 struct Reviewed {
@@ -6062,7 +6062,7 @@ const PALETTE: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::ShowComments, "Review Comments…", IC_COMMIT, "⌥⇧C"),
     (Cmd::SendComments, "Send Comments to Agent", IC_PUSH, "⌥↩ / ⌘F12"),
     (Cmd::LocalReview, "Review This Branch (CodeRabbit CLI → the agent)", IC_PR, ""),
-    (Cmd::Reviewers, "Send In the Reviewers (slop cop, style, architecture, CodeRabbit)", IC_PR, ""),
+    (Cmd::Reviewers, "Send In the Reviewers (footprint, style, architecture, CodeRabbit)", IC_PR, ""),
     (Cmd::Todo, "New Task…", IC_CHECK, "⌘⇧L"),
     (Cmd::OpenRepository, "Open Repository or Project…  (clones a GitHub URL into ~/dev)", IC_FILES, "⌘O"),
     (Cmd::InstallUsageBars, "Install Plan Usage Bars (statusline shim)", IC_GRAPH, ""),
@@ -9915,7 +9915,7 @@ impl Storm {
         let base = self.review_base();
         let briefs: [(&'static str, String); 4] = [
             (
-                "slop cop",
+                "footprint",
                 format!(
                     "You are reviewing the branch in this repo against `{base}` for the \
                      footprint half of the Slop Cop check in CI; the code style half is \
@@ -26681,7 +26681,7 @@ impl Storm {
          and carry on.\n\n\
          Have the branch read before you open it:\n\
          \x20 curl -s -X POST \"$TIDE_RPC/reviewers\" -H \"X-Tide-Token: $TIDE_TOKEN\"\n\
-         Those are the four reviewers ⌘K sends in — a slop cop on the diff's \
+         Those are the four reviewers ⌘K sends in — one on the diff's \
          footprint, one on house style, one on the architecture, and \
          CodeRabbit — each reading this branch against its base in a session \
          of its own. They take a few minutes and \
@@ -41436,10 +41436,10 @@ mod code_tour_tests {
     fn merging_waits_for_the_reviewers_unless_you_skip_them() {
         assert!(confirm(None, false).blocked());
         assert!(!confirm(None, true).blocked());
-        assert!(!confirm(Some(read_by("slop cop + code rabbit")), false).blocked());
+        assert!(!confirm(Some(read_by("footprint + code rabbit")), false).blocked());
         // a review the branch has moved past still counts: acting on what a
         // review found is what moves the branch
-        let mut moved = confirm(Some(read_by("slop cop")), false);
+        let mut moved = confirm(Some(read_by("footprint")), false);
         moved.moved = true;
         assert!(!moved.blocked());
     }
@@ -41449,13 +41449,13 @@ mod code_tour_tests {
     #[test]
     fn a_review_is_remembered_by_branch() {
         let all = reviewed_from(
-            r#"{"fix/scheduler": {"oid": "abc", "when": 1700000000, "who": "slop cop"},
+            r#"{"fix/scheduler": {"oid": "abc", "when": 1700000000, "who": "footprint"},
                  "old": {"who": "code rabbit"},
                  "nameless": {"oid": "x", "when": 1, "who": ""}}"#,
         );
         assert_eq!(all.len(), 2, "a row with nobody on it is no review: {all:?}");
         let one = all.get("fix/scheduler").unwrap();
-        assert_eq!((one.oid.as_str(), one.when, one.who.as_str()), ("abc", 1_700_000_000, "slop cop"));
+        assert_eq!((one.oid.as_str(), one.when, one.who.as_str()), ("abc", 1_700_000_000, "footprint"));
         // a row from before the oid was stored is still a review
         assert_eq!(all.get("old").map(|r| (r.oid.as_str(), r.when)), Some(("", 0)));
         assert!(reviewed_from("not json").is_empty());
@@ -41463,7 +41463,7 @@ mod code_tour_tests {
 
         // it comes back the same way it went in, newest sixty branches only
         let mut many: HashMap<String, Reviewed> = (0..70)
-            .map(|i| (format!("b{i}"), Reviewed { oid: "o".into(), when: i, who: "slop cop".into() }))
+            .map(|i| (format!("b{i}"), Reviewed { oid: "o".into(), when: i, who: "footprint".into() }))
             .collect();
         many.insert("newest".into(), read_by("code rabbit"));
         let back = reviewed_from(&reviewed_to_json(&many));

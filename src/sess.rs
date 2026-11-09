@@ -19,7 +19,7 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Spawned {
     pub id: String,
-    /// The job that opened it, as the picker should name it: "slop cop",
+    /// The job that opened it, as the picker should name it: "footprint",
     /// "code rabbit", and so on.
     pub why: String,
     /// Unix seconds, so the oldest rows are the ones dropped.
@@ -107,6 +107,7 @@ pub fn guess(title: &str) -> Option<&'static str> {
     }
     const MARKS: [&str; 7] = [
         "against ",
+        // what the footprint reviewer was called until November 2026
         "slop cop",
         "coderabbit",
         "code rabbit",
@@ -152,9 +153,9 @@ mod tests {
     #[test]
     fn a_session_tide_opened_is_known_by_its_id() {
         let mut list = Vec::new();
-        put(&mut list, "abc123", "slop cop");
+        put(&mut list, "abc123", "footprint");
         put(&mut list, "def456", "code rabbit");
-        assert_eq!(why(&list, "abc123", "Slop Cop review against origin/next").as_deref(), Some("slop cop"));
+        assert_eq!(why(&list, "abc123", "Branch review against origin/next").as_deref(), Some("footprint"));
         assert_eq!(why(&list, "def456", "whatever the adapter called it").as_deref(), Some("code rabbit"));
         // one of yours, with nothing in its title to suggest otherwise
         assert!(why(&list, "ghi789", "Gym location race condition fix").is_none());
@@ -164,7 +165,7 @@ mod tests {
     #[test]
     fn a_session_is_written_down_once() {
         let mut list = Vec::new();
-        put(&mut list, "abc123", "slop cop");
+        put(&mut list, "abc123", "footprint");
         put(&mut list, "abc123", "architecture");
         assert_eq!(list.len(), 1);
         assert_eq!(why(&list, "abc123", "").as_deref(), Some("architecture"));
@@ -175,7 +176,7 @@ mod tests {
     fn the_oldest_rows_are_the_ones_dropped() {
         let mut list = Vec::new();
         for i in 0..KEEP + 5 {
-            list.push(Spawned { id: format!("s{i}"), why: "slop cop".into(), when: i as u64 });
+            list.push(Spawned { id: format!("s{i}"), why: "footprint".into(), when: i as u64 });
         }
         put(&mut list, "newest", "code style");
         assert_eq!(list.len(), KEEP);
@@ -218,7 +219,7 @@ mod tests {
     #[test]
     fn the_list_survives_the_round_trip() {
         let list = vec![
-            Spawned { id: "abc".into(), why: "slop cop".into(), when: 100 },
+            Spawned { id: "abc".into(), why: "footprint".into(), when: 100 },
             Spawned { id: "def".into(), why: String::new(), when: 200 },
         ];
         assert_eq!(from_json(&to_json(&list)), list);
