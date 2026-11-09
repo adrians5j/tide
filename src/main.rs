@@ -5340,6 +5340,113 @@ fn usage_block_text(spent: &[(&'static str, i64)]) -> Option<String> {
     })
 }
 
+/// A plan window that has just crossed a mark worth stopping the user for.
+#[derive(Clone, Debug, PartialEq)]
+struct UsageAlert {
+    /// 80 or 100.
+    mark: u8,
+    title: String,
+    body: String,
+}
+
+/// Which marks each plan window has reached, as (window, mark, when it comes
+/// back, how full). 80 is a warning, 100 is the stop.
+///
+/// The reset time rides along because it is what tells one window from the
+/// next: the poll reads the same file four times a minute, so an alert has to
+/// be raised against the window it belongs to and not against the reading.
+fn usage_marks(limits: Option<&usage::Limits>) -> Vec<(&'static str, u8, i64, f32)> {
+    let Some(l) = limits else { return Vec::new() };
+    [("The 5-hour session window", &l.five_hour), ("The weekly window", &l.seven_day)]
+        .into_iter()
+        .filter_map(|(label, w)| {
+            let w = w.as_ref()?;
+            let mark = match w.pct {
+                p if p >= 100.0 => 100,
+                p if p >= 80.0 => 80,
+                _ => return None,
+            };
+            Some((label, mark, w.resets_at, w.pct))
+        })
+        .collect()
+}
+
+/// What the alert says. At 100% it says what happens to a prompt sent anyway,
+/// because that is the question the alert raises.
+fn usage_alert_text(label: &str, mark: u8, resets_at: i64, pct: f32) -> (String, String) {
+    let left = usage::fmt_left(resets_at);
+    let rolls = match left.is_empty() {
+        true => String::new(),
+        false => format!(" It rolls over in {left}."),
+    };
+    match mark {
+        100 => (
+            "Prompts are held".to_string(),
+            format!(
+                "{label} is at 100%.{rolls} Anything you send waits in the queue until \
+                 then. Send anyway from the composer if you would rather spend the overage."
+            ),
+        ),
+        _ => (
+            format!("{label} is at {}%", pct.round() as i64),
+            format!("Prompts are held at 100%.{rolls}"),
+        ),
+    }
+}
+
+/// The alert on screen and the marks already raised, shared by every workspace
+/// in the process.
+///
+/// The plan windows belong to the account, not to a folder, so twelve open
+/// workspaces would otherwise each raise their own 80% and each want dismissing
+/// in turn. Raised once, shown by whichever workspace is on screen, dismissed
+/// for all of them at once.
+#[derive(Default)]
+struct UsageAlerts {
+    shown: Option<UsageAlert>,
+    raised: HashSet<(&'static str, u8, i64)>,
+}
+
+fn usage_alerts() -> &'static Mutex<UsageAlerts> {
+    static A: std::sync::OnceLock<Mutex<UsageAlerts>> = std::sync::OnceLock::new();
+    A.get_or_init(|| Mutex::new(UsageAlerts::default()))
+}
+
+/// Fold a reading in, raising an alert for any mark this window hasn't hit
+/// before. `true` when something new went up, so the caller can repaint.
+///
+/// The highest new mark wins: a jump from 40% to 100% between two polls is one
+/// alert about being held, not an 80% warning with the real news behind it.
+fn raise_usage_alert(limits: Option<&usage::Limits>) -> bool {
+    let Ok(mut a) = usage_alerts().lock() else { return false };
+    let mut best: Option<(&'static str, u8, i64, f32)> = None;
+    for (label, mark, resets_at, pct) in usage_marks(limits) {
+        if !a.raised.insert((label, mark, resets_at)) {
+            continue;
+        }
+        if best.map_or(true, |(_, m, _, _)| mark > m) {
+            best = Some((label, mark, resets_at, pct));
+        }
+    }
+    let Some((label, mark, resets_at, pct)) = best else { return false };
+    let (title, body) = usage_alert_text(label, mark, resets_at, pct);
+    a.shown = Some(UsageAlert { mark, title, body });
+    true
+}
+
+/// The alert to draw, if there is one.
+fn shown_usage_alert() -> Option<UsageAlert> {
+    usage_alerts().lock().ok()?.shown.clone()
+}
+
+/// Put it away. The mark stays raised, so the same window doesn't bring it
+/// straight back on the next poll.
+fn clear_usage_alert() {
+    if let Ok(mut a) = usage_alerts().lock() {
+        a.shown = None;
+    }
+}
+
 /// An image id for the phone, as a string.
 ///
 /// The id is gpui's content hash, a full u64. JavaScript parses JSON numbers as
@@ -9646,6 +9753,9 @@ impl Storm {
                     if this.limits != l {
                         let was_blocked = this.usage_block().is_some();
                         this.limits = l;
+                        // 80% is worth knowing before the window closes, and
+                        // 100% is worth more than a line in the composer
+                        raise_usage_alert(this.limits.as_ref());
                         // the window rolled over while something sat in the
                         // queue: send it rather than wait for a turn that can
                         // never end, since none is running
@@ -11204,6 +11314,12 @@ impl Storm {
             return;
         }
         if key != "escape" {
+            return;
+        }
+        // the usage alert sits over everything, so escape takes it first
+        if shown_usage_alert().is_some() {
+            clear_usage_alert();
+            cx.notify();
             return;
         }
         // escape inside the per-branch submenu backs out to the branch list,
@@ -17526,6 +17642,11 @@ impl Render for Storm {
                     }),
             );
         }
+        // last, so it covers whatever else is up: at 100% the dialog is the
+        // answer to why nothing is being sent
+        if let Some(alert) = shown_usage_alert() {
+            root = root.child(self.render_usage_alert(&alert, cx));
+        }
 
         root
     }
@@ -19035,6 +19156,135 @@ impl Storm {
                     cx.notify();
                 })),
         )
+    }
+
+    /// The 80%/100% alert: a dialog in the middle of the window, because a line
+    /// in the composer is something you read after wondering why nothing was
+    /// sent. Dismissed by the button, by the backdrop or by escape.
+    fn render_usage_alert(&self, alert: &UsageAlert, cx: &mut Context<Self>) -> impl IntoElement {
+        let color = usage_color(alert.mark as f32);
+        let held = alert.mark >= 100;
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_start()
+            .justify_center()
+            .child(
+                div().absolute().inset_0().bg(rgba(0x00000088)).id("usage-alert-backdrop").on_click(
+                    cx.listener(|_this, _e, _w, cx| {
+                        clear_usage_alert();
+                        cx.notify();
+                    }),
+                ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(140.))
+                    // placed, not centred by the parent: an absolute child has
+                    // no part in the flex line that would centre it
+                    .left(px((self.win_width / 2.0 - 210.0).max(20.)))
+                    .w(px(420.))
+                    .bg(rgb(POPUP_BG))
+                    .border_1()
+                    .border_color(rgb(color))
+                    .border_l_4()
+                    .rounded_lg()
+                    .shadow_lg()
+                    .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .px_4()
+                            .pt_3()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(18.))
+                                    .text_color(rgb(color))
+                                    .child(if held { "■" } else { "▲" }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(14.))
+                                    .text_color(rgb(TEXT))
+                                    .child(alert.title.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .px_4()
+                            .pt_2()
+                            .pb_3()
+                            .text_size(px(12.))
+                            .text_color(rgb(MUTED))
+                            .child(alert.body.clone()),
+                    )
+                    .child(
+                        div()
+                            .px_4()
+                            .py_2()
+                            .border_t_1()
+                            .border_color(rgb(BORDER))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_grow(1.0)
+                                    .text_size(px(10.))
+                                    .text_color(rgb(LINE_NUMBER))
+                                    .child("esc"),
+                            )
+                            // at 100% the other thing to do from here is spend
+                            // the overage, which the composer offers too
+                            .when(held, |d| {
+                                d.child(
+                                    div()
+                                        .id("usage-alert-skip")
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .text_size(px(11.))
+                                        .border_1()
+                                        .border_color(rgb(BORDER))
+                                        .text_color(rgb(MUTED))
+                                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                        .child("Send anyway")
+                                        .tooltip(tip("Send prompts through until this window rolls over"))
+                                        .on_click(cx.listener(|this, _e, _w, cx| {
+                                            clear_usage_alert();
+                                            this.skip_usage_block(cx);
+                                        })),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id("usage-alert-ok")
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_size(px(11.))
+                                    .border_1()
+                                    .border_color(rgb(color))
+                                    .text_color(rgb(color))
+                                    .hover(|s| s.bg(rgb(HOVER)))
+                                    .child("Got it")
+                                    .on_click(cx.listener(|_this, _e, _w, cx| {
+                                        clear_usage_alert();
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
     }
 
     /// The chip's detail panel, rendered at the root so nothing paints over it —
@@ -39561,6 +39811,85 @@ mod usage_block_tests {
         assert!(text.contains("2h"), "{text}");
         // and the skip is keyed to the last one back, so one click covers both
         assert_eq!(spent.iter().map(|(_, r)| *r).max(), Some(later));
+    }
+
+    /// 80 warns, 100 stops, and anything under 80 says nothing. The reset rides
+    /// along, since that is what tells one window from the next.
+    #[test]
+    fn the_marks_are_eighty_and_a_hundred() {
+        assert!(usage_marks(None).is_empty());
+        assert!(usage_marks(Some(&limits(Some(79.9), Some(0.0)))).is_empty());
+        assert_eq!(
+            usage_marks(Some(&limits(Some(80.0), None))),
+            vec![("The 5-hour session window", 80, 0, 80.0)]
+        );
+        assert_eq!(
+            usage_marks(Some(&limits(Some(100.0), Some(92.0)))),
+            vec![
+                ("The 5-hour session window", 100, 0, 100.0),
+                ("The weekly window", 80, 0, 92.0),
+            ]
+        );
+    }
+
+    /// The 100% alert says what happens to a prompt sent anyway; the 80% one
+    /// says the number, since there is nothing to decide yet.
+    #[test]
+    fn the_alert_says_which_window_and_what_now() {
+        let (title, body) = usage_alert_text("The 5-hour session window", 100, 0, 100.0);
+        assert_eq!(title, "Prompts are held");
+        assert!(body.starts_with("The 5-hour session window is at 100%."), "{body}");
+        assert!(body.contains("Send anyway"), "{body}");
+        let (title, body) = usage_alert_text("The weekly window", 80, 0, 84.4);
+        assert_eq!(title, "The weekly window is at 84%");
+        assert_eq!(body, "Prompts are held at 100%.");
+        // with a reset to quote, the wait is in both
+        let soon = now_secs() as i64 + 70 * 60;
+        let (_, body) = usage_alert_text("The 5-hour session window", 100, soon, 100.0);
+        assert!(body.contains("rolls over in 1h"), "{body}");
+        let (_, body) = usage_alert_text("The weekly window", 80, soon, 80.0);
+        assert!(body.contains("rolls over in 1h"), "{body}");
+    }
+
+    /// A mark is raised once per window. The poll reads the same file four
+    /// times a minute, and dismissing an alert must not bring it straight back.
+    #[test]
+    fn a_mark_is_raised_once_per_window() {
+        let at = |pct: f32, resets_at: i64| usage::Limits {
+            five_hour: Some(usage::Window { pct, resets_at }),
+            seven_day: None,
+            seen: 0,
+        };
+        // a window this test owns, so it can't collide with another one
+        let win = 4_070_908_800;
+        assert!(raise_usage_alert(Some(&at(81.0, win))));
+        assert_eq!(shown_usage_alert().map(|a| a.mark), Some(80));
+        clear_usage_alert();
+        assert!(!raise_usage_alert(Some(&at(84.0, win))));
+        assert!(shown_usage_alert().is_none());
+        // 100% in the same window is its own mark
+        assert!(raise_usage_alert(Some(&at(100.0, win))));
+        assert_eq!(shown_usage_alert().map(|a| a.mark), Some(100));
+        clear_usage_alert();
+        // and the next window starts over
+        assert!(raise_usage_alert(Some(&at(80.0, win + 18_000))));
+        assert_eq!(shown_usage_alert().map(|a| a.mark), Some(80));
+        clear_usage_alert();
+    }
+
+    /// A jump past both marks between two polls is one alert, about the mark
+    /// that matters.
+    #[test]
+    fn a_jump_past_both_marks_alerts_on_the_higher() {
+        let win = 4_070_995_200;
+        let l = usage::Limits {
+            five_hour: Some(usage::Window { pct: 100.0, resets_at: win }),
+            seven_day: None,
+            seen: 0,
+        };
+        assert!(raise_usage_alert(Some(&l)));
+        assert_eq!(shown_usage_alert().map(|a| a.mark), Some(100));
+        clear_usage_alert();
     }
 }
 
