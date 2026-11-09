@@ -928,6 +928,28 @@ fn save_agent_titled(root: &Path, theirs: bool) {
     }
 }
 
+/// Whether a paste into the agent composer sends straight away.
+///
+/// Dictation pastes its transcript into whatever has focus, so the ↩ after it is
+/// the last keystroke left in the loop. With this on, ⌘V into an empty composer
+/// sends what it pasted.
+///
+/// Process-global and read off disk once: the preference is about how you
+/// dictate rather than about one folder, so every workspace in the window
+/// shares it and a toggle in one takes in all of them. The file's existence is
+/// the whole setting.
+fn send_on_paste_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".config/tide/send-on-paste"))
+}
+
+fn send_on_paste() -> &'static AtomicBool {
+    static ON: std::sync::OnceLock<AtomicBool> = std::sync::OnceLock::new();
+    ON.get_or_init(|| {
+        AtomicBool::new(send_on_paste_path().is_some_and(|p| p.exists()))
+    })
+}
+
 /// A workspace whose agent was deliberately started over (a reset, or ⌃N).
 /// The adapter only remembers a session once it carries messages, so the fresh
 /// empty one isn't in `session/list` — without this flag the next launch would
@@ -6121,6 +6143,7 @@ enum Cmd {
     OpenRepository,
     OpenPrNumber,
     InstallUsageBars,
+    SendOnPaste,
 }
 
 /// (command, label, icon glyph, shortcut hint)
@@ -6165,6 +6188,7 @@ const PALETTE: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::ResetWorkspacePause, "Reset Workspace & Pause", IC_HOME, ""),
     (Cmd::WorkspaceHistory, "Workspace History…  (every folder, and what it was for)", IC_HISTORY, "⌘⇧E"),
     (Cmd::TogglePause, "Pause / Resume Workspace  (⌥Tab skips paused)", IC_HOME, ""),
+    (Cmd::SendOnPaste, "Send Dictation on Paste (no ↩)", IC_HOME, ""),
     (Cmd::AddComment, "Comment on This Line…", IC_COMMIT, "⌥C"),
     (Cmd::ShowComments, "Review Comments…", IC_COMMIT, "⌥⇧C"),
     (Cmd::SendComments, "Send Comments to Agent", IC_PUSH, "⌥↩ / ⌘F12"),
@@ -15671,6 +15695,7 @@ impl Storm {
             Cmd::OpenPrNumber => self.open_prnum_prompt(window, cx),
             Cmd::InstallUsageBars => self.install_usage_bars(cx),
             Cmd::TogglePause => self.toggle_pause(cx),
+            Cmd::SendOnPaste => self.toggle_send_on_paste(cx),
             Cmd::ResetWorkspace => self.reset_workspace(cx),
             // reset, then hand the workspace back — the git work keeps running in
             // its own thread, so closing here doesn't cancel the checkout/pull
@@ -15701,6 +15726,33 @@ impl Storm {
         self.ws_paused = !self.ws_paused;
         save_ws_paused(&self.root, self.ws_paused);
         let msg = if self.ws_paused { "Workspace paused — ⌥Tab skips it" } else { "Workspace resumed" };
+        self.show_flash(msg, cx);
+        cx.notify();
+    }
+
+    /// Turn send-on-paste on or off. The file is the setting, so it survives a
+    /// restart, and the flash says which way it went: a preference that changes
+    /// what ⌘V does should never be something you have to test for.
+    fn toggle_send_on_paste(&mut self, cx: &mut Context<Self>) {
+        let on = !send_on_paste().load(Ordering::Relaxed);
+        send_on_paste().store(on, Ordering::Relaxed);
+        if let Some(p) = send_on_paste_path() {
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            match on {
+                true => {
+                    let _ = std::fs::write(p, "on\n");
+                }
+                false => {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
+        let msg = match on {
+            true => "⌘V into an empty composer now sends straight away",
+            false => "⌘V pastes into the composer again; ↩ sends",
+        };
         self.show_flash(msg, cx);
         cx.notify();
     }
@@ -26573,6 +26625,21 @@ impl Storm {
             if self.attach_clipboard_image(ImgToken::Composer, cx) {
                 return;
             }
+            // dictation pastes the whole message, so it goes as it lands.
+            // Only into an empty composer: a paste into something you were
+            // already writing is an edit, not a transcript. Ahead of the
+            // collapse, since a long transcript is still the message.
+            if send_on_paste().load(Ordering::Relaxed) && self.agent_input.text.trim().is_empty() {
+                let clip = cx.read_from_clipboard().and_then(|i| i.text());
+                let text = clip.unwrap_or_default().trim().to_string();
+                if !text.is_empty() {
+                    self.agent_input.clear();
+                    self.agent_input.insert_text(&text);
+                    self.send_composer(cx);
+                    cx.notify();
+                    return;
+                }
+            }
             if self.paste_collapsed(cx) {
                 return;
             }
@@ -26690,22 +26757,7 @@ impl Storm {
             }
             // ↩ sends; the field's own newline handling is bypassed here
             "enter" if !ks.modifiers.shift => {
-                let shown = self.agent_input.text.trim().to_string();
-                if shown.is_empty() && self.agent_imgs.is_empty() {
-                    return;
-                }
-                let full = self.expand_mentions(&self.expand_pastes(&shown));
-                self.agent_input.clear();
-                self.agent_ghost = None;
-                self.agent_hist = None;
-                self.agent_pastes.clear();
-                self.agent_mentions.clear();
-                self.at_open = false;
-                self.at_items.clear();
-                // the transcript shows what you typed (tokens and all); the
-                // agent gets the pasted content spliced back in
-                let label = (full != shown).then_some(shown);
-                self.send_agent_prompt_by(full, label, Sender::You, cx);
+                self.send_composer(cx);
             }
             "enter" => {
                 self.agent_input.newline(); // ⇧↩ too, since it costs nothing
@@ -26724,6 +26776,27 @@ impl Storm {
         self.recompute_agent_ghost();
         self.recompute_mentions(cx);
         cx.notify();
+    }
+
+    /// Send what is in the composer. What ↩ does, and what a paste does when
+    /// send-on-paste is on.
+    fn send_composer(&mut self, cx: &mut Context<Self>) {
+        let shown = self.agent_input.text.trim().to_string();
+        if shown.is_empty() && self.agent_imgs.is_empty() {
+            return;
+        }
+        let full = self.expand_mentions(&self.expand_pastes(&shown));
+        self.agent_input.clear();
+        self.agent_ghost = None;
+        self.agent_hist = None;
+        self.agent_pastes.clear();
+        self.agent_mentions.clear();
+        self.at_open = false;
+        self.at_items.clear();
+        // the transcript shows what you typed (tokens and all); the agent gets
+        // the pasted content spliced back in
+        let label = (full != shown).then_some(shown);
+        self.send_agent_prompt_by(full, label, Sender::You, cx);
     }
 
     /// Your own turns, newest last — what ↑ walks through.
@@ -30670,6 +30743,10 @@ impl Storm {
                             format!("Waiting for the reviewers…{}", self.caret_if(focused))
                         } else if blocked.is_some() {
                             format!("Waiting for the plan window…{}", self.caret_if(focused))
+                        } else if send_on_paste().load(Ordering::Relaxed) {
+                            // the empty box is exactly the state the setting
+                            // applies to, so it is where it says so
+                            format!("Message the agent… ⌘V sends{}", self.caret_if(focused))
                         } else {
                             format!("Message the agent…{}", self.caret_if(focused))
                         })
