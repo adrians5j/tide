@@ -19723,6 +19723,9 @@ impl Storm {
             );
         }
 
+        // the sessions in the window, once: every row below reads them, and
+        // this panel redraws on every notify behind it
+        let sessions = report.top(from, to);
         // one row per workspace, with the share of the window it took and how
         // much of that was the reviewers TIDE sends in on its own
         let roots = report.by_root(from, to);
@@ -19730,8 +19733,7 @@ impl Storm {
         let mut ws_rows = div().flex().flex_col().gap(px(5.));
         for (root, u) in roots.iter().take(10) {
             let name = Path::new(root).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| root.clone());
-            let mine: u64 = report
-                .top(from, to)
+            let mine: u64 = sessions
                 .iter()
                 .filter(|(s, _)| s.root == *root && self.tokens_why.contains_key(&s.id))
                 .map(|(_, u)| u.weighted())
@@ -19778,7 +19780,7 @@ impl Storm {
         // and the sessions behind those numbers, which is where a jump gets a
         // name: a reviewer, a brief, or the pane you were typing in
         let mut sess_rows = div().flex().flex_col().gap(px(4.));
-        for (s, u) in report.top(from, to).into_iter().take(12) {
+        for (s, u) in sessions.iter().take(12) {
             let why = self.tokens_why.get(&s.id).cloned().unwrap_or_default();
             let name = Path::new(&s.root).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             sess_rows = sess_rows.child(
