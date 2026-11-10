@@ -35287,18 +35287,28 @@ impl Storm {
         }
 
         Some(
-            div().ml(px(40.)).max_w(px(680.)).child(
-                div()
-                    .pl_3()
-                    .py_2()
-                    .min_w(px(0.))
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .border_l_2()
-                    .border_color(rgb(if waiting { BORDER } else { ACCENT }))
-                    .child(head)
-                    .when(!folded, |d| d.child(body)),
+            // The indent and the width cap go on separate nodes, the way the
+            // slide's prose and the ask box do. Both on one node, which is what
+            // this was, and the box measures 23px taller than the content it
+            // holds. That matters here more than anywhere else in the deck: a
+            // left border is painted at the element's own height, so a box that
+            // measures longer than it draws leaves a blue rule running past the
+            // thread, down through the slides under it. The clip is the guard
+            // on that. Whatever the measurement does, the rule stops here.
+            div().pl(px(40.)).overflow_hidden().child(
+                div().max_w(px(680.)).min_w(px(0.)).child(
+                    div()
+                        .pl_3()
+                        .py_2()
+                        .min_w(px(0.))
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .border_l_2()
+                        .border_color(rgb(if waiting { BORDER } else { ACCENT }))
+                        .child(head)
+                        .when(!folded, |d| d.child(body)),
+                ),
             ),
         )
     }
