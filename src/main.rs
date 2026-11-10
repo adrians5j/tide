@@ -29690,6 +29690,287 @@ impl Storm {
         job_at(&self.job_turns, ix)
     }
 
+    /// One row of the transcript: a message, the "thinking" line under the
+    /// last one, or a prompt still sitting in the queue.
+    fn agent_row(
+        &mut self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // `this` rather than `self`: the listeners in here each have a `this`
+        // of their own, and the body reads as it did inside the list's closure
+        let this = self;
+        // a closed job hides its working, not what came of it: a
+        // summary card is the agent's closing word on the job, and
+        // a screenshot is something it meant you to see
+        let result = matches!(
+            this.agent_msgs.get(ix),
+            Some(AgentMsg::Summary { .. } | AgentMsg::Shot { .. })
+        );
+        if !result && this.job_turn(ix).is_some_and(|q| !q.open && ix > q.at) {
+            return div().into_any_element();
+        }
+        if let Some(m) = this.agent_msgs.get(ix) {
+            // the closing summary, in its own card
+            if matches!(m, AgentMsg::Reviewing) {
+                let card = reviewing_card(&this.reviewers, cx);
+                return div().px_3().py_1().child(card).into_any_element();
+            }
+            if let AgentMsg::Summary { title, text } = m {
+                let (title, text) = (title.clone(), text.clone());
+                return div()
+                    .px_3()
+                    .py_1()
+                    .child(summary_card(&title, &text))
+                    .into_any_element();
+            }
+            // agent prose is selectable, so it can be quoted back
+            if let AgentMsg::Agent(t) = m {
+                let t = t.clone();
+                return div()
+                    .px_3()
+                    .py_1()
+                    .child(this.render_agent_md(ix, &t, window, cx))
+                    .into_any_element();
+            }
+            // a screenshot: right-click for copy / open, and no
+            // hover preview — the picture is already full size
+            if let AgentMsg::Shot { note, image, path, dims } = m {
+                let (note, image, path, dims) =
+                    (note.clone(), image.clone(), path.clone(), *dims);
+                let shot_w = this.shot_width();
+                let (img_ctx, path_ctx) = (image.clone(), path.clone());
+                return div()
+                    .id(("shot-row", ix))
+                    .px_3()
+                    .py_1()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .text_size(px(10.))
+                            .text_color(rgb(MUTED))
+                            .child(
+                                div()
+                                    .font_family(ICON_FONT)
+                                    .text_size(px(10.))
+                                    .child(IC_BROWSER),
+                            )
+                            .child(div().flex_grow(1.0).truncate().child(
+                                if note.is_empty() {
+                                    "screenshot".to_string()
+                                } else {
+                                    note.clone()
+                                },
+                            )),
+                    )
+                    .child(
+                        // the frame takes the pane's width and
+                        // clips: without this it sizes to the
+                        // picture, and a wide shot runs off the
+                        // side of the transcript
+                        div()
+                            .w_full()
+                            .min_w(px(0.))
+                            .rounded_md()
+                            .overflow_hidden()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .child(shot_img(image.clone(), dims, shot_w)),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                            this.ctx_shot = Some(img_ctx.clone());
+                            this.tree_ctx_path = Some(path_ctx.clone());
+                            this.tree_ctx_kind = CtxKind::Shot;
+                            this.tree_ctx = Some((
+                                f32::from(ev.position.x),
+                                f32::from(ev.position.y),
+                            ));
+                            window.focus(&this.tree_ctx_focus, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element();
+            }
+            // your own words get the same treatment: select them,
+            // right-click them, copy them
+            if let AgentMsg::User { text, imgs, by } = m {
+                let (text, imgs) = (text.clone(), imgs.clone());
+                let by = *by;
+                let tide = by == Sender::Tide;
+                // a job TIDE started is one line until you open it:
+                // the prompt behind it is a page of instructions
+                // written for the agent, not for you
+                let shut =
+                    this.job_turns.iter().any(|q| q.at == ix && !q.open);
+                let body = (!shut).then(|| {
+                    div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .min_w(px(0.))
+                    .gap_1()
+                    .child(user_head(&text, ix, by))
+                    .child(
+                        div()
+                            // a plain block sizes to its content, so
+                            // a long line laid itself out past the
+                            // bubble and got clipped. Flex + w_full
+                            // + min_w(0) is what makes it wrap.
+                            .flex()
+                            .flex_col()
+                            .w_full()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            // TIDE's own messages are quieter and
+                            // outlined; yours stay the solid blue
+                            .when(tide, |d| {
+                                d.bg(rgb(BG))
+                                    .border_1()
+                                    .border_color(rgb(USER_BUBBLE))
+                                    .text_color(rgb(TEXT))
+                            })
+                            .when(!tide, |d| {
+                                d.bg(rgb(USER_BUBBLE)).text_color(rgb(SEL_TEXT))
+                            })
+                            .text_size(px(14.5))
+                            .child(this.render_agent_md(ix, &text, window, cx)),
+                    )
+                    .children(user_images(&imgs, ix))
+                });
+                return div()
+                    .px_3()
+                    .py_1()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .min_w(px(0.))
+                    .gap_1()
+                    .children(this.job_chip(ix, cx))
+                    .children(body)
+                    .into_any_element();
+            }
+            return div().px_3().py_1().child(render_agent_msg(m, ix, this.shot_width())).into_any_element();
+        }
+        let after = ix - this.agent_msgs.len();
+        // the "thinking" row sits between the transcript and the queue
+        if this.agent_busy && after == 0 {
+            const SPIN: [&str; 10] =
+                ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let secs = this
+                .agent_turn_start
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(0);
+            let elapsed = if secs >= 60 {
+                format!("{}m {}s", secs / 60, secs % 60)
+            } else {
+                format!("{secs}s")
+            };
+            return div()
+                .px_3()
+                .py_1()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .text_size(px(12.))
+                .child(
+                    div()
+                        .text_color(rgb(ACCENT))
+                        .child(SPIN[this.agent_spin % SPIN.len()]),
+                )
+                .child(div().text_color(rgb(MUTED)).child("thinking…"))
+                .child(div().text_color(rgb(LINE_NUMBER)).child(elapsed))
+                .into_any_element();
+        }
+        let qi = after - usize::from(this.agent_busy);
+        match this
+            .agent_queue
+            .get(qi)
+            .map(|q| q.label.clone().unwrap_or_else(|| q.text.clone()))
+        {
+            Some(text) => div()
+                .px_3()
+                .py_1()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .text_size(px(10.))
+                        .text_color(rgb(MUTED))
+                        .child("You  ·  queued")
+                        // a queued message hasn't been sent yet, so
+                        // changing your mind has to be possible
+                        .child(
+                            div()
+                                .id(("agent-queue-drop", qi))
+                                .px_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(GIT_DELETED)))
+                                .child("✕ remove")
+                                .tooltip(tip("Don't send this one"))
+                                .on_click(cx.listener(move |this, _e, _w, cx| {
+                                    if qi < this.agent_queue.len() {
+                                        this.agent_queue.remove(qi);
+                                        cx.notify();
+                                    }
+                                })),
+                        )
+                        // and putting it back in the box to edit is
+                        // the other half of that
+                        .child(
+                            div()
+                                .id(("agent-queue-edit", qi))
+                                .px_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                .child("edit")
+                                .tooltip(tip("Move it back into the composer"))
+                                .on_click(cx.listener(move |this, _e, window, cx| {
+                                    if qi < this.agent_queue.len() {
+                                        let q = this.agent_queue.remove(qi);
+                                        this.agent_input.set(q.text);
+                                        this.agent_imgs.extend(q.imgs);
+                                        window.focus(&this.agent_focus, cx);
+                                        cx.notify();
+                                    }
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(SELECTED_BG))
+                        .text_size(px(14.5))
+                        .text_color(rgb(MUTED))
+                        .child(text),
+                )
+                .into_any_element(),
+            None => div().into_any_element(),
+        }
+    }
+
     /// How a named job is going, as the one line it draws in the transcript:
     /// its name, its state, and the arrow that opens the working behind it.
     /// Failure is an error row inside the turn — that is the shape an adapter
@@ -29762,6 +30043,58 @@ impl Storm {
                     if let Some(q) = this.job_turns.iter_mut().find(|q| q.at == ix) {
                         q.open = !q.open;
                     }
+                    cx.notify();
+                })),
+        )
+    }
+
+    /// The line that folds an open job away again, under the last row of it.
+    ///
+    /// The chip that opened it is at the top of the turn, which on anything
+    /// worth opening is a long way back up: the way to fold a job away was to
+    /// scroll until you found the line you clicked. This is that line again, at
+    /// the end, and folding from here scrolls back to it.
+    fn job_foot(&self, ix: usize, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let last = self.agent_msgs.len().saturating_sub(1);
+        let q = self
+            .job_turns
+            .iter()
+            .find(|q| q.open && q.end.map_or(ix == last, |e| ix + 1 == e))?;
+        // a turn of two or three rows shows its own opening line already
+        if q.end.unwrap_or(self.agent_msgs.len()).saturating_sub(q.at) < 4 {
+            return None;
+        }
+        let at = q.at;
+        let name = match q.job.char_indices().nth(46) {
+            Some((b, _)) => format!("{}\u{2026}", q.job[..b].trim_end()),
+            None => q.job.clone(),
+        };
+        Some(
+            div()
+                .id(("job-foot", ix))
+                .mx_3()
+                .mt_1()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1p5()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .text_size(px(11.5))
+                .text_color(rgb(LINE_NUMBER))
+                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                .child(div().text_size(px(10.)).child("\u{25b4}"))
+                .child(format!("Fold {name} away"))
+                .tooltip(tip("Fold the job away and go back to its line"))
+                .on_click(cx.listener(move |this, _e, _w, cx| {
+                    if let Some(q) = this.job_turns.iter_mut().find(|q| q.at == at) {
+                        q.open = false;
+                    }
+                    // everything between here and the job line has just gone:
+                    // without this the view lands wherever that left it
+                    this.agent_list.scroll_to_reveal_item(at);
                     cx.notify();
                 })),
         )
@@ -30333,273 +30666,16 @@ impl Storm {
             gpui::list(
                 self.agent_list.clone(),
                 cx.processor(|this: &mut Self, ix: usize, window: &mut Window, cx: &mut Context<Self>| {
-                    // a closed job hides its working, not what came of it: a
-                    // summary card is the agent's closing word on the job, and
-                    // a screenshot is something it meant you to see
-                    let result = matches!(
-                        this.agent_msgs.get(ix),
-                        Some(AgentMsg::Summary { .. } | AgentMsg::Shot { .. })
-                    );
-                    if !result && this.job_turn(ix).is_some_and(|q| !q.open && ix > q.at) {
-                        return div().into_any_element();
-                    }
-                    if let Some(m) = this.agent_msgs.get(ix) {
-                        // the closing summary, in its own card
-                        if matches!(m, AgentMsg::Reviewing) {
-                            let card = reviewing_card(&this.reviewers, cx);
-                            return div().px_3().py_1().child(card).into_any_element();
-                        }
-                        if let AgentMsg::Summary { title, text } = m {
-                            let (title, text) = (title.clone(), text.clone());
-                            return div()
-                                .px_3()
-                                .py_1()
-                                .child(summary_card(&title, &text))
-                                .into_any_element();
-                        }
-                        // agent prose is selectable, so it can be quoted back
-                        if let AgentMsg::Agent(t) = m {
-                            let t = t.clone();
-                            return div()
-                                .px_3()
-                                .py_1()
-                                .child(this.render_agent_md(ix, &t, window, cx))
-                                .into_any_element();
-                        }
-                        // a screenshot: right-click for copy / open, and no
-                        // hover preview — the picture is already full size
-                        if let AgentMsg::Shot { note, image, path, dims } = m {
-                            let (note, image, path, dims) =
-                                (note.clone(), image.clone(), path.clone(), *dims);
-                            let shot_w = this.shot_width();
-                            let (img_ctx, path_ctx) = (image.clone(), path.clone());
-                            return div()
-                                .id(("shot-row", ix))
-                                .px_3()
-                                .py_1()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap_2()
-                                        .text_size(px(10.))
-                                        .text_color(rgb(MUTED))
-                                        .child(
-                                            div()
-                                                .font_family(ICON_FONT)
-                                                .text_size(px(10.))
-                                                .child(IC_BROWSER),
-                                        )
-                                        .child(div().flex_grow(1.0).truncate().child(
-                                            if note.is_empty() {
-                                                "screenshot".to_string()
-                                            } else {
-                                                note.clone()
-                                            },
-                                        )),
-                                )
-                                .child(
-                                    // the frame takes the pane's width and
-                                    // clips: without this it sizes to the
-                                    // picture, and a wide shot runs off the
-                                    // side of the transcript
-                                    div()
-                                        .w_full()
-                                        .min_w(px(0.))
-                                        .rounded_md()
-                                        .overflow_hidden()
-                                        .border_1()
-                                        .border_color(rgb(BORDER))
-                                        .child(shot_img(image.clone(), dims, shot_w)),
-                                )
-                                .on_mouse_down(
-                                    MouseButton::Right,
-                                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                                        this.ctx_shot = Some(img_ctx.clone());
-                                        this.tree_ctx_path = Some(path_ctx.clone());
-                                        this.tree_ctx_kind = CtxKind::Shot;
-                                        this.tree_ctx = Some((
-                                            f32::from(ev.position.x),
-                                            f32::from(ev.position.y),
-                                        ));
-                                        window.focus(&this.tree_ctx_focus, cx);
-                                        cx.notify();
-                                    }),
-                                )
-                                .into_any_element();
-                        }
-                        // your own words get the same treatment: select them,
-                        // right-click them, copy them
-                        if let AgentMsg::User { text, imgs, by } = m {
-                            let (text, imgs) = (text.clone(), imgs.clone());
-                            let by = *by;
-                            let tide = by == Sender::Tide;
-                            // a job TIDE started is one line until you open it:
-                            // the prompt behind it is a page of instructions
-                            // written for the agent, not for you
-                            let shut =
-                                this.job_turns.iter().any(|q| q.at == ix && !q.open);
-                            let body = (!shut).then(|| {
-                                div()
-                                .flex()
-                                .flex_col()
-                                .w_full()
-                                .min_w(px(0.))
-                                .gap_1()
-                                .child(user_head(&text, ix, by))
-                                .child(
-                                    div()
-                                        // a plain block sizes to its content, so
-                                        // a long line laid itself out past the
-                                        // bubble and got clipped. Flex + w_full
-                                        // + min_w(0) is what makes it wrap.
-                                        .flex()
-                                        .flex_col()
-                                        .w_full()
-                                        .min_w(px(0.))
-                                        .overflow_hidden()
-                                        .px_2()
-                                        .py_1()
-                                        .rounded_md()
-                                        // TIDE's own messages are quieter and
-                                        // outlined; yours stay the solid blue
-                                        .when(tide, |d| {
-                                            d.bg(rgb(BG))
-                                                .border_1()
-                                                .border_color(rgb(USER_BUBBLE))
-                                                .text_color(rgb(TEXT))
-                                        })
-                                        .when(!tide, |d| {
-                                            d.bg(rgb(USER_BUBBLE)).text_color(rgb(SEL_TEXT))
-                                        })
-                                        .text_size(px(14.5))
-                                        .child(this.render_agent_md(ix, &text, window, cx)),
-                                )
-                                .children(user_images(&imgs, ix))
-                            });
-                            return div()
-                                .px_3()
-                                .py_1()
-                                .flex()
-                                .flex_col()
-                                .w_full()
-                                .min_w(px(0.))
-                                .gap_1()
-                                .children(this.job_chip(ix, cx))
-                                .children(body)
-                                .into_any_element();
-                        }
-                        return div().px_3().py_1().child(render_agent_msg(m, ix, this.shot_width())).into_any_element();
-                    }
-                    let after = ix - this.agent_msgs.len();
-                    // the "thinking" row sits between the transcript and the queue
-                    if this.agent_busy && after == 0 {
-                        const SPIN: [&str; 10] =
-                            ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-                        let secs = this
-                            .agent_turn_start
-                            .map(|t| t.elapsed().as_secs())
-                            .unwrap_or(0);
-                        let elapsed = if secs >= 60 {
-                            format!("{}m {}s", secs / 60, secs % 60)
-                        } else {
-                            format!("{secs}s")
-                        };
-                        return div()
-                            .px_3()
-                            .py_1()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .text_size(px(12.))
-                            .child(
-                                div()
-                                    .text_color(rgb(ACCENT))
-                                    .child(SPIN[this.agent_spin % SPIN.len()]),
-                            )
-                            .child(div().text_color(rgb(MUTED)).child("thinking…"))
-                            .child(div().text_color(rgb(LINE_NUMBER)).child(elapsed))
-                            .into_any_element();
-                    }
-                    let qi = after - usize::from(this.agent_busy);
-                    match this
-                        .agent_queue
-                        .get(qi)
-                        .map(|q| q.label.clone().unwrap_or_else(|| q.text.clone()))
-                    {
-                        Some(text) => div()
-                            .px_3()
-                            .py_1()
+                    let row = this.agent_row(ix, window, cx);
+                    match this.job_foot(ix, cx) {
+                        Some(foot) => div()
                             .flex()
                             .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_2()
-                                    .text_size(px(10.))
-                                    .text_color(rgb(MUTED))
-                                    .child("You  ·  queued")
-                                    // a queued message hasn't been sent yet, so
-                                    // changing your mind has to be possible
-                                    .child(
-                                        div()
-                                            .id(("agent-queue-drop", qi))
-                                            .px_1()
-                                            .rounded_md()
-                                            .cursor_pointer()
-                                            .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(GIT_DELETED)))
-                                            .child("✕ remove")
-                                            .tooltip(tip("Don't send this one"))
-                                            .on_click(cx.listener(move |this, _e, _w, cx| {
-                                                if qi < this.agent_queue.len() {
-                                                    this.agent_queue.remove(qi);
-                                                    cx.notify();
-                                                }
-                                            })),
-                                    )
-                                    // and putting it back in the box to edit is
-                                    // the other half of that
-                                    .child(
-                                        div()
-                                            .id(("agent-queue-edit", qi))
-                                            .px_1()
-                                            .rounded_md()
-                                            .cursor_pointer()
-                                            .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                                            .child("edit")
-                                            .tooltip(tip("Move it back into the composer"))
-                                            .on_click(cx.listener(move |this, _e, window, cx| {
-                                                if qi < this.agent_queue.len() {
-                                                    let q = this.agent_queue.remove(qi);
-                                                    this.agent_input.set(q.text);
-                                                    this.agent_imgs.extend(q.imgs);
-                                                    window.focus(&this.agent_focus, cx);
-                                                    cx.notify();
-                                                }
-                                            })),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(rgb(SELECTED_BG))
-                                    .text_size(px(14.5))
-                                    .text_color(rgb(MUTED))
-                                    .child(text),
-                            )
+                            .min_w(px(0.))
+                            .child(row)
+                            .child(foot)
                             .into_any_element(),
-                        None => div().into_any_element(),
+                        None => row,
                     }
                 }),
             )
