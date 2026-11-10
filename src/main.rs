@@ -78,6 +78,7 @@ const IC_GRAPH: &str = "\u{ebe2}"; // codicon "graph-line" — plan usage
 const IC_GEAR: &str = "\u{eb51}"; // codicon "gear" — the agent's own settings
 const IC_TOUR: &str = "\u{ebd5}"; // codicon "compass" — code tours
 const IC_HISTORY: &str = "\u{ea82}"; // codicon "history" — past workspaces
+const IC_BRIEF: &str = "\u{eaa4}"; // codicon "book" — a brief, read rather than edited
 // The codicon font is renamed to "Segoe Fluent Icons" because GPUI refuses to
 // load any font lacking an 'm' glyph — except that one specially-cased name.
 const ICON_FONT: &str = "Segoe Fluent Icons";
@@ -36395,6 +36396,12 @@ impl Storm {
             let active = ix == self.active;
             let browser = tab.browser;
             let dirty = !browser && tab.editor.read(cx).is_dirty();
+            // the tabs that aren't files
+            let glyph = match (browser, tab.brief.is_some()) {
+                (true, _) => Some(IC_BROWSER),
+                (_, true) => Some(IC_BRIEF),
+                _ => None,
+            };
             // a PR tab is its title; a file tab is its filename. A title can be
             // a sentence, so it is cut to something a tab bar can hold.
             let name = tab
@@ -36431,15 +36438,18 @@ impl Storm {
                 .border_color(rgb(BORDER))
                 .when(active, |d| d.bg(rgb(BG)))
                 .when(!active, |d| d.hover(|s| s.bg(rgb(HOVER))))
-                .when(browser, |d| {
-                    d.child(
-                        div()
-                            .font_family(ICON_FONT)
-                            .text_size(px(11.))
-                            .text_color(rgb(if active { TEXT } else { MUTED }))
-                            .child(IC_BROWSER),
-                    )
-                })
+                // a tab that isn't a file says so with a glyph. A brief's
+                // title reads like a sentence, the same as the pull request
+                // body's next to it, and the book is what tells them apart
+                // before you have read either tab's words
+                .children(glyph.map(|g| {
+                    div()
+                        .flex_shrink_0()
+                        .font_family(ICON_FONT)
+                        .text_size(px(11.))
+                        .text_color(rgb(if active { TEXT } else { MUTED }))
+                        .child(g)
+                }))
                 .child(
                     // label — click switches tab
                     div()
