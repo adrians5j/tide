@@ -35176,29 +35176,33 @@ impl Storm {
             );
         }
 
+        // The width, said outright, the same as the ask box's under it: 40 is
+        // the indent, 680 the cap the slide's prose uses, and `brief_w` is the
+        // slide as it was last painted. Left to size itself, the box went by
+        // what was in it rather than by the slide: taller than its own text on
+        // a long thread, which left the rule running down the deck past the
+        // slides under it, and narrow on a short one, which wrapped a question
+        // into a column a third of the width. Zero until a slide has been
+        // painted once, and the cap carries that one frame.
+        let box_w = match self.brief_w {
+            w if w > 60. => (w - 40.).min(680.),
+            _ => 0.,
+        };
         Some(
-            // The indent and the width cap go on separate nodes, the way the
-            // slide's prose and the ask box do. Both on one node, which is what
-            // this was, and the box measures 23px taller than the content it
-            // holds. That matters here more than anywhere else in the deck: a
-            // left border is painted at the element's own height, so a box that
-            // measures longer than it draws leaves a blue rule running past the
-            // thread, down through the slides under it. The clip is the guard
-            // on that. Whatever the measurement does, the rule stops here.
-            div().pl(px(40.)).overflow_hidden().child(
-                div().max_w(px(680.)).min_w(px(0.)).child(
-                    div()
-                        .pl_3()
-                        .py_2()
-                        .min_w(px(0.))
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .border_l_2()
-                        .border_color(rgb(if waiting { BORDER } else { ACCENT }))
-                        .child(head)
-                        .when(!folded, |d| d.child(body)),
-                ),
+            div().pl(px(40.)).child(
+                div()
+                    .when(box_w > 0., |d| d.w(px(box_w)))
+                    .max_w(px(680.))
+                    .min_w(px(0.))
+                    .pl_3()
+                    .py_2()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .border_l_2()
+                    .border_color(rgb(if waiting { BORDER } else { ACCENT }))
+                    .child(head)
+                    .when(!folded, |d| d.child(body)),
             ),
         )
     }
