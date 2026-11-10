@@ -11792,6 +11792,27 @@ impl Storm {
         cx.notify();
     }
 
+    /// Read one of a command's output streams into the Run console's buffer.
+    /// Clears `open` when the stream ends, so the run can stop waiting on a
+    /// pipe that something the command started is still holding.
+    fn pump_run_output<R: std::io::Read + Send + 'static>(
+        stream: R,
+        buf: Arc<Mutex<Vec<String>>>,
+        dirty: Arc<AtomicBool>,
+        open: Arc<AtomicBool>,
+    ) {
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                if let Ok(mut b) = buf.lock() {
+                    b.push(strip_ansi(&line));
+                }
+                dirty.store(true, Ordering::Relaxed);
+            }
+            open.store(false, Ordering::Relaxed);
+        });
+    }
+
     /// Run a command (zsh alias or git command) in the terminal pane so its
     /// output is visible. Ensures the terminal exists and is shown.
     /// Run `cmd` (through the login shell, so zsh aliases work) and stream its
@@ -11829,32 +11850,63 @@ impl Storm {
         let root = self.root.clone();
 
         std::thread::spawn(move || {
-            use std::io::{BufRead, BufReader};
             use std::os::unix::process::CommandExt;
-            let child = Command::new("zsh")
+            let mut command = Command::new("zsh");
+            command
                 .arg("-ic")
                 .arg(format!("{} 2>&1", cmd))
                 .current_dir(&root)
+                // nothing here is meant to be typed at: a command that asks for
+                // input reads EOF instead of waiting for a keystroke that has
+                // nowhere to be typed
+                .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                // its own process group: Stop signals the group, so the whole
-                // tree under zsh goes down with it
-                .process_group(0)
-                .spawn();
-            match child {
+                .stderr(std::process::Stdio::piped());
+            // Its own session, which is both halves of the job: Stop signals the
+            // group, so the whole tree under zsh goes down with it, and the
+            // child drops TIDE's controlling terminal. `zsh -i` that inherits a
+            // terminal it is not the foreground group of stops itself with
+            // SIGTTIN before it runs a thing — a build that sat at the spinner
+            // forever with not one line of output.
+            //
+            // SAFETY: setsid is async-signal-safe and is all that runs between
+            // the fork and the exec.
+            unsafe {
+                command.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+            match command.spawn() {
                 Ok(mut c) => {
                     pid.store(c.id(), Ordering::Relaxed);
+                    // both streams get a reader. stderr needs one because
+                    // `a && b 2>&1` redirects b alone, so a's errors come down
+                    // the other pipe, and because a pipe nobody reads fills at
+                    // 64K and blocks whatever is writing to it.
+                    let out_open = Arc::new(AtomicBool::new(c.stdout.is_some()));
+                    let err_open = Arc::new(AtomicBool::new(c.stderr.is_some()));
                     if let Some(out) = c.stdout.take() {
-                        for line in BufReader::new(out).lines().map_while(Result::ok) {
-                            if let Ok(mut b) = buf.lock() {
-                                b.push(strip_ansi(&line));
-                            }
-                            dirty.store(true, Ordering::Relaxed);
-                        }
+                        Self::pump_run_output(out, buf.clone(), dirty.clone(), out_open.clone());
                     }
+                    if let Some(err) = c.stderr.take() {
+                        Self::pump_run_output(err, buf.clone(), dirty.clone(), err_open.clone());
+                    }
+                    // the run is over when the shell is. Waiting for the pipes
+                    // to close instead would hang on anything the command left
+                    // behind that inherited them, a watcher or a dev server,
+                    // long after the build itself had finished.
                     let status = c.wait();
                     pid.store(0, Ordering::Relaxed);
                     ok.store(status.map(|s| s.success()).unwrap_or(false), Ordering::Relaxed);
+                    // they are usually at EOF by now; this is for the last
+                    // lines, before the console stops being read
+                    let until = std::time::Instant::now() + Duration::from_secs(2);
+                    while std::time::Instant::now() < until
+                        && (out_open.load(Ordering::Relaxed) || err_open.load(Ordering::Relaxed))
+                    {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
                 }
                 Err(e) => {
                     if let Ok(mut b) = buf.lock() {

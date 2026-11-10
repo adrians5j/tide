@@ -20,6 +20,9 @@ portable-pty = "0.9.0"
 # version gpui builds against, so a decoded `Frame` is the type gpui wants.
 tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 image = "0.25"
+# setsid(2) for the Run console: a command runs in its own session, away from
+# whatever terminal TIDE itself was launched from
+libc = "0.2"
 serde_json = "1.0.150"
 similar = "3.1.1"
 syntect       = { version = "5", default-features = false, features = ["default-themes", "regex-fancy"] }
