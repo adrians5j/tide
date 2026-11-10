@@ -725,39 +725,6 @@ fn load_ws_titles() -> HashMap<String, String> {
 fn load_ws_title(root: &Path) -> Option<String> {
     load_ws_titles().remove(&root.to_string_lossy().to_string())
 }
-/// A unix time as a clock reading — "14:32", or "Mon 14:32" once it isn't
-/// today. Local time, worked out from the offset the system reports.
-fn stamp_of(when: u64) -> String {
-    let out = Command::new("date")
-        .args(["-r", &when.to_string(), "+%H:%M|%j"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default();
-    let (clock, day) = out.trim().split_once('|').unwrap_or(("", ""));
-    if clock.is_empty() {
-        return String::new();
-    }
-    let today = Command::new("date")
-        .args(["+%j"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default();
-    if day == today.trim() {
-        format!("at {clock}")
-    } else {
-        format!("on {}", Command::new("date")
-            .args(["-r", &when.to_string(), "+%a %H:%M"])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| clock.to_string()))
-    }
-}
-
 /// A duration as a human reads it: seconds under a minute, minutes and seconds
 /// under an hour, hours and minutes past that. `10078s` is a number; `2h 48m`
 /// is an answer.
@@ -775,34 +742,6 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// When review comments were last handed to the agent, per workspace, and how
-/// many went. Persisted because the question it answers — "did I already send
-/// these?" — is one you ask after coming back, not during.
-fn review_sent_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".config/tide/review-sent.json"))
-}
-fn load_review_sent(root: &Path) -> Option<(u64, usize)> {
-    let map: HashMap<String, (u64, usize)> = review_sent_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())?;
-    map.get(&root.to_string_lossy().to_string()).copied()
-}
-fn save_review_sent(root: &Path, when: u64, count: usize) {
-    let Some(path) = review_sent_path() else { return };
-    let mut map: HashMap<String, (u64, usize)> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    map.insert(root.to_string_lossy().to_string(), (when, count));
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(s) = serde_json::to_string_pretty(&map) {
-        let _ = std::fs::write(path, s);
-    }
 }
 
 /// Where the work stands *within* a named workspace: "AI Chat" is the feature,
@@ -8949,9 +8888,6 @@ struct Storm {
     /// draws; written to disk by `mark_reviewed` and re-read whenever the
     /// merge dialog opens.
     reviewed: HashMap<String, Reviewed>,
-    /// When review comments last went to the agent, and how many — the answer
-    /// to "did I send those?" without scrolling the transcript back.
-    review_sent: Option<(u64, usize)>,
     // "open PR #…": a number to read, typed rather than filtered
     prnum_open: bool,
     prnum_query: Field,
@@ -9073,7 +9009,6 @@ impl Storm {
         // read once: a `#5619` in an answer is scanned per rendered row, and
         // that is no place for a `git remote` call
         let repo_web = github_base_url(&root);
-        let sent_at = load_review_sent(&root);
         let mut expanded = HashSet::new();
         expanded.insert(root.clone());
         let browser_default = default_browser_url(&root);
@@ -9491,7 +9426,6 @@ impl Storm {
             merge_confirm: None,
             reviewed: HashMap::new(),
             merge_focus: cx.focus_handle(),
-            review_sent: sent_at,
             prnum_open: false,
             prnum_query: Field::default(),
             prnum_focus: cx.focus_handle(),
@@ -16474,9 +16408,6 @@ impl Storm {
         self.review_note.clear();
         self.sync_comment_gutters(cx);
         self.save_review();
-        let when = now_secs();
-        self.review_sent = Some((when, n));
-        save_review_sent(&self.root, when, n);
         if take_focus {
             match pane {
                 Some(pane) => self.focus_pane(&pane, window, cx),
@@ -30278,48 +30209,6 @@ impl Storm {
                                     this.agent_tab = ix + 1;
                                     cx.notify();
                                 })),
-                        )
-                    })
-                    // the answer to "did I already send those?", which is
-                    // otherwise a scroll back through the transcript. It says
-                    // "comments" because it sits next to the reviewers chip,
-                    // and a bare "sent 3h" there reads as the reviewers
-                    .when_some(self.review_sent, |d, (when, count)| {
-                        let waiting = self
-                            .review
-                            .iter()
-                            .filter(|c| !c.draft && !c.sent && !c.resolved)
-                            .count();
-                        let ago = todo::age(when);
-                        let stamp = stamp_of(when);
-                        let tip_text = if waiting > 0 {
-                            format!(
-                                "{count} comment{} went to the agent {stamp}\n{waiting} written since, not sent yet",
-                                if count == 1 { "" } else { "s" }
-                            )
-                        } else {
-                            format!(
-                                "{count} comment{} went to the agent {stamp}\nnothing waiting",
-                                if count == 1 { "" } else { "s" }
-                            )
-                        };
-                        d.child(
-                            div()
-                                .id("review-sent")
-                                .flex_shrink_0()
-                                .px_1p5()
-                                .rounded_md()
-                                .text_size(px(10.))
-                                // amber while something written since hasn't gone
-                                .text_color(rgb(if waiting > 0 { FOLDER_ICON } else { MUTED }))
-                                .child(if waiting > 0 {
-                                    format!("comments sent {ago}  ·  {waiting} waiting")
-                                } else {
-                                    format!("comments sent {ago}")
-                                })
-                                .tooltip(move |_w, cx| {
-                                    cx.new(|_| TooltipView { text: tip_text.clone().into() }).into()
-                                }),
                         )
                     })
                     // the briefing panel is on the palette ("Show the Agent
