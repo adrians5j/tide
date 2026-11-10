@@ -15977,6 +15977,15 @@ impl Storm {
                 cx.notify();
                 return;
             }
+            // a dictated note asks the agent now, which is what ⌘↩ does
+            let empty = self.rc_query.text.trim().is_empty();
+            if let Some(text) = Self::dictated_paste(ks, empty, cx) {
+                self.rc_query.clear();
+                self.rc_query.insert_text(&text);
+                self.commit_comment(true, window, cx);
+                cx.notify();
+                return;
+            }
         }
         match ks.key.as_str() {
             "escape" => self.cancel_comment(window, cx),
@@ -26700,18 +26709,15 @@ impl Storm {
                 return;
             }
             // dictation pastes the whole message, so it goes as it lands.
-            // Only into an empty composer: a paste into something you were
-            // already writing is an edit, not a transcript. Ahead of the
-            // collapse, since a long transcript is still the message.
-            if self.agent_input.text.trim().is_empty() {
-                let clip = cx.read_from_clipboard().and_then(|i| i.text()).unwrap_or_default();
-                if let Some(text) = paste_to_send(&send_on_paste_setting(), &clip) {
-                    self.agent_input.clear();
-                    self.agent_input.insert_text(&text);
-                    self.send_composer(cx);
-                    cx.notify();
-                    return;
-                }
+            // Ahead of the collapse, since a long transcript is still the
+            // message and not an attachment.
+            let empty = self.agent_input.text.trim().is_empty();
+            if let Some(text) = Self::dictated_paste(ks, empty, cx) {
+                self.agent_input.clear();
+                self.agent_input.insert_text(&text);
+                self.send_composer(cx);
+                cx.notify();
+                return;
             }
             if self.paste_collapsed(cx) {
                 return;
@@ -26849,6 +26855,20 @@ impl Storm {
         self.recompute_agent_ghost();
         self.recompute_mentions(cx);
         cx.notify();
+    }
+
+    /// The message a ⌘V carried, when send-on-paste says this paste is one.
+    ///
+    /// `empty` is whether the box was empty before the paste: a paste into
+    /// something you were already writing is an edit, not a transcript. Every
+    /// box that sends to the agent asks this, since the dictation app pastes
+    /// into whichever one has focus.
+    fn dictated_paste(ks: &Keystroke, empty: bool, cx: &mut Context<Self>) -> Option<String> {
+        if !empty || ks.key != "v" || !ks.modifiers.platform || ks.modifiers.alt {
+            return None;
+        }
+        let clip = cx.read_from_clipboard().and_then(|i| i.text()).unwrap_or_default();
+        paste_to_send(&send_on_paste_setting(), &clip)
     }
 
     /// Send what is in the composer. What ↩ does, and what a paste does when
@@ -29297,6 +29317,17 @@ impl Storm {
     /// Keys in a slide's question box: ↩ sends, esc closes it.
     fn brief_ask_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
+        // a dictated question goes without the ⌘↩, same as the composer
+        if let Some(ix) = self.brief_ask_at {
+            let empty = self.brief_ask.text.trim().is_empty();
+            if let Some(text) = Self::dictated_paste(ks, empty, cx) {
+                self.brief_ask.clear();
+                self.brief_ask.insert_text(&text);
+                self.ask_about_slide(ix, cx);
+                cx.notify();
+                return;
+            }
+        }
         match ks.key.as_str() {
             "escape" => {
                 self.brief_ask.clear();
@@ -29327,6 +29358,14 @@ impl Storm {
     /// Keys in the tour card's question box: ↩ sends, esc leaves it.
     fn tour_ask_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
+        let empty = self.tour_ask.text.trim().is_empty();
+        if let Some(text) = Self::dictated_paste(ks, empty, cx) {
+            self.tour_ask.clear();
+            self.tour_ask.insert_text(&text);
+            self.ask_about_stop(window, cx);
+            cx.notify();
+            return;
+        }
         match ks.key.as_str() {
             "escape" => self.focus_active(window, cx),
             "enter" => self.ask_about_stop(window, cx),
