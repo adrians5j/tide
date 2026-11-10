@@ -38,6 +38,7 @@ mod usage;
 mod jobs;
 mod sess;
 mod wshist;
+mod tokens;
 use rpc::AgentState;
 use diff::{DiffKind, DiffRow};
 use syntax::{Highlighter, Run};
@@ -6139,6 +6140,7 @@ enum Cmd {
     ResetWorkspacePause,
     WorkspaceHistory,
     TogglePause,
+    Tokens,
     AddComment,
     ShowComments,
     SendComments,
@@ -6194,6 +6196,7 @@ const PALETTE: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::WorkspaceHistory, "Workspace History…  (every folder, and what it was for)", IC_HISTORY, "⌘⇧E"),
     (Cmd::TogglePause, "Pause / Resume Workspace  (⌥Tab skips paused)", IC_HOME, ""),
     (Cmd::SendOnPaste, "Send Dictation on Paste (no ↩)", IC_HOME, ""),
+    (Cmd::Tokens, "Where the Tokens Went…  (by workspace, by hour)", IC_GRAPH, ""),
     (Cmd::AddComment, "Comment on This Line…", IC_COMMIT, "⌥C"),
     (Cmd::ShowComments, "Review Comments…", IC_COMMIT, "⌥⇧C"),
     (Cmd::SendComments, "Send Comments to Agent", IC_PUSH, "⌥↩ / ⌘F12"),
@@ -8872,6 +8875,16 @@ struct Storm {
     /// when the window rolls over instead of staying off for the next one.
     usage_skip: Option<i64>,
     limits_open: bool,
+    /// The token panel: what the session logs say was spent, and over how long.
+    /// `None` until a scan has run, which happens off the UI thread.
+    tokens: Option<tokens::Report>,
+    tokens_open: bool,
+    tokens_reading: bool,
+    /// 0 for the last day, 1 for the last week.
+    tokens_week: bool,
+    /// Session id to the job TIDE opened it for, for the rows that
+    /// weren't you: the reviewers, mostly.
+    tokens_why: HashMap<String, String>,
     // custom workspace title (persisted); overrides the folder name in the UI
     ws_title: Option<String>,
     /// The checkpoint inside the titled work — "UI auto syncing" under "AI
@@ -9420,6 +9433,11 @@ impl Storm {
             limits: None,
             usage_skip: None,
             limits_open: false,
+            tokens: None,
+            tokens_open: false,
+            tokens_reading: false,
+            tokens_week: false,
+            tokens_why: HashMap::new(),
             ws_title,
             ws_subtitle,
             watch: None,
@@ -11343,6 +11361,13 @@ impl Storm {
         // the usage alert sits over everything, so escape takes it first
         if shown_usage_alert().is_some() {
             clear_usage_alert();
+            cx.notify();
+            return;
+        }
+        // the token panel is full-screen, so escape takes it before anything
+        // the window behind it has open
+        if self.tokens_open {
+            self.tokens_open = false;
             cx.notify();
             return;
         }
@@ -15747,6 +15772,7 @@ impl Storm {
             Cmd::OpenPrNumber => self.open_prnum_prompt(window, cx),
             Cmd::InstallUsageBars => self.install_usage_bars(cx),
             Cmd::TogglePause => self.toggle_pause(cx),
+            Cmd::Tokens => self.open_tokens(cx),
             Cmd::SendOnPaste => self.toggle_send_on_paste(cx),
             Cmd::ResetWorkspace => self.reset_workspace(cx),
             // reset, then hand the workspace back — the git work keeps running in
@@ -17708,6 +17734,9 @@ impl Render for Storm {
         if self.limits_open {
             root = root.children(self.render_usage_overlay(cx));
         }
+        if self.tokens_open {
+            root = root.child(self.render_tokens(cx));
+        }
         // one bottom-right column, so a flash and the run toast stack instead of
         // landing on top of each other
         let toast = self.run_active && !self.run_open;
@@ -19507,6 +19536,22 @@ impl Storm {
             .shadow_lg()
             .child(row("SESSION", &l.five_hour, ACCENT))
             .child(row("WEEKLY", &l.seven_day, GIT_MODIFIED))
+            // the bars say how much of the window is gone; this is the only
+            // thing in TIDE that says what spent it
+            .child(
+                div()
+                    .id("usage-breakdown")
+                    .pt_1()
+                    .cursor_pointer()
+                    .text_size(px(10.))
+                    .text_color(rgb(MUTED))
+                    .hover(|s| s.text_color(rgb(TEXT)))
+                    .child("Where the tokens went →")
+                    .on_click(cx.listener(|this, _e, _w, cx| {
+                        this.limits_open = false;
+                        this.open_tokens(cx);
+                    })),
+            )
             // the same notice the composer carries, for when the agent pane
             // isn't on screen — this chip is where you look at the number, so
             // it's where you should be able to act on it
@@ -19546,6 +19591,344 @@ impl Storm {
                         ),
                 )
             })
+    }
+
+    /// Open the token panel and read the session logs behind it.
+    ///
+    /// The read is off the UI thread: a first scan is a gigabyte and change of
+    /// log, and after that it picks up only what has been appended, which is
+    /// milliseconds. Whatever the last scan found is on screen meanwhile.
+    fn open_tokens(&mut self, cx: &mut Context<Self>) {
+        self.tokens_open = true;
+        // which sessions TIDE opened, and what for, read once per opening
+        // rather than per frame: the panel is where the reviewers show up as a
+        // line of their own
+        self.tokens_why = sess::load().into_iter().map(|s| (s.id, s.why)).collect();
+        if self.tokens_reading {
+            return;
+        }
+        self.tokens_reading = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let report = cx
+                .background_executor()
+                .spawn(async { tokens::scan(30 * 86_400) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.tokens = Some(report);
+                this.tokens_reading = false;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Where the tokens went: the session logs added up by hour, by workspace
+    /// and by session, over the last day or the last week.
+    fn render_tokens(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let week = self.tokens_week;
+        let span = if week { 7 * 86_400 } else { 86_400 };
+        let now = now_secs() as i64;
+        let to = now - now.rem_euclid(3600) + 3600;
+        let from = to - span;
+        let off = tokens::local_offset();
+        let empty = tokens::Report::default();
+        let report = self.tokens.as_ref().unwrap_or(&empty);
+        let total = report.total(from, to);
+
+        let head_num = |label: &'static str, value: String, color: u32| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(div().text_size(px(9.)).text_color(rgb(LINE_NUMBER)).child(label))
+                .child(div().text_size(px(15.)).text_color(rgb(color)).child(value))
+        };
+        let tab = |label: &'static str, on: bool, week: bool| {
+            div()
+                .id(label)
+                .px_2()
+                .py(px(1.))
+                .rounded_md()
+                .cursor_pointer()
+                .text_size(px(11.))
+                .border_1()
+                .border_color(rgb(if on { ACCENT } else { BORDER }))
+                .text_color(rgb(if on { TEXT } else { MUTED }))
+                .hover(|s| s.bg(rgb(HOVER)))
+                .child(label)
+                .on_click(cx.listener(move |this, _e, _w, cx| {
+                    this.tokens_week = week;
+                    cx.notify();
+                }))
+        };
+
+        // the bars: an hour each over a day, a day each over a week. A jump is
+        // the thing being looked for, so the tallest bar is the one that is
+        // coloured
+        let hours = report.by_hour(from, to);
+        let bars: Vec<(String, tokens::Use)> = if week {
+            let mut out: Vec<(String, tokens::Use)> = Vec::new();
+            let mut day = i64::MIN;
+            for (h, u) in hours {
+                let d = (h + off).div_euclid(86_400);
+                if d != day {
+                    day = d;
+                    out.push((tokens::day_label(h, off).split(' ').next().unwrap_or("").to_string(), u));
+                } else if let Some(last) = out.last_mut() {
+                    last.1.add(&u);
+                }
+            }
+            out
+        } else {
+            hours.into_iter().map(|(h, u)| (tokens::hour_label(h, off), u)).collect()
+        };
+        let peak = bars.iter().map(|(_, u)| u.weighted()).max().unwrap_or(0).max(1);
+        let mut chart = div().flex().flex_row().items_end().gap(px(3.)).h(px(104.));
+        for (i, (label, u)) in bars.iter().enumerate() {
+            let w = u.weighted();
+            let tall = (w as f32 / peak as f32 * 86.0).max(if w > 0 { 2.0 } else { 1.0 });
+            let top = w == peak && w > 0;
+            // every bar carries its own reading; the label row under them would
+            // not fit 24 of them, so it names one in four
+            let named = week || i % 4 == 0;
+            let tip_text = format!("{}  ·  {} weighted  ·  {} calls", label, usage::short(w), u.calls);
+            chart = chart.child(
+                div()
+                    .id(("token-bar", i))
+                    .flex_grow(1.0)
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(3.))
+                    .child(div().flex_grow(1.0))
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(tall))
+                            .rounded_sm()
+                            .bg(rgb(if top { GIT_MODIFIED } else if w > 0 { ACCENT } else { BORDER })),
+                    )
+                    .child(
+                        div()
+                            .h(px(12.))
+                            .text_size(px(8.))
+                            .text_color(rgb(LINE_NUMBER))
+                            .child(if named { label.clone() } else { String::new() }),
+                    )
+                    .tooltip(move |_w, cx| {
+                        cx.new(|_| TooltipView { text: tip_text.clone().into() }).into()
+                    }),
+            );
+        }
+
+        // one row per workspace, with the share of the window it took and how
+        // much of that was the reviewers TIDE sends in on its own
+        let roots = report.by_root(from, to);
+        let top_root = roots.first().map(|(_, u)| u.weighted()).unwrap_or(0).max(1);
+        let mut ws_rows = div().flex().flex_col().gap(px(5.));
+        for (root, u) in roots.iter().take(10) {
+            let name = Path::new(root).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| root.clone());
+            let mine: u64 = report
+                .top(from, to)
+                .iter()
+                .filter(|(s, _)| s.root == *root && self.tokens_why.contains_key(&s.id))
+                .map(|(_, u)| u.weighted())
+                .sum();
+            let share = u.weighted() as f32 / top_root as f32;
+            ws_rows = ws_rows.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(11.))
+                    .child(div().w(px(150.)).flex_shrink_0().truncate().text_color(rgb(TEXT)).child(name))
+                    .child(
+                        div().flex_grow(1.0).h(px(8.)).rounded_sm().bg(rgb(BORDER)).child(
+                            div().h_full().w(relative(share)).rounded_sm().bg(rgb(ACCENT)),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .w(px(64.))
+                            .flex_shrink_0()
+                            .text_color(rgb(TEXT))
+                            .child(usage::short(u.weighted())),
+                    )
+                    .child(
+                        div()
+                            .w(px(92.))
+                            .flex_shrink_0()
+                            .text_size(px(10.))
+                            .text_color(rgb(if mine > 0 { COMMENT_MARK } else { LINE_NUMBER }))
+                            .child(match mine {
+                                0 => "no reviewers".to_string(),
+                                m => format!(
+                                    "{} reviewers ({}%)",
+                                    usage::short(m),
+                                    (m as f32 / u.weighted().max(1) as f32 * 100.0).round() as i64
+                                ),
+                            }),
+                    ),
+            );
+        }
+
+        // and the sessions behind those numbers, which is where a jump gets a
+        // name: a reviewer, a brief, or the pane you were typing in
+        let mut sess_rows = div().flex().flex_col().gap(px(4.));
+        for (s, u) in report.top(from, to).into_iter().take(12) {
+            let why = self.tokens_why.get(&s.id).cloned().unwrap_or_default();
+            let name = Path::new(&s.root).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            sess_rows = sess_rows.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(11.))
+                    .child(
+                        div()
+                            .w(px(76.))
+                            .flex_shrink_0()
+                            .text_color(rgb(LINE_NUMBER))
+                            .child(tokens::day_label(s.first_in(from, to), off)),
+                    )
+                    .child(div().w(px(120.)).flex_shrink_0().truncate().text_color(rgb(MUTED)).child(name))
+                    .child(
+                        div()
+                            .flex_grow(1.0)
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_color(rgb(if why.is_empty() { MUTED } else { COMMENT_MARK }))
+                            .child(match why.is_empty() {
+                                true => "your pane".to_string(),
+                                false => why,
+                            }),
+                    )
+                    .child(
+                        div()
+                            .w(px(60.))
+                            .flex_shrink_0()
+                            .text_size(px(10.))
+                            .text_color(rgb(LINE_NUMBER))
+                            .child(format!("{} calls", u.calls)),
+                    )
+                    .child(
+                        div()
+                            .w(px(56.))
+                            .flex_shrink_0()
+                            .text_color(rgb(TEXT))
+                            .child(usage::short(u.weighted())),
+                    ),
+            );
+        }
+
+        let note = match (self.tokens_reading, self.tokens.is_some()) {
+            (true, false) => "reading the session logs…".to_string(),
+            (true, true) => "re-reading…".to_string(),
+            _ => format!(
+                "{} sessions  ·  {:.0} MB read",
+                report.sessions.len(),
+                report.bytes as f64 / 1e6
+            ),
+        };
+
+        div()
+            .id("tokens-backdrop")
+            .absolute()
+            .inset_0()
+            .bg(rgba(0x000000aa))
+            .flex()
+            .flex_col()
+            .items_center()
+            .on_click(cx.listener(|this, _e, _w, cx| {
+                this.tokens_open = false;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .id("tokens-panel")
+                    .occlude()
+                    .mt(px(60.))
+                    .w(px(860.))
+                    .max_h(px(720.))
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .bg(rgb(POPUP_BG))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .rounded_md()
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_grow(1.0)
+                                    .text_size(px(14.))
+                                    .text_color(rgb(TEXT))
+                                    .child("Where the tokens went"),
+                            )
+                            .child(tab("24 hours", !week, false))
+                            .child(tab("7 days", week, true))
+                            .child(div().text_size(px(10.)).text_color(rgb(LINE_NUMBER)).child("esc")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_6()
+                            .child(head_num("WEIGHTED", usage::short(total.weighted()), ACCENT))
+                            .child(head_num("FRESH IN", usage::short(total.input), TEXT))
+                            .child(head_num("CACHE WRITTEN", usage::short(total.cache_write), TEXT))
+                            .child(head_num("CACHE READ", usage::short(total.cache_read), MUTED))
+                            .child(head_num("OUT", usage::short(total.output), TEXT))
+                            .child(head_num("REQUESTS", total.calls.to_string(), MUTED))
+                            .child(div().flex_grow(1.0))
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(LINE_NUMBER))
+                                    .child(note),
+                            ),
+                    )
+                    .child(chart)
+                    .child(div().text_size(px(9.)).text_color(rgb(LINE_NUMBER)).child(
+                        "weighted at the published ratios: cache reads count a tenth, \
+                         cache writes a quarter over input, output five times it",
+                    ))
+                    .child(
+                        div()
+                            .id("tokens-body")
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .min_h(px(0.))
+                            .overflow_y_scroll()
+                            .child(
+                                div()
+                                    .text_size(px(9.))
+                                    .text_color(rgb(LINE_NUMBER))
+                                    .child("BY WORKSPACE"),
+                            )
+                            .child(ws_rows)
+                            .child(
+                                div()
+                                    .pt_1()
+                                    .text_size(px(9.))
+                                    .text_color(rgb(LINE_NUMBER))
+                                    .child("BIGGEST SESSIONS"),
+                            )
+                            .child(sess_rows),
+                    ),
+            )
     }
 
     /// The read-only Run console: a bottom dock streaming command output.
@@ -39591,6 +39974,73 @@ fn set_dock_icon() {
 #[cfg(not(target_os = "macos"))]
 fn set_dock_icon() {}
 
+/// `--tokens`, optionally with a number of days after it.
+fn tokens_arg() -> Option<f64> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let i = args.iter().position(|a| a == "--tokens")?;
+    Some(args.get(i + 1).and_then(|n| n.parse().ok()).unwrap_or(1.0))
+}
+
+/// The token report as lines, for the terminal.
+fn print_tokens(days: f64) {
+    let t = std::time::Instant::now();
+    let report = tokens::scan(30 * 86_400);
+    let off = tokens::local_offset();
+    let now = now_secs() as i64;
+    let to = now - now.rem_euclid(3600) + 3600;
+    let from = to - (days * 86_400.0) as i64;
+    let total = report.total(from, to);
+    let span = if days > 1.5 { format!("{days:.0} days") } else { "24 hours".to_string() };
+    println!("Where the tokens went  ·  last {span}  ·  read in {:?}", t.elapsed());
+    println!(
+        "  weighted {}  ·  fresh in {}  ·  cache written {}  ·  cache read {}  ·  out {}  ·  {} requests",
+        usage::short(total.weighted()),
+        usage::short(total.input),
+        usage::short(total.cache_write),
+        usage::short(total.cache_read),
+        usage::short(total.output),
+        total.calls,
+    );
+    let hours = report.by_hour(from, to);
+    let peak = hours.iter().map(|(_, u)| u.weighted()).max().unwrap_or(0).max(1);
+    println!("\n  by hour");
+    for (h, u) in hours.iter().filter(|(_, u)| !u.is_empty()) {
+        let bar = "#".repeat(((u.weighted() as f64 / peak as f64) * 40.0).round() as usize);
+        println!("    {}  {:>7}  {bar}", tokens::day_label(*h, off), usage::short(u.weighted()));
+    }
+    println!("\n  by workspace");
+    let why: HashMap<String, String> = sess::load().into_iter().map(|s| (s.id, s.why)).collect();
+    for (root, u) in report.by_root(from, to).iter().take(12) {
+        let theirs: u64 = report
+            .top(from, to)
+            .iter()
+            .filter(|(s, _)| s.root == *root && why.contains_key(&s.id))
+            .map(|(_, u)| u.weighted())
+            .sum();
+        let tail = match theirs {
+            0 => String::new(),
+            t => format!(
+                "   reviewers {} ({}%)",
+                usage::short(t),
+                (t as f32 / u.weighted().max(1) as f32 * 100.0).round() as i64
+            ),
+        };
+        println!("    {:>7}  {root}{tail}", usage::short(u.weighted()));
+    }
+    println!("\n  biggest sessions");
+    for (s, u) in report.top(from, to).into_iter().take(14) {
+        let job = why.get(&s.id).cloned().unwrap_or_else(|| "your pane".into());
+        println!(
+            "    {:>7}  {}  {:<14} {:<14} {} calls",
+            usage::short(u.weighted()),
+            tokens::day_label(s.first_in(from, to), off),
+            Path::new(&s.root).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+            job,
+            u.calls,
+        );
+    }
+}
+
 fn main() {
     // Each CLI arg is a project root (globs allowed) opened as its own
     // workspace. With no args, reopen last session's workspaces; if there is no
@@ -39617,6 +40067,13 @@ fn main() {
     // titles TIDE has been keeping all along, so ⌘⇧E opens onto something
     wshist::ensure_seeded(&load_ws_titles(), &load_ws_last_titles(), &load_ws_subtitles());
 
+    // `tide --tokens [days]` prints the same reading the panel draws, for when
+    // the question is "what did the last few hours cost" and the window you
+    // would ask it in is the one you are trying not to restart
+    if let Some(days) = tokens_arg() {
+        print_tokens(days);
+        return;
+    }
     application().run(move |cx: &mut App| {
         set_dock_icon();
         // bundle the Codicon icon font + Inter (UI font)

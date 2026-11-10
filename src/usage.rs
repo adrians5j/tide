@@ -133,7 +133,8 @@ pub fn short(n: u64) -> String {
     match n {
         0..=9_999 => n.to_string(),
         10_000..=999_999 => format!("{:.1}k", n as f64 / 1_000.0),
-        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
+        1_000_000..=999_999_999 => format!("{:.1}M", n as f64 / 1_000_000.0),
+        _ => format!("{:.2}G", n as f64 / 1_000_000_000.0),
     }
 }
 
@@ -161,6 +162,8 @@ mod tests {
         assert_eq!(short(912), "912");
         assert_eq!(short(847_300), "847.3k");
         assert_eq!(short(2_450_000), "2.5M");
+        // a day of cache reads runs past a billion, and "1090.0M" is not a number
+        assert_eq!(short(1_090_000_000), "1.09G");
     }
 
 

@@ -20,6 +20,9 @@ portable-pty = "0.9.0"
 # version gpui builds against, so a decoded `Frame` is the type gpui wants.
 tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 image = "0.25"
+# the substring search the token scan leans on: it reads gigabytes of session
+# log, and our own crate is built unoptimised
+memchr = "2"
 # setsid(2) for the Run console: a command runs in its own session, away from
 # whatever terminal TIDE itself was launched from
 libc = "0.2"
