@@ -3617,6 +3617,18 @@ fn is_markdown(path: &Path) -> bool {
 }
 
 /// Green under half, amber past it, red when the window is nearly spent.
+/// How a context size reads: quiet while a session is cheap to carry, amber
+/// once every turn is paying for a few hundred thousand tokens of history, red
+/// where a turn costs ten times what it did at the start of the session.
+fn context_color(per_call: u64) -> u32 {
+    match per_call {
+        0..=149_999 => LINE_NUMBER,
+        150_000..=399_999 => MUTED,
+        400_000..=699_999 => GIT_MODIFIED,
+        _ => GIT_DELETED,
+    }
+}
+
 fn usage_color(pct: f32) -> u32 {
     match pct {
         p if p >= 90.0 => GIT_DELETED,
@@ -19805,6 +19817,19 @@ impl Storm {
             let why = self.tokens_why.get(&s.id).cloned().unwrap_or_default();
             let name = Path::new(&s.root).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             let go = PathBuf::from(&s.root);
+            // the window's average, and what the last hour of it carried: a
+            // session climbs as it runs, so the recent number is the one that
+            // says what the next turn in it will cost
+            let per_call = u.per_call();
+            let now_per_call = s.latest(from, to).per_call();
+            let tip_text = format!(
+                "{} per request over the window, {} in its last hour\n\
+                 Every request re-sends the conversation, so this is what a turn in \
+                 here costs before it asks anything.\nClick to open the workspace it \
+                 ran in.",
+                usage::short(per_call),
+                usage::short(now_per_call),
+            );
             sess_rows = sess_rows.child(
                 div()
                     .id(("token-sess", i))
@@ -19817,7 +19842,9 @@ impl Storm {
                     .cursor_pointer()
                     .text_size(px(11.))
                     .hover(|s| s.bg(rgb(HOVER)))
-                    .tooltip(tip("Open the workspace this ran in"))
+                    .tooltip(move |_w, cx| {
+                        cx.new(|_| TooltipView { text: tip_text.clone().into() }).into()
+                    })
                     .on_click(cx.listener(move |this, _e, _w, cx| {
                         this.tokens_open = false;
                         cx.emit(ProjectNav::OpenPath(go.clone()));
@@ -19849,6 +19876,14 @@ impl Storm {
                             .text_size(px(10.))
                             .text_color(rgb(LINE_NUMBER))
                             .child(format!("{} calls", u.calls)),
+                    )
+                    .child(
+                        div()
+                            .w(px(64.))
+                            .flex_shrink_0()
+                            .text_size(px(10.))
+                            .text_color(rgb(context_color(now_per_call.max(per_call))))
+                            .child(format!("{} ctx", usage::short(per_call))),
                     )
                     .child(
                         div()
@@ -19927,6 +19962,14 @@ impl Storm {
                             .child(head_num("CACHE READ", usage::short(total.cache_read), MUTED))
                             .child(head_num("OUT", usage::short(total.output), TEXT))
                             .child(head_num("REQUESTS", total.calls.to_string(), MUTED))
+                            // the number behind the rest of them: every request
+                            // carries the whole conversation, so this is what a
+                            // turn costs before it has asked anything
+                            .child(head_num(
+                                "CONTEXT / REQ",
+                                usage::short(total.per_call()),
+                                context_color(total.per_call()),
+                            ))
                             .child(div().flex_grow(1.0))
                             .child(
                                 div()
@@ -40064,13 +40107,14 @@ fn print_tokens(span: TokenSpan) {
     };
     println!("Where the tokens went  ·  {said}  ·  read in {:?}", t.elapsed());
     println!(
-        "  weighted {}  ·  fresh in {}  ·  cache written {}  ·  cache read {}  ·  out {}  ·  {} requests",
+        "  weighted {}  ·  fresh in {}  ·  cache written {}  ·  cache read {}  ·  out {}  ·  {} requests  ·  {} of context a request",
         usage::short(total.weighted()),
         usage::short(total.input),
         usage::short(total.cache_write),
         usage::short(total.cache_read),
         usage::short(total.output),
         total.calls,
+        usage::short(total.per_call()),
     );
     let hours = report.by_hour(from, to);
     let peak = hours.iter().map(|(_, u)| u.weighted()).max().unwrap_or(0).max(1);
@@ -40102,12 +40146,14 @@ fn print_tokens(span: TokenSpan) {
     for (s, u) in report.top(from, to).into_iter().take(14) {
         let job = why.get(&s.id).cloned().unwrap_or_else(|| "your pane".into());
         println!(
-            "    {:>7}  {}  {:<14} {:<14} {} calls",
+            "    {:>7}  {}  {:<14} {:<14} {:>5} calls  {:>6} ctx/req (now {})",
             usage::short(u.weighted()),
             tokens::day_label(s.first_in(from, to), off),
             Path::new(&s.root).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
             job,
             u.calls,
+            usage::short(u.per_call()),
+            usage::short(s.latest(from, to).per_call()),
         );
     }
 }

@@ -41,6 +41,22 @@ picker hides behind a toggle). So a reviewer round shows up as four named
 sessions rather than as unexplained spend, and each workspace row says how much
 of its total was reviewers.
 
+## Context per request
+
+Every request re-sends the whole conversation, so what a turn costs is roughly
+the context it carries, whatever it asked. A session's context climbs as it
+runs, which means a session's cost is about its number of requests times its
+average context: twice as long is four times the spend, for the same work.
+
+The session rows carry that number, and the header carries it for the window.
+It goes amber past 400k and red past 700k. The tooltip adds what the session's
+last hour carried, which is closer to what the next turn in it will cost than
+the average of everything it has carried so far.
+
+The way down is a fresh session. In one week of these logs a long session's
+context climbed to about 900k fifteen times, and each reset dropped the cost of
+a request by a factor of ten.
+
 ## The weighting
 
 The panel sorts and draws by one number, at the published price ratios:

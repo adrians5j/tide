@@ -55,6 +55,25 @@ impl Use {
             + self.output * 5
     }
 
+    /// Everything the model read for one request: the fresh part, the part
+    /// written to the cache and the part served from it. This is the context
+    /// the conversation was carrying, and since every request re-sends the
+    /// whole conversation, it is what a turn costs almost regardless of what
+    /// the turn asked.
+    pub fn context(&self) -> u64 {
+        self.input + self.cache_write + self.cache_read
+    }
+
+    /// The context an average request in here carried. A session's own number
+    /// climbs as it goes, so this read over an hour is close to what the next
+    /// turn in it will cost; read over a week it is only an average.
+    pub fn per_call(&self) -> u64 {
+        match self.calls {
+            0 => 0,
+            n => self.context() / n,
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.calls == 0 && self.tokens() == 0
     }
@@ -96,6 +115,18 @@ impl Session {
             .find(|(h, u)| *h >= from && *h < to && !u.is_empty())
             .map(|(h, _)| *h)
             .unwrap_or(self.first)
+    }
+
+    /// The last hour inside `[from, to)` this session spent anything in, as
+    /// what that hour cost: what the session is carrying now, rather than the
+    /// average of everything it has carried.
+    pub fn latest(&self, from: i64, to: i64) -> Use {
+        self.hours
+            .iter()
+            .rev()
+            .find(|(h, u)| *h >= from && *h < to && !u.is_empty())
+            .map(|(_, u)| *u)
+            .unwrap_or_default()
     }
 
     /// What this session spent in `[from, to)`.
@@ -582,6 +613,30 @@ mod tests {
         assert_eq!(r.total(0, 3600 * 24).calls, 3);
         // and a window with nothing in it is empty rather than everything
         assert!(r.by_root(0, 3600).is_empty());
+    }
+
+    /// The number that says why a long session costs what it does: every
+    /// request carries the whole conversation, so this is the turn's price.
+    #[test]
+    fn the_context_a_request_carried_comes_out_of_the_same_numbers() {
+        let u = Use { input: 2, cache_write: 28_000, cache_read: 472_000, output: 500, calls: 2 };
+        assert_eq!(u.context(), 500_002);
+        assert_eq!(u.per_call(), 250_001);
+        // output is not context: it is what came back, not what was read
+        assert_eq!(Use::default().per_call(), 0);
+    }
+
+    /// An hour late in a session says what the next turn in it will cost; the
+    /// session's own average does not, because it has been climbing all along.
+    #[test]
+    fn the_latest_hour_is_the_one_that_predicts_the_next() {
+        let mut s = Session::default();
+        s.bump(3600 * 10, Use { cache_read: 100_000, calls: 1, ..Use::default() });
+        s.bump(3600 * 12, Use { cache_read: 900_000, calls: 1, ..Use::default() });
+        assert_eq!(s.latest(0, 3600 * 24).per_call(), 900_000);
+        assert_eq!(s.latest(0, 3600 * 11).per_call(), 100_000);
+        assert_eq!(s.between(0, 3600 * 24).per_call(), 500_000);
+        assert!(s.latest(0, 3600).is_empty());
     }
 
     /// The weighting is what the panel sorts by, so it has to be the published
