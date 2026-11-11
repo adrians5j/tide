@@ -8,9 +8,16 @@ Open it from the palette, "Where the Tokens Went…", or print the same reading
 without opening TIDE at all:
 
 ```
-tide --tokens        # the last 24 hours
-tide --tokens 7      # the last week
+tide --tokens        # today, since midnight
+tide --tokens day    # the last 24 hours, rolling
+tide --tokens week   # the last 7 days, a bar to the day
 ```
+
+The panel has the same three. Today is the clock's day, not the last 24 hours:
+at nine in the morning those are different questions, and the first one is the
+one you are asking when a five-hour window keeps running out.
+
+A workspace row, and any session row, opens that workspace when you click it.
 
 ## Where the numbers come from
 

@@ -8881,7 +8881,7 @@ struct Storm {
     tokens_open: bool,
     tokens_reading: bool,
     /// 0 for the last day, 1 for the last week.
-    tokens_week: bool,
+    tokens_span: TokenSpan,
     /// Session id to the job TIDE opened it for, for the rows that
     /// weren't you: the reviewers, mostly.
     tokens_why: HashMap<String, String>,
@@ -9436,7 +9436,7 @@ impl Storm {
             tokens: None,
             tokens_open: false,
             tokens_reading: false,
-            tokens_week: false,
+            tokens_span: TokenSpan::Today,
             tokens_why: HashMap::new(),
             ws_title,
             ws_subtitle,
@@ -19593,6 +19593,13 @@ impl Storm {
             })
     }
 
+    /// The stretch the token panel is reading. "Today" is the clock's day, not
+    /// the last 24 hours: at nine in the morning those are different questions
+    /// and the first one is the one a plan window is spent against.
+    fn token_window(&self) -> (i64, i64) {
+        token_window(self.tokens_span)
+    }
+
     /// Open the token panel and read the session logs behind it.
     ///
     /// The read is off the UI thread: a first scan is a gigabyte and change of
@@ -19627,11 +19634,9 @@ impl Storm {
     /// Where the tokens went: the session logs added up by hour, by workspace
     /// and by session, over the last day or the last week.
     fn render_tokens(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let week = self.tokens_week;
-        let span = if week { 7 * 86_400 } else { 86_400 };
-        let now = now_secs() as i64;
-        let to = now - now.rem_euclid(3600) + 3600;
-        let from = to - span;
+        let span = self.tokens_span;
+        let week = span == TokenSpan::Week;
+        let (from, to) = self.token_window();
         let off = tokens::local_offset();
         let empty = tokens::Report::default();
         let report = self.tokens.as_ref().unwrap_or(&empty);
@@ -19645,7 +19650,8 @@ impl Storm {
                 .child(div().text_size(px(9.)).text_color(rgb(LINE_NUMBER)).child(label))
                 .child(div().text_size(px(15.)).text_color(rgb(color)).child(value))
         };
-        let tab = |label: &'static str, on: bool, week: bool| {
+        let tab = |label: &'static str, want: TokenSpan| {
+            let on = span == want;
             div()
                 .id(label)
                 .px_2()
@@ -19659,7 +19665,7 @@ impl Storm {
                 .hover(|s| s.bg(rgb(HOVER)))
                 .child(label)
                 .on_click(cx.listener(move |this, _e, _w, cx| {
-                    this.tokens_week = week;
+                    this.tokens_span = want;
                     cx.notify();
                 }))
         };
@@ -19731,8 +19737,9 @@ impl Storm {
         let roots = report.by_root(from, to);
         let top_root = roots.first().map(|(_, u)| u.weighted()).unwrap_or(0).max(1);
         let mut ws_rows = div().flex().flex_col().gap(px(5.));
-        for (root, u) in roots.iter().take(10) {
+        for (i, (root, u)) in roots.iter().take(10).enumerate() {
             let name = Path::new(root).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| root.clone());
+            let go = PathBuf::from(root);
             let mine: u64 = sessions
                 .iter()
                 .filter(|(s, _)| s.root == *root && self.tokens_why.contains_key(&s.id))
@@ -19741,11 +19748,25 @@ impl Storm {
             let share = u.weighted() as f32 / top_root as f32;
             ws_rows = ws_rows.child(
                 div()
+                    .id(("token-ws", i))
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap_2()
+                    .px_1()
+                    .rounded_md()
+                    .cursor_pointer()
                     .text_size(px(11.))
+                    .hover(|s| s.bg(rgb(HOVER)))
+                    .tooltip(tip("Open this workspace"))
+                    // the row is the way into the workspace it is about: a
+                    // number you can't act on sends you to the switcher to
+                    // find the same folder by name
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                        this.tokens_open = false;
+                        cx.emit(ProjectNav::OpenPath(go.clone()));
+                        cx.notify();
+                    }))
                     .child(div().w(px(150.)).flex_shrink_0().truncate().text_color(rgb(TEXT)).child(name))
                     .child(
                         div().flex_grow(1.0).h(px(8.)).rounded_sm().bg(rgb(BORDER)).child(
@@ -19780,16 +19801,28 @@ impl Storm {
         // and the sessions behind those numbers, which is where a jump gets a
         // name: a reviewer, a brief, or the pane you were typing in
         let mut sess_rows = div().flex().flex_col().gap(px(4.));
-        for (s, u) in sessions.iter().take(12) {
+        for (i, (s, u)) in sessions.iter().take(12).enumerate() {
             let why = self.tokens_why.get(&s.id).cloned().unwrap_or_default();
             let name = Path::new(&s.root).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let go = PathBuf::from(&s.root);
             sess_rows = sess_rows.child(
                 div()
+                    .id(("token-sess", i))
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap_2()
+                    .px_1()
+                    .rounded_md()
+                    .cursor_pointer()
                     .text_size(px(11.))
+                    .hover(|s| s.bg(rgb(HOVER)))
+                    .tooltip(tip("Open the workspace this ran in"))
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                        this.tokens_open = false;
+                        cx.emit(ProjectNav::OpenPath(go.clone()));
+                        cx.notify();
+                    }))
                     .child(
                         div()
                             .w(px(76.))
@@ -19878,8 +19911,9 @@ impl Storm {
                                     .text_color(rgb(TEXT))
                                     .child("Where the tokens went"),
                             )
-                            .child(tab("24 hours", !week, false))
-                            .child(tab("7 days", week, true))
+                            .child(tab("Today", TokenSpan::Today))
+                            .child(tab("24 hours", TokenSpan::Day))
+                            .child(tab("7 days", TokenSpan::Week))
                             .child(div().text_size(px(10.)).text_color(rgb(LINE_NUMBER)).child("esc")),
                     )
                     .child(
@@ -36951,6 +36985,29 @@ impl Storm {
 
 /// Holds every open project as a live `Storm` view and renders the active one.
 /// Background projects keep their editors and running terminals alive.
+/// The window a span covers, as `[from, to)` in unix seconds, with `to` rounded
+/// up to the hour so the hour in progress is drawn.
+fn token_window(span: TokenSpan) -> (i64, i64) {
+    let now = now_secs() as i64;
+    let to = now - now.rem_euclid(3600) + 3600;
+    match span {
+        TokenSpan::Today => (tokens::day_start(now, tokens::local_offset()), to),
+        TokenSpan::Day => (to - 86_400, to),
+        TokenSpan::Week => (to - 7 * 86_400, to),
+    }
+}
+
+/// Which stretch the token panel is showing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TokenSpan {
+    /// Since local midnight.
+    Today,
+    /// The last 24 hours, rolling.
+    Day,
+    /// The last 7 days, rolling, a bar to the day.
+    Week,
+}
+
 /// Drag payload for reordering project rows in the switcher (dragged index).
 struct DraggedProject(usize);
 
@@ -39976,24 +40033,36 @@ fn set_dock_icon() {
 #[cfg(not(target_os = "macos"))]
 fn set_dock_icon() {}
 
-/// `--tokens`, optionally with a number of days after it.
-fn tokens_arg() -> Option<f64> {
+/// `--tokens`, on its own for today, or with `day`, `week`, or a number of days
+/// after it.
+fn tokens_arg() -> Option<TokenSpan> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let i = args.iter().position(|a| a == "--tokens")?;
-    Some(args.get(i + 1).and_then(|n| n.parse().ok()).unwrap_or(1.0))
+    Some(match args.get(i + 1).map(|s| s.as_str()) {
+        Some("today") | None => TokenSpan::Today,
+        Some("week") | Some("7") => TokenSpan::Week,
+        Some("day") | Some("1") | Some("24") => TokenSpan::Day,
+        Some(other) => match other.parse::<f64>() {
+            Ok(n) if n > 1.5 => TokenSpan::Week,
+            Ok(_) => TokenSpan::Day,
+            Err(_) => TokenSpan::Today,
+        },
+    })
 }
 
 /// The token report as lines, for the terminal.
-fn print_tokens(days: f64) {
+fn print_tokens(span: TokenSpan) {
     let t = std::time::Instant::now();
     let report = tokens::scan(30 * 86_400);
     let off = tokens::local_offset();
-    let now = now_secs() as i64;
-    let to = now - now.rem_euclid(3600) + 3600;
-    let from = to - (days * 86_400.0) as i64;
+    let (from, to) = token_window(span);
     let total = report.total(from, to);
-    let span = if days > 1.5 { format!("{days:.0} days") } else { "24 hours".to_string() };
-    println!("Where the tokens went  ·  last {span}  ·  read in {:?}", t.elapsed());
+    let said = match span {
+        TokenSpan::Today => "today, since midnight",
+        TokenSpan::Day => "the last 24 hours",
+        TokenSpan::Week => "the last 7 days",
+    };
+    println!("Where the tokens went  ·  {said}  ·  read in {:?}", t.elapsed());
     println!(
         "  weighted {}  ·  fresh in {}  ·  cache written {}  ·  cache read {}  ·  out {}  ·  {} requests",
         usage::short(total.weighted()),
@@ -40072,8 +40141,8 @@ fn main() {
     // `tide --tokens [days]` prints the same reading the panel draws, for when
     // the question is "what did the last few hours cost" and the window you
     // would ask it in is the one you are trying not to restart
-    if let Some(days) = tokens_arg() {
-        print_tokens(days);
+    if let Some(span) = tokens_arg() {
+        print_tokens(span);
         return;
     }
     application().run(move |cx: &mut App| {

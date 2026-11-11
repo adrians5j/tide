@@ -245,6 +245,13 @@ fn read_offset() -> i64 {
     sign * (h * 3600 + m * 60)
 }
 
+/// The top of the local day `when` falls in, as a UTC epoch. "Today" is a day
+/// on the clock in front of you, not the last 24 hours: at 09:00 the two
+/// readings are nine hours and a whole yesterday apart.
+pub fn day_start(when: i64, offset: i64) -> i64 {
+    (when + offset).div_euclid(86_400) * 86_400 - offset
+}
+
 /// `14:00` for an hour bucket, in local time.
 pub fn hour_label(hour: i64, offset: i64) -> String {
     let local = hour + offset;
@@ -502,6 +509,20 @@ mod tests {
         assert_eq!(epoch("2024-02-29T23:59:59Z"), Some(1709251199));
         assert!(epoch("not a date").is_none());
         assert!(epoch("2026-13-05T11:16:01Z").is_none());
+    }
+
+    /// Midnight where the reader is, not midnight in UTC.
+    #[test]
+    fn a_day_starts_at_the_local_midnight() {
+        // 2026-11-05T11:16:01Z, an hour ahead: the day began at 23:00 UTC
+        let noon = 1793877361;
+        assert_eq!(day_start(noon, 3600), 1793833200);
+        assert_eq!(hour_label(day_start(noon, 3600), 3600), "00:00");
+        // and five hours behind, it began at 05:00 UTC the same morning
+        assert_eq!(hour_label(day_start(noon, -5 * 3600), -5 * 3600), "00:00");
+        assert_eq!(day_start(noon, -5 * 3600), 1793854800);
+        // a moment already past midnight local but not UTC still reads as today
+        assert_eq!(day_start(1793833200, 3600), 1793833200);
     }
 
     #[test]
