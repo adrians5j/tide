@@ -6931,6 +6931,10 @@ const STOP_DIFF_GUTTER: f32 = 32.0;
 /// over the file rather than pushing it apart, so this can be generous: twenty
 /// rows is most stops whole.
 const STOP_DIFF_H: f32 = 20.0 * STOP_DIFF_ROW;
+/// How short the block gets before it stops shrinking. A stop that changed two
+/// lines still opens a window on the file you can read around, and a card that
+/// resizes itself to every stop's row count is a card that jumps.
+const STOP_DIFF_MIN_H: f32 = 300.0;
 /// Header row, the file line under it, the note box, padding and borders.
 const TOUR_CARD_CHROME: f32 = 87.0;
 /// Air above and below the card, so the code it parts doesn't touch it.
@@ -25912,8 +25916,12 @@ impl Storm {
             return None;
         }
         let (x, y, avail, h) = tab.editor.read(cx).line_screen_rect(*end)?;
-        // dragged width wins, inside what the pane can actually show
-        let want = self.card_width.unwrap_or(TOUR_CARD_W);
+        // dragged width wins, inside what the pane can actually show. A card
+        // carrying a before/after takes the whole pane: that block is two
+        // columns of code side by side, and 760px leaves each of them a
+        // keyhole. A card that is only words keeps the reading width.
+        let full = if self.stop_diff.is_empty() { TOUR_CARD_W } else { avail };
+        let want = self.card_width.unwrap_or(full);
         let width = (avail - RC_BOX_PAD * 2.0).clamp(280.0, want.max(280.0));
         Some((x + RC_BOX_PAD, y + h + TOUR_CARD_VPAD, width))
     }
@@ -25923,8 +25931,10 @@ impl Storm {
     /// the bottom of the window is for where you are in the tour; this is for
     /// what you're meant to see here.
     fn render_tour_card(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let (left, top, width) = self.tour_card_at(cx)?;
+        // before `tour_card_at`, which sizes the card by whether there is a
+        // before/after to put in it
         self.ensure_stop_diff();
+        let (left, top, width) = self.tour_card_at(cx)?;
         self.ensure_pkg_names();
         let changed = self.stop_diff.clone();
         // the columns are sized in characters, so they have to be measured in
@@ -25948,7 +25958,7 @@ impl Storm {
         // the height the before/after is drawn at, which is also what a drag
         // on the card's bottom edge starts from
         let diff_h = self.card_diff_h.unwrap_or_else(|| {
-            STOP_DIFF_H.min(changed.len() as f32 * STOP_DIFF_ROW + 4.0)
+            STOP_DIFF_H.min(changed.len() as f32 * STOP_DIFF_ROW + 4.0).max(STOP_DIFF_MIN_H)
         });
         let w = self.walk.as_ref()?;
         let stop = w.stops.get(w.at)?;
@@ -26685,7 +26695,7 @@ impl Storm {
         // the rows, the block's own padding and border, the horizontal
         // scrollbar along the bottom, the gap above it, and the resize grip
         let rows = self.stop_diff.len() as f32 * STOP_DIFF_ROW + 4.0;
-        self.card_diff_h.unwrap_or(STOP_DIFF_H.min(rows)) + 10.0 + 6.0 + 8.0
+        self.card_diff_h.unwrap_or(STOP_DIFF_H.min(rows).max(STOP_DIFF_MIN_H)) + 10.0 + 6.0 + 8.0
     }
 
     fn ensure_stop_diff(&mut self) {
