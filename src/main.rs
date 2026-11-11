@@ -127,6 +127,10 @@ enum AgentMsg {
     /// `dims` is the picture's own size in pixels, so its frame can be worked
     /// out exactly rather than left to a layout rule to approximate.
     Shot { note: String, image: Arc<gpui::Image>, path: PathBuf, dims: Option<(f32, f32)> },
+    /// The first row of a session TIDE opened for you rather than one you
+    /// asked for: it says so, says what was carried across, and carries the id
+    /// of the conversation it left, so that one is a click away.
+    Fresh { prev: Option<String> },
     /// A tool call the agent ran: title (for Bash, the command itself), latest
     /// status, what the adapter said about it (a description before it runs, the
     /// output after), and when it started, so a long one can show its age.
@@ -3626,6 +3630,44 @@ fn one_line(text: &str, max: usize) -> String {
         true => format!("{}\u{2026}", t.chars().take(max).collect::<String>().trim_end()),
         false => t,
     }
+}
+
+/// How many of the questions behind a handoff go into it. Three is what makes
+/// it a thread rather than a single line out of context, and three lines cost
+/// about a thousandth of the conversation they stand for.
+const HANDOFF_ASKS: usize = 3;
+
+/// What a new session is told about the one it replaces: the last few things
+/// asked, oldest first, and the answer to the last of them. Without this a
+/// follow-up question lands in a session that never did the thing being asked
+/// about; with it, that costs a few thousand tokens instead of the hundreds of
+/// thousands the whole transcript costs. `None` when there is nothing to say.
+fn handoff_tail(msgs: &[AgentMsg]) -> Option<String> {
+    let mut asked: Vec<String> = msgs
+        .iter()
+        .rev()
+        .filter_map(|m| match m {
+            AgentMsg::User { text, .. } if !text.trim().is_empty() => Some(one_line(text, 300)),
+            _ => None,
+        })
+        .take(HANDOFF_ASKS)
+        .collect();
+    if asked.is_empty() {
+        return None;
+    }
+    asked.reverse();
+    let answered = msgs.iter().rev().find_map(|m| match m {
+        AgentMsg::Agent(t) if !t.trim().is_empty() => Some(one_line(t, 800)),
+        _ => None,
+    });
+    let mut out = String::from("What was going on in it, oldest first:\n");
+    for a in &asked {
+        out.push_str(&format!("\n* Asked: {a}"));
+    }
+    if let Some(a) = answered {
+        out.push_str(&format!("\n* The last answer: {a}"));
+    }
+    Some(out)
 }
 
 /// Where a session is carrying enough history that it is worth starting again.
@@ -10653,6 +10695,9 @@ impl Storm {
                 }),
                 AgentMsg::Reviewing => serde_json::json!({
                     "k": "tool", "w": "reviewers", "t": "reading the branch…",
+                }),
+                AgentMsg::Fresh { .. } => serde_json::json!({
+                    "k": "tool", "w": "TIDE", "t": "new session, with a handoff",
                 }),
                 // the picture itself, not a note saying one exists elsewhere:
                 // "look at the screenshot" is useless on a phone that can't
@@ -26988,24 +27033,8 @@ impl Storm {
         )
     }
 
-    /// The last exchange of the conversation being left behind, trimmed to a
-    /// few lines. Without it a follow-up question lands in a session that never
-    /// did the thing being asked about; with it, that costs a few thousand
-    /// tokens instead of the hundreds of thousands the whole transcript costs.
     fn fresh_tail(&self) -> Option<String> {
-        let asked = self.agent_msgs.iter().rev().find_map(|m| match m {
-            AgentMsg::User { text, .. } if !text.trim().is_empty() => Some(one_line(text, 300)),
-            _ => None,
-        })?;
-        let answered = self.agent_msgs.iter().rev().find_map(|m| match m {
-            AgentMsg::Agent(t) if !t.trim().is_empty() => Some(one_line(t, 800)),
-            _ => None,
-        });
-        let mut out = format!("The last thing that happened in it:\n\n* Asked: {asked}");
-        if let Some(a) = answered {
-            out.push_str(&format!("\n* Answered: {a}"));
-        }
-        Some(out)
+        handoff_tail(&self.agent_msgs)
     }
 
     /// Ask something in a session of its own, with the handoff in front of it.
@@ -27028,7 +27057,11 @@ impl Storm {
         // before the reset: `fresh_handoff` reads the transcript, and
         // `new_agent_session` clears it
         let prompt = format!("{}\n\n{text}", self.fresh_handoff());
+        let prev = self.acp.as_ref().and_then(|a| a.session_id());
         self.new_agent_session(cx);
+        // the pane going empty is not an explanation. This says what happened,
+        // what went across, and where the conversation it left has gone
+        self.agent_msgs.push(AgentMsg::Fresh { prev });
         self.send_agent_prompt_by(prompt, label.or(Some(text)), Sender::You, cx);
     }
 
@@ -30526,6 +30559,51 @@ impl Storm {
                     .children(body)
                     .into_any_element();
             }
+            // the line a fresh session opens with
+            if let AgentMsg::Fresh { prev } = m {
+                let prev = prev.clone();
+                return div()
+                    .px_3()
+                    .py_1()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(10.))
+                    .text_color(rgb(MUTED))
+                    .child(
+                        div()
+                            .font_family(ICON_FONT)
+                            .text_size(px(10.))
+                            .text_color(rgb(COMMENT_MARK))
+                            .child(IC_AGENT),
+                    )
+                    .child(
+                        div().flex_shrink_0().text_color(rgb(COMMENT_MARK)).child("New session"),
+                    )
+                    .child(div().flex_grow(1.0).min_w(px(0.)).truncate().child(
+                        "the branch, the pull request and the last few questions came across",
+                    ))
+                    .when_some(prev, |d, id| {
+                        d.child(
+                            div()
+                                .id(("fresh-back", ix))
+                                .flex_shrink_0()
+                                .px_1p5()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .border_1()
+                                .border_color(rgb(BORDER))
+                                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                .child("\u{21bb} the one before")
+                                .tooltip(tip("Open the conversation this session started from"))
+                                .on_click(cx.listener(move |this, _e, _w, cx| {
+                                    this.resume_agent_session(id.clone(), cx)
+                                })),
+                        )
+                    })
+                    .into_any_element();
+            }
             // a tool call opens on a click and shuts on the next one. The
             // whole row is the target: there is nothing else in it to hit
             if let AgentMsg::Tool { id, .. } = m {
@@ -32393,6 +32471,8 @@ fn render_agent_msg(m: &AgentMsg, ix: usize, shot_w: f32, open: bool) -> impl In
         AgentMsg::Summary { title, text } => summary_card(title, text).into_any_element(),
         // drawn by the transcript itself, which has the live reviewer list
         AgentMsg::Reviewing => div().into_any_element(),
+        // same: the row has a click on it
+        AgentMsg::Fresh { .. } => div().into_any_element(),
         AgentMsg::Shot { note, image, dims, .. } => div()
             .flex()
             .flex_col()
@@ -43761,6 +43841,38 @@ mod handoff_tests {
         assert_eq!(out.chars().count(), 11, "ten characters and the ellipsis");
         assert!(out.ends_with('…'));
         assert!(!out.contains("  "), "no run of spaces survives the squeeze");
+    }
+
+    fn asked(t: &str) -> AgentMsg {
+        AgentMsg::User { text: t.into(), imgs: Vec::new(), by: Sender::You }
+    }
+
+    #[test]
+    fn the_handoff_carries_the_last_three_questions_oldest_first() {
+        let msgs = vec![
+            asked("one"),
+            AgentMsg::Agent("first answer".into()),
+            asked("two"),
+            asked("three"),
+            asked("four"),
+            AgentMsg::Agent("last answer".into()),
+        ];
+        let out = handoff_tail(&msgs).expect("a tail");
+        assert!(!out.contains("Asked: one"), "older than the last three");
+        let (a, b, c) = (
+            out.find("Asked: two").expect("two"),
+            out.find("Asked: three").expect("three"),
+            out.find("Asked: four").expect("four"),
+        );
+        assert!(a < b && b < c, "oldest first");
+        assert!(out.contains("The last answer: last answer"));
+        assert!(!out.contains("first answer"), "only the answer that still stands");
+    }
+
+    #[test]
+    fn a_conversation_with_nothing_asked_in_it_has_no_tail() {
+        assert!(handoff_tail(&[]).is_none());
+        assert!(handoff_tail(&[AgentMsg::Agent("hello".into())]).is_none());
     }
 
     #[test]

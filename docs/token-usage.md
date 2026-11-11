@@ -85,12 +85,17 @@ that would drop work in flight; then they ask in the session that is already
 there.
 
 **Every one of them carries a handoff** in front of the question: the
-workspace, the branch, the pull request, and the last exchange of the
-conversation being left behind, trimmed to a line each. The last exchange is
-what makes a follow-up land. Without it, "why did you do it that way?" arrives
-in a session that never did it; with it, that costs a few thousand tokens
-instead of the hundreds of thousands the transcript costs. The old
-conversation is not deleted, it is one click away under ↻ Resume.
+workspace, the branch, the pull request, the last three questions asked in the
+conversation being left behind, oldest first, and the answer to the last of
+them. Those questions are what makes a follow-up land. Without them, "why did
+you do it that way?" arrives in a session that never did it; with them, that
+costs a few thousand tokens instead of the hundreds of thousands the
+transcript costs.
+
+**A session that opened this way says so**, on its first line, along with what
+came across and a button that opens the conversation it started from. Nothing
+is deleted: that one is also under ↻ Resume, with every other session in the
+project.
 
 ## The weighting
 
