@@ -127,6 +127,11 @@ pub struct Acp {
     events: Arc<Mutex<Vec<AcpEvent>>>,
     dirty: Arc<AtomicBool>,
     ready: Arc<AtomicBool>,
+    /// The adapter said it takes `_session/steering`: a message can be put into
+    /// the turn that is running instead of waiting behind it. Read off
+    /// `initialize`'s `_meta.steering.supported`, so an older adapter simply
+    /// never sets it and everything queues as it always did.
+    steering: Arc<AtomicBool>,
     child: Mutex<Child>,
 }
 
@@ -180,6 +185,7 @@ impl Acp {
             events: Arc::new(Mutex::new(Vec::new())),
             dirty: Arc::new(AtomicBool::new(false)),
             ready: Arc::new(AtomicBool::new(false)),
+            steering: Arc::new(AtomicBool::new(false)),
             child: Mutex::new(child),
         });
 
@@ -323,6 +329,35 @@ impl Acp {
                 }
             }
         }
+    }
+
+    /// Can a message be put into the turn that is running, rather than queued
+    /// behind it? False until the handshake says so.
+    pub fn can_steer(&self) -> bool {
+        self.steering.load(Ordering::Relaxed)
+    }
+
+    /// Put `text` into the turn that is running (ACP `_session/steering`).
+    ///
+    /// The adapter hands it to the model at the next moment it can take one,
+    /// which is mid-turn rather than after it. With no turn running it starts
+    /// one, so this is safe to call either way; TIDE only reaches for it when
+    /// the agent is busy, because a prompt is the plainer thing otherwise.
+    pub fn steer(&self, text: &str, images: &[(String, String)]) {
+        let Some(sid) = self.session.lock().ok().and_then(|s| s.clone()) else { return };
+        let mut blocks: Vec<Value> = images
+            .iter()
+            .map(|(mime, data)| json!({ "type": "image", "mimeType": mime, "data": data }))
+            .collect();
+        if !text.is_empty() || blocks.is_empty() {
+            blocks.push(json!({ "type": "text", "text": text }));
+        }
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "id": self.take_id_for("_session/steering"),
+            "method": "_session/steering",
+            "params": { "sessionId": sid, "prompt": blocks }
+        }));
     }
 
     /// Interrupt the turn in flight (ACP `session/cancel`, a notification — the
@@ -618,6 +653,17 @@ impl Acp {
             return;
         }
         let Some(result) = msg.get("result") else { return };
+        // the handshake's answer carries what the adapter can do beyond the
+        // protocol proper; steering is the one TIDE asks for
+        if result
+            .get("_meta")
+            .and_then(|m| m.get("steering"))
+            .and_then(|s| s.get("supported"))
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false)
+        {
+            self.steering.store(true, Ordering::Relaxed);
+        }
         // session/list answer (matched by the id we recorded when asking)
         let is_list = msg
             .get("id")

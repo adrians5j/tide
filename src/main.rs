@@ -8636,6 +8636,9 @@ struct Storm {
     /// The agent was started over here (reset, or ⌃N) and hasn't been prompted
     /// since. Persisted, so a restart doesn't resume what was thrown away.
     agent_fresh: bool,
+    /// The next send waits for the turn in flight instead of going into it.
+    /// Set by ⌥↩ and by the queue button, read once and cleared.
+    queue_next: bool,
     /// What the live session is carrying per request, read off its own log.
     /// `None` until the session has answered once.
     agent_context: Option<u64>,
@@ -9335,6 +9338,7 @@ impl Storm {
             agent_autoresume: false,
             agent_resumed: false,
             agent_fresh,
+            queue_next: false,
             agent_context: None,
             fresh_hint_off: false,
             agent_titled,
@@ -27371,6 +27375,12 @@ impl Storm {
                 }
             }
             // ↩ sends; the field's own newline handling is bypassed here
+            // ⌥↩ holds it back: the message is the next thing to do, not a
+            // correction to what is running
+            "enter" if ks.modifiers.alt => {
+                self.queue_next = true;
+                self.send_composer(cx);
+            }
             "enter" if !ks.modifiers.shift => {
                 self.send_composer(cx);
             }
@@ -27943,9 +27953,29 @@ impl Storm {
             cx.notify();
             return;
         }
-        // a turn is already running: hold this one and send it when that ends,
-        // rather than firing a second session/prompt at the adapter
+        // a turn is already running. Two things to do with that: put the
+        // message into it, which is what you want when you have just seen it
+        // go the wrong way, or hold it until the turn ends, which is what you
+        // want when it is the next thing rather than a correction. Steering is
+        // the default because that is the one that can't be had by waiting.
         if self.agent_busy {
+            let queue = std::mem::take(&mut self.queue_next);
+            // only what you type yourself. TIDE's own messages — a merge note,
+            // a batch of review comments, the reviewers' reports — are the next
+            // thing to deal with, not a correction to the turn in flight, and
+            // steering one in would cut off whatever is running to deliver it
+            if !queue && by == Sender::You && acp.can_steer() {
+                let (imgs, kept) = split_images(self.agent_imgs.drain(..).collect());
+                let shown = label.unwrap_or_else(|| text.clone());
+                jobs::remember(&text, &shown, job.as_deref().unwrap_or_default(), by == Sender::Tide);
+                acp.steer(&text, &imgs);
+                // it reads as what it is: a message inside the turn that is
+                // running, not the start of a new one
+                self.agent_msgs.push(AgentMsg::User { text: shown, imgs: kept, by });
+                self.agent_list.scroll_to_end();
+                cx.notify();
+                return;
+            }
             // the attachments go with it, not with the next thing you send
             let imgs = self.agent_imgs.drain(..).collect();
             self.agent_queue.push(Queued { text, label, imgs, by, job });
@@ -27953,6 +27983,7 @@ impl Storm {
             cx.notify();
             return;
         }
+        self.queue_next = false;
         // the session now has content, so the next launch can resume it again
         self.mark_agent_fresh(false);
         let (imgs, kept) = split_images(self.agent_imgs.drain(..).collect());
@@ -31516,6 +31547,13 @@ impl Storm {
                             format!("Waiting for the reviewers…{}", self.caret_if(focused))
                         } else if blocked.is_some() {
                             format!("Waiting for the plan window…{}", self.caret_if(focused))
+                        } else if busy && self.acp.as_ref().is_some_and(|a| a.can_steer()) {
+                            // mid-turn the same ↩ does something else, and the
+                            // empty box is where to say so
+                            format!(
+                                "↩ goes into this turn  ·  ⌥↩ waits for it{}",
+                                self.caret_if(focused)
+                            )
                         } else if sends_on_paste(&send_on_paste_setting()) {
                             // the empty box is exactly the state the setting
                             // applies to, so it is where it says so
