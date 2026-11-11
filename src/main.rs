@@ -3617,6 +3617,11 @@ fn is_markdown(path: &Path) -> bool {
 }
 
 /// Green under half, amber past it, red when the window is nearly spent.
+/// Where a session is carrying enough history that it is worth starting again:
+/// the same place the colour turns amber. At 400k a turn costs roughly four
+/// times what the same turn costs in a session that has just opened.
+const FRESH_AT: u64 = 400_000;
+
 /// How a context size reads: quiet while a session is cheap to carry, amber
 /// once every turn is paying for a few hundred thousand tokens of history, red
 /// where a turn costs ten times what it did at the start of the session.
@@ -8631,6 +8636,12 @@ struct Storm {
     /// The agent was started over here (reset, or ⌃N) and hasn't been prompted
     /// since. Persisted, so a restart doesn't resume what was thrown away.
     agent_fresh: bool,
+    /// What the live session is carrying per request, read off its own log.
+    /// `None` until the session has answered once.
+    agent_context: Option<u64>,
+    /// The "this session has grown expensive" line in the composer, put away
+    /// for this session.
+    fresh_hint_off: bool,
     /// The current title was written by an agent, so an agent may improve it.
     agent_titled: bool,
     agent_picker: bool,              // the resume list is open
@@ -9324,6 +9335,8 @@ impl Storm {
             agent_autoresume: false,
             agent_resumed: false,
             agent_fresh,
+            agent_context: None,
+            fresh_hint_off: false,
             agent_titled,
             agent_picker: false,
             agent_brief_open: false,
@@ -9801,9 +9814,26 @@ impl Storm {
     /// one small file, and only when it changed.
     fn start_usage_poll(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| loop {
-            let l = cx.background_executor().spawn(async move { usage::load_limits() }).await;
+            // which session to read, asked on the UI thread; the reading itself
+            // is a file tail and goes to the background with the limits
+            let Ok(live) = this.update(cx, |this, _cx| {
+                (this.root.clone(), this.acp.as_ref().and_then(|a| a.session_id()))
+            }) else {
+                break;
+            };
+            let (l, ctx) = cx
+                .background_executor()
+                .spawn(async move {
+                    let (root, id) = live;
+                    (usage::load_limits(), id.and_then(|id| tokens::live_context(&root, &id)))
+                })
+                .await;
             if this
                 .update(cx, |this, cx| {
+                    if this.agent_context != ctx {
+                        this.agent_context = ctx;
+                        cx.notify();
+                    }
                     if this.limits != l {
                         let was_blocked = this.usage_block().is_some();
                         this.limits = l;
@@ -14597,7 +14627,13 @@ impl Storm {
         if self.acp.is_none() {
             return false;
         }
-        self.send_agent_prompt_as(merged_note(number, about.as_ref()), None, cx);
+        // the merge is the end of the work, so the question after it starts a
+        // session of its own; mid-turn it goes here, like any other prompt
+        let note = merged_note(number, about.as_ref());
+        match self.agent_busy {
+            true => self.send_agent_prompt_as(note, None, cx),
+            false => self.ask_fresh(note, None, cx),
+        }
         true
     }
 
@@ -26868,6 +26904,8 @@ impl Storm {
     /// Drop the current conversation and start a fresh session.
     fn new_agent_session(&mut self, cx: &mut Context<Self>) {
         self.ensure_acp(cx);
+        self.agent_context = None;
+        self.fresh_hint_off = false;
         self.agent_resumed = true; // an explicit new session outranks auto-resume
         self.agent_autoresume = false;
         self.mark_agent_fresh(true);
@@ -26876,6 +26914,58 @@ impl Storm {
             acp.new_session(&self.root);
         }
         cx.notify();
+    }
+
+    /// The few lines a new session needs to carry on from where the last one
+    /// stopped: which folder, which branch, which pull request. Everything else
+    /// in a finished conversation is history the next piece of work pays for on
+    /// every turn, and the repo is right there to be read.
+    fn fresh_handoff(&self) -> String {
+        let mut lines = vec![format!("Workspace: {}", self.root.display())];
+        if let Some(t) = self.ws_title.as_ref().filter(|t| !t.trim().is_empty()) {
+            lines.push(format!("The work here: {t}"));
+        }
+        let branch = self.branch_label();
+        if !branch.is_empty() {
+            lines.push(format!("Branch: {branch}"));
+        }
+        if let Some((n, title, _, _, _, state)) = self.pr_link.as_ref() {
+            let state = match state {
+                PrState::Merged => "merged",
+                PrState::Closed => "closed",
+                _ => "open",
+            };
+            lines.push(format!("Pull request: #{n} \u{201c}{title}\u{201d} ({state})"));
+        }
+        format!(
+            "This is a new session, started on purpose: the last one had done its job \
+             and its history is not what comes next. Where things stand:\n\n{}\n\n\
+             Read whatever else you need from the repo rather than asking me to \
+             repeat it.",
+            lines.iter().map(|l| format!("* {l}")).collect::<Vec<_>>().join("\n"),
+        )
+    }
+
+    /// Ask something in a session of its own, with the handoff in front of it.
+    ///
+    /// A question that opens a new piece of work does not need the last one's
+    /// transcript, and carrying it is what makes a long day expensive: every
+    /// request re-sends the whole conversation, so the turns after this one all
+    /// pay for whatever is still in the context when they run.
+    fn ask_fresh(&mut self, text: String, label: Option<String>, cx: &mut Context<Self>) {
+        // never over the top of work in flight: the turn running now would be
+        // dropped with the session it is running in. The reviewers are the same
+        // case from the other side — `send_agent_prompt_by` refuses to send
+        // while they read, and refusing after the reset would leave an empty
+        // pane and no question in it
+        let reviewing = self.reviewers.iter().any(|r| !r.done);
+        if self.agent_busy || reviewing || self.acp.is_none() {
+            self.send_agent_prompt_by(text, label, Sender::You, cx);
+            return;
+        }
+        self.new_agent_session(cx);
+        let prompt = format!("{}\n\n{text}", self.fresh_handoff());
+        self.send_agent_prompt_by(prompt, label.or(Some(text)), Sender::You, cx);
     }
 
     /// Remember (on disk, per workspace) whether the agent here was started over
@@ -27774,6 +27864,8 @@ impl Storm {
         prompt: fn() -> String,
         shown: Option<&'static str>,
         job: Option<&'static str>,
+        // ask in a session of its own, rather than on the end of this one
+        fresh: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         div()
@@ -27792,12 +27884,15 @@ impl Storm {
             .tooltip(tip(hint))
             .on_click(cx.listener(move |this, _e, _w, cx| {
                 this.job_next = job.map(str::to_string);
-                this.send_agent_prompt_by(
-                    prompt(),
-                    shown.map(str::to_string),
-                    Sender::You,
-                    cx,
-                );
+                match fresh {
+                    true => this.ask_fresh(prompt(), shown.map(str::to_string), cx),
+                    false => this.send_agent_prompt_by(
+                        prompt(),
+                        shown.map(str::to_string),
+                        Sender::You,
+                        cx,
+                    ),
+                }
             }))
     }
 
@@ -31007,6 +31102,32 @@ impl Storm {
                                 })),
                         )
                     })
+                    // what this session carries into every request. The number
+                    // nobody can see is the one that decides what a day costs:
+                    // a turn on a 700k context is worth ten of the same turn on
+                    // a fresh one, and nothing else in the pane says so
+                    .when_some(self.agent_context, |d, ctx| {
+                        let text = format!(
+                            "This session carries {} into every request.\n\
+                             A turn costs about that whatever it asks, because every \
+                             request re-sends the conversation.\n\
+                             \u{21ba} New session starts again at nothing.",
+                            usage::short(ctx),
+                        );
+                        d.child(
+                            div()
+                                .id("agent-ctx")
+                                .flex_shrink_0()
+                                .px_1p5()
+                                .rounded_md()
+                                .text_size(px(10.))
+                                .text_color(rgb(context_color(ctx)))
+                                .child(format!("ctx {}", usage::short(ctx)))
+                                .tooltip(move |_w, cx| {
+                                    cx.new(|_| TooltipView { text: text.clone().into() }).into()
+                                }),
+                        )
+                    })
                     // the briefing panel is on the palette ("Show the Agent
                     // Briefing") rather than up here: it is read once in a
                     // while, and the bar is for what you reach for
@@ -31204,6 +31325,66 @@ impl Storm {
             .rounded_md()
             .flex()
             .flex_col()
+            // the session has grown expensive to carry. Said here because this
+            // is where the next turn is about to be typed, and the moment to
+            // start again is before it, not after the window has gone
+            .when(
+                self.agent_context.is_some_and(|c| c >= FRESH_AT) && !self.fresh_hint_off,
+                |d| {
+                    let ctx = self.agent_context.unwrap_or(0);
+                    d.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .mb_1()
+                            .px_1p5()
+                            .py(px(1.))
+                            .rounded_md()
+                            .text_size(px(10.))
+                            .text_color(rgb(context_color(ctx)))
+                            .child(format!(
+                                "Every turn here carries {} of this conversation",
+                                usage::short(ctx)
+                            ))
+                            .child(
+                                div()
+                                    .id("fresh-now")
+                                    .px_1p5()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .border_1()
+                                    .border_color(rgb(BORDER))
+                                    .text_color(rgb(MUTED))
+                                    .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                    .child("\u{21ba} New session")
+                                    .tooltip(tip(
+                                        "Start again at nothing. This conversation stays \
+                                         in \u{21bb} Resume",
+                                    ))
+                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                        this.new_agent_session(cx)
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("fresh-hush")
+                                    .px_1p5()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_color(rgb(LINE_NUMBER))
+                                    .hover(|s| s.text_color(rgb(TEXT)))
+                                    .child("not now")
+                                    .tooltip(tip("Leave it; the line comes back next session"))
+                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                        this.fresh_hint_off = true;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                },
+            )
             // the plan window is spent. The box still takes what you type — the
             // message is yours and shouldn't be lost — it just won't send until
             // the window comes back or you say to send anyway
@@ -31418,6 +31599,7 @@ impl Storm {
                             || CHECK_CI_PROMPT.to_string(),
                             None,
                             None,
+                            false,
                             cx,
                         ))
                     })
@@ -31429,16 +31611,21 @@ impl Storm {
                         || STATUS_PROMPT.to_string(),
                         None,
                         None,
+                        false,
                         cx,
                     ))
                     .child(self.quick_prompt(
                         "quick-next",
-                        "What next?",
+                        "What next? \u{21ba}",
                         MUTED,
-                        "Ask where this stands and what to do next",
+                        "Ask where this stands and what to do next, in a new session: \
+                         what comes next doesn't need this conversation, and carrying it \
+                         is paid for on every turn after. This one stays in \u{21bb} Resume. \
+                         While a turn is running it asks here instead",
                         || WHAT_NEXT_PROMPT.to_string(),
                         None,
                         None,
+                        true,
                         cx,
                     ))
                     .child(self.quick_prompt(
@@ -31449,6 +31636,7 @@ impl Storm {
                         || PROVE_IT_PROMPT.to_string(),
                         None,
                         None,
+                        false,
                         cx,
                     ))
                     // the deck it builds opens in its own tab, so the turn
@@ -31461,6 +31649,7 @@ impl Storm {
                         talk_brief_request,
                         Some("Asked for a presentation of this conversation"),
                         Some("Presentation of this conversation"),
+                        false,
                         cx,
                     ))
                     .child(div().flex_grow(1.0))

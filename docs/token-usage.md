@@ -57,6 +57,23 @@ The way down is a fresh session. In one week of these logs a long session's
 context climbed to about 900k fifteen times, and each reset dropped the cost of
 a request by a factor of ten.
 
+## What TIDE does about it
+
+Two things, both aimed at the same arithmetic.
+
+**The pane says what it is carrying.** A `ctx 612k` chip sits in the agent bar,
+read off the live session's own log every fifteen seconds, amber past 400k and
+red past 700k. Past 400k the composer grows a line offering a new session,
+which can be put away for that session with "not now".
+
+**The questions that start new work start new sessions.** "What next? ↺" and
+the note TIDE sends after a merge both open a session of their own and carry a
+handoff in front of the question: the workspace, the branch and the pull
+request, four lines instead of a transcript. Neither does it while a turn is
+running or while the reviewers are reading, because that would drop work in
+flight; then they ask in the session that is already there. The old
+conversation is not deleted, it is one click away under ↻ Resume.
+
 ## The weighting
 
 The panel sorts and draws by one number, at the published price ratios:

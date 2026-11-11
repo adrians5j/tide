@@ -298,6 +298,57 @@ pub fn day_label(hour: i64, offset: i64) -> String {
     format!("{} {}", DAYS[day], hour_label(hour, offset))
 }
 
+/// What the session with this id is carrying right now, from the last request
+/// it made: the context a turn in it costs before the turn asks anything.
+///
+/// Reads the end of one log rather than the whole of it. `root` says which
+/// project directory to look in first, since that is a name away; a session
+/// that was started somewhere else is found by looking through the rest.
+pub fn live_context(root: &Path, id: &str) -> Option<u64> {
+    if id.is_empty() {
+        return None;
+    }
+    let dir = logs_dir()?;
+    let named = dir.join(crate::usage::project_slug(root)).join(format!("{id}.jsonl"));
+    let path = match named.exists() {
+        true => named,
+        false => std::fs::read_dir(&dir)
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|e| e.path().join(format!("{id}.jsonl")))
+            .find(|p| p.exists())?,
+    };
+    last_context(&path)
+}
+
+/// The context on the last request in a log file. The tail is enough: one
+/// assistant line is a few kilobytes, and the ones before it are history.
+fn last_context(path: &Path) -> Option<u64> {
+    let len = std::fs::metadata(path).ok()?.len();
+    let mut f = std::fs::File::open(path).ok()?;
+    // a tool result can run to megabytes, so the window has to be generous or
+    // a long one buries the request that follows it
+    const TAIL: u64 = 4 << 20;
+    if len > TAIL {
+        f.seek(SeekFrom::Start(len - TAIL)).ok()?;
+    }
+    let mut found = None;
+    let mut reader = BufReader::with_capacity(1 << 20, f);
+    let mut raw = Vec::new();
+    while let Ok(n) = reader.read_until(b'\n', &mut raw) {
+        if n == 0 {
+            break;
+        }
+        if has_usage(&raw) {
+            if let Some((_, _, u)) = read_line(&String::from_utf8_lossy(&raw)) {
+                found = Some(u.context());
+            }
+        }
+        raw.clear();
+    }
+    found
+}
+
 fn logs_dir() -> Option<PathBuf> {
     Some(PathBuf::from(std::env::var("HOME").ok()?).join(".claude/projects"))
 }
@@ -647,6 +698,33 @@ mod tests {
         assert_eq!(u.tokens(), 1300);
         assert_eq!(u.weighted(), 100 + 125 + 100 + 500);
         assert!(Use::default().is_empty());
+    }
+
+    /// The live reading comes off the end of a log: the last request's context,
+    /// not the first's and not the sum of them.
+    #[test]
+    fn the_live_context_is_the_last_request_in_the_log() {
+        let dir = std::env::temp_dir().join(format!("tide-tok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("live.jsonl");
+        let line = |cr: u64| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"2026-11-05T11:16:01.291Z","cwd":"/w","message":{{"usage":{{"input_tokens":1,"cache_creation_input_tokens":999,"cache_read_input_tokens":{cr},"output_tokens":5}}}}}}"#
+            )
+        };
+        let body = format!(
+            "{}\n{}\n{}\n",
+            line(10_000),
+            r#"{"type":"user","message":{"content":"something long"}}"#,
+            line(500_000),
+        );
+        std::fs::write(&path, body).unwrap();
+        assert_eq!(last_context(&path), Some(501_000));
+        // a log with nothing in it yet is no reading, not a zero
+        std::fs::write(&path, "{\"type\":\"queue-operation\"}\n").unwrap();
+        assert_eq!(last_context(&path), None);
+        assert_eq!(last_context(&dir.join("nope.jsonl")), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
