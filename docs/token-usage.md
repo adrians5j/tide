@@ -1,8 +1,8 @@
 # Where the tokens went
 
 The plan bars say how much of the window is gone. They don't say what spent it.
-This does: tokens by hour, by workspace and by session, over the last day or the
-last week.
+This does: tokens by hour, by workspace and by session, for today, the last 24
+hours or the last week.
 
 Open it from the palette, "Where the Tokens Went…", or print the same reading
 without opening TIDE at all:
