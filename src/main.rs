@@ -8286,6 +8286,10 @@ struct Storm {
     card_resize: Option<(f32, f32, f32, f32, bool)>,
     /// Slides of the open brief that have come up the window far enough to be
     /// drawn. Cleared when a new brief arrives, so it reveals itself again.
+    /// Tool calls you have opened, by call id. A call is one line until then:
+    /// a transcript is a conversation, and a page of shell between two
+    /// sentences is the agent's working, not its answer.
+    tool_open: HashSet<String>,
     brief_seen: HashSet<usize>,
     /// How wide a slide is actually painted, measured rather than derived. The
     /// question box takes its width from this instead of from the layout: a
@@ -9120,6 +9124,7 @@ impl Storm {
             card_width: None,
             card_diff_h: None,
             card_resize: None,
+            tool_open: HashSet::new(),
             rc_width: None,
             brief_seen: HashSet::new(),
             brief_w: 0.,
@@ -30459,7 +30464,30 @@ impl Storm {
                     .children(body)
                     .into_any_element();
             }
-            return div().px_3().py_1().child(render_agent_msg(m, ix, this.shot_width())).into_any_element();
+            // a tool call opens on a click and shuts on the next one. The
+            // whole row is the target: there is nothing else in it to hit
+            if let AgentMsg::Tool { id, .. } = m {
+                let key = id.clone();
+                let open = this.tool_open.contains(&key);
+                return div()
+                    .id(("tool-row", ix))
+                    .px_3()
+                    .py_1()
+                    .cursor_pointer()
+                    .child(render_agent_msg(m, ix, this.shot_width(), open))
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                        if !this.tool_open.remove(&key) {
+                            this.tool_open.insert(key.clone());
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element();
+            }
+            return div()
+                .px_3()
+                .py_1()
+                .child(render_agent_msg(m, ix, this.shot_width(), true))
+                .into_any_element();
         }
         let after = ix - this.agent_msgs.len();
         // the "thinking" row sits between the transcript and the queue
@@ -32259,7 +32287,7 @@ fn user_images(imgs: &[SentImage], ix: usize) -> Option<impl IntoElement> {
     Some(row)
 }
 
-fn render_agent_msg(m: &AgentMsg, ix: usize, shot_w: f32) -> impl IntoElement {
+fn render_agent_msg(m: &AgentMsg, ix: usize, shot_w: f32, open: bool) -> impl IntoElement {
     match m {
         // handled by the transcript itself, so it can be selected like an answer
         AgentMsg::User { text, imgs, by } => div()
@@ -32314,12 +32342,18 @@ fn render_agent_msg(m: &AgentMsg, ix: usize, shot_w: f32) -> impl IntoElement {
                 _ => ("●", ACCENT),
             };
             // for a Bash call the title *is* the command, so it is long and
-            // carries newlines. It wraps rather than ending in an ellipsis —
-            // half a command tells you nothing about what is running. Only a
+            // carries newlines. Closed, the row is its first line and nothing
+            // else; open, it wraps rather than ending in an ellipsis — half a
+            // command tells you nothing about what is running. Only a
             // genuinely enormous one is cut, so a stray megabyte of here-doc
             // can't push the rest of the transcript off screen.
             const LONGEST: usize = 900;
-            let mut head = title.trim().to_string();
+            let full = title.trim();
+            let rest = full.lines().count().saturating_sub(1);
+            let mut head = match open {
+                true => full.to_string(),
+                false => full.lines().next().unwrap_or_default().to_string(),
+            };
             if head.chars().count() > LONGEST {
                 head = head.chars().take(LONGEST).collect::<String>() + " …";
             }
@@ -32368,8 +32402,22 @@ fn render_agent_msg(m: &AgentMsg, ix: usize, shot_w: f32) -> impl IntoElement {
                                 .font_family("Menlo")
                                 .text_size(px(11.5))
                                 .text_color(rgb(if running { TEXT } else { MUTED }))
+                                // closed, the first line is cut at the pane's
+                                // edge instead of wrapping: every closed call
+                                // is exactly one line tall, whatever it ran
+                                .when(!open, |d| d.truncate())
                                 .child(head),
                         )
+                        // how much is behind the line you can see
+                        .when(rest > 0 && !open, |d| {
+                            d.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(LINE_NUMBER))
+                                    .child(format!("+{rest}")),
+                            )
+                        })
                         // how long it has been going: the whole point of the row
                         // when a command takes minutes
                         .when(running, |d| {
