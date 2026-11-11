@@ -3617,10 +3617,24 @@ fn is_markdown(path: &Path) -> bool {
 }
 
 /// Green under half, amber past it, red when the window is nearly spent.
-/// Where a session is carrying enough history that it is worth starting again:
-/// the same place the colour turns amber. At 400k a turn costs roughly four
-/// times what the same turn costs in a session that has just opened.
-const FRESH_AT: u64 = 400_000;
+/// A block of text as one line, cut to `max` characters. What a handoff says
+/// about the conversation it replaces: enough of a question or an answer to
+/// recognise it, never enough to be worth carrying.
+fn one_line(text: &str, max: usize) -> String {
+    let t = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match t.chars().count() > max {
+        true => format!("{}\u{2026}", t.chars().take(max).collect::<String>().trim_end()),
+        false => t,
+    }
+}
+
+/// Where a session is carrying enough history that it is worth starting again.
+/// A day of these logs, 3,724 requests across nine workspaces, spent 62% of its
+/// weighted total on the requests carrying more than 400k; had nothing carried
+/// more than 250k, the same day's work would have cost a third less. So the
+/// line sits at 250k, below where the colour turns amber, because by the time
+/// a session looks expensive it has already been expensive for hours.
+const FRESH_AT: u64 = 250_000;
 
 /// How a context size reads: quiet while a session is cheap to carry, amber
 /// once every turn is paying for a few hundred thousand tokens of history, red
@@ -8653,6 +8667,12 @@ struct Storm {
     /// The "this session has grown expensive" line in the composer, put away
     /// for this session.
     fresh_hint_off: bool,
+    /// The turn that just ended left the session over `FRESH_AT`, so the next
+    /// thing you type opens a session of its own. Set when a turn ends rather
+    /// than acted on there: the answer you are reading stays on screen, and the
+    /// reset happens at the only moment it costs nothing, which is before the
+    /// next question rather than after the last one.
+    fresh_pending: bool,
     /// The current title was written by an agent, so an agent may improve it.
     agent_titled: bool,
     agent_picker: bool,              // the resume list is open
@@ -9350,6 +9370,7 @@ impl Storm {
             queue_next: false,
             agent_context: None,
             fresh_hint_off: false,
+            fresh_pending: false,
             agent_titled,
             agent_picker: false,
             agent_brief_open: false,
@@ -26925,6 +26946,7 @@ impl Storm {
         self.ensure_acp(cx);
         self.agent_context = None;
         self.fresh_hint_off = false;
+        self.fresh_pending = false;
         self.agent_resumed = true; // an explicit new session outranks auto-resume
         self.agent_autoresume = false;
         self.mark_agent_fresh(true);
@@ -26958,11 +26980,32 @@ impl Storm {
         }
         format!(
             "This is a new session, started on purpose: the last one had done its job \
-             and its history is not what comes next. Where things stand:\n\n{}\n\n\
+             and its history is not what comes next. Where things stand:\n\n{}\n{}\n\
              Read whatever else you need from the repo rather than asking me to \
              repeat it.",
             lines.iter().map(|l| format!("* {l}")).collect::<Vec<_>>().join("\n"),
+            self.fresh_tail().map(|t| format!("\n{t}\n")).unwrap_or_default(),
         )
+    }
+
+    /// The last exchange of the conversation being left behind, trimmed to a
+    /// few lines. Without it a follow-up question lands in a session that never
+    /// did the thing being asked about; with it, that costs a few thousand
+    /// tokens instead of the hundreds of thousands the whole transcript costs.
+    fn fresh_tail(&self) -> Option<String> {
+        let asked = self.agent_msgs.iter().rev().find_map(|m| match m {
+            AgentMsg::User { text, .. } if !text.trim().is_empty() => Some(one_line(text, 300)),
+            _ => None,
+        })?;
+        let answered = self.agent_msgs.iter().rev().find_map(|m| match m {
+            AgentMsg::Agent(t) if !t.trim().is_empty() => Some(one_line(t, 800)),
+            _ => None,
+        });
+        let mut out = format!("The last thing that happened in it:\n\n* Asked: {asked}");
+        if let Some(a) = answered {
+            out.push_str(&format!("\n* Answered: {a}"));
+        }
+        Some(out)
     }
 
     /// Ask something in a session of its own, with the handoff in front of it.
@@ -26982,8 +27025,10 @@ impl Storm {
             self.send_agent_prompt_by(text, label, Sender::You, cx);
             return;
         }
-        self.new_agent_session(cx);
+        // before the reset: `fresh_handoff` reads the transcript, and
+        // `new_agent_session` clears it
         let prompt = format!("{}\n\n{text}", self.fresh_handoff());
+        self.new_agent_session(cx);
         self.send_agent_prompt_by(prompt, label.or(Some(text)), Sender::You, cx);
     }
 
@@ -27185,6 +27230,16 @@ impl Storm {
                 self.acp_state = Some(AgentState::Done);
                 self.agent_cur = None;
                 self.agent_cur_thought = None;
+                // nothing queued behind it and nothing in the context worth
+                // keeping: the next question starts somewhere cheap. Not when
+                // you have said "stay in this one", and not with messages
+                // still waiting, since they were typed for this conversation
+                if self.agent_queue.is_empty()
+                    && !self.fresh_hint_off
+                    && self.agent_context.is_some_and(|c| c >= FRESH_AT)
+                {
+                    self.fresh_pending = true;
+                }
                 self.agent_next_queued();
             }
             Error(e) => {
@@ -27450,6 +27505,13 @@ impl Storm {
         // the transcript shows what you typed (tokens and all); the agent gets
         // the pasted content spliced back in
         let label = (full != shown).then_some(shown);
+        // the last turn left this conversation expensive to carry, so this
+        // question opens its own session with the handoff in front of it.
+        // `ask_fresh` sends it here anyway if a turn or a review is running
+        if std::mem::take(&mut self.fresh_pending) {
+            self.ask_fresh(full, label, cx);
+            return;
+        }
         self.send_agent_prompt_by(full, label, Sender::You, cx);
     }
 
@@ -31401,6 +31463,7 @@ impl Storm {
                 self.agent_context.is_some_and(|c| c >= FRESH_AT) && !self.fresh_hint_off,
                 |d| {
                     let ctx = self.agent_context.unwrap_or(0);
+                    let pending = self.fresh_pending;
                     d.child(
                         div()
                             .flex()
@@ -31413,10 +31476,16 @@ impl Storm {
                             .rounded_md()
                             .text_size(px(10.))
                             .text_color(rgb(context_color(ctx)))
-                            .child(format!(
-                                "Every turn here carries {} of this conversation",
-                                usage::short(ctx)
-                            ))
+                            .child(match pending {
+                                true => format!(
+                                    "Carrying {} \u{2014} your next message starts a new session",
+                                    usage::short(ctx)
+                                ),
+                                false => format!(
+                                    "Every turn here carries {} of this conversation",
+                                    usage::short(ctx)
+                                ),
+                            })
                             .child(
                                 div()
                                     .id("fresh-now")
@@ -31444,10 +31513,17 @@ impl Storm {
                                     .cursor_pointer()
                                     .text_color(rgb(LINE_NUMBER))
                                     .hover(|s| s.text_color(rgb(TEXT)))
-                                    .child("not now")
-                                    .tooltip(tip("Leave it; the line comes back next session"))
+                                    .child(match pending {
+                                        true => "stay in this one",
+                                        false => "not now",
+                                    })
+                                    .tooltip(tip(
+                                        "Keep asking in this conversation; the line comes \
+                                         back next session",
+                                    ))
                                     .on_click(cx.listener(|this, _e, _w, cx| {
                                         this.fresh_hint_off = true;
+                                        this.fresh_pending = false;
                                         cx.notify();
                                     })),
                             ),
@@ -43666,5 +43742,30 @@ mod comment_thread_tests {
         // the answered thread is two turns, and neither of them is waiting
         assert_eq!(rc_thread_rows(&answered), 4);
         assert_eq!(rc_thread_rows(&you), 3);
+    }
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::*;
+
+    #[test]
+    fn a_handoff_line_is_one_line() {
+        let q = "please fix\n  the thing\n\nthat broke";
+        assert_eq!(one_line(q, 300), "please fix the thing that broke");
+    }
+
+    #[test]
+    fn a_long_one_is_cut_with_an_ellipsis() {
+        let out = one_line(&"ab ".repeat(200), 10);
+        assert_eq!(out.chars().count(), 11, "ten characters and the ellipsis");
+        assert!(out.ends_with('…'));
+        assert!(!out.contains("  "), "no run of spaces survives the squeeze");
+    }
+
+    #[test]
+    fn a_short_one_is_left_alone() {
+        assert_eq!(one_line("done", 300), "done");
+        assert_eq!(one_line("", 300), "");
     }
 }

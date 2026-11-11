@@ -63,15 +63,33 @@ Two things, both aimed at the same arithmetic.
 
 **The pane says what it is carrying.** A `ctx 612k` chip sits in the agent bar,
 read off the live session's own log every fifteen seconds, amber past 400k and
-red past 700k. Past 400k the composer grows a line offering a new session,
-which can be put away for that session with "not now".
+red past 700k. Past 250k the composer grows a line saying so.
+
+**A turn that ends over 250k hands the next question to a new session.** The
+line then reads "your next message starts a new session", and typing one opens
+it. The reset waits for the question rather than happening when the turn ends,
+so the answer you are reading stays on screen, and nothing is reset while
+messages are queued behind the turn. "stay in this one" turns it off for the
+rest of that session.
+
+250k is low on purpose. One day of these logs, 3,724 requests across nine
+workspaces, spent 62% of its weighted total on requests carrying more than
+400k. Had nothing carried more than 250k, the same day's work would have cost
+a third less, and that is the conservative reading: after a reset the context
+starts at nothing rather than sitting at the cap.
 
 **The questions that start new work start new sessions.** "What next? ↺" and
-the note TIDE sends after a merge both open a session of their own and carry a
-handoff in front of the question: the workspace, the branch and the pull
-request, four lines instead of a transcript. Neither does it while a turn is
-running or while the reviewers are reading, because that would drop work in
-flight; then they ask in the session that is already there. The old
+the note TIDE sends after a merge both open a session of their own. Neither
+does it while a turn is running or while the reviewers are reading, because
+that would drop work in flight; then they ask in the session that is already
+there.
+
+**Every one of them carries a handoff** in front of the question: the
+workspace, the branch, the pull request, and the last exchange of the
+conversation being left behind, trimmed to a line each. The last exchange is
+what makes a follow-up land. Without it, "why did you do it that way?" arrives
+in a session that never did it; with it, that costs a few thousand tokens
+instead of the hundreds of thousands the transcript costs. The old
 conversation is not deleted, it is one click away under ↻ Resume.
 
 ## The weighting
