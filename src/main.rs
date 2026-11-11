@@ -9537,7 +9537,7 @@ impl Storm {
             tokens: None,
             tokens_open: false,
             tokens_reading: false,
-            tokens_span: TokenSpan::Today,
+            tokens_span: TokenSpan::Window,
             tokens_why: HashMap::new(),
             ws_title,
             ws_subtitle,
@@ -19724,7 +19724,14 @@ impl Storm {
     /// the last 24 hours: at nine in the morning those are different questions
     /// and the first one is the one a plan window is spent against.
     fn token_window(&self) -> (i64, i64) {
-        token_window(self.tokens_span)
+        token_window(self.tokens_span, self.five_hour_reset())
+    }
+
+    /// When the plan's five-hour window rolls over, off the reading the 15s
+    /// poll already keeps. `None` without the statusline shim, or before its
+    /// first run.
+    fn five_hour_reset(&self) -> Option<i64> {
+        self.limits.as_ref().and_then(|l| l.five_hour.as_ref()).map(|w| w.resets_at)
     }
 
     /// Open the token panel and read the session logs behind it.
@@ -20010,6 +20017,12 @@ impl Storm {
             );
         }
 
+        // only on the window's own tab: on the others it would read as the
+        // share of that stretch, which it isn't
+        let window_pct = (span == TokenSpan::Window)
+            .then(|| self.limits.as_ref().and_then(|l| l.five_hour.as_ref()))
+            .flatten()
+            .map(|w| (w.pct, w.resets_at));
         let note = match (self.tokens_reading, self.tokens.is_some()) {
             (true, false) => "reading the session logs…".to_string(),
             (true, true) => "re-reading…".to_string(),
@@ -20061,6 +20074,7 @@ impl Storm {
                                     .text_color(rgb(TEXT))
                                     .child("Where the tokens went"),
                             )
+                            .child(tab("This window", TokenSpan::Window))
                             .child(tab("Today", TokenSpan::Today))
                             .child(tab("24 hours", TokenSpan::Day))
                             .child(tab("7 days", TokenSpan::Week))
@@ -20085,6 +20099,17 @@ impl Storm {
                                 usage::short(total.per_call()),
                                 context_color(total.per_call()),
                             ))
+                            // the plan's own meter, which is the authority on
+                            // the window. Everything to its left is the scan's
+                            // reading of the same stretch, by the hour
+                            .when_some(window_pct, |d, (pct, resets)| {
+                                d.child(head_num(
+                                    "WINDOW USED",
+                                    format!("{pct:.0}%"),
+                                    usage_color(pct),
+                                ))
+                                .child(head_num("RESETS IN", usage::fmt_left(resets), MUTED))
+                            })
                             .child(div().flex_grow(1.0))
                             .child(
                                 div()
@@ -20095,8 +20120,15 @@ impl Storm {
                     )
                     .child(chart)
                     .child(div().text_size(px(9.)).text_color(rgb(LINE_NUMBER)).child(
-                        "weighted at the published ratios: cache reads count a tenth, \
-                         cache writes a quarter over input, output five times it",
+                        match span {
+                            TokenSpan::Window =>
+                                "weighted at the published ratios: cache reads count a tenth, \
+                                 cache writes a quarter over input, output five times it  \u{b7}  \
+                                 counted by the hour, so the window starts at the nearest one",
+                            _ =>
+                                "weighted at the published ratios: cache reads count a tenth, \
+                                 cache writes a quarter over input, output five times it",
+                        },
                     ))
                     .child(
                         div()
@@ -37470,20 +37502,45 @@ impl Storm {
 /// Holds every open project as a live `Storm` view and renders the active one.
 /// Background projects keep their editors and running terminals alive.
 /// The window a span covers, as `[from, to)` in unix seconds, with `to` rounded
-/// up to the hour so the hour in progress is drawn.
-fn token_window(span: TokenSpan) -> (i64, i64) {
+/// up to the hour so the hour in progress is drawn. `resets_at` is the plan's
+/// five-hour reset, which only the `Window` span needs.
+fn token_window(span: TokenSpan, resets_at: Option<i64>) -> (i64, i64) {
     let now = now_secs() as i64;
     let to = now - now.rem_euclid(3600) + 3600;
     match span {
+        TokenSpan::Window => (window_from(now, resets_at), to),
         TokenSpan::Today => (tokens::day_start(now, tokens::local_offset()), to),
         TokenSpan::Day => (to - 86_400, to),
         TokenSpan::Week => (to - 7 * 86_400, to),
     }
 }
 
+/// When the five-hour window opened, snapped to the nearest hour.
+///
+/// Claude Code reports when the window *resets*; five hours before that is
+/// when it started. The snap is not a rounding error being hidden: the scan
+/// counts by the hour, so an hour is the smallest piece there is, and the
+/// nearest one is closer than the hour the window opened in. A reading that is
+/// missing, stale or from the future is no reading: then it is the last five
+/// hours, which is the same question asked a slightly different way.
+fn window_from(now: i64, resets_at: Option<i64>) -> i64 {
+    const FIVE: i64 = 5 * 3600;
+    let opened = resets_at
+        .map(|r| r - FIVE)
+        .filter(|t| *t <= now && now - t < FIVE + 3600)
+        .unwrap_or(now - FIVE);
+    let rem = opened.rem_euclid(3600);
+    match rem >= 1800 {
+        true => opened - rem + 3600,
+        false => opened - rem,
+    }
+}
+
 /// Which stretch the token panel is showing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TokenSpan {
+    /// The plan's five-hour window, from when it opened. The one that runs out.
+    Window,
     /// Since local midnight.
     Today,
     /// The last 24 hours, rolling.
@@ -40517,19 +40574,20 @@ fn set_dock_icon() {
 #[cfg(not(target_os = "macos"))]
 fn set_dock_icon() {}
 
-/// `--tokens`, on its own for today, or with `day`, `week`, or a number of days
-/// after it.
+/// `--tokens`, on its own for the five-hour window, or with `today`, `day`,
+/// `week`, or a number of days after it.
 fn tokens_arg() -> Option<TokenSpan> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let i = args.iter().position(|a| a == "--tokens")?;
     Some(match args.get(i + 1).map(|s| s.as_str()) {
-        Some("today") | None => TokenSpan::Today,
+        Some("window") | Some("5h") | None => TokenSpan::Window,
+        Some("today") => TokenSpan::Today,
         Some("week") | Some("7") => TokenSpan::Week,
         Some("day") | Some("1") | Some("24") => TokenSpan::Day,
         Some(other) => match other.parse::<f64>() {
             Ok(n) if n > 1.5 => TokenSpan::Week,
             Ok(_) => TokenSpan::Day,
-            Err(_) => TokenSpan::Today,
+            Err(_) => TokenSpan::Window,
         },
     })
 }
@@ -40539,9 +40597,16 @@ fn print_tokens(span: TokenSpan) {
     let t = std::time::Instant::now();
     let report = tokens::scan(30 * 86_400);
     let off = tokens::local_offset();
-    let (from, to) = token_window(span);
+    let limits = usage::load_limits();
+    let five = limits.as_ref().and_then(|l| l.five_hour.as_ref());
+    let (from, to) = token_window(span, five.map(|w| w.resets_at));
     let total = report.total(from, to);
     let said = match span {
+        TokenSpan::Window => &format!(
+            "the five-hour window, from {}{}",
+            tokens::hour_label(from, off),
+            five.map(|w| format!(", {:.0}% of it spent", w.pct)).unwrap_or_default(),
+        ),
         TokenSpan::Today => "today, since midnight",
         TokenSpan::Day => "the last 24 hours",
         TokenSpan::Week => "the last 7 days",
@@ -43867,6 +43932,32 @@ mod handoff_tests {
         assert!(a < b && b < c, "oldest first");
         assert!(out.contains("The last answer: last answer"));
         assert!(!out.contains("first answer"), "only the answer that still stands");
+    }
+
+    #[test]
+    fn the_window_opens_five_hours_before_it_resets() {
+        let now = 1_000_000_000; // 2800 seconds past the hour
+        // resets in two hours, so it opened three hours ago, nearest hour
+        assert_eq!(window_from(now, Some(now + 2 * 3600)), 999_990_000);
+        assert_eq!((now - window_from(now, Some(now + 2 * 3600))) / 60, 166, "2h46m back");
+    }
+
+    #[test]
+    fn no_reading_means_the_last_five_hours() {
+        let now = 1_000_000_000;
+        let from = window_from(now, None);
+        assert_eq!(from % 3600, 0, "snapped to an hour");
+        assert!((now - from - 5 * 3600).abs() <= 1800, "five hours, give or take the snap");
+    }
+
+    #[test]
+    fn a_stale_or_impossible_reading_is_no_reading() {
+        let now = 1_000_000_000;
+        let fallback = window_from(now, None);
+        // a reset two hours in the past: that window closed, this is a new one
+        assert_eq!(window_from(now, Some(now - 2 * 3600)), fallback);
+        // a reset further out than the window is long
+        assert_eq!(window_from(now, Some(now + 6 * 3600)), fallback);
     }
 
     #[test]

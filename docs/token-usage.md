@@ -1,21 +1,28 @@
 # Where the tokens went
 
 The plan bars say how much of the window is gone. They don't say what spent it.
-This does: tokens by hour, by workspace and by session, for today, the last 24
-hours or the last week.
+This does: tokens by hour, by workspace and by session, for the five-hour
+window, today, the last 24 hours or the last week.
 
 Open it from the palette, "Where the Tokens Went…", or print the same reading
 without opening TIDE at all:
 
 ```
-tide --tokens        # today, since midnight
+tide --tokens        # the plan's five-hour window, from when it opened
+tide --tokens today  # since local midnight
 tide --tokens day    # the last 24 hours, rolling
 tide --tokens week   # the last 7 days, a bar to the day
 ```
 
-The panel has the same three. Today is the clock's day, not the last 24 hours:
-at nine in the morning those are different questions, and the first one is the
-one you are asking when a five-hour window keeps running out.
+The panel has the same four and opens on the window, since that is the one
+that runs out. Its start comes from the statusline payload: Claude Code says
+when the window resets, and five hours before that is when it opened. The scan
+counts by the hour, so the window starts at the nearest one; the plan's own
+percentage is in the header beside the breakdown, and that number is exact.
+Without the statusline shim the span is the last five hours instead.
+
+Today is the clock's day, not the last 24 hours: at nine in the morning those
+are different questions.
 
 A workspace row, and any session row, opens that workspace when you click it.
 
