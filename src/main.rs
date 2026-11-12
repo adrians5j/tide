@@ -26835,16 +26835,39 @@ impl Storm {
 
     /// Drop the current conversation and start a fresh session.
     fn new_agent_session(&mut self, cx: &mut Context<Self>) {
+        self.start_new_session(false, cx);
+    }
+
+    /// The same, with what was said left on screen above the line the new
+    /// session starts under. What the model carries forward is unchanged
+    /// either way: the new session gets the handoff and nothing else. This is
+    /// only about whether you can still read what you were talking about.
+    fn new_agent_session_keeping(&mut self, cx: &mut Context<Self>) {
+        self.start_new_session(true, cx);
+    }
+
+    fn start_new_session(&mut self, keep: bool, cx: &mut Context<Self>) {
         self.ensure_acp(cx);
+        // read before the handshake replaces it: this is the session being left
+        let prev = self.acp.as_ref().and_then(|a| a.session_id());
         self.agent_context = None;
         self.fresh_hint_off = false;
         self.fresh_pending = false;
         self.agent_resumed = true; // an explicit new session outranks auto-resume
         self.agent_autoresume = false;
         self.mark_agent_fresh(true);
-        self.reset_agent_transcript();
+        match keep {
+            true => self.reset_agent_live(),
+            false => self.reset_agent_transcript(),
+        }
         if let Some(acp) = self.acp.clone() {
             acp.new_session(&self.root);
+        }
+        // the line the new session starts under, drawn only when there is
+        // something above it to be the other side of
+        if keep && !self.agent_msgs.is_empty() {
+            self.agent_msgs.push(AgentMsg::Fresh { prev, tab: false });
+            self.agent_list.scroll_to_end();
         }
         cx.notify();
     }
@@ -26901,14 +26924,11 @@ impl Storm {
             self.send_agent_prompt_by(text, label, Sender::You, cx);
             return;
         }
-        // before the reset: `fresh_handoff` reads the transcript, and
-        // `new_agent_session` clears it
         let prompt = format!("{}\n\n{text}", self.fresh_handoff());
-        let prev = self.acp.as_ref().and_then(|a| a.session_id());
-        self.new_agent_session(cx);
-        // the pane going empty is not an explanation. This says what happened,
-        // what went across, and where the conversation it left has gone
-        self.agent_msgs.push(AgentMsg::Fresh { prev, tab: false });
+        // what was said stays on screen. The model starts over; you don't, and
+        // a link somebody posted four answers ago is still four answers up
+        // rather than something to ask for again
+        self.new_agent_session_keeping(cx);
         self.send_agent_prompt_by(prompt, label.or(Some(text)), Sender::You, cx);
     }
 
@@ -26923,6 +26943,16 @@ impl Storm {
     }
 
     fn reset_agent_transcript(&mut self) {
+        self.reset_agent_live();
+        self.agent_msgs.clear();
+        self.job_turns.clear();
+    }
+
+    /// Everything a new session resets except what is on screen: the state
+    /// that belongs to the session being left, not to the reading of it.
+    /// `job_turns` holds indexes into `agent_msgs`, so the two are cleared
+    /// together or not at all.
+    fn reset_agent_live(&mut self) {
         self.agent_briefed = false; // a new session hasn't been told anything yet
         self.acp_state = None;
         self.agent_ghost = None;
@@ -26933,8 +26963,6 @@ impl Storm {
         self.agent_pastes.clear();
         self.agent_list.scroll_to_end(); // a replayed session opens at its end
         self.agent_picker = false;
-        self.agent_msgs.clear();
-        self.job_turns.clear();
         self.agent_cur = None;
         self.agent_cur_thought = None;
         self.agent_ctx = None;
@@ -27353,7 +27381,7 @@ impl Storm {
                     return;
                 }
                 "n" => {
-                    self.new_agent_session(cx);
+                    self.new_agent_session_keeping(cx);
                     return;
                 }
                 // every other control combo is inert here rather than falling
@@ -30988,47 +31016,80 @@ impl Storm {
                     .into_any_element();
             }
             // the line a fresh session opens with
+            // the line a new session starts under. It is drawn as a rule
+            // across the pane because that is what it is: everything above it
+            // is the conversation before, still there to scroll back into,
+            // and everything under it is a session that has never seen it
             if let AgentMsg::Fresh { prev, tab } = m {
                 let prev = prev.clone();
                 let head = if *tab { "New tab" } else { "New session" };
+                let rule = || div().flex_grow(1.0).h(px(1.)).bg(rgb(BORDER));
+                let above = ix > 0;
                 return div()
                     .px_3()
-                    .py_1()
+                    .pt_4()
+                    .pb_2()
                     .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .text_size(px(10.))
-                    .text_color(rgb(MUTED))
+                    .flex_col()
+                    .gap_1p5()
                     .child(
                         div()
-                            .font_family(ICON_FONT)
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
                             .text_size(px(10.))
-                            .text_color(rgb(COMMENT_MARK))
-                            .child(IC_AGENT),
+                            .child(div().w(px(16.)).h(px(1.)).bg(rgb(COMMENT_MARK)))
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .font_family(ICON_FONT)
+                                    .text_color(rgb(COMMENT_MARK))
+                                    .child(IC_AGENT),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_color(rgb(COMMENT_MARK))
+                                    .child(head),
+                            )
+                            .child(rule())
+                            .when_some(prev, |d, id| {
+                                d.child(
+                                    div()
+                                        .id(("fresh-back", ix))
+                                        .flex_shrink_0()
+                                        .px_1p5()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .text_color(rgb(MUTED))
+                                        .border_1()
+                                        .border_color(rgb(BORDER))
+                                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                        .child("\u{21bb} resume the one before")
+                                        .tooltip(tip(
+                                            "Open the conversation this session started from, \
+                                             as its own session again",
+                                        ))
+                                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                                            this.resume_agent_session(id.clone(), cx)
+                                        })),
+                                )
+                            }),
                     )
-                    .child(div().flex_shrink_0().text_color(rgb(COMMENT_MARK)).child(head))
-                    .child(div().flex_grow(1.0).min_w(px(0.)).truncate().child(
-                        "the branch, the pull request and the last few questions came across",
-                    ))
-                    .when_some(prev, |d, id| {
-                        d.child(
-                            div()
-                                .id(("fresh-back", ix))
-                                .flex_shrink_0()
-                                .px_1p5()
-                                .rounded_md()
-                                .cursor_pointer()
-                                .border_1()
-                                .border_color(rgb(BORDER))
-                                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                                .child("\u{21bb} the one before")
-                                .tooltip(tip("Open the conversation this session started from"))
-                                .on_click(cx.listener(move |this, _e, _w, cx| {
-                                    this.resume_agent_session(id.clone(), cx)
-                                })),
-                        )
-                    })
+                    .child(
+                        div()
+                            .pl(px(22.))
+                            .text_size(px(10.))
+                            .text_color(rgb(MUTED))
+                            .child(match above {
+                                true => "the branch, the pull request and the last few questions \
+                                         came across · what is above the line is still there to \
+                                         read, the agent just can't see it",
+                                false => "the branch, the pull request and the last few \
+                                          questions came across",
+                            }),
+                    )
                     .into_any_element();
             }
             // a tool call opens on a click and shuts on the next one. The
@@ -31877,8 +31938,13 @@ impl Storm {
                             .text_color(rgb(MUTED))
                             .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
                             .child("+ New")
-                            .tooltip(tip("Start a fresh session  (⌃N)"))
-                            .on_click(cx.listener(|this, _e, _w, cx| this.new_agent_session(cx))),
+                            .tooltip(tip(
+                                "Start a fresh session  (⌃N) · what is on screen stays, \
+                                 under a line",
+                            ))
+                            .on_click(
+                                cx.listener(|this, _e, _w, cx| this.new_agent_session_keeping(cx)),
+                            ),
                     )
                     .child(
                         div()
@@ -32089,11 +32155,12 @@ impl Storm {
                                     .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
                                     .child("\u{21ba} New session")
                                     .tooltip(tip(
-                                        "Start again at nothing. This conversation stays \
-                                         in \u{21bb} Resume",
+                                        "Start again at nothing. What is on screen stays, \
+                                         under a line, and this conversation is still in \
+                                         \u{21bb} Resume",
                                     ))
                                     .on_click(cx.listener(|this, _e, _w, cx| {
-                                        this.new_agent_session(cx)
+                                        this.new_agent_session_keeping(cx)
                                     })),
                             )
                             .child(
@@ -32661,20 +32728,35 @@ impl Storm {
                                 )
                             }),
                     );
-                // newest first: the turn you want is nearly always a recent one
-                let mine: Vec<(usize, &String)> = self
+                // newest first: the turn you want is nearly always a recent one.
+                // The session breaks are in the list too, so a conversation
+                // that has started over twice reads as three stretches rather
+                // than as one run of forty questions
+                let mine: Vec<(usize, Option<&String>, bool)> = self
                     .agent_msgs
                     .iter()
                     .enumerate()
                     .filter_map(|(ix, m)| match m {
-                        AgentMsg::User { text, .. } => Some((ix, text)),
+                        AgentMsg::User { text, .. } => Some((ix, Some(text), false)),
+                        AgentMsg::Fresh { tab, .. } => Some((ix, None, *tab)),
                         _ => None,
                     })
                     .collect();
-                let total = mine.len();
-                for (pos, (ix, text)) in mine.into_iter().rev().enumerate() {
+                let total = mine.iter().filter(|(_, t, _)| t.is_some()).count();
+                let mut seen = 0usize;
+                for (ix, text, tab) in mine.into_iter().rev() {
+                    let Some(text) = text else {
+                        // a filtered list is a list of hits; a break in it has
+                        // nothing to match and would read as one
+                        if !q.is_empty() {
+                            continue;
+                        }
+                        panel = panel.child(Self::jump_break(ix, tab, cx));
+                        continue;
+                    };
                     // keep the conversation's own numbering, counted from the top
-                    let n = total - pos;
+                    seen += 1;
+                    let n = total - seen + 1;
                     if !q.is_empty() && !text.to_lowercase().contains(&q) {
                         continue;
                     }
@@ -32721,6 +32803,38 @@ impl Storm {
                 }
                 d.child(panel)
             })
+    }
+}
+
+impl Storm {
+    /// A session break in the jump list: the same line the transcript draws,
+    /// at list scale. Clicking it scrolls to where that session began.
+    fn jump_break(ix: usize, tab: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id(("agent-jump-break", ix))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py(px(3.))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(HOVER)))
+            .text_size(px(10.))
+            .child(div().flex_shrink_0().w(px(20.)))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(rgb(COMMENT_MARK))
+                    .child(if tab { "new tab" } else { "new session" }),
+            )
+            .child(div().flex_grow(1.0).h(px(1.)).bg(rgb(BORDER)))
+            .on_click(cx.listener(move |this, _e, _w, cx| {
+                this.agent_list.scroll_to_reveal_item(ix);
+                this.agent_jump_open = false;
+                this.agent_jump_query.clear();
+                cx.notify();
+            }))
     }
 }
 
