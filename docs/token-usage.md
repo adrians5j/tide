@@ -124,6 +124,13 @@ The four raw numbers are in the header if you want them. This is an estimate of
 what a stretch of work was worth, not a bill, and not what the plan's own meter
 counts.
 
+## Which part of TIDE spent it
+
+The panel's smallest unit is a session, and a session holds every question you
+asked in it whatever you asked it from. `tide --spend` answers the other
+question, what the pane, the stop asks, the comment threads and TIDE's own jobs
+each cost, off a log of its own. See [spend-log.md](spend-log.md).
+
 ## The scan
 
 Session logs run to gigabytes. The scan remembers how many bytes of each file it

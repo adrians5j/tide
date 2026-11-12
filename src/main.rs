@@ -37,6 +37,7 @@ mod todo;
 mod usage;
 mod jobs;
 mod sess;
+mod spend;
 mod wshist;
 mod tokens;
 use rpc::AgentState;
@@ -7220,6 +7221,7 @@ struct Conv {
     job_turns: Vec<JobTurn>,
     job_next: Option<String>,
     turn_start: Option<std::time::Instant>,
+    mark: Option<spend::Mark>,
     sel: Option<(usize, usize, usize)>,
     sel_ch: Option<(usize, usize, usize, usize, usize)>,
     sel_anchor: Option<(usize, usize, usize)>,
@@ -7319,6 +7321,9 @@ struct Queued {
     /// The job it is part of, if TIDE started it as one. `Some` folds the
     /// turn into one line when it finally goes.
     job: Option<String>,
+    /// The part of TIDE it came from, kept so a prompt held behind a turn is
+    /// still counted against what sent it.
+    kind: &'static str,
 }
 
 /// One stop on a walk through an answer's code references: the file, the lines,
@@ -8935,6 +8940,14 @@ struct Storm {
     /// Spinner frame + when the running turn started, for the live "thinking" row.
     agent_spin: usize,
     agent_turn_start: Option<std::time::Instant>,
+    /// The part of TIDE the next prompt is coming from, set by whoever is
+    /// about to send one and read by `send_agent_prompt_by`. `None` is the
+    /// agent pane, which is where a prompt comes from when nothing says
+    /// otherwise. See `spend.rs`.
+    spend_next: Option<&'static str>,
+    /// The running turn's mark: where its session log stood when the prompt
+    /// went out, so what the turn costs can be read off the bytes it adds.
+    turn_mark: Option<spend::Mark>,
     /// Whether this session has been told how to reach TIDE (a hidden preamble
     /// on the first prompt, so the transcript stays yours).
     agent_briefed: bool,
@@ -9626,6 +9639,8 @@ impl Storm {
             rc_snippet: None,
             agent_spin: 0,
             agent_turn_start: None,
+            spend_next: None,
+            turn_mark: None,
             agent_briefed: false,
             agent_ghost: None,
             agent_hist: None,
@@ -10241,6 +10256,7 @@ impl Storm {
             prompt.push_str(&format!("\n\n({})", about.join("  ·  ")));
         }
         self.focus_agent(window, cx);
+        self.spend_next = Some(spend::TODO);
         self.send_agent_prompt_as(prompt, None, cx);
         self.show_flash("Handed to the agent — marked in progress", cx);
         cx.notify();
@@ -16694,6 +16710,7 @@ impl Storm {
                 };
                 label.push_str(&format!("\n• {where_}"));
             }
+            self.spend_next = Some(spend::COMMENT);
             self.send_agent_prompt_as(msg, Some(label), cx);
         } else if let Some(pane) = pane.clone() {
             pane.read(cx).send_paste(&msg);
@@ -26943,6 +26960,7 @@ impl Storm {
         std::mem::swap(&mut self.job_turns, &mut c.job_turns);
         std::mem::swap(&mut self.job_next, &mut c.job_next);
         std::mem::swap(&mut self.agent_turn_start, &mut c.turn_start);
+        std::mem::swap(&mut self.turn_mark, &mut c.mark);
         std::mem::swap(&mut self.agent_sel, &mut c.sel);
         std::mem::swap(&mut self.agent_sel_ch, &mut c.sel_ch);
         std::mem::swap(&mut self.agent_sel_anchor, &mut c.sel_anchor);
@@ -27226,6 +27244,7 @@ impl Storm {
             }
             TurnEnd => {
                 self.agent_busy = false;
+                self.close_spend();
                 self.agent_turn_start = None;
                 self.end_job_clock();
                 self.acp_state = Some(AgentState::Done);
@@ -27248,6 +27267,8 @@ impl Storm {
                 // they were typed behind actually happened
                 self.agent_queue.clear();
                 self.agent_busy = false;
+                // a failed turn still spent what it spent before it failed
+                self.close_spend();
                 self.end_job_clock();
                 self.acp_state = Some(AgentState::Failed);
                 self.agent_cur = None;
@@ -28013,6 +28034,12 @@ impl Storm {
         // before the paths that queue it, so a job started while the agent is
         // busy is still one line when it finally goes
         let job = std::mem::take(&mut self.job_next);
+        // the same, for the part of TIDE this came from: a prompt that doesn't
+        // name one is the pane when you typed it and a job when TIDE sent it
+        let kind = self.spend_next.take().unwrap_or(match by {
+            Sender::You => spend::PANE,
+            Sender::Tide => spend::JOB,
+        });
         // the reviewers' reports are the next thing this thread gets, and a
         // message sent now would land in front of them. `deliver_reviews` is
         // the one send that happens while they exist, and by then they're done.
@@ -28037,6 +28064,9 @@ impl Storm {
                 let (imgs, kept) = split_images(self.agent_imgs.drain(..).collect());
                 let shown = label.unwrap_or_else(|| text.clone());
                 jobs::remember(&text, &shown, job.as_deref().unwrap_or_default(), by == Sender::Tide);
+                // no mark of its own: a steered message joins the turn that is
+                // running, and what it costs is that turn's, counted against
+                // whatever sent it
                 acp.steer(&text, &imgs);
                 // it reads as what it is: a message inside the turn that is
                 // running, not the start of a new one
@@ -28047,7 +28077,7 @@ impl Storm {
             }
             // the attachments go with it, not with the next thing you send
             let imgs = self.agent_imgs.drain(..).collect();
-            self.agent_queue.push(Queued { text, label, imgs, by, job });
+            self.agent_queue.push(Queued { text, label, imgs, by, job, kind });
             self.agent_list.scroll_to_end();
             cx.notify();
             return;
@@ -28076,6 +28106,7 @@ impl Storm {
         };
         acp.prompt_with(&sent, &imgs);
         self.agent_msgs.push(AgentMsg::User { text: shown, imgs: kept, by });
+        self.open_spend(kind, job.as_deref().unwrap_or_default(), by, &acp);
         self.mark_turn_start(job);
         self.agent_turn_start = Some(std::time::Instant::now());
         self.start_agent_spinner(cx);
@@ -29954,6 +29985,7 @@ impl Storm {
         // same bargain as a slide's question: one line in the pane, and the
         // question itself is already on the card you typed it on
         self.job_next = Some(format!("Question on stop {at}"));
+        self.spend_next = Some(spend::STOP_ASK);
         self.send_agent_prompt_by(text, Some(q), Sender::You, cx);
         self.agent_list.scroll_to_end();
         // the answer lands in the pane; typing carries on in the editor
@@ -29986,6 +30018,7 @@ impl Storm {
         // the pane gets one line saying it is in hand — not the question again,
         // the tool calls, and the long version of the answer under it
         self.job_next = Some(format!("Question on slide {}", ix + 1));
+        self.spend_next = Some(spend::SLIDE_ASK);
         self.send_agent_prompt_by(text, Some(q), Sender::You, cx);
         self.agent_list.scroll_to_end();
         cx.notify();
@@ -30335,6 +30368,40 @@ impl Storm {
             }
         }
         cx.notify();
+    }
+
+    /// Note where the session log stands as a prompt goes out, so the turn it
+    /// starts can be measured against it when it ends. See `spend.rs`.
+    ///
+    /// A prompt sent before the handshake has named the session gets an empty
+    /// id and a zero offset, which is right: a session with no id yet is one
+    /// the adapter is about to open, and its log starts empty. `close_spend`
+    /// fills the id in.
+    fn open_spend(&mut self, kind: &'static str, job: &str, by: Sender, acp: &Arc<acp::Acp>) {
+        let sid = acp.session_id().unwrap_or_default();
+        self.turn_mark = Some(spend::open(&self.root, &sid, kind, job, by == Sender::Tide));
+    }
+
+    /// The turn is over: read what it added to the session log and write the
+    /// line down. Three seconds late, because the last request's usage reaches
+    /// the log a moment after the adapter says the turn ended, and on a thread
+    /// of its own, because this is a file read and a file write and the turn
+    /// that just ended has a pane to repaint.
+    fn close_spend(&mut self) {
+        let Some(mut mark) = self.turn_mark.take() else { return };
+        if mark.sid.is_empty() {
+            match self.acp.as_ref().and_then(|a| a.session_id()) {
+                Some(sid) => mark.sid = sid,
+                // the session never came up, so nothing was spent on it
+                None => return,
+            }
+        }
+        let secs = self.agent_turn_start.map(|t| t.elapsed().as_secs() as i64).unwrap_or(0);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            let used = spend::measure(&mark);
+            spend::record(&mark, &used, secs);
+        });
     }
 
     /// A user message has just landed in the transcript. Whatever turn was
@@ -31205,7 +31272,7 @@ impl Storm {
         if self.agent_queue.is_empty() {
             return;
         }
-        let Queued { text, label, imgs, by, job } = self.agent_queue.remove(0);
+        let Queued { text, label, imgs, by, job, kind } = self.agent_queue.remove(0);
         if let Some(acp) = self.acp.clone() {
             let shown = label.unwrap_or_else(|| text.clone());
             // held before it could carry the tab's handoff (the window was
@@ -31224,6 +31291,7 @@ impl Storm {
             let (wire, kept) = split_images(imgs);
             acp.prompt_with(&sent, &wire);
             self.agent_msgs.push(AgentMsg::User { text: shown, imgs: kept, by });
+            self.open_spend(kind, job.as_deref().unwrap_or_default(), by, &acp);
             self.mark_turn_start(job);
             self.agent_turn_start = Some(std::time::Instant::now());
             self.acp_state = Some(AgentState::Working);
@@ -39117,6 +39185,7 @@ impl Workspace {
                                         text = format!("[{label}] {text}");
                                     }
                                 }
+                                storm.spend_next = Some(spend::PHONE);
                                 storm.send_agent_prompt_by(text, None, Sender::You, cx)
                             });
                         }
@@ -41448,7 +41517,12 @@ fn set_dock_icon() {}
 fn tokens_arg() -> Option<TokenSpan> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let i = args.iter().position(|a| a == "--tokens")?;
-    Some(match args.get(i + 1).map(|s| s.as_str()) {
+    Some(span_from(args.get(i + 1).map(String::as_str)))
+}
+
+/// The word after `--tokens` or `--spend`, as a window.
+fn span_from(arg: Option<&str>) -> TokenSpan {
+    match arg {
         Some("window") | Some("5h") | None => TokenSpan::Window,
         Some("today") => TokenSpan::Today,
         Some("week") | Some("7") => TokenSpan::Week,
@@ -41458,7 +41532,7 @@ fn tokens_arg() -> Option<TokenSpan> {
             Ok(_) => TokenSpan::Day,
             Err(_) => TokenSpan::Window,
         },
-    })
+    }
 }
 
 /// The token report as lines, for the terminal.
@@ -41527,6 +41601,62 @@ fn print_tokens(span: TokenSpan) {
     }
 }
 
+/// `--spend`, with the same windows `--tokens` takes.
+fn spend_arg() -> Option<TokenSpan> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let i = args.iter().position(|a| a == "--spend")?;
+    Some(span_from(args.get(i + 1).map(String::as_str)))
+}
+
+/// What each part of TIDE spent, for the terminal. The reading is the log
+/// `spend.rs` writes, which is already per turn and already measured, so there
+/// is no scan behind this.
+fn print_spend(span: TokenSpan) {
+    let (from, to) = token_window(span);
+    let rows = spend::since(&spend::load(), from, to);
+    let said = match span {
+        TokenSpan::Window => "the last five hours",
+        TokenSpan::Today => "today, since midnight",
+        TokenSpan::Day => "the last 24 hours",
+        TokenSpan::Week => "the last 7 days",
+    };
+    let mut all = tokens::Use::default();
+    for r in &rows {
+        all.add(&r.used);
+    }
+    println!(
+        "Where TIDE's tokens went  ·  {said}  ·  {} turns  ·  weighted {}",
+        rows.len(),
+        usage::short(all.weighted())
+    );
+    if rows.is_empty() {
+        println!("\n  Nothing logged in that window. The log is ~/.config/tide/spend.jsonl,");
+        println!("  one line per turn, written as the turn ends.");
+        return;
+    }
+    let table = |title: &str, rows: Vec<(String, u64, tokens::Use)>, n: usize| {
+        println!("\n  {title}");
+        for (name, turns, u) in rows.into_iter().take(n) {
+            let share = (u.weighted() as f64 / all.weighted().max(1) as f64 * 100.0).round();
+            println!(
+                "    {:>7}  {share:>3}%  {turns:>4} turn{}  {:>5} req  {:>7} ctx/req   {name}",
+                usage::short(u.weighted()),
+                if turns == 1 { " " } else { "s" },
+                u.calls,
+                usage::short(u.per_call()),
+            );
+        }
+    };
+    table("by what sent it", spend::by_kind(&rows), 20);
+    table("by job", spend::by_job(&rows), 20);
+    table("by workspace", spend::by_root(&rows), 12);
+    // what this log cannot see, said plainly, so a number read off it is not
+    // mistaken for the whole bill
+    println!(
+        "\n  Turns TIDE sent only. The reviewers run in sessions of their own and the\n           terminal panes are not TIDE's doing at all: `tide --tokens` counts both."
+    );
+}
+
 fn main() {
     // Each CLI arg is a project root (globs allowed) opened as its own
     // workspace. With no args, reopen last session's workspaces; if there is no
@@ -41558,6 +41688,12 @@ fn main() {
     // would ask it in is the one you are trying not to restart
     if let Some(span) = tokens_arg() {
         print_tokens(span);
+        return;
+    }
+    // the same question asked of TIDE's own parts: what the pane, the stop
+    // asks, the comment threads and the jobs each cost
+    if let Some(span) = spend_arg() {
+        print_spend(span);
         return;
     }
     application().run(move |cx: &mut App| {
