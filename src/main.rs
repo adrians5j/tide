@@ -5498,6 +5498,31 @@ fn pr_row_from(v: &serde_json::Value) -> Option<PrRow> {
     })
 }
 
+/// When the binary that is running was built, as its mtime in epoch seconds.
+///
+/// A rebuild replaces the file, so a reading that differs from the one taken
+/// at startup is a different build, whichever way the clock moved.
+fn exe_built() -> i64 {
+    std::env::current_exe()
+        .and_then(std::fs::metadata)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The same reading, taken once, at startup: the build this process is.
+fn exe_ran() -> i64 {
+    static RAN: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *RAN.get_or_init(exe_built)
+}
+
+/// One argument, safe to hand to `sh -c`.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// A civil date from days since 1970-01-01 (Howard Hinnant's algorithm, the
 /// other way round from `iso_secs`).
 fn civil_from_days(z: i64) -> (i64, i64, i64) {
@@ -37446,6 +37471,16 @@ struct Workspace {
     /// Project indices whose agent is mid-turn when ⌘Q was pressed; `Some` shows
     /// the "are you sure" panel instead of quitting.
     quit_busy: Option<Vec<usize>>,
+    /// A newer build is sitting in `target/`, as its mtime. `Some` puts the
+    /// restart prompt up. Only ever set while nothing is working.
+    restart_at: Option<i64>,
+    /// The newest build the prompt has been dismissed for, so "later" means
+    /// later and not "in ten seconds".
+    restart_skip: i64,
+    restart_focus: FocusHandle,
+    /// The prompt just went up; the next render claims the keyboard for it,
+    /// rather than every render taking it again.
+    restart_focus_pending: bool,
     /// One listener for the whole window, so a phone on the same network can
     /// read any workspace. Always on: it costs a bound socket, and the work of
     /// building a transcript only happens while a phone is actually polling.
@@ -37469,6 +37504,10 @@ impl Workspace {
             caret_on: true,
             switcher_scroll: ScrollHandle::new(),
             quit_busy: None,
+            restart_at: None,
+            restart_skip: 0,
+            restart_focus: cx.focus_handle(),
+            restart_focus_pending: false,
             remote: None,
             quit_focus: cx.focus_handle(),
         };
@@ -37480,6 +37519,7 @@ impl Workspace {
         // a restart and a bookmark on the phone keeps working.
         ws.remote = remote_token().and_then(rpc::RemoteHub::start);
         ws.start_remote_poll(cx);
+        ws.start_build_poll(cx);
         // start on the first workspace that isn't parked; a paused one is only
         // the landing spot when every workspace is paused
         ws.active = ws
@@ -37884,6 +37924,79 @@ impl Workspace {
 impl Workspace {
     /// Workspaces whose agent is mid-turn — a terminal pane that reported
     /// `working`, or the ACP panel with a prompt in flight.
+    /// Watch for a build landing in `target/`.
+    ///
+    /// The usual way to change TIDE is to rebuild it from a session running
+    /// inside it, and then forget: the binary is new, the thing on screen is
+    /// an hour old, and the first sign of it is a fix that isn't there. So the
+    /// window asks. Only when nothing is working, so the question never costs
+    /// a turn, and once per build, so "later" holds.
+    fn start_build_poll(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(10)).await;
+            let built = cx.background_executor().spawn(async { exe_built() }).await;
+            if this
+                .update(cx, |this, cx| {
+                    if this.restart_at.is_some()
+                        || this.quit_busy.is_some()
+                        || built <= exe_ran()
+                        || built == this.restart_skip
+                        // mid-turn the answer would be lost with the session
+                        // it is running in. It will still be a new build when
+                        // the turn ends
+                        || !this.busy_workspaces(cx).is_empty()
+                    {
+                        return;
+                    }
+                    this.restart_at = Some(built);
+                    this.restart_focus_pending = true;
+                    cx.notify();
+                })
+                .is_err()
+            {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// Start the new build and go. The one that comes up reopens what this one
+    /// had open: with no arguments TIDE restores the last session, and with
+    /// them it opens the same roots again.
+    fn restart_now(&mut self, cx: &mut Context<Self>) {
+        if let Some(p) = self.projects.get(self.active) {
+            p.update(cx, |s, cx| s.save_tab(s.active, cx));
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            let mut line = format!("while kill -0 {} 2>/dev/null; do sleep 0.2; done; exec {}",
+                std::process::id(),
+                shell_quote(&exe.to_string_lossy()));
+            for a in std::env::args().skip(1) {
+                line.push(' ');
+                line.push_str(&shell_quote(&a));
+            }
+            // it waits for this process to go before taking its place: the
+            // phone's listener is on a fixed port, and two of them overlapping
+            // would push the new one onto a different number
+            let _ = Command::new("/bin/sh").arg("-c").arg(line).spawn();
+        }
+        cx.quit();
+    }
+
+    /// Keys while the restart prompt is up: ↩ restarts, esc leaves it.
+    fn restart_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match ev.keystroke.key.as_str() {
+            "enter" => self.restart_now(cx),
+            "escape" => {
+                self.restart_skip = self.restart_at.take().unwrap_or(0);
+                self.focus_pending = true;
+                window.focus(&self.focus, cx);
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
     fn busy_workspaces(&self, cx: &App) -> Vec<usize> {
         self.projects
             .iter()
@@ -37933,6 +38046,62 @@ impl Workspace {
 
     /// One row per still-working workspace, in the same shape ⌘E uses: number
     /// key-cap, state dot, folder icon, title + path, branch line.
+    /// The prompt that goes up when a build lands and nothing is working.
+    fn render_restart_prompt(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000088))
+            .child(
+                div()
+                    .w(px(460.))
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .bg(rgb(PANEL_BG))
+                    .border_1()
+                    .border_color(rgb(ACCENT))
+                    .rounded_lg()
+                    .shadow_lg()
+                    .track_focus(&self.restart_focus)
+                    .on_key_down(cx.listener(Self::restart_key))
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .text_color(rgb(TEXT))
+                            .child("A newer TIDE is built"),
+                    )
+                    .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(
+                        "This window is running the build it started with. Nothing is \
+                         working right now, so this is the cheap moment to take the new \
+                         one: it comes back up with these workspaces open.",
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .pt_1()
+                            .child(div().flex_grow(1.0))
+                            .child(rc_button("restart-later", "Later", false, false).on_click(
+                                cx.listener(|this, _e, window, cx| {
+                                    this.restart_skip = this.restart_at.take().unwrap_or(0);
+                                    this.focus_pending = true;
+                                    window.focus(&this.focus, cx);
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(rc_button("restart-now", "Restart  \u{21a9}", true, false)
+                                .on_click(cx.listener(|this, _e, _w, cx| this.restart_now(cx)))),
+                    ),
+            )
+    }
+
     fn render_quit_confirm(&self, busy: &[usize], cx: &mut Context<Self>) -> impl IntoElement {
         let n = busy.len();
         let mut rows = div().flex().flex_col().gap_1();
@@ -38250,6 +38419,13 @@ impl Render for Workspace {
 
         if let Some(busy) = self.quit_busy.clone() {
             root = root.child(self.render_quit_confirm(&busy, cx));
+        }
+
+        if self.restart_at.is_some() {
+            if std::mem::take(&mut self.restart_focus_pending) {
+                window.focus(&self.restart_focus, cx);
+            }
+            root = root.child(self.render_restart_prompt(cx));
         }
 
         if self.switcher_open {
