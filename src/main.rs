@@ -1114,6 +1114,23 @@ fn touch_ws_seen(root: &Path) {
     }
 }
 
+/// A state, unless it is a `working` that nothing has backed up in
+/// `STATE_STALE`.
+fn live_state(state: Option<AgentState>, seen: u64) -> Option<AgentState> {
+    match state {
+        Some(AgentState::Working) if now_secs().saturating_sub(seen) > STATE_STALE => None,
+        other => other,
+    }
+}
+
+/// How long a pane can claim to be working with nothing to show for it.
+///
+/// Only `working` goes stale. `blocked` is an agent waiting for an answer and
+/// prints nothing while it waits, which is exactly the state worth keeping on
+/// screen; `done` and `failed` are endings and stand until something replaces
+/// them.
+const STATE_STALE: u64 = 10 * 60;
+
 /// How long a workspace sits untouched before TIDE asks whether to park it.
 /// Two days: long enough that a weekend of one branch doesn't bury the others,
 /// short enough that a folder you have stopped opening is still fresh in mind.
@@ -7184,6 +7201,8 @@ struct Conv {
     context: Option<u64>,
     title: Option<String>,
     state: Option<AgentState>,
+    /// When an event last arrived in this conversation.
+    seen: u64,
     briefed: bool,
     ghost: Option<String>,
     hist: Option<usize>,
@@ -8450,7 +8469,9 @@ struct Storm {
     // loopback channel agents in the panes report their state to, and the latest
     // state per pane (keyed by the pane terminal's EntityId as u64)
     agent_rpc: Option<rpc::Server>,
-    agent_states: HashMap<u64, (AgentState, String)>,
+    /// What each pane's agent last reported: the state, its summary, and when
+    /// TIDE last had any sign of life from that pane — a report, or output.
+    agent_states: HashMap<u64, (AgentState, String, u64)>,
     pane_cmds: HashMap<u64, String>, // pane entity id -> the command it's running
     // ── review comments: notes pinned to lines, sent to the agent in one go ──
     review: Vec<ReviewComment>,
@@ -9037,6 +9058,10 @@ struct Storm {
     /// report through the RPC channel — hooks can't see this agent, so the panel
     /// reports itself.
     acp_state: Option<AgentState>,
+    /// When the live conversation last had an event off the adapter. A turn
+    /// that is running produces them constantly, so silence is the only sign
+    /// there is that an adapter died with its state still saying `working`.
+    acp_seen: u64,
     /// The commit HEAD is on, refreshed by the git poll. A tour built against
     /// a different one is describing code that has since moved.
     head_oid: String,
@@ -9647,6 +9672,7 @@ impl Storm {
             agent_list: gpui::ListState::new(0, gpui::ListAlignment::Bottom, px(600.)),
             agent_list_len: 0,
             acp_state: None,
+            acp_seen: 0,
             head_oid: String::new(),
             walk_group: String::new(),
             pending_tour_pr: None,
@@ -11018,7 +11044,18 @@ impl Storm {
                             this.term_tabs.get(this.active_term).map(|t| t.active.as_u64())
                         });
                         if let Some(pane) = pane {
-                            this.agent_states.insert(pane, (r.state, r.summary));
+                            this.agent_states.insert(pane, (r.state, r.summary, now_secs()));
+                        }
+                    }
+                    // a pane that is still printing is still working,
+                    // whatever the last report said. This is the half the hooks
+                    // can't give us: they report transitions, so a dead agent's
+                    // "working" is never taken back by anything
+                    for t in this.all_terminals() {
+                        let id = t.entity_id().as_u64();
+                        let out = t.read(cx).out_at();
+                        if let Some((_, _, at)) = this.agent_states.get_mut(&id) {
+                            *at = (*at).max(out);
                         }
                     }
                     cx.notify();
@@ -11067,7 +11104,16 @@ impl Storm {
 
     /// Reported state of one pane.
     fn pane_state(&self, t: &Entity<Terminal>) -> Option<(AgentState, &str)> {
-        self.agent_states.get(&t.entity_id().as_u64()).map(|(s, m)| (*s, m.as_str()))
+        let (state, msg, at) = self.agent_states.get(&t.entity_id().as_u64())?;
+        // "working" is the one state nothing takes back on its own: a hook
+        // reports it when a prompt goes in and says "done" when the turn ends,
+        // so an agent that was killed, or a terminal that was closed on one,
+        // leaves a pane claiming to work for the rest of the day. Ten minutes
+        // with no report and nothing printed is not a long turn.
+        if *state == AgentState::Working && now_secs().saturating_sub(*at) > STATE_STALE {
+            return None;
+        }
+        Some((*state, msg.as_str()))
     }
 
     /// The most attention-hungry state across a tab's panes (for its tab dot).
@@ -11089,9 +11135,16 @@ impl Storm {
             .flat_map(|t| t.terminals())
             .filter_map(|t| self.pane_state(&t).map(|(s, m)| (s, m.to_string())))
             // the ACP panel counts as one more agent in this workspace —
-            // one per tab, since a tab you are not looking at is still working
-            .chain(self.acp_state.map(|s| (s, String::new())))
-            .chain(self.convs.iter().filter_map(|c| c.state).map(|s| (s, String::new())))
+            // one per tab, since a tab you are not looking at is still working.
+            // A `working` that has gone quiet for ten minutes is not one: the
+            // adapter is a child process and it can die without saying so
+            .chain(live_state(self.acp_state, self.acp_seen).map(|s| (s, String::new())))
+            .chain(
+                self.convs
+                    .iter()
+                    .filter_map(|c| live_state(c.state, c.seen))
+                    .map(|s| (s, String::new())),
+            )
             .max_by_key(|(s, _)| s.priority())
             // nothing live to report → fall back to the persisted idle marker,
             // which is how a workspace marked idle elsewhere shows up here
@@ -26866,6 +26919,7 @@ impl Storm {
         std::mem::swap(&mut self.agent_context, &mut c.context);
         std::mem::swap(&mut self.agent_title, &mut c.title);
         std::mem::swap(&mut self.acp_state, &mut c.state);
+        std::mem::swap(&mut self.acp_seen, &mut c.seen);
         std::mem::swap(&mut self.agent_briefed, &mut c.briefed);
         std::mem::swap(&mut self.agent_ghost, &mut c.ghost);
         std::mem::swap(&mut self.agent_hist, &mut c.hist);
@@ -26977,6 +27031,7 @@ impl Storm {
                 for ev in acp.drain() {
                     self.apply_acp_event(ev);
                 }
+                self.acp_seen = now_secs();
                 cx.notify();
             }
         }
@@ -26992,6 +27047,7 @@ impl Storm {
             for ev in acp.drain() {
                 self.apply_acp_event(ev);
             }
+            self.acp_seen = now_secs();
             self.swap_conv(i);
             cx.notify();
         }
@@ -28013,6 +28069,7 @@ impl Storm {
         self.start_agent_spinner(cx);
         // same signal a terminal agent's UserPromptSubmit hook sends
         self.acp_state = Some(AgentState::Working);
+        self.acp_seen = now_secs();
         if self.ws_idle {
             self.ws_idle = false;
             save_ws_idle(&self.root, false);
@@ -44672,6 +44729,20 @@ mod handoff_tests {
             path: PathBuf::from("/tmp/a.png"),
             dims: None,
         }
+    }
+
+    #[test]
+    fn a_working_state_nothing_backs_up_stops_counting() {
+        let now = now_secs();
+        // a turn that said something a minute ago is a turn that is running
+        assert_eq!(live_state(Some(AgentState::Working), now - 60), Some(AgentState::Working));
+        // one that has said nothing for half an hour is not
+        assert_eq!(live_state(Some(AgentState::Working), now - 1800), None);
+        // waiting for an answer prints nothing by definition, and an ending
+        // stands until something replaces it
+        assert_eq!(live_state(Some(AgentState::Blocked), now - 1800), Some(AgentState::Blocked));
+        assert_eq!(live_state(Some(AgentState::Done), now - 1800), Some(AgentState::Done));
+        assert_eq!(live_state(None, now), None);
     }
 
     #[test]

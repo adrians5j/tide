@@ -12,7 +12,7 @@ use gpui::{
 };
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -89,6 +89,13 @@ impl EventListener for EventProxy {
     }
 }
 
+fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Scroll dampening factor (lines emitted per line-height of trackpad travel).
 /// 1.0 keeps the raw speed; lower is calmer. Set `TIDE_SCROLL_SPEED` to tune
 /// without a rebuild; defaults to a gentler-than-native 0.4.
@@ -112,6 +119,10 @@ pub struct Terminal {
     writer: Writer,
     master: Box<dyn MasterPty + Send>,
     dirty: Arc<AtomicBool>,
+    /// When this pane last printed something, in epoch seconds. A pane whose
+    /// agent says it is working and that has printed nothing for ten minutes
+    /// is not working: the hook that would have said so died with it.
+    out_at: Arc<AtomicU64>,
     cols: usize,
     rows: usize,
     /// per-visible-row cache: (content hash, shaped line) — avoids re-shaping
@@ -201,11 +212,14 @@ impl Terminal {
         }
 
         // repaint pump: ~60fps, only notifies when the grid changed
+        let out_at = Arc::new(AtomicU64::new(epoch_secs()));
         {
             let dirty = dirty.clone();
+            let out_at = out_at.clone();
             cx.spawn(async move |this, cx| loop {
                 cx.background_executor().timer(Duration::from_millis(16)).await;
                 if dirty.swap(false, Ordering::Relaxed) {
+                    out_at.store(epoch_secs(), Ordering::Relaxed);
                     if this.update(cx, |_, cx| cx.notify()).is_err() {
                         break;
                     }
@@ -229,6 +243,7 @@ impl Terminal {
             writer,
             master: pair.master,
             dirty,
+            out_at,
             cols,
             rows,
             shaped_cache: Vec::new(),
@@ -242,6 +257,11 @@ impl Terminal {
             sel_text: None,
             _child: child,
         }
+    }
+
+    /// When this pane last printed something, in epoch seconds.
+    pub fn out_at(&self) -> u64 {
+        self.out_at.load(Ordering::Relaxed)
     }
 
     /// Window-space rect this terminal painted into last frame (None before the
