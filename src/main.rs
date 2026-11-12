@@ -5161,7 +5161,11 @@ fn brief_spec(pr: Option<u64>) -> String {
          brief is five to eight slides, each one idea, each one standing on its \
          own. Post the whole thing in one call:\n\
          \x20 curl -s -X POST \"$TIDE_RPC/brief\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n\
-         \x20   -d '{{\"pr\":{number},\"title\":\"Background task recovery\",\"slides\":[\
+         \x20   -d '{{\"pr\":{number},\"title\":\"Background task recovery\",\
+         \"tldr\":[\"A task whose worker died used to stay marked running for ever.\",\
+         \"A sweep every 60s re-queues anything holding a stale claim.\",\
+         \"Nothing else changed: the queue, the store and the API are as they were.\"],\
+         \"slides\":[\
          {{\"title\":\"Tasks that die halfway now get picked up\",\
          \"text\":\"A task whose worker crashed mid-run used to sit as `running` \
          for ever, because nothing ever looked at it again. The loop now treats \
@@ -5181,6 +5185,13 @@ fn brief_spec(pr: Option<u64>) -> String {
          {{\"label\":\"Recover\",\"note\":\"every 60s\",\"mark\":\"new\",\
 \"file\":\"packages/api-tasks/src/recover.ts:17\"}}],\
          \"edges\":[\"writes pending\",\"on a stale lease\"]}}}}]}}'\n\n\
+         `tldr` is the whole deck in three or four lines, read before any of it: \
+         what changed, what it replaces, and the one thing worth knowing before \
+         the detail. Full sentences, no fragments, no backticks, no paths. It is \
+         the answer to \"what is this?\" for somebody who will not read the \
+         slides at all, and it has to stand without them. Write it last, out of \
+         the deck you ended up with, rather than first out of the one you \
+         planned.\n\n\
          `title` on a slide is a sentence that says something — “Tasks that die \
          halfway now get picked up”, never “Recovery” or “Background”. `text` is \
          two or three sentences: what changed, what it was before, and the one \
@@ -5239,7 +5250,11 @@ fn brief_spec(pr: Option<u64>) -> String {
          brief is five to eight slides, each one idea, each one standing on its \
          own. Post the whole thing in one call:\n\
          \x20 curl -s -X POST \"$TIDE_RPC/brief\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n\
-         \x20   -d '{\"title\":\"Background task recovery\",\"slides\":[\
+         \x20   -d '{\"title\":\"Background task recovery\",\
+         \"tldr\":[\"A task whose worker died used to stay marked running for ever.\",\
+         \"A sweep every 60s re-queues anything holding a stale claim.\",\
+         \"Nothing else changed: the queue, the store and the API are as they were.\"],\
+         \"slides\":[\
          {\"title\":\"Tasks that die halfway now get picked up\",\
          \"text\":\"A task whose worker crashed mid-run used to sit as `running` \
          for ever, because nothing ever looked at it again. The loop now treats \
@@ -5259,6 +5274,13 @@ fn brief_spec(pr: Option<u64>) -> String {
          {\"label\":\"Recover\",\"note\":\"every 60s\",\"mark\":\"new\",\
 \"file\":\"packages/api-tasks/src/recover.ts:17\"}],\
          \"edges\":[\"writes pending\",\"on a stale lease\"]}}]}'\n\n\
+         `tldr` is the whole deck in three or four lines, read before any of it: \
+         what changed, what it replaces, and the one thing worth knowing before \
+         the detail. Full sentences, no fragments, no backticks, no paths. It is \
+         the answer to \"what is this?\" for somebody who will not read the \
+         slides at all, and it has to stand without them. Write it last, out of \
+         the deck you ended up with, rather than first out of the one you \
+         planned.\n\n\
          `title` on a slide is a sentence that says something — “Tasks that die \
          halfway now get picked up”, never “Recovery” or “Background”. `text` is \
          two or three sentences: what changed, what it was before, and the one \
@@ -7818,6 +7840,9 @@ struct Brief {
     /// once the branch has moved, the header says so rather than letting you
     /// read a description of code that isn't there any more.
     oid: String,
+    /// The deck in three or four lines, drawn above the first slide. Empty on
+    /// a brief written before this existed, and on one whose author skipped it.
+    tldr: Vec<String>,
     slides: Vec<Slide>,
 }
 
@@ -7888,6 +7913,7 @@ fn brief_from(b: rpc::Brief) -> Brief {
         title: b.title,
         made: b.made,
         oid: b.oid,
+        tldr: b.tldr,
         slides: b
             .slides
             .into_iter()
@@ -36317,6 +36343,11 @@ impl Storm {
             // the last slide gets to sit in the middle of the window like every
             // other one, rather than pinned to the bottom edge
             .pb(px(340.));
+        // the main points before the deck that makes them, for the reading
+        // where you want the answer and not the walk to it
+        if let Some(tldr) = Self::brief_tldr(&brief.tldr) {
+            deck = deck.child(tldr);
+        }
         for (ix, slide) in brief.slides.iter().enumerate() {
             deck = deck.child(self.brief_slide(ix, slide, n, pr.unwrap_or(0), me.clone(), cx));
         }
@@ -36366,7 +36397,10 @@ impl Storm {
     /// Under it, the number and the title of the slide at the top of the view.
     fn brief_progress(&self, brief: &Brief) -> Div {
         let n = brief.slides.len();
-        let at = self.brief_scroll.top_item().min(n.saturating_sub(1));
+        // the TL;DR is the deck's first child but not its first slide, so the
+        // counter would read 02 while slide one is on screen
+        let lead = usize::from(!brief.tldr.is_empty());
+        let at = self.brief_scroll.top_item().saturating_sub(lead).min(n.saturating_sub(1));
         let title = brief.slides.get(at).map(|s| s.title.clone()).unwrap_or_default();
         // the scroll rather than the slide number: a deck moves continuously,
         // and a part-filled cell is what the bar has for saying so
@@ -36400,6 +36434,69 @@ impl Storm {
                     )
                     .child(div().min_w(px(0.)).truncate().text_color(rgb(MUTED)).child(title)),
             )
+    }
+
+    /// The deck in three or four lines, above the first slide.
+    ///
+    /// It sits inside the scroll rather than over it: it is the first thing
+    /// you read and then it is behind you, and a banner pinned to the top of a
+    /// deck you have read four slides of is a banner in the way.
+    fn brief_tldr(lines: &[String]) -> Option<Div> {
+        if lines.is_empty() {
+            return None;
+        }
+        let mut body = div().flex().flex_col().gap_2().min_w(px(0.));
+        for line in lines {
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap_2p5()
+                    .min_w(px(0.))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .mt(px(7.))
+                            .size(px(5.))
+                            .rounded_full()
+                            .bg(rgb(ACCENT)),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .text_size(px(15.))
+                            .line_height(px(24.))
+                            .text_color(rgb(TEXT))
+                            .child(line.clone()),
+                    ),
+            );
+        }
+        Some(
+            div()
+                .flex_shrink_0()
+                .pt(px(28.))
+                .pb(px(8.))
+                .max_w(px(680.))
+                .min_w(px(0.))
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(rgb(LINE_NUMBER))
+                        .child("THE SHORT OF IT"),
+                )
+                .child(
+                    div()
+                        .pl_3()
+                        .border_l_2()
+                        .border_color(rgb(ACCENT))
+                        .min_w(px(0.))
+                        .child(body),
+                ),
+        )
     }
 
     fn brief_slide(
@@ -43829,6 +43926,7 @@ mod code_tour_tests {
         let b = brief_from(rpc::Brief {
             pr: Some(7),
             title: "T".into(),
+            tldr: Vec::new(),
             slides: vec![slide("flow"), slide("split"), slide("parts"), slide("whatever")],
             made: 0,
             oid: String::new(),
@@ -44274,6 +44372,7 @@ mod code_tour_tests {
             title: "T".into(),
             made: 0,
             oid: String::new(),
+            tldr: Vec::new(),
             slides: slides.clone(),
         };
         let fresh = vec![

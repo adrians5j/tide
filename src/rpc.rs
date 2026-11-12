@@ -196,6 +196,9 @@ pub struct Brief {
     /// The pull request it is about, when it is about one.
     pub pr: Option<u64>,
     pub title: String,
+    /// The whole thing in three or four lines, read before the deck. Empty
+    /// when the agent didn't write one, and nothing is drawn then.
+    pub tldr: Vec<String>,
     pub slides: Vec<BriefSlide>,
     /// Unix seconds it was written. The agent never sends this; TIDE writes it
     /// into the copy it keeps, so a brief read back off disk can say its age.
@@ -593,7 +596,7 @@ fn handle(
             None => respond(
                 &mut stream,
                 400,
-                "{\"error\":\"want {\\\"title\\\":\\\"<what the change is>\\\",\\\"slides\\\":                 [{\\\"title\\\":\\\"<a sentence>\\\",\\\"text\\\":\\\"<two or three more>\\\",                 \\\"diagram\\\":{\\\"kind\\\":\\\"flow|split|parts\\\",                 \\\"nodes\\\":[{\\\"label\\\":\\\"<a few words>\\\"}]}}]}\"}",
+                "{\"error\":\"want {\\\"title\\\":\\\"<what the change is>\\\",\\\"tldr\\\":                 [\\\"<the whole thing in three or four lines>\\\"],\\\"slides\\\":                 [{\\\"title\\\":\\\"<a sentence>\\\",\\\"text\\\":\\\"<two or three more>\\\",                 \\\"diagram\\\":{\\\"kind\\\":\\\"flow|split|parts\\\",                 \\\"nodes\\\":[{\\\"label\\\":\\\"<a few words>\\\"}]}}]}\"}",
             ),
         }
         return;
@@ -1051,12 +1054,39 @@ pub fn parse_brief(body: &str) -> Option<Brief> {
     Some(Brief {
         pr,
         title: clean(v.get("title").and_then(|t| t.as_str()).unwrap_or(""), 160),
+        tldr: parse_tldr(v.get("tldr").or_else(|| v.get("summary"))),
         slides,
         made: num("made"),
         oid: clean(v.get("oid").and_then(|x| x.as_str()).unwrap_or(""), 40),
         raw: body.to_string(),
         read,
     })
+}
+
+/// The deck in three or four lines. A list of strings is the shape asked for;
+/// one string is taken as lines, since an agent writing a paragraph of three
+/// bullets into one field is the likelier mistake than a wrong key. Leading
+/// bullet characters come off, because they are drawn rather than typed.
+fn parse_tldr(v: Option<&serde_json::Value>) -> Vec<String> {
+    let tidy = |s: &str| -> String {
+        s.trim()
+            .trim_start_matches(['-', '*', '\u{2022}', '\u{b7}'])
+            .trim()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(240)
+            .collect::<String>()
+            .trim()
+            .to_string()
+    };
+    let lines: Vec<String> = match v {
+        Some(serde_json::Value::Array(a)) => {
+            a.iter().filter_map(|x| x.as_str()).map(tidy).collect()
+        }
+        Some(serde_json::Value::String(s)) => s.lines().map(tidy).collect(),
+        _ => Vec::new(),
+    };
+    lines.into_iter().filter(|l| !l.is_empty()).take(6).collect()
 }
 
 /// The picture on one slide, or `None` when there isn't one worth drawing.
@@ -2485,6 +2515,28 @@ mod tests {
         assert_eq!(b.slides[1].files, vec![("src/only.ts".to_string(), 3)]);
         // a slide that named none says none, rather than guessing
         assert!(b.slides[2].files.is_empty());
+    }
+
+    /// The deck in three or four lines, which is what gets read when nothing
+    /// else does. Loose on the way in like the rest of a brief.
+    #[test]
+    fn the_short_of_it_comes_off_the_wire_either_shape() {
+        let b = parse_brief(
+            r#"{"tldr":["First line.","  • Second line.  ","","Third line."],
+                "slides":[{"title":"A","text":"B"}]}"#,
+        )
+        .expect("a brief");
+        assert_eq!(b.tldr, vec!["First line.", "Second line.", "Third line."],
+            "the bullet is drawn, not typed, and an empty line is not a point");
+
+        // written as one string instead of a list, which is the likelier slip
+        let one = parse_brief("{\"tldr\":\"- A.\\n- B.\",\"slides\":[{\"title\":\"A\"}]}")
+            .expect("a brief");
+        assert_eq!(one.tldr, vec!["A.", "B."]);
+
+        // a brief written before any of this had one, and says so
+        let none = parse_brief("{\"slides\":[{\"title\":\"A\",\"text\":\"B\"}]}").expect("a brief");
+        assert!(none.tldr.is_empty());
     }
 
     #[test]
