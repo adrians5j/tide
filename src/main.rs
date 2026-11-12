@@ -3700,13 +3700,8 @@ fn context_color(per_call: u64) -> u32 {
     }
 }
 
-fn usage_color(pct: f32) -> u32 {
-    match pct {
-        p if p >= 90.0 => GIT_DELETED,
-        p if p >= 60.0 => GIT_MODIFIED,
-        _ => GIT_NEW,
-    }
-}
+/// How a context size reads: quiet while a session is cheap to carry, amber
+/// once every turn is paying for a few hundred thousand tokens of history, red
 
 /// A short random lowercase-alphanumeric id (e.g. for `wip: <id>` commits),
 /// seeded from the system clock and mixed so successive calls differ.
@@ -5418,146 +5413,6 @@ fn ask_changed_note(paths: &[String], base: &str, all: bool) -> String {
     )
 }
 
-/// The plan windows that are spent, as (what it is, when it comes back). Empty
-/// when there's room, or when no reading has arrived — an absent reading is not
-/// a full one, and guessing would block work for nothing.
-fn usage_spent(limits: Option<&usage::Limits>) -> Vec<(&'static str, i64)> {
-    let Some(l) = limits else { return Vec::new() };
-    [("The 5-hour session window", &l.five_hour), ("The weekly window", &l.seven_day)]
-        .into_iter()
-        .filter_map(|(label, w)| match w {
-            Some(w) if w.pct >= 100.0 => Some((label, w.resets_at)),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Why sending is off, in one sentence, or None when nothing is spent. The
-/// soonest window back is the one quoted: that's the wait that actually ends.
-fn usage_block_text(spent: &[(&'static str, i64)]) -> Option<String> {
-    let (first, _) = *spent.first()?;
-    let back = spent
-        .iter()
-        .map(|(_, r)| *r)
-        .filter(|r| *r > 0)
-        .min()
-        .map(usage::fmt_left)
-        .filter(|s| !s.is_empty());
-    Some(match (spent.len(), back) {
-        (1, Some(l)) => format!("{first} is at 100%, back in {l}"),
-        (1, None) => format!("{first} is at 100%"),
-        (_, Some(l)) => format!("Both plan windows are at 100%, the first back in {l}"),
-        (_, None) => "Both plan windows are at 100%".to_string(),
-    })
-}
-
-/// A plan window that has just crossed a mark worth stopping the user for.
-#[derive(Clone, Debug, PartialEq)]
-struct UsageAlert {
-    /// 80 or 100.
-    mark: u8,
-    title: String,
-    body: String,
-}
-
-/// Which marks each plan window has reached, as (window, mark, when it comes
-/// back, how full). 80 is a warning, 100 is the stop.
-///
-/// The reset time rides along because it is what tells one window from the
-/// next: the poll reads the same file four times a minute, so an alert has to
-/// be raised against the window it belongs to and not against the reading.
-fn usage_marks(limits: Option<&usage::Limits>) -> Vec<(&'static str, u8, i64, f32)> {
-    let Some(l) = limits else { return Vec::new() };
-    [("The 5-hour session window", &l.five_hour), ("The weekly window", &l.seven_day)]
-        .into_iter()
-        .filter_map(|(label, w)| {
-            let w = w.as_ref()?;
-            let mark = match w.pct {
-                p if p >= 100.0 => 100,
-                p if p >= 80.0 => 80,
-                _ => return None,
-            };
-            Some((label, mark, w.resets_at, w.pct))
-        })
-        .collect()
-}
-
-/// What the alert says. At 100% it says what happens to a prompt sent anyway,
-/// because that is the question the alert raises.
-fn usage_alert_text(label: &str, mark: u8, resets_at: i64, pct: f32) -> (String, String) {
-    let left = usage::fmt_left(resets_at);
-    let rolls = match left.is_empty() {
-        true => String::new(),
-        false => format!(" It rolls over in {left}."),
-    };
-    match mark {
-        100 => (
-            "Prompts are held".to_string(),
-            format!(
-                "{label} is at 100%.{rolls} Anything you send waits in the queue until \
-                 then. Send anyway from the composer if you would rather spend the overage."
-            ),
-        ),
-        _ => (
-            format!("{label} is at {}%", pct.round() as i64),
-            format!("Prompts are held at 100%.{rolls}"),
-        ),
-    }
-}
-
-/// The alert on screen and the marks already raised, shared by every workspace
-/// in the process.
-///
-/// The plan windows belong to the account, not to a folder, so twelve open
-/// workspaces would otherwise each raise their own 80% and each want dismissing
-/// in turn. Raised once, shown by whichever workspace is on screen, dismissed
-/// for all of them at once.
-#[derive(Default)]
-struct UsageAlerts {
-    shown: Option<UsageAlert>,
-    raised: HashSet<(&'static str, u8, i64)>,
-}
-
-fn usage_alerts() -> &'static Mutex<UsageAlerts> {
-    static A: std::sync::OnceLock<Mutex<UsageAlerts>> = std::sync::OnceLock::new();
-    A.get_or_init(|| Mutex::new(UsageAlerts::default()))
-}
-
-/// Fold a reading in, raising an alert for any mark this window hasn't hit
-/// before. `true` when something new went up, so the caller can repaint.
-///
-/// The highest new mark wins: a jump from 40% to 100% between two polls is one
-/// alert about being held, not an 80% warning with the real news behind it.
-fn raise_usage_alert(limits: Option<&usage::Limits>) -> bool {
-    let Ok(mut a) = usage_alerts().lock() else { return false };
-    let mut best: Option<(&'static str, u8, i64, f32)> = None;
-    for (label, mark, resets_at, pct) in usage_marks(limits) {
-        if !a.raised.insert((label, mark, resets_at)) {
-            continue;
-        }
-        if best.map_or(true, |(_, m, _, _)| mark > m) {
-            best = Some((label, mark, resets_at, pct));
-        }
-    }
-    let Some((label, mark, resets_at, pct)) = best else { return false };
-    let (title, body) = usage_alert_text(label, mark, resets_at, pct);
-    a.shown = Some(UsageAlert { mark, title, body });
-    true
-}
-
-/// The alert to draw, if there is one.
-fn shown_usage_alert() -> Option<UsageAlert> {
-    usage_alerts().lock().ok()?.shown.clone()
-}
-
-/// Put it away. The mark stays raised, so the same window doesn't bring it
-/// straight back on the next poll.
-fn clear_usage_alert() {
-    if let Ok(mut a) = usage_alerts().lock() {
-        a.shown = None;
-    }
-}
-
 /// An image id for the phone, as a string.
 ///
 /// The id is gpui's content hash, a full u64. JavaScript parses JSON numbers as
@@ -6232,7 +6087,6 @@ enum Cmd {
     Todo,
     OpenRepository,
     OpenPrNumber,
-    InstallUsageBars,
     SendOnPaste,
 }
 
@@ -6287,7 +6141,6 @@ const PALETTE: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::Reviewers, "Send In the Reviewers (footprint, style, architecture, CodeRabbit)", IC_PR, ""),
     (Cmd::Todo, "New Task…", IC_CHECK, "⌘⇧L"),
     (Cmd::OpenRepository, "Open Repository or Project…  (clones a GitHub URL into ~/dev)", IC_FILES, "⌘O"),
-    (Cmd::InstallUsageBars, "Install Plan Usage Bars (statusline shim)", IC_GRAPH, ""),
 ];
 
 /// A running process row for the Process Manager dialog.
@@ -9095,12 +8948,10 @@ struct Storm {
     admin_autoopen: bool,
     /// Plan usage windows, as last reported to the statusline shim, and whether
     /// the topbar chip's detail panel is open.
-    limits: Option<usage::Limits>,
     /// The resets this workspace was told to send through anyway. A spent plan
     /// window stops TIDE sending prompts; this is the "send anyway" the composer
     /// offers, keyed to the reset it was taken against so it lapses by itself
     /// when the window rolls over instead of staying off for the next one.
-    usage_skip: Option<i64>,
     limits_open: bool,
     /// The token panel: what the session logs say was spent, and over how long.
     /// `None` until a scan has run, which happens off the UI thread.
@@ -9666,8 +9517,6 @@ impl Storm {
             admin_pane: None,
             admin_spin: 0,
             admin_autoopen: false,
-            limits: None,
-            usage_skip: None,
             limits_open: false,
             tokens: None,
             tokens_open: false,
@@ -9899,44 +9748,6 @@ impl Storm {
 
     /// Install the statusline shim that feeds the usage chip: write the script,
     /// then wrap whatever `statusLine` command `~/.claude/settings.json` already
-    /// has so an existing status line keeps rendering unchanged.
-    fn install_usage_bars(&mut self, cx: &mut Context<Self>) {
-        let Ok(home) = std::env::var("HOME") else {
-            self.show_flash("No HOME — cannot install", cx);
-            return;
-        };
-        let home = PathBuf::from(home);
-        let shim = home.join(".claude/tide-statusline.sh");
-        if let Err(e) = std::fs::write(&shim, usage::STATUSLINE_SHIM) {
-            self.show_flash(&format!("Could not write the shim: {e}"), cx);
-            return;
-        }
-        let _ = Command::new("chmod").arg("+x").arg(&shim).output();
-        let settings = home.join(".claude/settings.json");
-        let text = std::fs::read_to_string(&settings).unwrap_or_else(|_| "{}".to_string());
-        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::json!({}));
-        let shim_q = format!("\"{}\"", shim.display());
-        let prev = v
-            .get("statusLine")
-            .and_then(|s| s.get("command"))
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string();
-        if prev.contains("tide-statusline.sh") {
-            self.show_flash("Usage bars already installed", cx);
-            return;
-        }
-        // the old command becomes the shim's argument, stdin and all
-        let cmd = if prev.is_empty() { shim_q.clone() } else { format!("{shim_q} {prev}") };
-        v["statusLine"] = serde_json::json!({ "type": "command", "command": cmd });
-        let Ok(out) = serde_json::to_string_pretty(&v) else { return };
-        if let Err(e) = std::fs::write(&settings, out + "\n") {
-            self.show_flash(&format!("Could not update settings.json: {e}"), cx);
-            return;
-        }
-        self.show_flash("Usage bars installed — restart Claude Code to start reporting", cx);
-        self.start_usage_poll(cx);
-    }
 
     /// Ask "what would a build do?" once — `yarn build --preview --json`, which
     /// builds nothing and takes ~2s. On demand only: polling meant every open
@@ -9983,46 +9794,8 @@ impl Storm {
         .detach();
     }
 
-    /// The plan windows that are spent, as (what it is, when it comes back).
-    /// Empty when there's room, or when no reading has arrived — an absent
-    /// reading is not a full one, and guessing would block work for nothing.
-    fn usage_spent(&self) -> Vec<(&'static str, i64)> {
-        usage_spent(self.limits.as_ref())
-    }
-
-    /// What the skip is taken against: the last of the spent windows to come
-    /// back. Skipping while both are full shouldn't have to be done twice, and
-    /// a skip shouldn't survive the window it was meant for.
-    fn usage_skip_key(&self) -> Option<i64> {
-        self.usage_spent().iter().map(|(_, r)| *r).max()
-    }
-
-    /// Why sending is off, in one sentence, or None when it isn't.
-    ///
-    /// At 100% a prompt can only come back as a rate-limit error, and an error
-    /// is a worse answer than not sending: the turn is gone and the message
-    /// with it. Turns already running are left alone — stopping one mid-flight
-    /// would throw away work that has already been paid for.
-    fn usage_block(&self) -> Option<String> {
-        if self.usage_skip.is_some() && self.usage_skip == self.usage_skip_key() {
-            return None;
-        }
-        usage_block_text(&self.usage_spent())
-    }
-
-    /// Send anyway, until this window rolls over. Anything held in the queue
-    /// goes now rather than waiting for a turn that can't start on its own.
-    fn skip_usage_block(&mut self, cx: &mut Context<Self>) {
-        self.usage_skip = self.usage_skip_key();
-        self.show_flash("Sending anyway until the window resets", cx);
-        if !self.agent_busy {
-            self.agent_next_queued();
-        }
-        cx.notify();
-    }
-
-    /// Re-read the statusline dump so the usage chip follows the session. Cheap:
-    /// one small file, and only when it changed.
+    /// Re-read the live session's context every 15s, so the `ctx` chip follows
+    /// the conversation. The reading is a tail of the session's own log.
     fn start_usage_poll(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| loop {
             // which session to read, asked on the UI thread; the reading itself
@@ -10032,31 +9805,17 @@ impl Storm {
             }) else {
                 break;
             };
-            let (l, ctx) = cx
+            let ctx = cx
                 .background_executor()
                 .spawn(async move {
                     let (root, id) = live;
-                    (usage::load_limits(), id.and_then(|id| tokens::live_context(&root, &id)))
+                    id.and_then(|id| tokens::live_context(&root, &id))
                 })
                 .await;
             if this
                 .update(cx, |this, cx| {
                     if this.agent_context != ctx {
                         this.agent_context = ctx;
-                        cx.notify();
-                    }
-                    if this.limits != l {
-                        let was_blocked = this.usage_block().is_some();
-                        this.limits = l;
-                        // 80% is worth knowing before the window closes, and
-                        // 100% is worth more than a line in the composer
-                        raise_usage_alert(this.limits.as_ref());
-                        // the window rolled over while something sat in the
-                        // queue: send it rather than wait for a turn that can
-                        // never end, since none is running
-                        if was_blocked && this.usage_block().is_none() && !this.agent_busy {
-                            this.agent_next_queued();
-                        }
                         cx.notify();
                     }
                 })
@@ -10304,12 +10063,6 @@ impl Storm {
     fn start_reviewers(&mut self, cx: &mut Context<Self>) -> bool {
         if self.reviewers.iter().any(|r| !r.done) {
             self.show_flash("The reviewers are still working", cx);
-            return false;
-        }
-        // two more sessions is the most expensive thing on this menu, so it
-        // waits out a spent window like anything else
-        if let Some(why) = self.usage_block() {
-            self.show_flash(&format!("{why}. Send anyway from the composer."), cx);
             return false;
         }
         // last round's tabs go when a new one starts
@@ -11618,12 +11371,6 @@ impl Storm {
             return;
         }
         if key != "escape" {
-            return;
-        }
-        // the usage alert sits over everything, so escape takes it first
-        if shown_usage_alert().is_some() {
-            clear_usage_alert();
-            cx.notify();
             return;
         }
         // the token panel is full-screen, so escape takes it before anything
@@ -16054,7 +15801,6 @@ impl Storm {
             Cmd::OpenRepository => self.act_new_project(&NewProject, window, cx),
             Cmd::WorkspaceHistory => self.open_ws_history(window, cx),
             Cmd::OpenPrNumber => self.open_prnum_prompt(window, cx),
-            Cmd::InstallUsageBars => self.install_usage_bars(cx),
             Cmd::TogglePause => self.toggle_pause(cx),
             Cmd::Tokens => self.open_tokens(cx),
             Cmd::SendOnPaste => self.toggle_send_on_paste(cx),
@@ -18015,9 +17761,6 @@ impl Render for Storm {
         if self.ws_open {
             root = root.child(self.render_project_dropdown(cx));
         }
-        if self.limits_open {
-            root = root.children(self.render_usage_overlay(cx));
-        }
         if self.tokens_open {
             root = root.child(self.render_tokens(cx));
         }
@@ -18074,12 +17817,6 @@ impl Render for Storm {
                     }),
             );
         }
-        // last, so it covers whatever else is up: at 100% the dialog is the
-        // answer to why nothing is being sent
-        if let Some(alert) = shown_usage_alert() {
-            root = root.child(self.render_usage_alert(&alert, cx));
-        }
-
         root
     }
 }
@@ -18639,7 +18376,6 @@ impl Storm {
                 })
                 .children(self.render_ws_tally(cx))
                 .children(self.render_todo_chip(cx))
-                .children(self.render_usage_chip(cx))
                 .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(format!("{} MB", self.mem_mb)))
                 // last item in the bar, hard against the right edge
                 .child({
@@ -19518,377 +19254,11 @@ impl Storm {
         Some(row)
     }
 
-    /// Plan usage: a small percentage chip in the topbar. Clicking it opens
-    /// `render_usage_overlay`, which is drawn at the root. `None` until the
-    /// statusline shim has run (see `docs/usage-bars.md`) — a missing reading is
-    /// not a 0% reading.
-    fn render_usage_chip(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let l = self.limits.clone()?;
-        // both windows on the chip — session first, then weekly — so the common
-        // case needs no click; each keeps its own colour
-        let pct = |w: &Option<usage::Window>| match w {
-            Some(w) => (format!("{}%", w.pct.round() as i64), usage_color(w.pct)),
-            None => ("—".to_string(), MUTED),
-        };
-        let (five_txt, five_color) = pct(&l.five_hour);
-        let (week_txt, week_color) = pct(&l.seven_day);
-        // the tooltip is where the numbers get their names
-        let line = |label: &str, w: &Option<usage::Window>| match w {
-            Some(w) if w.resets_at > 0 => format!(
-                "{label}: {}%  ·  {} left (resets {})",
-                w.pct.round() as i64,
-                usage::fmt_left(w.resets_at),
-                usage::fmt_reset(w.resets_at)
-            ),
-            Some(w) => format!("{label}: {}%", w.pct.round() as i64),
-            None => format!("{label}: no reading yet"),
-        };
-        let held = self.usage_block().is_some();
-        let tip_text = format!(
-            "{}\n{}{}",
-            line("Session (5 hours)", &l.five_hour),
-            line("Weekly", &l.seven_day),
-            if held { "\n\nPrompts to the agent are held. Click for Send anyway." } else { "" }
-        );
-        let open = self.limits_open;
-        Some(
-            div()
-                .id("usage-chip")
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_1()
-                .px_1p5()
-                .rounded_md()
-                .cursor_pointer()
-                .text_size(px(11.))
-                .when(open, |d| d.bg(rgb(HOVER)))
-                .hover(|s| s.bg(rgb(HOVER)))
-                .child(div().font_family(ICON_FONT).text_size(px(11.)).text_color(rgb(MUTED)).child(IC_GRAPH))
-                .child(div().text_color(rgb(five_color)).child(five_txt))
-                .child(div().text_color(rgb(LINE_NUMBER)).child("/"))
-                .child(div().text_color(rgb(week_color)).child(week_txt))
-                .when(held, |d| {
-                    d.child(
-                        div()
-                            .px_1()
-                            .rounded_sm()
-                            .bg(rgba((GIT_MODIFIED << 8) | 0x22))
-                            .text_size(px(10.))
-                            .text_color(rgb(GIT_MODIFIED))
-                            .child("held"),
-                    )
-                })
-                .tooltip(move |_w, cx| {
-                    let text = tip_text.clone();
-                    cx.new(|_| TooltipView { text: text.into() }).into()
-                })
-                .on_click(cx.listener(|this, _e, _w, cx| {
-                    this.limits_open = !this.limits_open;
-                    cx.notify();
-                })),
-        )
-    }
-
-    /// The 80%/100% alert: a dialog in the middle of the window, because a line
-    /// in the composer is something you read after wondering why nothing was
-    /// sent. Dismissed by the button, by the backdrop or by escape.
-    fn render_usage_alert(&self, alert: &UsageAlert, cx: &mut Context<Self>) -> impl IntoElement {
-        let color = usage_color(alert.mark as f32);
-        let held = alert.mark >= 100;
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_start()
-            .justify_center()
-            .child(
-                div().absolute().inset_0().bg(rgba(0x00000088)).id("usage-alert-backdrop").on_click(
-                    cx.listener(|_this, _e, _w, cx| {
-                        clear_usage_alert();
-                        cx.notify();
-                    }),
-                ),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .top(px(140.))
-                    // placed, not centred by the parent: an absolute child has
-                    // no part in the flex line that would centre it
-                    .left(px((self.win_width / 2.0 - 210.0).max(20.)))
-                    .w(px(420.))
-                    .bg(rgb(POPUP_BG))
-                    .border_1()
-                    .border_color(rgb(color))
-                    .border_l_4()
-                    .rounded_lg()
-                    .shadow_lg()
-                    .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
-                    .child(
-                        div()
-                            .px_4()
-                            .pt_3()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_size(px(18.))
-                                    .text_color(rgb(color))
-                                    .child(if held { "■" } else { "▲" }),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(14.))
-                                    .text_color(rgb(TEXT))
-                                    .child(alert.title.clone()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .px_4()
-                            .pt_2()
-                            .pb_3()
-                            .text_size(px(12.))
-                            .text_color(rgb(MUTED))
-                            .child(alert.body.clone()),
-                    )
-                    .child(
-                        div()
-                            .px_4()
-                            .py_2()
-                            .border_t_1()
-                            .border_color(rgb(BORDER))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_end()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex_grow(1.0)
-                                    .text_size(px(10.))
-                                    .text_color(rgb(LINE_NUMBER))
-                                    .child("esc"),
-                            )
-                            // at 100% the other thing to do from here is spend
-                            // the overage, which the composer offers too
-                            .when(held, |d| {
-                                d.child(
-                                    div()
-                                        .id("usage-alert-skip")
-                                        .px_2()
-                                        .py_0p5()
-                                        .rounded_md()
-                                        .cursor_pointer()
-                                        .text_size(px(11.))
-                                        .border_1()
-                                        .border_color(rgb(BORDER))
-                                        .text_color(rgb(MUTED))
-                                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                                        .child("Send anyway")
-                                        .tooltip(tip("Send prompts through until this window rolls over"))
-                                        .on_click(cx.listener(|this, _e, _w, cx| {
-                                            clear_usage_alert();
-                                            this.skip_usage_block(cx);
-                                        })),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .id("usage-alert-ok")
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .text_size(px(11.))
-                                    .border_1()
-                                    .border_color(rgb(color))
-                                    .text_color(rgb(color))
-                                    .hover(|s| s.bg(rgb(HOVER)))
-                                    .child("Got it")
-                                    .on_click(cx.listener(|_this, _e, _w, cx| {
-                                        clear_usage_alert();
-                                        cx.notify();
-                                    })),
-                            ),
-                    ),
-            )
-    }
-
-    /// The chip's detail panel, rendered at the root so nothing paints over it —
-    /// inside the topbar it was drawn before the editor and disappeared behind it.
-    /// A transparent backdrop takes the dismissing click.
-    fn render_usage_overlay(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let l = self.limits.clone()?;
-        Some(
-            div()
-                .absolute()
-                .inset_0()
-                .id("usage-backdrop")
-                .child(self.render_usage_panel(&l, cx))
-                .on_click(cx.listener(|this, _e, _w, cx| {
-                    this.limits_open = false;
-                    cx.notify();
-                })),
-        )
-    }
-
-    fn render_usage_panel(&self, l: &usage::Limits, cx: &mut Context<Self>) -> impl IntoElement {
-        let row = |label: &'static str, w: &Option<usage::Window>, color: u32| {
-            let w = w.clone();
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .child(
-                            div()
-                                .flex_grow(1.0)
-                                .text_size(px(10.))
-                                .text_color(rgb(MUTED))
-                                .child(label),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(13.))
-                                .text_color(rgb(match &w {
-                                    Some(w) => usage_color(w.pct),
-                                    None => MUTED,
-                                }))
-                                .child(match &w {
-                                    Some(w) => format!("{}%", w.pct.round() as i64),
-                                    None => "—".to_string(),
-                                }),
-                        ),
-                )
-                // the bar: a filled track, so the number has a shape to go with it
-                .child(
-                    div()
-                        .h(px(5.))
-                        .w_full()
-                        .rounded_md()
-                        .bg(rgb(BORDER))
-                        .child(
-                            div()
-                                .h_full()
-                                .w(relative(w.as_ref().map(|w| w.pct / 100.0).unwrap_or(0.0)))
-                                .rounded_md()
-                                .bg(rgb(color)),
-                        ),
-                )
-                .child(
-                    div()
-                        .text_size(px(10.))
-                        // the same grey as the labels above it: this line is
-                        // the one you actually read, so it can't be the dimmest
-                        // thing in the panel
-                        .text_color(rgb(MUTED))
-                        .child(match &w {
-                            // the wait first: "how long do I have to hold off"
-                            // is the question, the clock time is the footnote
-                            Some(w) if w.resets_at > 0 => format!(
-                                "{} left  ·  resets {}",
-                                usage::fmt_left(w.resets_at),
-                                usage::fmt_reset(w.resets_at)
-                            ),
-                            Some(_) => String::new(),
-                            None => "no reading yet".to_string(),
-                        }),
-                )
-        };
-        div()
-            .absolute()
-            .top(px(46.))
-            .right(px(12.))
-            .w(px(260.))
-            .p_3()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .bg(rgb(POPUP_BG))
-            .border_1()
-            .border_color(rgb(BORDER))
-            .rounded_md()
-            .shadow_lg()
-            .child(row("SESSION", &l.five_hour, ACCENT))
-            .child(row("WEEKLY", &l.seven_day, GIT_MODIFIED))
-            // the bars say how much of the window is gone; this is the only
-            // thing in TIDE that says what spent it
-            .child(
-                div()
-                    .id("usage-breakdown")
-                    .pt_1()
-                    .cursor_pointer()
-                    .text_size(px(10.))
-                    .text_color(rgb(MUTED))
-                    .hover(|s| s.text_color(rgb(TEXT)))
-                    .child("Where the tokens went →")
-                    .on_click(cx.listener(|this, _e, _w, cx| {
-                        this.limits_open = false;
-                        this.open_tokens(cx);
-                    })),
-            )
-            // the same notice the composer carries, for when the agent pane
-            // isn't on screen — this chip is where you look at the number, so
-            // it's where you should be able to act on it
-            .when_some(self.usage_block(), |d, _why| {
-                d.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .pt_2()
-                        .border_t_1()
-                        .border_color(rgb(BORDER))
-                        .child(
-                            div()
-                                .text_size(px(10.))
-                                .text_color(rgb(GIT_MODIFIED))
-                                .child("Prompts to the agent are held until this resets."),
-                        )
-                        .child(
-                            div()
-                                .id("usage-skip-panel")
-                                .self_start()
-                                .px_1p5()
-                                .py(px(1.))
-                                .rounded_md()
-                                .cursor_pointer()
-                                .border_1()
-                                .border_color(rgb(BORDER))
-                                .text_size(px(10.))
-                                .text_color(rgb(MUTED))
-                                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                                .child("Send anyway")
-                                .on_click(cx.listener(|this, _e, _w, cx| {
-                                    this.skip_usage_block(cx);
-                                    this.limits_open = false;
-                                })),
-                        ),
-                )
-            })
-    }
-
     /// The stretch the token panel is reading. "Today" is the clock's day, not
-    /// the last 24 hours: at nine in the morning those are different questions
-    /// and the first one is the one a plan window is spent against.
+    /// the last 24 hours: at nine in the morning those are different questions,
+    /// and the day you have had is the one you are asking about.
     fn token_window(&self) -> (i64, i64) {
-        token_window(self.tokens_span, self.five_hour_reset())
-    }
-
-    /// When the plan's five-hour window rolls over, off the reading the 15s
-    /// poll already keeps. `None` without the statusline shim, or before its
-    /// first run.
-    fn five_hour_reset(&self) -> Option<i64> {
-        self.limits.as_ref().and_then(|l| l.five_hour.as_ref()).map(|w| w.resets_at)
+        token_window(self.tokens_span)
     }
 
     /// Open the token panel and read the session logs behind it.
@@ -20176,10 +19546,6 @@ impl Storm {
 
         // only on the window's own tab: on the others it would read as the
         // share of that stretch, which it isn't
-        let window_pct = (span == TokenSpan::Window)
-            .then(|| self.limits.as_ref().and_then(|l| l.five_hour.as_ref()))
-            .flatten()
-            .map(|w| (w.pct, w.resets_at));
         let note = match (self.tokens_reading, self.tokens.is_some()) {
             (true, false) => "reading the session logs…".to_string(),
             (true, true) => "re-reading…".to_string(),
@@ -20231,7 +19597,7 @@ impl Storm {
                                     .text_color(rgb(TEXT))
                                     .child("Where the tokens went"),
                             )
-                            .child(tab("This window", TokenSpan::Window))
+                            .child(tab("Last 5 hours", TokenSpan::Window))
                             .child(tab("Today", TokenSpan::Today))
                             .child(tab("24 hours", TokenSpan::Day))
                             .child(tab("7 days", TokenSpan::Week))
@@ -20256,17 +19622,6 @@ impl Storm {
                                 usage::short(total.per_call()),
                                 context_color(total.per_call()),
                             ))
-                            // the plan's own meter, which is the authority on
-                            // the window. Everything to its left is the scan's
-                            // reading of the same stretch, by the hour
-                            .when_some(window_pct, |d, (pct, resets)| {
-                                d.child(head_num(
-                                    "WINDOW USED",
-                                    format!("{pct:.0}%"),
-                                    usage_color(pct),
-                                ))
-                                .child(head_num("RESETS IN", usage::fmt_left(resets), MUTED))
-                            })
                             .child(div().flex_grow(1.0))
                             .child(
                                 div()
@@ -20281,7 +19636,7 @@ impl Storm {
                             TokenSpan::Window =>
                                 "weighted at the published ratios: cache reads count a tenth, \
                                  cache writes a quarter over input, output five times it  \u{b7}  \
-                                 counted by the hour, so the window starts at the nearest one",
+                                 counted by the hour, so it starts at the nearest one",
                             _ =>
                                 "weighted at the published ratios: cache reads count a tenth, \
                                  cache writes a quarter over input, output five times it",
@@ -28385,18 +27740,6 @@ impl Storm {
         }
         self.ensure_acp(cx);
         let Some(acp) = self.acp.clone() else { return };
-        // the plan window is spent: a prompt sent now comes back as a
-        // rate-limit error and takes the message with it. It waits in the queue
-        // instead of being refused, because the caller may be the reviewers
-        // handing over reports nobody can type again
-        if let Some(why) = self.usage_block() {
-            let imgs = self.agent_imgs.drain(..).collect();
-            self.agent_queue.push(Queued { text, label, imgs, by, job });
-            self.show_flash(&format!("{why}. Held in the queue — Send anyway in the composer."), cx);
-            self.agent_list.scroll_to_end();
-            cx.notify();
-            return;
-        }
         // a turn is already running. Two things to do with that: put the
         // message into it, which is what you want when you have just seen it
         // go the wrong way, or hold it until the turn ends, which is what you
@@ -31236,9 +30579,7 @@ impl Storm {
 
     /// Send the next queued prompt, if any. Called when a turn ends.
     fn agent_next_queued(&mut self) {
-        // a queued prompt is not a running turn: it waits out the limit in the
-        // queue, where it stays visible, instead of being fired into an error
-        if self.agent_queue.is_empty() || self.usage_block().is_some() {
+        if self.agent_queue.is_empty() {
             return;
         }
         let Queued { text, label, imgs, by, job } = self.agent_queue.remove(0);
@@ -31969,7 +31310,6 @@ impl Storm {
         // the very bottom of the pane
         let rows = self.agent_input.text.split('\n').count().clamp(4, 14) as f32;
         let busy = self.agent_busy;
-        let blocked = self.usage_block();
         let pending_comments =
             self.review.iter().filter(|c| !c.draft && !c.sent && !c.resolved).count();
         // one box, full width: the text on top, controls along its bottom edge
@@ -32064,49 +31404,6 @@ impl Storm {
                     )
                 },
             )
-            // the plan window is spent. The box still takes what you type — the
-            // message is yours and shouldn't be lost — it just won't send until
-            // the window comes back or you say to send anyway
-            .when_some(blocked.clone(), |d, why| {
-                d.child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .mb_1()
-                        .px_1p5()
-                        .py(px(2.))
-                        .rounded_md()
-                        .bg(rgba((GIT_MODIFIED << 8) | 0x1a))
-                        .text_size(px(10.5))
-                        .child(
-                            div()
-                                .flex_grow(1.0)
-                                .min_w(px(0.))
-                                .text_color(rgb(GIT_MODIFIED))
-                                .child(format!("{why}. Prompts are held.")),
-                        )
-                        .child(
-                            div()
-                                .id("usage-skip")
-                                .flex_shrink_0()
-                                .px_1()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .text_color(rgb(MUTED))
-                                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                                .child("Send anyway")
-                                .tooltip(tip(
-                                    "Send regardless, until this window resets  ·  \
-                                     the next prompt may come back as a rate-limit error",
-                                ))
-                                .on_click(cx.listener(|this, _e, _w, cx| {
-                                    this.skip_usage_block(cx);
-                                })),
-                        ),
-                )
-            })
             // pasted images waiting to go with the next message: a thumbnail
             // chip each, hover for a bigger look
             .when(!self.agent_imgs.is_empty(), |d| {
@@ -32193,8 +31490,6 @@ impl Storm {
                         let reading = self.reviewers.iter().any(|r| !r.done);
                         div().text_color(rgb(MUTED)).child(if reading {
                             format!("Waiting for the reviewers…{}", self.caret_if(focused))
-                        } else if blocked.is_some() {
-                            format!("Waiting for the plan window…{}", self.caret_if(focused))
                         } else if busy && self.acp.as_ref().is_some_and(|a| a.can_steer()) {
                             // mid-turn the same ↩ does something else, and the
                             // empty box is where to say so
@@ -37950,31 +37245,24 @@ impl Storm {
 /// The window a span covers, as `[from, to)` in unix seconds, with `to` rounded
 /// up to the hour so the hour in progress is drawn. `resets_at` is the plan's
 /// five-hour reset, which only the `Window` span needs.
-fn token_window(span: TokenSpan, resets_at: Option<i64>) -> (i64, i64) {
+fn token_window(span: TokenSpan) -> (i64, i64) {
     let now = now_secs() as i64;
     let to = now - now.rem_euclid(3600) + 3600;
     match span {
-        TokenSpan::Window => (window_from(now, resets_at), to),
+        TokenSpan::Window => (window_from(now), to),
         TokenSpan::Today => (tokens::day_start(now, tokens::local_offset()), to),
         TokenSpan::Day => (to - 86_400, to),
         TokenSpan::Week => (to - 7 * 86_400, to),
     }
 }
 
-/// When the five-hour window opened, snapped to the nearest hour.
+/// Where the last five hours start, snapped to the nearest hour.
 ///
-/// Claude Code reports when the window *resets*; five hours before that is
-/// when it started. The snap is not a rounding error being hidden: the scan
-/// counts by the hour, so an hour is the smallest piece there is, and the
-/// nearest one is closer than the hour the window opened in. A reading that is
-/// missing, stale or from the future is no reading: then it is the last five
-/// hours, which is the same question asked a slightly different way.
-fn window_from(now: i64, resets_at: Option<i64>) -> i64 {
-    const FIVE: i64 = 5 * 3600;
-    let opened = resets_at
-        .map(|r| r - FIVE)
-        .filter(|t| *t <= now && now - t < FIVE + 3600)
-        .unwrap_or(now - FIVE);
+/// The snap is not a rounding error being hidden: the scan counts by the hour,
+/// so an hour is the smallest piece there is, and the nearest one is closer
+/// than the hour the stretch began in.
+fn window_from(now: i64) -> i64 {
+    let opened = now - 5 * 3600;
     let rem = opened.rem_euclid(3600);
     match rem >= 1800 {
         true => opened - rem + 3600,
@@ -37985,7 +37273,7 @@ fn window_from(now: i64, resets_at: Option<i64>) -> i64 {
 /// Which stretch the token panel is showing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TokenSpan {
-    /// The plan's five-hour window, from when it opened. The one that runs out.
+    /// The last five hours, rolling.
     Window,
     /// Since local midnight.
     Today,
@@ -41043,16 +40331,10 @@ fn print_tokens(span: TokenSpan) {
     let t = std::time::Instant::now();
     let report = tokens::scan(30 * 86_400);
     let off = tokens::local_offset();
-    let limits = usage::load_limits();
-    let five = limits.as_ref().and_then(|l| l.five_hour.as_ref());
-    let (from, to) = token_window(span, five.map(|w| w.resets_at));
+    let (from, to) = token_window(span);
     let total = report.total(from, to);
     let said = match span {
-        TokenSpan::Window => &format!(
-            "the five-hour window, from {}{}",
-            tokens::hour_label(from, off),
-            five.map(|w| format!(", {:.0}% of it spent", w.pct)).unwrap_or_default(),
-        ),
+        TokenSpan::Window => &format!("the last five hours, from {}", tokens::hour_label(from, off)),
         TokenSpan::Today => "today, since midnight",
         TokenSpan::Day => "the last 24 hours",
         TokenSpan::Week => "the last 7 days",
@@ -41586,140 +40868,6 @@ mod send_on_paste_tests {
         // a marker that isn't ASCII either
         assert_eq!(paste_to_send("»", "» send this"), Some("send this".into()));
         assert!(paste_to_send("»", "café").is_none());
-    }
-}
-
-#[cfg(test)]
-mod usage_block_tests {
-    use super::*;
-
-    fn limits(five: Option<f32>, week: Option<f32>) -> usage::Limits {
-        let w = |pct: f32| usage::Window { pct, resets_at: 0 };
-        usage::Limits { five_hour: five.map(w), seven_day: week.map(w), seen: 0 }
-    }
-
-    /// Under 100% nothing is held, and a reading that never arrived holds
-    /// nothing either — an unknown window is not a full one.
-    #[test]
-    fn room_left_blocks_nothing() {
-        assert!(usage_block_text(&usage_spent(None)).is_none());
-        assert!(usage_block_text(&usage_spent(Some(&limits(Some(99.4), Some(0.0))))).is_none());
-        assert!(usage_block_text(&usage_spent(Some(&limits(None, None)))).is_none());
-    }
-
-    /// At 100% the message names the window that's spent, because "which one"
-    /// decides whether the wait is hours or days.
-    #[test]
-    fn a_spent_window_says_which() {
-        let session = usage_block_text(&usage_spent(Some(&limits(Some(100.0), Some(12.0)))));
-        assert_eq!(session.as_deref(), Some("The 5-hour session window is at 100%"));
-        let weekly = usage_block_text(&usage_spent(Some(&limits(Some(3.0), Some(100.0)))));
-        assert_eq!(weekly.as_deref(), Some("The weekly window is at 100%"));
-        let both = usage_block_text(&usage_spent(Some(&limits(Some(100.0), Some(100.0)))));
-        assert_eq!(both.as_deref(), Some("Both plan windows are at 100%"));
-    }
-
-    /// The reading is clamped on the way in, so "over" still reads as spent.
-    #[test]
-    fn a_clamped_reading_still_counts() {
-        let l = usage::parse_limits(
-            r#"{"rate_limits":{"five_hour":{"used_percentage":140,"resets_at":0}}}"#,
-            0,
-        )
-        .expect("limits");
-        assert_eq!(l.five_hour.as_ref().map(|w| w.pct), Some(100.0));
-        assert!(usage_block_text(&usage_spent(Some(&l))).is_some());
-    }
-
-    /// The soonest window back is the one quoted: that's the wait that ends.
-    #[test]
-    fn the_nearer_reset_is_the_one_quoted() {
-        let soon = now_secs() as i64 + 2 * 3600 + 60;
-        let later = now_secs() as i64 + 48 * 3600;
-        let spent = [("The 5-hour session window", soon), ("The weekly window", later)];
-        let text = usage_block_text(&spent).expect("blocked");
-        assert!(text.contains("2h"), "{text}");
-        // and the skip is keyed to the last one back, so one click covers both
-        assert_eq!(spent.iter().map(|(_, r)| *r).max(), Some(later));
-    }
-
-    /// 80 warns, 100 stops, and anything under 80 says nothing. The reset rides
-    /// along, since that is what tells one window from the next.
-    #[test]
-    fn the_marks_are_eighty_and_a_hundred() {
-        assert!(usage_marks(None).is_empty());
-        assert!(usage_marks(Some(&limits(Some(79.9), Some(0.0)))).is_empty());
-        assert_eq!(
-            usage_marks(Some(&limits(Some(80.0), None))),
-            vec![("The 5-hour session window", 80, 0, 80.0)]
-        );
-        assert_eq!(
-            usage_marks(Some(&limits(Some(100.0), Some(92.0)))),
-            vec![
-                ("The 5-hour session window", 100, 0, 100.0),
-                ("The weekly window", 80, 0, 92.0),
-            ]
-        );
-    }
-
-    /// The 100% alert says what happens to a prompt sent anyway; the 80% one
-    /// says the number, since there is nothing to decide yet.
-    #[test]
-    fn the_alert_says_which_window_and_what_now() {
-        let (title, body) = usage_alert_text("The 5-hour session window", 100, 0, 100.0);
-        assert_eq!(title, "Prompts are held");
-        assert!(body.starts_with("The 5-hour session window is at 100%."), "{body}");
-        assert!(body.contains("Send anyway"), "{body}");
-        let (title, body) = usage_alert_text("The weekly window", 80, 0, 84.4);
-        assert_eq!(title, "The weekly window is at 84%");
-        assert_eq!(body, "Prompts are held at 100%.");
-        // with a reset to quote, the wait is in both
-        let soon = now_secs() as i64 + 70 * 60;
-        let (_, body) = usage_alert_text("The 5-hour session window", 100, soon, 100.0);
-        assert!(body.contains("rolls over in 1h"), "{body}");
-        let (_, body) = usage_alert_text("The weekly window", 80, soon, 80.0);
-        assert!(body.contains("rolls over in 1h"), "{body}");
-    }
-
-    /// A mark is raised once per window. The poll reads the same file four
-    /// times a minute, and dismissing an alert must not bring it straight back.
-    #[test]
-    fn a_mark_is_raised_once_per_window() {
-        let at = |pct: f32, resets_at: i64| usage::Limits {
-            five_hour: Some(usage::Window { pct, resets_at }),
-            seven_day: None,
-            seen: 0,
-        };
-        // a window this test owns, so it can't collide with another one
-        let win = 4_070_908_800;
-        assert!(raise_usage_alert(Some(&at(81.0, win))));
-        assert_eq!(shown_usage_alert().map(|a| a.mark), Some(80));
-        clear_usage_alert();
-        assert!(!raise_usage_alert(Some(&at(84.0, win))));
-        assert!(shown_usage_alert().is_none());
-        // 100% in the same window is its own mark
-        assert!(raise_usage_alert(Some(&at(100.0, win))));
-        assert_eq!(shown_usage_alert().map(|a| a.mark), Some(100));
-        clear_usage_alert();
-        // and the next window starts over
-        assert!(raise_usage_alert(Some(&at(80.0, win + 18_000))));
-        assert_eq!(shown_usage_alert().map(|a| a.mark), Some(80));
-        clear_usage_alert();
-    }
-
-    /// A jump past both marks between two polls is one alert, about the mark
-    /// that matters.
-    #[test]
-    fn a_jump_past_both_marks_alerts_on_the_higher() {
-        let win = 4_070_995_200;
-        let l = usage::Limits {
-            five_hour: Some(usage::Window { pct: 100.0, resets_at: win }),
-            seven_day: None,
-            seen: 0,
-        };
-        assert!(raise_usage_alert(Some(&l)));
-        assert_eq!(shown_usage_alert().map(|a| a.mark), Some(100));
-        clear_usage_alert();
     }
 }
 
@@ -44439,29 +43587,11 @@ mod handoff_tests {
     }
 
     #[test]
-    fn the_window_opens_five_hours_before_it_resets() {
+    fn the_last_five_hours_start_on_an_hour() {
         let now = 1_000_000_000; // 2800 seconds past the hour
-        // resets in two hours, so it opened three hours ago, nearest hour
-        assert_eq!(window_from(now, Some(now + 2 * 3600)), 999_990_000);
-        assert_eq!((now - window_from(now, Some(now + 2 * 3600))) / 60, 166, "2h46m back");
-    }
-
-    #[test]
-    fn no_reading_means_the_last_five_hours() {
-        let now = 1_000_000_000;
-        let from = window_from(now, None);
+        let from = window_from(now);
         assert_eq!(from % 3600, 0, "snapped to an hour");
         assert!((now - from - 5 * 3600).abs() <= 1800, "five hours, give or take the snap");
-    }
-
-    #[test]
-    fn a_stale_or_impossible_reading_is_no_reading() {
-        let now = 1_000_000_000;
-        let fallback = window_from(now, None);
-        // a reset two hours in the past: that window closed, this is a new one
-        assert_eq!(window_from(now, Some(now - 2 * 3600)), fallback);
-        // a reset further out than the window is long
-        assert_eq!(window_from(now, Some(now + 6 * 3600)), fallback);
     }
 
     #[test]
