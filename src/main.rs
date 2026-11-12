@@ -7346,6 +7346,8 @@ struct Queued {
     /// The part of TIDE it came from, kept so a prompt held behind a turn is
     /// still counted against what sent it.
     kind: &'static str,
+    /// What on screen it belongs to, kept for the same reason.
+    tag: String,
 }
 
 /// One stop on a walk through an answer's code references: the file, the lines,
@@ -8971,6 +8973,13 @@ struct Storm {
     /// agent pane, which is where a prompt comes from when nothing says
     /// otherwise. See `spend.rs`.
     spend_next: Option<&'static str>,
+    /// What on screen the next prompt belongs to, so the brief or the slide
+    /// that sent it can say what it cost. Set beside `spend_next`.
+    spend_tag: Option<String>,
+    /// Rows of the spend log folded in by tag, and how far into the file that
+    /// reading got. The log only grows, so the poll reads the tail.
+    spend_tags: HashMap<String, (tokens::Use, u32)>,
+    spend_at: u64,
     /// The running turn's mark: where its session log stood when the prompt
     /// went out, so what the turn costs can be read off the bytes it adds.
     turn_mark: Option<spend::Mark>,
@@ -9666,6 +9675,9 @@ impl Storm {
             agent_spin: 0,
             agent_turn_start: None,
             spend_next: None,
+            spend_tag: None,
+            spend_tags: HashMap::new(),
+            spend_at: 0,
             turn_mark: None,
             agent_briefed: false,
             agent_ghost: None,
@@ -28092,6 +28104,7 @@ impl Storm {
             Sender::You => spend::PANE,
             Sender::Tide => spend::JOB,
         });
+        let tag = self.spend_tag.take().unwrap_or_default();
         // the reviewers' reports are the next thing this thread gets, and a
         // message sent now would land in front of them. `deliver_reviews` is
         // the one send that happens while they exist, and by then they're done.
@@ -28129,7 +28142,7 @@ impl Storm {
             }
             // the attachments go with it, not with the next thing you send
             let imgs = self.agent_imgs.drain(..).collect();
-            self.agent_queue.push(Queued { text, label, imgs, by, job, kind });
+            self.agent_queue.push(Queued { text, label, imgs, by, job, kind, tag });
             self.agent_list.scroll_to_end();
             cx.notify();
             return;
@@ -28158,7 +28171,7 @@ impl Storm {
         };
         acp.prompt_with(&sent, &imgs);
         self.agent_msgs.push(AgentMsg::User { text: shown, imgs: kept, by });
-        self.open_spend(kind, job.as_deref().unwrap_or_default(), by, &acp);
+        self.open_spend(kind, job.as_deref().unwrap_or_default(), &tag, by, &acp);
         self.mark_turn_start(job);
         self.agent_turn_start = Some(std::time::Instant::now());
         self.start_agent_spinner(cx);
@@ -30429,9 +30442,17 @@ impl Storm {
     /// id and a zero offset, which is right: a session with no id yet is one
     /// the adapter is about to open, and its log starts empty. `close_spend`
     /// fills the id in.
-    fn open_spend(&mut self, kind: &'static str, job: &str, by: Sender, acp: &Arc<acp::Acp>) {
+    fn open_spend(
+        &mut self,
+        kind: &'static str,
+        job: &str,
+        tag: &str,
+        by: Sender,
+        acp: &Arc<acp::Acp>,
+    ) {
         let sid = acp.session_id().unwrap_or_default();
-        self.turn_mark = Some(spend::open(&self.root, &sid, kind, job, by == Sender::Tide));
+        self.turn_mark =
+            Some(spend::open(&self.root, &sid, kind, job, tag, by == Sender::Tide));
     }
 
     /// The turn is over: read what it added to the session log and write the
@@ -31305,7 +31326,7 @@ impl Storm {
         if self.agent_queue.is_empty() {
             return;
         }
-        let Queued { text, label, imgs, by, job, kind } = self.agent_queue.remove(0);
+        let Queued { text, label, imgs, by, job, kind, tag } = self.agent_queue.remove(0);
         if let Some(acp) = self.acp.clone() {
             let shown = label.unwrap_or_else(|| text.clone());
             // held before it could carry the tab's handoff (the window was
@@ -31324,7 +31345,7 @@ impl Storm {
             let (wire, kept) = split_images(imgs);
             acp.prompt_with(&sent, &wire);
             self.agent_msgs.push(AgentMsg::User { text: shown, imgs: kept, by });
-            self.open_spend(kind, job.as_deref().unwrap_or_default(), by, &acp);
+            self.open_spend(kind, job.as_deref().unwrap_or_default(), &tag, by, &acp);
             self.mark_turn_start(job);
             self.agent_turn_start = Some(std::time::Instant::now());
             self.acp_state = Some(AgentState::Working);
@@ -36551,6 +36572,7 @@ impl Storm {
                 .child(
                     div()
                         .pl_3()
+                        .w_full()
                         .border_l_2()
                         .border_color(rgb(ACCENT))
                         .min_w(px(0.))

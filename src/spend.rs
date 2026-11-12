@@ -54,6 +54,11 @@ pub struct Mark {
     pub kind: String,
     /// The job it belongs to, when TIDE started it as one ("Brief of #6176").
     pub job: String,
+    /// What on screen this turn belongs to, when something does: `brief:6236`,
+    /// `slide:6236:4`, `stop:6200:7`. The thing itself then asks what it cost
+    /// without having to guess which turn was its own. Empty for a turn that
+    /// belongs to the pane and nothing else.
+    pub tag: String,
     /// `true` when TIDE sent it rather than you typing it.
     pub by_tide: bool,
     pub root: PathBuf,
@@ -73,6 +78,7 @@ pub struct Row {
     pub secs: i64,
     pub kind: String,
     pub job: String,
+    pub tag: String,
     pub by_tide: bool,
     pub root: String,
     pub sid: String,
@@ -92,7 +98,7 @@ pub fn path() -> Option<PathBuf> {
 }
 
 /// Where the log of the session being prompted is, and how far it has got.
-pub fn open(root: &Path, sid: &str, kind: &str, job: &str, by_tide: bool) -> Mark {
+pub fn open(root: &Path, sid: &str, kind: &str, job: &str, tag: &str, by_tide: bool) -> Mark {
     let from = tokens::session_log(root, sid)
         .and_then(|p| std::fs::metadata(p).ok())
         .map(|m| m.len())
@@ -100,6 +106,7 @@ pub fn open(root: &Path, sid: &str, kind: &str, job: &str, by_tide: bool) -> Mar
     Mark {
         kind: kind.to_string(),
         job: job.to_string(),
+        tag: tag.to_string(),
         by_tide,
         root: root.to_path_buf(),
         sid: sid.to_string(),
@@ -134,6 +141,7 @@ pub fn record(mark: &Mark, used: &Use, secs: i64) {
         secs,
         kind: mark.kind.clone(),
         job: mark.job.clone(),
+        tag: mark.tag.clone(),
         by_tide: mark.by_tide,
         root: mark.root.to_string_lossy().to_string(),
         sid: mark.sid.clone(),
@@ -159,6 +167,27 @@ fn trim(p: &Path) {
     let lines: Vec<&str> = body.lines().collect();
     let keep = lines.split_at(lines.len() / 2).1.join("\n");
     let _ = std::fs::write(p, format!("{keep}\n"));
+}
+
+/// The rows written since byte `from`, and where the file now ends.
+///
+/// The log only ever grows, so a reader that remembers its offset reads the
+/// turns it hasn't seen and nothing else. That is what lets the window ask
+/// "what did this brief cost" without parsing megabytes on every frame.
+pub fn tail(from: u64) -> (Vec<Row>, u64) {
+    let Some(p) = path() else { return (Vec::new(), from) };
+    let Ok(m) = std::fs::metadata(&p) else { return (Vec::new(), 0) };
+    // trimmed, or a different file than the one that offset was for: start over
+    let from = if m.len() < from { 0 } else { from };
+    let Ok(mut f) = std::fs::File::open(&p) else { return (Vec::new(), from) };
+    if from > 0 && f.seek(SeekFrom::Start(from)).is_err() {
+        return (Vec::new(), from);
+    }
+    let mut body = String::new();
+    if std::io::Read::read_to_string(&mut f, &mut body).is_err() {
+        return (Vec::new(), from);
+    }
+    (body.lines().filter_map(from_line).collect(), m.len())
 }
 
 pub fn load() -> Vec<Row> {
@@ -213,6 +242,7 @@ pub fn to_line(r: &Row) -> String {
         "secs": r.secs,
         "kind": r.kind,
         "job": r.job,
+        "tag": r.tag,
         "tide": r.by_tide,
         "root": r.root,
         "sid": r.sid,
@@ -234,6 +264,7 @@ pub fn from_line(line: &str) -> Option<Row> {
         secs: v.get("secs").and_then(serde_json::Value::as_i64).unwrap_or(0),
         kind: s("kind"),
         job: s("job"),
+        tag: s("tag"),
         by_tide: v.get("tide").and_then(serde_json::Value::as_bool).unwrap_or(false),
         root: s("root"),
         sid: s("sid"),
@@ -257,6 +288,7 @@ mod tests {
             secs: 12,
             kind: kind.into(),
             job: String::new(),
+            tag: String::new(),
             by_tide: false,
             root: "/w".into(),
             sid: "abc".into(),
