@@ -28079,19 +28079,14 @@ impl Storm {
          one: a storyboard, agent-browser driving the real app, an MP4 with \
          the cursor, the zoom and the captions drawn on. Backend, infra, \
          refactors, CI and tests don't get one; there is nothing to watch.\n\
-         Attach the MP4 and embed a GIF of it above: the GIF plays by itself \
-         in the body, the video is there at full quality for anyone who \
-         wants a closer look.\n\
-         \x20 ffmpeg -i out.mp4 -vf \"fps=12,scale=900:-1:flags=lanczos,\
-         split[a][b];[a]palettegen=max_colors=160[p];[b][p]paletteuse=\
-         dither=bayer\" -loop 0 demo.gif\n\
-         Attach both (`--attach ./demo.gif --attach ./out.mp4`) and reference \
-         the GIF in the body with `![demo](./demo.gif)`. Keep the GIF under \
-         about 8 MB: drop to `fps=10,scale=800` or shorten the storyboard if \
-         it goes over. A video reference has to sit alone in its own \
-         paragraph for GitHub to draw a player; inside a sentence it comes \
-         out as a link. Don't write a `<video>` tag, which GitHub strips out \
-         of a body.\n\
+         Attach the MP4 and reference it: `--attach ./out.mp4`, with \
+         `![demo](./out.mp4)` on a line of its own in the body. No GIF of \
+         it. A GIF is a worse copy of the video it was made from: bigger, \
+         twelve frames a second, a couple of hundred colours. The MP4 \
+         already plays in the body without one. A video reference has to sit \
+         alone in its own paragraph for GitHub to draw a player; inside a \
+         sentence it comes out as a link. Don't write a `<video>` tag, which \
+         GitHub strips out of a body.\n\
          If you can't bring the app up to film it, say so in the PR rather \
          than quietly leaving the video out.\n\n\
          A PR body is about the code, not about who said what. Never write that \
