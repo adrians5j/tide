@@ -2348,6 +2348,7 @@ fn md_links(
     me: WeakEntity<Storm>,
     resolves: &dyn Fn(&str) -> bool,
     repo_web: Option<&str>,
+    todos: &[todo::Todo],
 ) -> Div {
     let rows = md_prepare(text);
     let mut col = div().flex().flex_col().min_w(px(0.)).text_color(rgb(color));
@@ -2362,6 +2363,7 @@ fn md_links(
                     .map(|r| (r.clone(), LinkTarget::Url(row.text[r].to_string()))),
             )
             .chain(pr_links(&row.text, repo_web))
+            .chain(todo_links(&row.text, todos))
             .collect();
         links.sort_by_key(|(r, _)| r.start);
         links.dedup_by(|b, a| b.0.start < a.0.end);
@@ -2390,6 +2392,12 @@ fn md_links(
                         let (path, line) = (path.clone(), *line);
                         if let Some(me) = me.upgrade() {
                             me.update(cx, |this, cx| this.open_file_ref(&path, line, window, cx));
+                        }
+                    }
+                    Some(LinkTarget::Todo(id)) => {
+                        let id = id.clone();
+                        if let Some(me) = me.upgrade() {
+                            me.update(cx, |this, cx| this.show_todo(&id, window, cx));
                         }
                     }
                     None => {}
@@ -7881,6 +7889,34 @@ enum LinkTarget {
     /// A file in the project, at a line (0 = no line given).
     File(String, usize),
     Url(String),
+    /// A line on the todo list, by id. An answer that backlogs something
+    /// names the id it filed it under, and that id is worth a click.
+    Todo(String),
+}
+
+/// Every todo id that appears as a word in `text`. Ids are slugs made of the
+/// words the line is about, so this is an exact match against the list rather
+/// than a pattern: nothing is a todo id unless there is a todo with that id.
+fn todo_links(text: &str, list: &[todo::Todo]) -> Vec<(std::ops::Range<usize>, LinkTarget)> {
+    let edge = |c: char| !(c.is_alphanumeric() || c == '-' || c == '_');
+    let mut out = Vec::new();
+    for t in list {
+        // two characters is a word that turns up in prose by accident
+        if t.id.len() < 3 {
+            continue;
+        }
+        let mut from = 0;
+        while let Some(at) = text[from..].find(&t.id).map(|i| i + from) {
+            let end = at + t.id.len();
+            let before = text[..at].chars().next_back().is_none_or(edge);
+            let after = text[end..].chars().next().is_none_or(edge);
+            if before && after {
+                out.push((at..end, LinkTarget::Todo(t.id.clone())));
+            }
+            from = end;
+        }
+    }
+    out
 }
 
 /// Scan `text` for pull-request references: `#5619`, and `owner/repo#5619`
@@ -8429,6 +8465,10 @@ struct Storm {
     /// sentences is the agent's working, not its answer.
     tool_open: HashSet<String>,
     brief_seen: HashSet<usize>,
+    /// Slides you have ticked and then opened again. A ticked slide folds to
+    /// its title; this is the handful you have asked to see anyway, so the
+    /// fold is the tick's doing and not a second thing to keep in step.
+    brief_unfold: HashSet<usize>,
     /// How wide a slide is actually painted, measured rather than derived. The
     /// question box takes its width from this instead of from the layout: a
     /// field whose wrap width is settled can't break after every character,
@@ -9280,6 +9320,7 @@ impl Storm {
             tool_open: HashSet::new(),
             rc_width: None,
             brief_seen: HashSet::new(),
+            brief_unfold: HashSet::new(),
             brief_w: 0.,
             ws_idle,
             ws_paused,
@@ -10723,10 +10764,14 @@ impl Storm {
             let group = t.group.filter(|g| !g.is_empty()).unwrap_or_else(|| fallback.clone());
             let status =
                 t.status.as_deref().and_then(todo::Status::parse).unwrap_or(todo::Status::Todo);
+            let text = t.text.unwrap_or_default();
+            // the id is read back to you in the pane and quoted in answers,
+            // so it is made of the words it is about
+            let id = todo::slug(&text, &self.todos);
             added += todo::add(
                 &mut self.todos,
-                random_id(),
-                &t.text.unwrap_or_default(),
+                id,
+                &text,
                 &t.details.unwrap_or_default(),
                 category_key(&t.category.unwrap_or_default()),
                 status,
@@ -13692,6 +13737,21 @@ impl Storm {
         self.todo_mtime = todo::mtime();
     }
 
+    /// Open the list in the sidebar on one line: the one an answer named.
+    ///
+    /// The filter is how a pane shared by every workspace shows a single line,
+    /// and it leaves the id on screen, so what you clicked is still readable
+    /// and escape puts the whole list back.
+    fn show_todo(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.todos = todo::load(); // another workspace may have written since
+        self.todo_here_only = false; // and it may have been written in one
+        self.todo_filter.set(id.to_string());
+        self.left_view = LeftView::Todos;
+        self.show_left = true;
+        window.focus(&self.todo_filter_focus, cx);
+        cx.notify();
+    }
+
     /// The form, empty, for a new task.
     fn open_todo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.todos = todo::load(); // every workspace writes to the same file
@@ -13764,9 +13824,10 @@ impl Storm {
             }
             None => {
                 let origin = self.folder_name();
+                let id = todo::slug(&text, &self.todos);
                 todo::add(
                     &mut self.todos,
-                    random_id(),
+                    id,
                     &text,
                     &details,
                     category,
@@ -21804,6 +21865,7 @@ impl Storm {
                                         cx.entity().downgrade(),
                                         &known,
                                         self.repo_web.as_deref(),
+                                        &self.todos,
                                     )
                                         .min_w(px(0.))
                                 })
@@ -27975,11 +28037,15 @@ impl Storm {
          And it edits: send back the `id` that read gave you, with only the \
          fields you're changing. `\"delete\":true` takes the line off the list.\n\
          \x20 curl -s -X POST \"$TIDE_RPC/todo\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n\
-         \x20   -d '{\"todos\":[{\"id\":\"58w65\",\"status\":\"done\"}]}'\n\
+         \x20   -d '{\"todos\":[{\"id\":\"drop-the-wcp-shim\",\"status\":\"done\"}]}'\n\
          Without an `id` every post files a new task, so an edit that leaves it \
          out silently becomes a duplicate. An `id` TIDE doesn't know is dropped \
          rather than filed as something new. Read the list back if you want to \
-         be sure a change landed.\n\n\
+         be sure a change landed.\n\
+         An id is the description in one word, so it says which line it \
+         is: name it in your answer when you file something or finish \
+         it (\"it is on the list as drop-the-wcp-shim\") and TIDE makes \
+         it a link to that line.\n\n\
          \"Insert this into content planner\", \"put these posts in the \
          planner\", \"schedule these\" — the posts go to the local bridge on \
          port 47400, not into a file and not into your answer. One event per \
@@ -28584,6 +28650,8 @@ impl Storm {
             // a URL opens the browser. Sorted and non-overlapping, since that's
             // what the highlighter and the click ranges both need.
             let repo_web = self.repo_web.clone();
+            // taken before the closure below borrows the whole of `self`
+            let todo_hits = todo_links(&row.text, &self.todos);
             let mut links: Vec<(std::ops::Range<usize>, LinkTarget)> = file_refs(&row.text)
                 .into_iter()
                 .filter(|r| self.file_ref_target(&r.path, cx).is_some())
@@ -28594,6 +28662,7 @@ impl Storm {
                         .map(|r| (r.clone(), LinkTarget::Url(row.text[r].to_string()))),
                 )
                 .chain(pr_links(&row.text, repo_web.as_deref()))
+                .chain(todo_hits)
                 .collect();
             links.sort_by_key(|(r, _)| r.start);
             links.dedup_by(|b, a| b.0.start < a.0.end);
@@ -28684,6 +28753,14 @@ impl Storm {
                                                         None => this
                                                             .open_file_ref(&path, line, window, cx),
                                                     }
+                                                });
+                                            }
+                                        }
+                                        Some(LinkTarget::Todo(id)) => {
+                                            let id = id.clone();
+                                            if let Some(me) = me.upgrade() {
+                                                me.update(cx, |this, cx| {
+                                                    this.show_todo(&id, window, cx)
                                                 });
                                             }
                                         }
@@ -29763,6 +29840,7 @@ impl Storm {
         };
         let path = PathBuf::from(&name);
         self.brief_seen.clear(); // a new deck reveals itself again
+        self.brief_unfold.clear();
         self.brief_ask_at = None;
         // the poll that received this had no Window to focus with, and the
         // deck holds the key context for ⌘W and the rest
@@ -30029,11 +30107,27 @@ impl Storm {
         } else {
             brief.read.remove(&ix);
         }
-        if let Some(number) = brief.pr {
-            let read = brief.read.clone();
+        let number = brief.pr;
+        let read = brief.read.clone();
+        // a slide folds because it is ticked, so a tick either way is the
+        // last word on whether it is open
+        self.brief_unfold.remove(&ix);
+        if let Some(number) = number {
             save_brief_read(number, &read);
         }
         cx.notify();
+    }
+
+    /// Open a folded slide without unticking it, or fold it again. Folding one
+    /// that was never ticked ticks it: the words are the tick, and putting a
+    /// slide away is what finishing it looks like.
+    fn fold_slide(&mut self, ix: usize, folded: bool, cx: &mut Context<Self>) {
+        if folded {
+            self.mark_slide_read(ix, true, cx); // which clears the unfold
+        } else {
+            self.brief_unfold.insert(ix);
+            cx.notify();
+        }
     }
 
     fn open_brief_node(
@@ -36244,6 +36338,9 @@ impl Storm {
             .get(self.active)
             .and_then(|t| t.brief.as_ref())
             .is_some_and(|b| b.read.contains(&ix));
+        // a slide you have ticked folds to its title, so what is left open is
+        // what you still have to read. Opening one again keeps the tick
+        let folded = read && !self.brief_unfold.contains(&ix);
         // the words are the tick: reading a slide and then aiming at a 14px
         // box is two actions for one thought. Everything with a click of its
         // own inside here occludes, so a link still opens its file.
@@ -36267,7 +36364,7 @@ impl Storm {
                         div()
                             .flex_shrink_0()
                             .w(px(28.))
-                            .pt(px(7.))
+                            .pt(px(if folded { 1. } else { 7. }))
                             .flex()
                             .flex_col()
                             .items_start()
@@ -36295,7 +36392,7 @@ impl Storm {
                                     .tooltip(tip(if read {
                                         "Read  ·  click to put it back"
                                     } else {
-                                        "Mark this slide as read"
+                                        "Mark this slide as read, and fold it away"
                                     }))
                                     .on_click(cx.listener(move |this, _e, _w, cx| {
                                         this.mark_slide_read(ix, !read, cx)
@@ -36305,13 +36402,13 @@ impl Storm {
                     .child(
                         div()
                             .min_w(px(0.))
-                            .text_size(px(22.))
+                            .text_size(px(if folded { 15. } else { 22. }))
                             .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(rgb(TEXT))
+                            .text_color(rgb(if folded { MUTED } else { TEXT }))
                             .child(slide.title.clone()),
                     ),
             )
-            .when(!slide.text.trim().is_empty(), |d| {
+            .when(!folded && !slide.text.trim().is_empty(), |d| {
                 // the padding and the wrap width go on separate nodes: on one
                 // node the text is measured against the 680 and painted into
                 // the 640 left after the padding, which costs a line, and
@@ -36320,11 +36417,13 @@ impl Storm {
                     div().max_w(px(680.)).min_w(px(0.)).child(md_text(&slide.text, 15., TEXT)),
                 ))
             })
-            .when(!slide.files.is_empty(), |d| {
+            .when(!folded && !slide.files.is_empty(), |d| {
                 d.child(div().pl(px(40.)).child(self.brief_files(ix, &slide.files, cx)))
             })
+            // the words fold the slide away and tick it on the way; a folded
+            // one opens again without losing the tick
             .on_click(cx.listener(move |this, _e, _w, cx| {
-                this.mark_slide_read(ix, !read, cx)
+                this.fold_slide(ix, !folded, cx)
             }));
 
         let body = div()
@@ -36333,11 +36432,11 @@ impl Storm {
             .gap_4()
             .max_w(px(780.))
             .child(said)
-            .when_some(slide.dia.clone(), |d, dia| {
+            .when_some(slide.dia.clone().filter(|_| !folded), |d, dia| {
                 d.child(div().pl(px(40.)).child(self.brief_diagram(ix, &dia, cx)))
             })
-            .children(self.brief_thread(pr, ix, cx))
-            .child(self.brief_ask_row(ix, cx));
+            .children((!folded).then(|| self.brief_thread(pr, ix, cx)).flatten())
+            .when(!folded, |d| d.child(self.brief_ask_row(ix, cx)));
 
         // not seen yet: laid out, and drawn at nothing. The padding it will
         // animate away is already spent here, so the reveal moves the words
@@ -36359,7 +36458,8 @@ impl Storm {
             .flex()
             .flex_col()
             .flex_shrink_0()
-            .py_8()
+            .when(folded, |d| d.py_3())
+            .when(!folded, |d| d.py_8())
             .when(ix > 0, |d| d.border_t_1().border_color(rgb(BORDER)))
             // the probe goes in first so it paints under the slide and can't
             // take a click off a diagram box
@@ -36490,7 +36590,10 @@ impl Storm {
             }));
 
         let mut body = div().flex().flex_col().gap_3().min_w(px(0.));
-        for turn in &thread.turns {
+        // an answer under a slide quotes files and pull requests the same way
+        // an answer in the pane does, and is just as worth opening
+        let known = |p: &str| self.resolve_file_ref(p).is_some();
+        for (ti, turn) in thread.turns.iter().enumerate() {
             let answered = !turn.answer.trim().is_empty();
             body = body.child(
                 div()
@@ -36508,7 +36611,18 @@ impl Storm {
                             .child(turn.q.clone()),
                     )
                     .child(if answered {
-                        md_text(&turn.answer, 14., TEXT).into_any_element()
+                        md_links(
+                            &turn.answer,
+                            14.,
+                            TEXT,
+                            ix * 64 + ti,
+                            cx.entity().downgrade(),
+                            &known,
+                            self.repo_web.as_deref(),
+                            &self.todos,
+                        )
+                        .min_w(px(0.))
+                        .into_any_element()
                     } else {
                         div()
                             .text_size(px(12.))
@@ -42200,6 +42314,45 @@ mod pr_ref_tests {
         // a heading marker and a bare hash have nothing to point at
         assert!(refs("# Heading").is_empty());
         assert!(refs("#0").is_empty(), "there is no PR zero");
+    }
+
+    fn listed(ids: &[&str]) -> Vec<todo::Todo> {
+        let mut list = Vec::new();
+        for id in ids {
+            todo::add(
+                &mut list,
+                (*id).to_string(),
+                "something",
+                "",
+                "",
+                todo::Status::Todo,
+                "",
+                "",
+                "",
+                "",
+                "",
+            );
+        }
+        list
+    }
+
+    #[test]
+    fn a_todo_id_in_an_answer_is_a_link_to_its_line() {
+        let list = listed(&["move-the-team-handler", "flaky-test"]);
+        let hits = todo_links("filed as move-the-team-handler, after flaky-test.", &list);
+        let mut ranges: Vec<&str> =
+            hits.iter().map(|(r, _)| &"filed as move-the-team-handler, after flaky-test."[r.clone()]).collect();
+        ranges.sort();
+        assert_eq!(ranges, vec!["flaky-test", "move-the-team-handler"]);
+    }
+
+    #[test]
+    fn a_word_that_only_starts_with_an_id_is_not_one() {
+        let list = listed(&["flaky-test"]);
+        assert!(todo_links("the flaky-tests are back", &list).is_empty());
+        assert!(todo_links("xflaky-test", &list).is_empty());
+        // a short id would match prose by accident, so it never links
+        assert!(todo_links("ab cd", &listed(&["ab"])).is_empty());
     }
 
     #[test]

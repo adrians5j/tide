@@ -195,6 +195,48 @@ pub fn from_json(body: &str) -> Vec<Todo> {
         .collect()
 }
 
+/// How long an id gets before it is cut back to a whole word.
+const SLUG_MAX: usize = 32;
+
+/// An id you can read: the description, lowercased and hyphenated, cut at a
+/// word.
+///
+/// `kt1eu` says nothing. `move-the-team-handler-next-to` says which line it is
+/// without opening the list, and the id is what an answer quotes back at you
+/// ("the follow-up is on the todo list as …"), so it is worth the
+/// characters. Numbered when the list already has that one, since two lines
+/// can be about the same thing.
+pub fn slug(text: &str, taken: &[Todo]) -> String {
+    let mut s = String::new();
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() {
+            s.push(c.to_ascii_lowercase());
+        } else if !s.is_empty() && !s.ends_with('-') {
+            s.push('-');
+        }
+    }
+    let s = s.trim_matches('-');
+    // every character in it is ASCII, so this cut is always on a boundary
+    let mut base = match s.len() > SLUG_MAX {
+        true => s[..s[..SLUG_MAX].rfind('-').unwrap_or(SLUG_MAX)].to_string(),
+        false => s.to_string(),
+    };
+    if base.is_empty() {
+        base = "todo".to_string();
+    }
+    let has = |id: &str| taken.iter().any(|t| t.id == id);
+    if !has(&base) {
+        return base;
+    }
+    for n in 2..1000 {
+        let next = format!("{base}-{n}");
+        if !has(&next) {
+            return next;
+        }
+    }
+    base
+}
+
 /// Add a line. `id` comes from the caller so this file needs no randomness.
 /// Everything but the description is optional, which is what makes the form
 /// worth filling in rather than a chore.
@@ -283,6 +325,8 @@ pub fn view(list: &[Todo], query: &str, origin: Option<&str>) -> Vec<usize> {
                 || list[i].group.to_lowercase().contains(&q)
                 || list[i].origin.to_lowercase().contains(&q)
                 || list[i].category.to_lowercase().contains(&q)
+                // an id is a word now, and pasting one in should find its line
+                || list[i].id.to_lowercase().contains(&q)
         })
         .collect();
     // in progress first, then todo, then done; newest at the top of each group
@@ -335,6 +379,31 @@ pub fn age(created: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_id_is_the_description_in_a_word_you_can_read() {
+        assert_eq!(
+            slug("Move the team handler next to teams", &[]),
+            "move-the-team-handler-next-to"
+        );
+        assert_eq!(slug("Fix the CLI --watch flag", &[]), "fix-the-cli-watch-flag");
+    }
+
+    #[test]
+    fn an_id_with_nothing_in_it_still_has_a_name() {
+        assert_eq!(slug("!!! ???", &[]), "todo");
+        assert_eq!(slug("", &[]), "todo");
+    }
+
+    #[test]
+    fn two_lines_about_the_same_thing_get_different_ids() {
+        let mut list = Vec::new();
+        for want in ["flaky-test", "flaky-test-2", "flaky-test-3"] {
+            let id = slug("Flaky test", &list);
+            assert_eq!(id, want);
+            add(&mut list, id, "Flaky test", "", "", Status::Todo, "", "", "", "", "");
+        }
+    }
 
     fn todo(id: &str, text: &str, status: Status, created: u64, scope: &str) -> Todo {
         Todo {
