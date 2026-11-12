@@ -26223,14 +26223,18 @@ impl Storm {
                                     .flex_col()
                                     .child(
                                         div()
-                                            .text_size(px(10.))
+                                            .text_size(px(11.))
                                             .text_color(rgb(if mine { COMMENT_MARK } else { accent }))
                                             .child(if mine { "You" } else { "Agent" }),
                                     )
+                                    // the same 13 the stop's own prose is set
+                                    // in: the answer is the half of the card
+                                    // you actually read, and at 12 it was the
+                                    // smallest text on screen
                                     .child(
                                         div()
                                             .line_height(px(TOUR_LINE_H))
-                                            .child(md_text(&text, 12., TEXT)),
+                                            .child(md_text(&text, 13., TEXT)),
                                     )
                             })),
                     )
@@ -26254,7 +26258,9 @@ impl Storm {
                                 .bg(rgb(BG))
                                 .border_1()
                                 .border_color(rgb(if asking { accent } else { BORDER }))
-                                .text_size(px(12.))
+                                // what you type and what comes back are set
+                                // the same size
+                                .text_size(px(13.))
                                 .text_color(rgb(TEXT))
                                 .track_focus(&self.tour_ask_focus)
                                 .on_key_down(cx.listener(Self::tour_ask_key))
