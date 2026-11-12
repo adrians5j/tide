@@ -105,14 +105,14 @@ handoff, and leaves this one where it is. The arithmetic is the same: the new
 question pays for a few hundred tokens of bearings instead of everything said
 so far. See [agent-tabs.md](agent-tabs.md).
 
-**A session that opened this way draws a line rather than an empty pane.** The
-rule says "New session", what came across, and carries a button that resumes the
-conversation it started from. Everything above the line stays where it was, so a
-link posted four answers ago is four answers up rather than something to ask for
-again; the agent under the line simply cannot see it. The session that was left
-is also under ↻ Resume, with every other session in the project, and the jump
-list that scrolls you to one of your own messages draws the same line, so a pane
-that has started over twice reads as three stretches.
+**A session that opened this way draws a line rather than an empty pane.** A
+rule across the transcript with "New session" in it, and nothing else. Everything
+above it stays where it was, so a link posted four answers ago is four answers up
+rather than something to ask for again; the agent under the line simply cannot
+see it. The session that was left is under ↻ Resume, with every other session
+in the project, and the jump list that scrolls you to one of your own messages
+draws the same line, so a pane that has started over twice reads as three
+stretches.
 
 ## The weighting
 

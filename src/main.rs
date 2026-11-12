@@ -133,7 +133,7 @@ enum AgentMsg {
     /// of the conversation it left, so that one is a click away. `tab` when it
     /// is a tab you opened beside the last one rather than a reset of it — the
     /// conversation it came from is still there, one click along the strip.
-    Fresh { prev: Option<String>, tab: bool },
+    Fresh { tab: bool },
     /// A tool call the agent ran: title (for Bash, the command itself), latest
     /// status, what the adapter said about it (a description before it runs, the
     /// output after), and when it started, so a long one can show its age.
@@ -26848,8 +26848,6 @@ impl Storm {
 
     fn start_new_session(&mut self, keep: bool, cx: &mut Context<Self>) {
         self.ensure_acp(cx);
-        // read before the handshake replaces it: this is the session being left
-        let prev = self.acp.as_ref().and_then(|a| a.session_id());
         self.agent_context = None;
         self.fresh_hint_off = false;
         self.fresh_pending = false;
@@ -26866,7 +26864,7 @@ impl Storm {
         // the line the new session starts under, drawn only when there is
         // something above it to be the other side of
         if keep && !self.agent_msgs.is_empty() {
-            self.agent_msgs.push(AgentMsg::Fresh { prev, tab: false });
+            self.agent_msgs.push(AgentMsg::Fresh { tab: false });
             self.agent_list.scroll_to_end();
         }
         cx.notify();
@@ -27067,7 +27065,7 @@ impl Storm {
         self.swap_conv(self.conv);
         if handoff.is_some() {
             // an empty pane is not an explanation of what came across
-            self.agent_msgs.push(AgentMsg::Fresh { prev: None, tab: true });
+            self.agent_msgs.push(AgentMsg::Fresh { tab: true });
         }
         self.agent_handoff = handoff;
         self.agent_tab = 0;
@@ -31016,80 +31014,28 @@ impl Storm {
                     .into_any_element();
             }
             // the line a fresh session opens with
-            // the line a new session starts under. It is drawn as a rule
-            // across the pane because that is what it is: everything above it
-            // is the conversation before, still there to scroll back into,
-            // and everything under it is a session that has never seen it
-            if let AgentMsg::Fresh { prev, tab } = m {
-                let prev = prev.clone();
+            // the line a new session starts under: a rule with the words in
+            // it, and nothing else. Everything above it is the conversation
+            // before, still there to scroll back into; everything under it is
+            // a session that has never seen it. The one that was left is in
+            // ↻ Resume, which is where you go when you want it back.
+            if let AgentMsg::Fresh { tab } = m {
                 let head = if *tab { "New tab" } else { "New session" };
                 let rule = || div().flex_grow(1.0).h(px(1.)).bg(rgb(BORDER));
-                let above = ix > 0;
                 return div()
                     .px_3()
-                    .pt_4()
+                    .pt_3()
                     .pb_2()
                     .flex()
-                    .flex_col()
-                    .gap_1p5()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .text_size(px(10.))
+                    .child(rule())
                     .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .text_size(px(10.))
-                            .child(div().w(px(16.)).h(px(1.)).bg(rgb(COMMENT_MARK)))
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .font_family(ICON_FONT)
-                                    .text_color(rgb(COMMENT_MARK))
-                                    .child(IC_AGENT),
-                            )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_color(rgb(COMMENT_MARK))
-                                    .child(head),
-                            )
-                            .child(rule())
-                            .when_some(prev, |d, id| {
-                                d.child(
-                                    div()
-                                        .id(("fresh-back", ix))
-                                        .flex_shrink_0()
-                                        .px_1p5()
-                                        .rounded_md()
-                                        .cursor_pointer()
-                                        .text_color(rgb(MUTED))
-                                        .border_1()
-                                        .border_color(rgb(BORDER))
-                                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                                        .child("\u{21bb} resume the one before")
-                                        .tooltip(tip(
-                                            "Open the conversation this session started from, \
-                                             as its own session again",
-                                        ))
-                                        .on_click(cx.listener(move |this, _e, _w, cx| {
-                                            this.resume_agent_session(id.clone(), cx)
-                                        })),
-                                )
-                            }),
+                        div().flex_shrink_0().text_color(rgb(COMMENT_MARK)).child(head),
                     )
-                    .child(
-                        div()
-                            .pl(px(22.))
-                            .text_size(px(10.))
-                            .text_color(rgb(MUTED))
-                            .child(match above {
-                                true => "the branch, the pull request and the last few questions \
-                                         came across · what is above the line is still there to \
-                                         read, the agent just can't see it",
-                                false => "the branch, the pull request and the last few \
-                                          questions came across",
-                            }),
-                    )
+                    .child(rule())
                     .into_any_element();
             }
             // a tool call opens on a click and shuts on the next one. The
@@ -32738,7 +32684,7 @@ impl Storm {
                     .enumerate()
                     .filter_map(|(ix, m)| match m {
                         AgentMsg::User { text, .. } => Some((ix, Some(text), false)),
-                        AgentMsg::Fresh { tab, .. } => Some((ix, None, *tab)),
+                        AgentMsg::Fresh { tab } => Some((ix, None, *tab)),
                         _ => None,
                     })
                     .collect();
