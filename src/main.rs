@@ -1082,6 +1082,43 @@ fn save_ws_client(root: &Path, client: Option<&str>) {
     }
 }
 
+/// When each workspace was last used, by path: the last time you were looking
+/// at it, or its agent was sent something.
+///
+/// Persisted, because "has anything happened here in two days" is a question
+/// that outlives a restart, and a launch with nine folders open is exactly
+/// when it needs answering.
+fn ws_seen_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".config/tide/workspace-seen.json"))
+}
+fn load_ws_seen() -> HashMap<String, i64> {
+    ws_seen_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<HashMap<String, i64>>(&s).ok())
+        .unwrap_or_default()
+}
+fn ws_seen_at(root: &Path) -> Option<i64> {
+    load_ws_seen().get(&root.to_string_lossy().to_string()).copied()
+}
+/// Mark a workspace used, now.
+fn touch_ws_seen(root: &Path) {
+    let Some(path) = ws_seen_path() else { return };
+    let mut m = load_ws_seen();
+    m.insert(root.to_string_lossy().to_string(), now_secs() as i64);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(s) = serde_json::to_string_pretty(&m) {
+        let _ = std::fs::write(path, s);
+    }
+}
+
+/// How long a workspace sits untouched before TIDE asks whether to park it.
+/// Two days: long enough that a weekend of one branch doesn't bury the others,
+/// short enough that a folder you have stopped opening is still fresh in mind.
+const PAUSE_AFTER: i64 = 2 * 86_400;
+
 /// Paused workspaces: ⌥Tab skips them, so parked work stays out of the rotation
 /// until you pick it up again. Persisted per project path, like the idle marker.
 fn ws_paused_path() -> Option<PathBuf> {
@@ -37894,6 +37931,11 @@ struct Workspace {
     /// The prompt just went up; the next render claims the keyboard for it,
     /// rather than every render taking it again.
     restart_focus_pending: bool,
+    /// A workspace nothing has happened in for `PAUSE_AFTER`, by index. `Some`
+    /// puts the "park it?" prompt up.
+    pause_ask: Option<usize>,
+    pause_focus: FocusHandle,
+    pause_focus_pending: bool,
     /// One listener for the whole window, so a phone on the same network can
     /// read any workspace. Always on: it costs a bound socket, and the work of
     /// building a transcript only happens while a phone is actually polling.
@@ -37921,6 +37963,9 @@ impl Workspace {
             restart_skip: 0,
             restart_focus: cx.focus_handle(),
             restart_focus_pending: false,
+            pause_ask: None,
+            pause_focus: cx.focus_handle(),
+            pause_focus_pending: false,
             remote: None,
             quit_focus: cx.focus_handle(),
         };
@@ -37933,6 +37978,7 @@ impl Workspace {
         ws.remote = remote_token().and_then(rpc::RemoteHub::start);
         ws.start_remote_poll(cx);
         ws.start_build_poll(cx);
+        ws.start_pause_poll(cx);
         // start on the first workspace that isn't parked; a paused one is only
         // the landing spot when every workspace is paused
         ws.active = ws
@@ -38166,6 +38212,8 @@ impl Workspace {
         if i < self.projects.len() {
             self.active = i;
             self.focus_pending = true;
+            // arriving on a workspace is the clearest sign it is still in use
+            touch_ws_seen(&self.projects[i].read(cx).root);
             cx.notify();
         }
     }
@@ -38373,6 +38421,97 @@ impl Workspace {
         .detach();
     }
 
+    /// Look for a workspace nothing has happened in, and offer to park it.
+    ///
+    /// Nine folders open and three of them are work you finished last week:
+    /// ⌥Tab walks through them anyway, and pausing one is a thing you have to
+    /// remember to do. This remembers. The workspace in front of you is
+    /// touched as it goes, so sitting in one keeps it out of this.
+    fn start_pause_poll(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(180)).await;
+            if this
+                .update(cx, |this, cx| {
+                    // the one you are looking at is in use by definition
+                    if let Some(p) = this.projects.get(this.active) {
+                        touch_ws_seen(&p.read(cx).root);
+                    }
+                    if this.pause_ask.is_some()
+                        || this.restart_at.is_some()
+                        || this.quit_busy.is_some()
+                        || this.projects.len() < 2
+                    {
+                        return;
+                    }
+                    let busy = this.busy_workspaces(cx);
+                    let now = now_secs() as i64;
+                    let seen = load_ws_seen();
+                    for (i, p) in this.projects.iter().enumerate() {
+                        if i == this.active || busy.contains(&i) {
+                            continue;
+                        }
+                        let s = p.read(cx);
+                        if s.ws_paused {
+                            continue;
+                        }
+                        match seen.get(&s.root.to_string_lossy().to_string()).copied() {
+                            // never recorded: start its clock rather than ask
+                            // about a workspace TIDE has only just started
+                            // keeping time on
+                            None => touch_ws_seen(&s.root),
+                            Some(at) if now - at >= PAUSE_AFTER => {
+                                this.pause_ask = Some(i);
+                                this.pause_focus_pending = true;
+                                cx.notify();
+                                return;
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                })
+                .is_err()
+            {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// Park it: ⌥Tab stops landing on it until it is resumed by hand.
+    fn pause_asked(&mut self, cx: &mut Context<Self>) {
+        let Some(i) = self.pause_ask.take() else { return };
+        if let Some(p) = self.projects.get(i).cloned() {
+            p.update(cx, |s, cx| {
+                if !s.ws_paused {
+                    s.toggle_pause(cx);
+                }
+            });
+        }
+        cx.notify();
+    }
+
+    /// Keep it in the rotation, and start its clock again: saying "I still
+    /// want this one" is the same answer as having opened it.
+    fn pause_kept(&mut self, cx: &mut Context<Self>) {
+        let Some(i) = self.pause_ask.take() else { return };
+        if let Some(p) = self.projects.get(i) {
+            touch_ws_seen(&p.read(cx).root);
+        }
+        cx.notify();
+    }
+
+    fn pause_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match ev.keystroke.key.as_str() {
+            "enter" => self.pause_asked(cx),
+            "escape" => {
+                self.pause_kept(cx);
+                self.focus_pending = true;
+                window.focus(&self.focus, cx);
+            }
+            _ => {}
+        }
+    }
+
     /// Start the new build and go. The one that comes up reopens what this one
     /// had open: with no arguments TIDE restores the last session, and with
     /// them it opens the same roots again.
@@ -38459,6 +38598,102 @@ impl Workspace {
 
     /// One row per still-working workspace, in the same shape ⌘E uses: number
     /// key-cap, state dot, folder icon, title + path, branch line.
+    /// The prompt that offers to park a workspace nothing has happened in.
+    fn render_pause_prompt(&self, i: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let p = self.projects.get(i)?;
+        let (name, root) = {
+            let s = p.read(cx);
+            (s.project_name(), s.root.clone())
+        };
+        let since = ws_seen_at(&root).map(|t| todo::age(t.max(0) as u64)).unwrap_or_default();
+        let folder = root
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default();
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(0x00000088))
+                .child(
+                    div()
+                        .w(px(460.))
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .bg(rgb(PANEL_BG))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .rounded_lg()
+                        .shadow_lg()
+                        .track_focus(&self.pause_focus)
+                        .on_key_down(cx.listener(Self::pause_key))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .font_family(ICON_FONT)
+                                        .text_size(px(13.))
+                                        .text_color(rgb(FOLDER_ICON))
+                                        .child(IC_FOLDER),
+                                )
+                                .child(
+                                    div()
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .text_size(px(14.))
+                                        .text_color(rgb(TEXT))
+                                        .child(format!("Park {name}?")),
+                                )
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(10.))
+                                        .text_color(rgb(LINE_NUMBER))
+                                        .child(folder),
+                                ),
+                        )
+                        .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(format!(
+                            "Nothing has happened in it since {since}: you haven't opened \
+                             it and its agent has had nothing to do. A parked workspace \
+                             stays open and keeps its session; \u{2325}Tab just stops \
+                             landing on it until you resume it.",
+                        )))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .pt_1()
+                                .child(div().flex_grow(1.0))
+                                .child(rc_button("pause-keep", "Keep it", false, false).on_click(
+                                    cx.listener(|this, _e, window, cx| {
+                                        this.pause_kept(cx);
+                                        this.focus_pending = true;
+                                        window.focus(&this.focus, cx);
+                                    }),
+                                ))
+                                .child(
+                                    rc_button("pause-ok", "Pause  \u{21a9}", true, false).on_click(
+                                        cx.listener(|this, _e, _w, cx| this.pause_asked(cx)),
+                                    ),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// The prompt that goes up when a build lands and nothing is working.
     fn render_restart_prompt(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -38839,6 +39074,13 @@ impl Render for Workspace {
                 window.focus(&self.restart_focus, cx);
             }
             root = root.child(self.render_restart_prompt(cx));
+        }
+
+        if let Some(i) = self.pause_ask {
+            if std::mem::take(&mut self.pause_focus_pending) {
+                window.focus(&self.pause_focus, cx);
+            }
+            root = root.children(self.render_pause_prompt(i, cx));
         }
 
         if self.switcher_open {
