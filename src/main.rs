@@ -41650,11 +41650,20 @@ fn print_spend(span: TokenSpan) {
     table("by what sent it", spend::by_kind(&rows), 20);
     table("by job", spend::by_job(&rows), 20);
     table("by workspace", spend::by_root(&rows), 12);
-    // what this log cannot see, said plainly, so a number read off it is not
-    // mistaken for the whole bill
-    println!(
-        "\n  Turns TIDE sent only. The reviewers run in sessions of their own and the\n           terminal panes are not TIDE's doing at all: `tide --tokens` counts both."
-    );
+    // what the numbers are, and what the log cannot see: this is a reading
+    // that gets pasted somewhere else to be read, so it carries its own key
+    for line in [
+        "",
+        "  weighted = in + 1.25 x cache written + 0.1 x cache read + 5 x out, at the",
+        "  published price ratios. An estimate of what a stretch of work was worth,",
+        "  not a bill. ctx/req is what an average request in those turns carried.",
+        "",
+        "  Turns TIDE sent only. The reviewers run in sessions of their own, and a",
+        "  terminal pane is not TIDE's doing at all: `tide --tokens` counts both.",
+        "  The log behind this is ~/.config/tide/spend.jsonl, one JSON line per turn.",
+    ] {
+        println!("{line}");
+    }
 }
 
 fn main() {
