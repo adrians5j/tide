@@ -5498,6 +5498,48 @@ fn pr_row_from(v: &serde_json::Value) -> Option<PrRow> {
     })
 }
 
+/// A civil date from days since 1970-01-01 (Howard Hinnant's algorithm, the
+/// other way round from `iso_secs`).
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// When something happened, at the detail the distance deserves: `14:32`
+/// today, `Thu 14:32` within the week, `6 Nov 14:32` further back. Local time.
+fn when_label(at: i64, now: i64, off: i64) -> String {
+    if at <= 0 {
+        return String::new();
+    }
+    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let local = at + off;
+    let hm = format!(
+        "{:02}:{:02}",
+        local.rem_euclid(86_400) / 3600,
+        local.rem_euclid(3600) / 60
+    );
+    let day = local.div_euclid(86_400);
+    match (now + off).div_euclid(86_400) - day {
+        0 => hm,
+        1..=6 => format!("{} {hm}", DAYS[day.rem_euclid(7) as usize]),
+        _ => {
+            let (_, m, d) = civil_from_days(day);
+            format!("{d} {} {hm}", MONTHS[(m - 1).clamp(0, 11) as usize])
+        }
+    }
+}
+
 /// `2026-10-09T07:21:04Z` as unix seconds. GitHub always answers in UTC with
 /// this exact shape, so a parser beats a date crate here.
 fn iso_secs(s: &str) -> u64 {
@@ -8660,6 +8702,8 @@ struct Storm {
     agent_focus: FocusHandle,        // focus for the dock (routes typing)
     agent_ctx: Option<(u64, u64)>,   // ACP usage_update: (context used, window)
     agent_sessions: Vec<(String, String)>, // resumable sessions: (id, title)
+    /// When each of them started and was last written to, off its log.
+    agent_session_at: HashMap<String, (i64, i64)>,
     /// The sessions TIDE opened for itself, read when the picker opens. Four
     /// reviewers a round pile up fast, and they are not what you came to the
     /// resume list for.
@@ -9387,6 +9431,7 @@ impl Storm {
             agent_focus: cx.focus_handle(),
             agent_ctx: None,
             agent_sessions: Vec::new(),
+            agent_session_at: HashMap::new(),
             agent_spawned: Vec::new(),
             agent_show_spawned: false,
             agent_autoresume: false,
@@ -26867,6 +26912,16 @@ impl Storm {
             }
             Sessions(list) => {
                 self.agent_sessions = list;
+                // when each one started and when it was last written to, off
+                // the logs. Read here rather than per frame: the picker is a
+                // live view and this is forty stats
+                self.agent_session_at = self
+                    .agent_sessions
+                    .iter()
+                    .filter_map(|(id, _)| {
+                        tokens::session_times(&self.root, id).map(|t| (id.clone(), t))
+                    })
+                    .collect();
                 // this answer was for the auto-resume, not the picker
                 if std::mem::take(&mut self.agent_autoresume) {
                     self.agent_resumed = true;
@@ -26874,10 +26929,16 @@ impl Storm {
                     // the newest session here is often a reviewer TIDE opened
                     // minutes ago; resuming into one of those drops you into a
                     // conversation you never had
+                    // by when it was last written to, not by the order the
+                    // adapter listed them in: after a day of resets at 250k
+                    // those differ, and the one you were in last is the point
                     let newest = self
                         .agent_sessions
                         .iter()
-                        .find(|(id, title)| sess::why(&spawned, id, title).is_none())
+                        .filter(|(id, title)| sess::why(&spawned, id, title).is_none())
+                        .max_by_key(|(id, _)| {
+                            self.agent_session_at.get(id).map(|(_, seen)| *seen).unwrap_or(0)
+                        })
                         .cloned();
                     if let Some((id, _)) = newest {
                         self.reset_agent_transcript();
@@ -31689,14 +31750,27 @@ impl Storm {
 
         // the resume list replaces the transcript while it's open
         let picker = self.agent_picker.then(|| {
-            // every row with the job that opened it, when TIDE opened it
-            let rows: Vec<(usize, &String, &String, Option<String>)> = self
+            // every row with the job that opened it, when TIDE opened it,
+            // and when its log was started and last written to
+            let now = now_secs() as i64;
+            let off = tokens::local_offset();
+            let mut rows: Vec<(usize, String, String, Option<String>, (i64, i64))> = self
                 .agent_sessions
                 .iter()
                 .enumerate()
-                .map(|(i, (id, title))| (i, id, title, sess::why(&self.agent_spawned, id, title)))
+                .map(|(i, (id, title))| {
+                    let at = self.agent_session_at.get(id).copied().unwrap_or((0, 0));
+                    (i, id.clone(), title.clone(), sess::why(&self.agent_spawned, id, title), at)
+                })
                 .collect();
-            let theirs = rows.iter().filter(|(.., why)| why.is_some()).count();
+            // newest first, by when it was last written to. The adapter's own
+            // order is near enough most of the time, and wrong exactly when it
+            // matters: after a day of resets at 250k, which of eight is the
+            // one you were in
+            rows.sort_by_key(|(i, .., (_, seen))| (std::cmp::Reverse(*seen), *i));
+            // the first of yours, which is the one "where was I" means
+            let latest = rows.iter().find(|(.., why, _)| why.is_none()).map(|(i, ..)| *i);
+            let theirs = rows.iter().filter(|(.., why, _)| why.is_some()).count();
             let mine = rows.len() - theirs;
             let show = self.agent_show_spawned;
             let mut col = div()
@@ -31747,11 +31821,23 @@ impl Storm {
                         )
                     }),
             );
-            for (i, id, title, why) in rows {
+            for (n, (i, id, title, why, (made, seen))) in rows.iter().enumerate() {
+                let (i, why) = (*i, why.clone());
                 if why.is_some() && !show {
                     continue;
                 }
                 let sid = id.clone();
+                let newest = latest == Some(i);
+                // started, and last written to. The second one is what "which
+                // was I in" means; the first is what "which is this" means
+                let line = match (when_label(*made, now, off), *seen) {
+                    (m, _) if m.is_empty() => id.chars().take(8).collect::<String>(),
+                    (m, s) => format!(
+                        "{}  \u{b7}  started {m}  \u{b7}  last {}",
+                        id.chars().take(8).collect::<String>(),
+                        todo::age(s.max(0) as u64),
+                    ),
+                };
                 col = col.child(
                     div()
                         .id(("agent-session", i))
@@ -31760,42 +31846,77 @@ impl Storm {
                         .cursor_pointer()
                         .hover(|s| s.bg(rgb(HOVER)))
                         .flex()
-                        .flex_col()
+                        .flex_row()
+                        .gap_2()
+                        // the position in the list, so eight sessions off one
+                        // afternoon can be told apart and talked about
                         .child(
                             div()
-                                .flex()
-                                .items_center()
-                                .gap_1p5()
-                                .child(
-                                    div()
-                                        .min_w(px(0.))
-                                        .text_size(px(12.))
-                                        // a reviewer's row is there to be
-                                        // walked past, not read
-                                        .text_color(rgb(match why.is_some() {
-                                            true => MUTED,
-                                            false => TEXT,
-                                        }))
-                                        .truncate()
-                                        .child(title.clone()),
-                                )
-                                .children(why.map(|w| {
-                                    div()
-                                        .flex_shrink_0()
-                                        .px_1()
-                                        .rounded_sm()
-                                        .border_1()
-                                        .border_color(rgb(BORDER))
-                                        .text_size(px(9.))
-                                        .text_color(rgb(LINE_NUMBER))
-                                        .child(w)
-                                })),
+                                .flex_shrink_0()
+                                .w(px(18.))
+                                .pt(px(2.))
+                                .font_family("Menlo")
+                                .text_size(px(10.))
+                                .text_color(rgb(if newest { COMMENT_MARK } else { LINE_NUMBER }))
+                                .child(format!("{:02}", n + 1)),
                         )
                         .child(
                             div()
-                                .text_size(px(10.))
-                                .text_color(rgb(LINE_NUMBER))
-                                .child(id.chars().take(8).collect::<String>()),
+                                .flex_grow(1.0)
+                                .min_w(px(0.))
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1p5()
+                                        .child(
+                                            div()
+                                                .min_w(px(0.))
+                                                .text_size(px(12.))
+                                                // a reviewer's row is there to be
+                                                // walked past, not read
+                                                .text_color(rgb(match why.is_some() {
+                                                    true => MUTED,
+                                                    false => TEXT,
+                                                }))
+                                                .truncate()
+                                                .child(title.clone()),
+                                        )
+                                        .children(why.map(|w| {
+                                            div()
+                                                .flex_shrink_0()
+                                                .px_1()
+                                                .rounded_sm()
+                                                .border_1()
+                                                .border_color(rgb(BORDER))
+                                                .text_size(px(9.))
+                                                .text_color(rgb(LINE_NUMBER))
+                                                .child(w)
+                                        }))
+                                        // the one you were in when you closed
+                                        // the app, which is the whole question
+                                        // this list is opened to answer
+                                        .when(newest, |d| {
+                                            d.child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .px_1()
+                                                    .rounded_sm()
+                                                    .bg(rgba((COMMENT_MARK << 8) | 0x22))
+                                                    .text_size(px(9.))
+                                                    .text_color(rgb(COMMENT_MARK))
+                                                    .child("latest"),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.))
+                                        .text_color(rgb(LINE_NUMBER))
+                                        .child(line),
+                                ),
                         )
                         .on_click(cx.listener(move |this, _e, _w, cx| {
                             this.resume_agent_session(sid.clone(), cx);
@@ -43584,6 +43705,16 @@ mod handoff_tests {
         assert!(a < b && b < c, "oldest first");
         assert!(out.contains("The last answer: last answer"));
         assert!(!out.contains("first answer"), "only the answer that still stands");
+    }
+
+    #[test]
+    fn a_time_is_written_at_the_detail_the_distance_deserves() {
+        // 2026-11-12 10:05 UTC, read in UTC
+        let at = 1_794_477_900;
+        assert_eq!(when_label(at, at, 0), "10:05", "today is the clock alone");
+        assert_eq!(when_label(at, at + 2 * 86_400, 0), "Thu 10:05", "this week, the day");
+        assert_eq!(when_label(at, at + 30 * 86_400, 0), "12 Nov 10:05", "older, the date");
+        assert!(when_label(0, at, 0).is_empty(), "no reading, no label");
     }
 
     #[test]

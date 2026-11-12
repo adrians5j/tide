@@ -305,20 +305,50 @@ pub fn day_label(hour: i64, offset: i64) -> String {
 /// project directory to look in first, since that is a name away; a session
 /// that was started somewhere else is found by looking through the rest.
 pub fn live_context(root: &Path, id: &str) -> Option<u64> {
+    last_context(&session_log(root, id)?)
+}
+
+/// Where Claude Code keeps one session's log. `root` says which project
+/// directory to look in first, since that is a name away; a session started
+/// somewhere else is found by looking through the rest.
+pub fn session_log(root: &Path, id: &str) -> Option<PathBuf> {
     if id.is_empty() {
         return None;
     }
     let dir = logs_dir()?;
     let named = dir.join(crate::usage::project_slug(root)).join(format!("{id}.jsonl"));
-    let path = match named.exists() {
-        true => named,
-        false => std::fs::read_dir(&dir)
-            .ok()?
-            .filter_map(Result::ok)
-            .map(|e| e.path().join(format!("{id}.jsonl")))
-            .find(|p| p.exists())?,
+    if named.exists() {
+        return Some(named);
+    }
+    std::fs::read_dir(&dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|e| e.path().join(format!("{id}.jsonl")))
+        .find(|p| p.exists())
+}
+
+/// When a session started and when it was last written to, as epoch seconds.
+///
+/// Both come off its log: the file is created with the session's first turn
+/// and appended to on every one after it. The adapter's session list carries
+/// neither, and after a day of resets at 250k a list of eight titles says
+/// nothing about which one you were in last.
+pub fn session_times(root: &Path, id: &str) -> Option<(i64, i64)> {
+    let m = std::fs::metadata(session_log(root, id)?).ok()?;
+    let secs = |t: std::io::Result<std::time::SystemTime>| {
+        t.ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
     };
-    last_context(&path)
+    let modified = secs(m.modified());
+    // a filesystem without birth times answers with the mtime, which is not a
+    // start time but is never later than one
+    let created = match secs(m.created()) {
+        0 => modified,
+        c => c.min(modified),
+    };
+    Some((created, modified))
 }
 
 /// The context on the last request in a log file. The tail is enough: one
