@@ -327,21 +327,24 @@ pub fn session_log(root: &Path, id: &str) -> Option<PathBuf> {
         .find(|p| p.exists())
 }
 
-/// When a session started and when it was last written to, as epoch seconds.
+/// When a session started and when its last turn was, as epoch seconds.
 ///
 /// Both come off its log: the file is created with the session's first turn
 /// and appended to on every one after it. The adapter's session list carries
 /// neither, and after a day of resets at 250k a list of eight titles says
 /// nothing about which one you were in last.
 pub fn session_times(root: &Path, id: &str) -> Option<(i64, i64)> {
-    let m = std::fs::metadata(session_log(root, id)?).ok()?;
+    let path = session_log(root, id)?;
+    let m = std::fs::metadata(&path).ok()?;
     let secs = |t: std::io::Result<std::time::SystemTime>| {
         t.ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0)
     };
-    let modified = secs(m.modified());
+    let mtime = secs(m.modified());
+    // the last turn, not the last write: see `last_turn_at`
+    let modified = last_turn_at(&path).unwrap_or(mtime);
     // a filesystem without birth times answers with the mtime, which is not a
     // start time but is never later than one
     let created = match secs(m.created()) {
@@ -349,6 +352,42 @@ pub fn session_times(root: &Path, id: &str) -> Option<(i64, i64)> {
         c => c.min(modified),
     };
     Some((created, modified))
+}
+
+/// When the last turn in a log was written, as epoch seconds.
+///
+/// The file's mtime is not that. When a session's process exits, Claude Code
+/// appends a `last-prompt` and a `cost-state` record, and neither carries a
+/// timestamp. A session nobody has said anything in since this morning gets
+/// its mtime set to whenever its process happened to shut down, which, when
+/// TIDE restarts, is a few seconds after the new instance starts asking which
+/// session to resume. That is how a session idle for an hour beat the live one
+/// by 26 seconds and got resumed in its place.
+///
+/// Only the tail is read: the last timestamped line is at the end of the file,
+/// and these logs run to megabytes.
+fn last_turn_at(path: &Path) -> Option<i64> {
+    const TAIL: u64 = 256 << 10;
+    let len = std::fs::metadata(path).ok()?.len();
+    let mut f = std::fs::File::open(path).ok()?;
+    let partial = len > TAIL;
+    if partial {
+        f.seek(SeekFrom::Start(len - TAIL)).ok()?;
+    }
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut f, &mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines = text.lines();
+    if partial {
+        lines.next(); // the seek lands mid-line
+    }
+    // the whole line is parsed rather than searched for a timestamp: a tool
+    // result quoting a file listing carries dates of its own, and the one that
+    // counts is the record's own top-level field
+    lines
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| epoch(v.get("timestamp")?.as_str()?))
+        .max()
 }
 
 /// The context on the last request in a log file. The tail is enough: one
@@ -754,6 +793,41 @@ mod tests {
         std::fs::write(&path, "{\"type\":\"queue-operation\"}\n").unwrap();
         assert_eq!(last_context(&path), None);
         assert_eq!(last_context(&dir.join("nope.jsonl")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The exit records Claude Code appends carry no timestamp, so the file's
+    /// mtime is minutes or hours later than anything that was said in it. The
+    /// resume picks the newest session by this number; it has to be the last
+    /// turn.
+    #[test]
+    fn the_exit_records_do_not_count_as_a_turn() {
+        let dir = std::env::temp_dir().join(format!("tide-turn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sess.jsonl");
+        let body = concat!(
+            r#"{"type":"user","timestamp":"2026-11-12T11:47:30.000Z","message":{"content":"hi"}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-11-12T11:47:34.682Z","message":{"content":"ok"}}"#,
+            "\n",
+            r#"{"type":"last-prompt","lastPrompt":"...","sessionId":"abc"}"#,
+            "\n",
+            r#"{"type":"cost-state","sessionId":"abc","totalCostUSD":17.6}"#,
+            "\n",
+        );
+        std::fs::write(&path, body).unwrap();
+        assert_eq!(last_turn_at(&path), epoch("2026-11-12T11:47:34.682Z"));
+        // a date quoted inside a tool result is not the record's own time
+        let quoted = format!(
+            "{}\n{}\n",
+            r#"{"type":"user","timestamp":"2026-11-12T11:47:30.000Z","message":{"content":"hi"}}"#,
+            r#"{"type":"user","timestamp":"2026-11-12T11:47:31.000Z","toolUseResult":{"file":{"timestamp":"2030-01-01T00:00:00.000Z"}}}"#,
+        );
+        std::fs::write(&path, quoted).unwrap();
+        assert_eq!(last_turn_at(&path), epoch("2026-11-12T11:47:31.000Z"));
+        // nothing timestamped in it at all: the caller falls back to the mtime
+        std::fs::write(&path, "{\"type\":\"cost-state\"}\n").unwrap();
+        assert_eq!(last_turn_at(&path), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

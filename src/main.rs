@@ -27140,7 +27140,7 @@ impl Storm {
                     // the newest session here is often a reviewer TIDE opened
                     // minutes ago; resuming into one of those drops you into a
                     // conversation you never had
-                    // by when it was last written to, not by the order the
+                    // by when its last turn was, not by the order the
                     // adapter listed them in: after a day of resets at 250k
                     // those differ, and the one you were in last is the point
                     let newest = self
