@@ -8834,6 +8834,12 @@ struct Storm {
     at_items: Vec<Mention>,
     /// The screenshot a right-click menu is open on.
     ctx_shot: Option<Arc<gpui::Image>>,
+    /// The picture viewer, open over everything: a batch of screenshots, the
+    /// one being read, and the keyboard.
+    shots: Option<ShotView>,
+    shots_focus: FocusHandle,
+    /// The viewer just opened; the next render takes the keyboard for it.
+    shots_focus_pending: bool,
     /// The tour this workspace is holding, if the agent has built one. One
     /// at a time, and only for as long as the app runs: a tour is of a pull
     /// request, and a new one replaces the last.
@@ -9505,6 +9511,9 @@ impl Storm {
             at_sel: 0,
             at_items: Vec::new(),
             ctx_shot: None,
+            shots: None,
+            shots_focus: cx.focus_handle(),
+            shots_focus_pending: false,
             tour: None,
             md_find: Field::default(),
             md_find_focus: cx.focus_handle(),
@@ -11451,6 +11460,12 @@ impl Storm {
             return;
         }
         if key != "escape" {
+            return;
+        }
+        // the picture viewer is over everything, so escape takes it first
+        if self.shots.is_some() {
+            self.shots = None;
+            cx.notify();
             return;
         }
         // the token panel is full-screen, so escape takes it before anything
@@ -17843,6 +17858,13 @@ impl Render for Storm {
         }
         if self.tokens_open {
             root = root.child(self.render_tokens(cx));
+        }
+        // the picture viewer goes over the lot, including the token panel
+        if self.shots.is_some() {
+            if std::mem::take(&mut self.shots_focus_pending) {
+                window.focus(&self.shots_focus, cx);
+            }
+            root = root.children(self.render_shots(window, cx));
         }
         // one bottom-right column, so a flash and the run toast stack instead of
         // landing on top of each other
@@ -27666,7 +27688,13 @@ impl Storm {
          and the picture lands in this transcript next to what you're saying \
          about it. Use it when you checked something in a browser and I'd \
          otherwise have to take your word for it: a page you fixed, a state you \
-         reproduced, a layout that looks wrong. `agent-browser console` and \
+         reproduced, a layout that looks wrong. \
+         Several in a row with nothing said between them read as one batch: \
+         TIDE draws them as a strip of thumbnails and opens them in a viewer \
+         with arrow keys, and the `note` is what labels each one in it. So \
+         send a batch when the pictures belong together, give every one a \
+         note, and put the prose after the last of them rather than between \
+         them. `agent-browser console` and \
          `agent-browser errors` are worth reading before you say a page works. \
          The local sign-in details are above.\n\n\
          Evidence, not a description. When you tell me something works, is \
@@ -30194,6 +30222,335 @@ impl Storm {
         job_at(&self.job_turns, ix)
     }
 
+    /// The run of screenshots `ix` belongs to, as `(first, last)` inclusive.
+    ///
+    /// A batch is however many pictures arrived with nothing said between
+    /// them. The agent sends them one call at a time, so "a batch" is not
+    /// something the wire says: it is what the transcript shows.
+    fn shot_run(&self, ix: usize) -> (usize, usize) {
+        shot_run(&self.agent_msgs, ix)
+    }
+
+    /// Open the viewer on one batch, at the picture that was clicked.
+    fn open_shots(&mut self, first: usize, last: usize, at: usize, cx: &mut Context<Self>) {
+        let pics: Vec<ShotPic> = (first..=last)
+            .filter_map(|i| match self.agent_msgs.get(i) {
+                Some(AgentMsg::Shot { note, image, dims, path }) => Some(ShotPic {
+                    note: note.clone(),
+                    image: image.clone(),
+                    dims: *dims,
+                    path: path.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        if pics.is_empty() {
+            return;
+        }
+        self.shots = Some(ShotView { at: at.saturating_sub(first).min(pics.len() - 1), pics });
+        self.shots_focus_pending = true;
+        cx.notify();
+    }
+
+    /// Step through the batch. It wraps: five pictures and a right arrow is a
+    /// loop, not a dead end.
+    fn shots_step(&mut self, by: i32, cx: &mut Context<Self>) {
+        let Some(v) = self.shots.as_mut() else { return };
+        let n = v.pics.len() as i32;
+        v.at = (v.at as i32 + by).rem_euclid(n.max(1)) as usize;
+        cx.notify();
+    }
+
+    fn shots_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        match ev.keystroke.key.as_str() {
+            "left" | "up" => self.shots_step(-1, cx),
+            "right" | "down" | "space" => self.shots_step(1, cx),
+            "escape" => {
+                self.shots = None;
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    /// A batch of screenshots as a strip of thumbnails, each one a click away
+    /// from filling the window.
+    fn shot_strip(&mut self, first: usize, last: usize, cx: &mut Context<Self>) -> AnyElement {
+        let n = last - first + 1;
+        let mut row = div().flex().flex_row().flex_wrap().gap_2();
+        for i in first..=last {
+            let Some(AgentMsg::Shot { note, image, dims, .. }) = self.agent_msgs.get(i) else {
+                continue;
+            };
+            let (note, image, dims) = (note.clone(), image.clone(), *dims);
+            let (w, h) = match dims.filter(|(w, h)| *w > 0. && *h > 0.) {
+                Some((w, h)) => shot_box(w, h, 148., 96.),
+                None => (148., 96.),
+            };
+            row = row.child(
+                div()
+                    .id(("shot-thumb", i))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .w(px(148.))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .w(px(148.))
+                            .h(px(96.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .overflow_hidden()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .hover(|s| s.border_color(rgb(ACCENT)))
+                            .child(gpui::img(image).w(px(w)).h(px(h))),
+                    )
+                    // what the picture shows, under it. A strip of unlabelled
+                    // thumbnails is a worse version of the column it replaced
+                    .child(
+                        div()
+                            .w(px(148.))
+                            .truncate()
+                            .text_size(px(9.))
+                            .text_color(rgb(LINE_NUMBER))
+                            .child(match note.trim().is_empty() {
+                                true => format!("{}", i - first + 1),
+                                false => note.clone(),
+                            }),
+                    )
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                        this.open_shots(first, last, i, cx)
+                    })),
+            );
+        }
+        div()
+            .id(("shot-batch", first))
+            .px_3()
+            .py_1()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(10.))
+                    .text_color(rgb(MUTED))
+                    .child(div().font_family(ICON_FONT).text_size(px(10.)).child(IC_BROWSER))
+                    .child(format!("{n} screenshots"))
+                    .child(
+                        div()
+                            .text_color(rgb(LINE_NUMBER))
+                            .child("click one to open the batch"),
+                    ),
+            )
+            .child(row)
+            .into_any_element()
+    }
+
+    /// The viewer: one picture filling the window, the rest of its batch down
+    /// the side, and what the agent said each one shows.
+    fn render_shots(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let v = self.shots.as_ref()?;
+        let pic = v.pics.get(v.at)?;
+        let win = window.viewport_size();
+        // the strip down the right and the chrome around the picture, taken
+        // off before the picture is asked how big it can be
+        let max_w = (f32::from(win.width) - 260.).max(240.);
+        let max_h = (f32::from(win.height) - 150.).max(200.);
+        let img = match pic.dims.filter(|(w, h)| *w > 0. && *h > 0.) {
+            Some((w, h)) => {
+                let (w, h) = shot_box(w, h, max_w, max_h);
+                gpui::img(pic.image.clone()).w(px(w)).h(px(h))
+            }
+            None => gpui::img(pic.image.clone()).max_w(px(max_w)).max_h(px(max_h)),
+        };
+        let n = v.pics.len();
+        let at = v.at;
+
+        let mut strip = div()
+            .id("shot-strip")
+            .w(px(168.))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .pr_1()
+            .overflow_y_scroll();
+        for (i, p) in v.pics.iter().enumerate() {
+            let here = i == at;
+            let (w, h) = match p.dims.filter(|(w, h)| *w > 0. && *h > 0.) {
+                Some((w, h)) => shot_box(w, h, 152., 92.),
+                None => (152., 92.),
+            };
+            strip = strip.child(
+                div()
+                    .id(("shot-side", i))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .w(px(156.))
+                            .h(px(96.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .overflow_hidden()
+                            .border_1()
+                            .border_color(rgb(if here { ACCENT } else { BORDER }))
+                            .when(!here, |d| d.opacity(0.65))
+                            .child(gpui::img(p.image.clone()).w(px(w)).h(px(h))),
+                    )
+                    .child(
+                        div()
+                            .w(px(156.))
+                            .truncate()
+                            .text_size(px(9.))
+                            .text_color(rgb(if here { TEXT } else { LINE_NUMBER }))
+                            .child(match p.note.trim().is_empty() {
+                                true => format!("{}", i + 1),
+                                false => p.note.clone(),
+                            }),
+                    )
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                        if let Some(v) = this.shots.as_mut() {
+                            v.at = i;
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+
+        let arrow = |id: &'static str, glyph: &'static str, by: i32| {
+            div()
+                .id(id)
+                .w(px(28.))
+                .h(px(28.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .cursor_pointer()
+                .text_size(px(15.))
+                .text_color(rgb(MUTED))
+                .border_1()
+                .border_color(rgb(BORDER))
+                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                .child(glyph)
+                .on_click(cx.listener(move |this, _e, _w, cx| this.shots_step(by, cx)))
+        };
+        let name = pic
+            .path
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        Some(
+            div()
+                .id("shots-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(rgba(0x000000e0))
+                .flex()
+                .flex_col()
+                .track_focus(&self.shots_focus)
+                .on_key_down(cx.listener(Self::shots_key))
+                // a click on the backdrop puts it away, the way every other
+                // picture viewer does
+                .on_click(cx.listener(|this, _e, _w, cx| {
+                    this.shots = None;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .px_4()
+                        .py_2()
+                        .flex_shrink_0()
+                        .text_size(px(11.))
+                        .text_color(rgb(MUTED))
+                        .child(div().flex_shrink_0().child(format!("{} of {n}", at + 1)))
+                        .child(div().flex_shrink_0().text_color(rgb(LINE_NUMBER)).child(name))
+                        .child(div().flex_grow(1.0))
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_color(rgb(LINE_NUMBER))
+                                .child("\u{2190} \u{2192} to move  \u{b7}  esc to close"),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_grow(1.0)
+                        .min_h(px(0.))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_3()
+                        .px_4()
+                        .child(arrow("shot-prev", "\u{2039}", -1))
+                        .child(
+                            // the picture, and under it what it shows
+                            div()
+                                .flex_grow(1.0)
+                                .min_w(px(0.))
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap_2()
+                                // clicks on the picture are not clicks on the
+                                // backdrop, which closes
+                                .on_mouse_down(MouseButton::Left, |_e, _w, cx| {
+                                    cx.stop_propagation()
+                                })
+                                .child(
+                                    div()
+                                        .rounded_md()
+                                        .overflow_hidden()
+                                        .border_1()
+                                        .border_color(rgb(BORDER))
+                                        .child(img),
+                                )
+                                .child(
+                                    div()
+                                        .max_w(px(max_w))
+                                        .text_size(px(12.))
+                                        .text_color(rgb(TEXT))
+                                        .child(match pic.note.trim().is_empty() {
+                                            true => "no description".to_string(),
+                                            false => pic.note.clone(),
+                                        }),
+                                ),
+                        )
+                        .child(arrow("shot-next", "\u{203a}", 1))
+                        .child(
+                            div()
+                                .h_full()
+                                .py_2()
+                                .flex()
+                                .on_mouse_down(MouseButton::Left, |_e, _w, cx| {
+                                    cx.stop_propagation()
+                                })
+                                .child(strip),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// One row of the transcript: a message, the "thinking" line under the
     /// last one, or a prompt still sitting in the queue.
     fn agent_row(
@@ -30243,6 +30600,17 @@ impl Storm {
             if let AgentMsg::Shot { note, image, path, dims } = m {
                 let (note, image, path, dims) =
                     (note.clone(), image.clone(), path.clone(), *dims);
+                // several in a row are one batch, and a batch is a strip of
+                // thumbnails rather than a column you scroll through. The
+                // whole strip is drawn on the first of them; the rest of the
+                // run keeps its row in the list and draws nothing
+                let (first, last) = this.shot_run(ix);
+                if last > first {
+                    if ix != first {
+                        return div().into_any_element();
+                    }
+                    return this.shot_strip(first, last, cx);
+                }
                 let shot_w = this.shot_width();
                 let (img_ctx, path_ctx) = (image.clone(), path.clone());
                 return div()
@@ -32292,6 +32660,39 @@ fn summary_card(title: &str, text: &str) -> Div {
 /// So: fit the picture's own pixels into `max_w` (the pane) and a 720px ceiling,
 /// keeping its shape, and give the element both numbers. The frame is then the
 /// picture, with nothing around it.
+/// The run of screenshots `ix` belongs to, as `(first, last)` inclusive.
+/// Anything that is not a screenshot ends the run, which is what makes a
+/// batch a batch: pictures with nothing said between them.
+fn shot_run(msgs: &[AgentMsg], ix: usize) -> (usize, usize) {
+    let shot = |i: usize| matches!(msgs.get(i), Some(AgentMsg::Shot { .. }));
+    let mut first = ix;
+    while first > 0 && shot(first - 1) {
+        first -= 1;
+    }
+    let mut last = ix;
+    while shot(last + 1) {
+        last += 1;
+    }
+    (first, last)
+}
+
+/// One picture out of a batch, held by the viewer. The same four fields
+/// `AgentMsg::Shot` carries; cloned when the viewer opens so switching tabs
+/// underneath it can't move the ground.
+#[derive(Clone)]
+struct ShotPic {
+    note: String,
+    image: Arc<gpui::Image>,
+    dims: Option<(f32, f32)>,
+    path: PathBuf,
+}
+
+/// The screenshot viewer: a batch of pictures and which one is up.
+struct ShotView {
+    pics: Vec<ShotPic>,
+    at: usize,
+}
+
 fn shot_img(image: Arc<gpui::Image>, dims: Option<(f32, f32)>, max_w: f32) -> gpui::Img {
     let img = gpui::img(image);
     let Some((w, h)) = dims.filter(|(w, h)| *w > 0. && *h > 0.) else {
@@ -43902,6 +44303,33 @@ mod handoff_tests {
         assert!(a < b && b < c, "oldest first");
         assert!(out.contains("The last answer: last answer"));
         assert!(!out.contains("first answer"), "only the answer that still stands");
+    }
+
+    fn shot(note: &str) -> AgentMsg {
+        AgentMsg::Shot {
+            note: note.into(),
+            image: Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, Vec::new())),
+            path: PathBuf::from("/tmp/a.png"),
+            dims: None,
+        }
+    }
+
+    #[test]
+    fn pictures_with_nothing_between_them_are_one_batch() {
+        let msgs = vec![
+            AgentMsg::Agent("here they are".into()),
+            shot("one"),
+            shot("two"),
+            shot("three"),
+            AgentMsg::Agent("and that is all".into()),
+            shot("alone"),
+        ];
+        // every picture in the run answers with the same run
+        for ix in 1..=3 {
+            assert_eq!(shot_run(&msgs, ix), (1, 3), "from {ix}");
+        }
+        // a word between them ends it, and one on its own is a run of one
+        assert_eq!(shot_run(&msgs, 5), (5, 5));
     }
 
     #[test]
