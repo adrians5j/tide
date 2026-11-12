@@ -102,7 +102,7 @@ actions!(
         ShowProjects, PushDialog, RunCommand, NewProject, FetchRemotes, PullRemote, WipPush, RunBuild,
         NewScratch, ToggleAgent, GitLog, SetWsTitle, TodoList, WalkNext, WalkPrev, RefreshPr, AddComment, ShowComments, SendComments,
         QuitApp, ToggleMdPreview, QuoteAgentSel, PrScreen,
-        MdFind, SendElsewhere, WsHistory
+        MdFind, SendElsewhere, WsHistory, NewAgentTab, NewAgentTabCtx
     ]
 );
 
@@ -129,8 +129,10 @@ enum AgentMsg {
     Shot { note: String, image: Arc<gpui::Image>, path: PathBuf, dims: Option<(f32, f32)> },
     /// The first row of a session TIDE opened for you rather than one you
     /// asked for: it says so, says what was carried across, and carries the id
-    /// of the conversation it left, so that one is a click away.
-    Fresh { prev: Option<String> },
+    /// of the conversation it left, so that one is a click away. `tab` when it
+    /// is a tab you opened beside the last one rather than a reset of it — the
+    /// conversation it came from is still there, one click along the strip.
+    Fresh { prev: Option<String>, tab: bool },
     /// A tool call the agent ran: title (for Bash, the command itself), latest
     /// status, what the adapter said about it (a description before it runs, the
     /// output after), and when it started, so a long one can show its age.
@@ -7127,6 +7129,86 @@ struct FileRef {
 /// the branch, gathered in parallel and handed to the main thread when they're
 /// all done. Each has its own adapter process, so nothing they do touches the
 /// conversation you're in.
+/// One conversation in the agent pane, while it is not the one on screen.
+///
+/// Everything the pane draws reads Storm's own `agent_*` fields: one
+/// transcript, one composer, one adapter. A tab is that whole bundle, parked
+/// here until you come back to it, and `swap_conv` exchanges the two. The
+/// alternative was an index threaded through every one of the two hundred
+/// places that touch `agent_msgs`.
+#[derive(Default)]
+struct Conv {
+    /// This tab's own adapter. A second conversation is a second `npx`
+    /// process, the way a reviewer is: the protocol carries one session per
+    /// connection, so two live sessions means two connections.
+    acp: Option<Arc<acp::Acp>>,
+    msgs: Vec<AgentMsg>,
+    queue: Vec<Queued>,
+    input: Field,
+    list: Option<gpui::ListState>,
+    list_len: usize,
+    cur: Option<usize>,
+    cur_thought: Option<usize>,
+    busy: bool,
+    ctx: Option<(u64, u64)>,
+    context: Option<u64>,
+    title: Option<String>,
+    state: Option<AgentState>,
+    briefed: bool,
+    ghost: Option<String>,
+    hist: Option<usize>,
+    mentions: HashMap<String, String>,
+    imgs: Vec<PastedImage>,
+    img_seq: usize,
+    pastes: HashMap<usize, String>,
+    paste_seq: usize,
+    job_turns: Vec<JobTurn>,
+    job_next: Option<String>,
+    turn_start: Option<std::time::Instant>,
+    sel: Option<(usize, usize, usize)>,
+    sel_ch: Option<(usize, usize, usize, usize, usize)>,
+    sel_anchor: Option<(usize, usize, usize)>,
+    resumed: bool,
+    autoresume: bool,
+    fresh_hint_off: bool,
+    fresh_pending: bool,
+    /// What goes in front of this tab's first question: the workspace, the
+    /// branch, the pull request and the last few questions from the tab it was
+    /// opened beside. `None` in a tab opened empty.
+    handoff: Option<String>,
+}
+
+impl Conv {
+    /// A tab with nothing in it: its own composer, its own scroll, and nothing
+    /// to resume into. Opening a tab is a choice to start something, not a
+    /// restart that lost a session.
+    fn empty() -> Self {
+        Self {
+            input: Field::multiline(),
+            list: Some(gpui::ListState::new(0, gpui::ListAlignment::Bottom, px(600.))),
+            resumed: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// What a conversation tab is called: the adapter's title for the session once
+/// it has one, else where it sits in the strip.
+fn conv_label(title: Option<&str>, i: usize) -> String {
+    match title.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => {
+            let short: String = t.chars().take(18).collect();
+            if short.chars().count() < t.chars().count() {
+                format!("{}\u{2026}", short.trim_end())
+            } else {
+                short
+            }
+        }
+        None if i == 0 => "Main".to_string(),
+        None => format!("Tab {}", i + 1),
+    }
+}
+
 struct Reviewer {
     name: &'static str,
     acp: Arc<acp::Acp>,
@@ -8852,6 +8934,15 @@ struct Storm {
     reviewers: Vec<Reviewer>,
     /// Which tab the pane is showing: 0 is the conversation, 1.. a reviewer.
     agent_tab: usize,
+    /// Every conversation open in this pane. The one on screen is held in the
+    /// `agent_*` fields instead, so its slot here is empty until you switch
+    /// away from it.
+    convs: Vec<Conv>,
+    /// Which of them that is.
+    conv: usize,
+    /// The handoff waiting to go in front of this conversation's first
+    /// question, set when the tab was opened with the last one's bearings.
+    agent_handoff: Option<String>,
     /// `@token` → what the agent is sent in its place, for every mention picked
     /// since the composer was last cleared.
     agent_mentions: HashMap<String, String>,
@@ -9470,6 +9561,9 @@ impl Storm {
             tour_jump: None,
             reviewers: Vec::new(),
             agent_tab: 0,
+            convs: vec![Conv::default()],
+            conv: 0,
+            agent_handoff: None,
             agent_mentions: HashMap::new(),
             agent_jump_open: false,
             agent_jump_query: Field::default(),
@@ -11015,8 +11109,10 @@ impl Storm {
             .iter()
             .flat_map(|t| t.terminals())
             .filter_map(|t| self.pane_state(&t).map(|(s, m)| (s, m.to_string())))
-            // the ACP panel counts as one more agent in this workspace
+            // the ACP panel counts as one more agent in this workspace —
+            // one per tab, since a tab you are not looking at is still working
             .chain(self.acp_state.map(|s| (s, String::new())))
+            .chain(self.convs.iter().filter_map(|c| c.state).map(|s| (s, String::new())))
             .max_by_key(|(s, _)| s.priority())
             // nothing live to report → fall back to the persisted idle marker,
             // which is how a workspace marked idle elsewhere shows up here
@@ -27093,7 +27189,7 @@ impl Storm {
         self.new_agent_session(cx);
         // the pane going empty is not an explanation. This says what happened,
         // what went across, and where the conversation it left has gone
-        self.agent_msgs.push(AgentMsg::Fresh { prev });
+        self.agent_msgs.push(AgentMsg::Fresh { prev, tab: false });
         self.send_agent_prompt_by(prompt, label.or(Some(text)), Sender::You, cx);
     }
 
@@ -27137,6 +27233,160 @@ impl Storm {
         cx.notify();
     }
 
+    /// Exchange the pane's live state with tab `i`'s.
+    ///
+    /// Called twice it leaves everything where it started, which is how a
+    /// background tab's events are folded into the right transcript: swap it
+    /// in, apply them, swap it back.
+    fn swap_conv(&mut self, i: usize) {
+        if i >= self.convs.len() {
+            return;
+        }
+        let mut c = std::mem::take(&mut self.convs[i]);
+        std::mem::swap(&mut self.acp, &mut c.acp);
+        std::mem::swap(&mut self.agent_msgs, &mut c.msgs);
+        std::mem::swap(&mut self.agent_queue, &mut c.queue);
+        std::mem::swap(&mut self.agent_input, &mut c.input);
+        std::mem::swap(&mut self.agent_list_len, &mut c.list_len);
+        std::mem::swap(&mut self.agent_cur, &mut c.cur);
+        std::mem::swap(&mut self.agent_cur_thought, &mut c.cur_thought);
+        std::mem::swap(&mut self.agent_busy, &mut c.busy);
+        std::mem::swap(&mut self.agent_ctx, &mut c.ctx);
+        std::mem::swap(&mut self.agent_context, &mut c.context);
+        std::mem::swap(&mut self.agent_title, &mut c.title);
+        std::mem::swap(&mut self.acp_state, &mut c.state);
+        std::mem::swap(&mut self.agent_briefed, &mut c.briefed);
+        std::mem::swap(&mut self.agent_ghost, &mut c.ghost);
+        std::mem::swap(&mut self.agent_hist, &mut c.hist);
+        std::mem::swap(&mut self.agent_mentions, &mut c.mentions);
+        std::mem::swap(&mut self.agent_imgs, &mut c.imgs);
+        std::mem::swap(&mut self.agent_img_seq, &mut c.img_seq);
+        std::mem::swap(&mut self.agent_pastes, &mut c.pastes);
+        std::mem::swap(&mut self.agent_paste_seq, &mut c.paste_seq);
+        std::mem::swap(&mut self.job_turns, &mut c.job_turns);
+        std::mem::swap(&mut self.job_next, &mut c.job_next);
+        std::mem::swap(&mut self.agent_turn_start, &mut c.turn_start);
+        std::mem::swap(&mut self.agent_sel, &mut c.sel);
+        std::mem::swap(&mut self.agent_sel_ch, &mut c.sel_ch);
+        std::mem::swap(&mut self.agent_sel_anchor, &mut c.sel_anchor);
+        std::mem::swap(&mut self.agent_resumed, &mut c.resumed);
+        std::mem::swap(&mut self.agent_autoresume, &mut c.autoresume);
+        std::mem::swap(&mut self.fresh_hint_off, &mut c.fresh_hint_off);
+        std::mem::swap(&mut self.fresh_pending, &mut c.fresh_pending);
+        std::mem::swap(&mut self.agent_handoff, &mut c.handoff);
+        // the scroll position belongs to the transcript it was taken on
+        let list = c
+            .list
+            .take()
+            .unwrap_or_else(|| gpui::ListState::new(0, gpui::ListAlignment::Bottom, px(600.)));
+        c.list = Some(std::mem::replace(&mut self.agent_list, list));
+        self.convs[i] = c;
+    }
+
+    /// Show conversation `i`. The one you were reading keeps its place: its
+    /// transcript, its scroll, whatever was half-typed in its composer, and
+    /// the turn it has running.
+    fn switch_conv(&mut self, i: usize, cx: &mut Context<Self>) {
+        if i == self.conv || i >= self.convs.len() {
+            self.agent_tab = 0;
+            cx.notify();
+            return;
+        }
+        self.swap_conv(self.conv);
+        self.swap_conv(i);
+        self.conv = i;
+        self.agent_tab = 0;
+        self.agent_picker = false;
+        self.agent_jump_open = false;
+        cx.notify();
+    }
+
+    /// Another conversation, in a tab of its own.
+    ///
+    /// `with_context` puts the same handoff a fresh session gets in front of
+    /// its first question: the workspace, the branch, the pull request and the
+    /// last few questions asked in the tab you opened it beside. The tab you
+    /// came from keeps running — a second question doesn't have to wait for
+    /// the first one to finish answering.
+    fn new_conv(&mut self, with_context: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // read before the swap: `fresh_handoff` reads the transcript that is
+        // about to be parked
+        let handoff = with_context.then(|| self.fresh_handoff());
+        self.swap_conv(self.conv);
+        self.convs.push(Conv::empty());
+        self.conv = self.convs.len() - 1;
+        self.swap_conv(self.conv);
+        if handoff.is_some() {
+            // an empty pane is not an explanation of what came across
+            self.agent_msgs.push(AgentMsg::Fresh { prev: None, tab: true });
+        }
+        self.agent_handoff = handoff;
+        self.agent_tab = 0;
+        self.agent_picker = false;
+        self.agent_jump_open = false;
+        self.ensure_acp(cx);
+        // its adapter is a second `npx` boot: the pane says it is coming up
+        // rather than sitting there empty for a second and a half
+        self.start_boot_spinner(cx);
+        // opened from the strip with the caret somewhere else: a tab you have
+        // to click into before you can type in it is half a tab
+        window.focus(&self.agent_focus, cx);
+        cx.notify();
+    }
+
+    /// Close conversation `i` and the adapter behind it. The last one stays:
+    /// a pane with no conversation in it has nothing to show.
+    fn close_conv(&mut self, i: usize, cx: &mut Context<Self>) {
+        if self.convs.len() < 2 || i >= self.convs.len() {
+            return;
+        }
+        if i == self.conv {
+            // step off it first, so the live fields belong to the tab that
+            // stays rather than to the one being thrown away
+            let next = if i + 1 < self.convs.len() { i + 1 } else { i - 1 };
+            self.switch_conv(next, cx);
+        }
+        let c = self.convs.remove(i);
+        if let Some(acp) = c.acp {
+            acp.shutdown();
+        }
+        if self.conv > i {
+            self.conv -= 1;
+        }
+        cx.notify();
+    }
+
+    /// Fold every conversation's events into its own transcript. Returns false
+    /// when there is no adapter left anywhere, which stops the poll.
+    fn drain_agent_events(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut alive = false;
+        if let Some(acp) = self.acp.clone() {
+            alive = true;
+            if acp.dirty() {
+                for ev in acp.drain() {
+                    self.apply_acp_event(ev);
+                }
+                cx.notify();
+            }
+        }
+        for i in 0..self.convs.len() {
+            let Some(acp) = self.convs[i].acp.clone() else { continue };
+            alive = true;
+            if !acp.dirty() {
+                continue;
+            }
+            // the events belong to that tab's transcript, not to the one on
+            // screen: stand in it for as long as it takes to fold them in
+            self.swap_conv(i);
+            for ev in acp.drain() {
+                self.apply_acp_event(ev);
+            }
+            self.swap_conv(i);
+            cx.notify();
+        }
+        alive
+    }
+
     /// Spawn the ACP adapter on first use and start the event drain poll.
     fn ensure_acp(&mut self, cx: &mut Context<Self>) {
         if self.acp.is_none() {
@@ -27162,16 +27412,7 @@ impl Storm {
     fn start_acp_poll(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_millis(80)).await;
-            let alive = this.update(cx, |this, cx| {
-                let Some(acp) = this.acp.clone() else { return false };
-                if acp.dirty() {
-                    for ev in acp.drain() {
-                        this.apply_acp_event(ev);
-                    }
-                    cx.notify();
-                }
-                true
-            });
+            let alive = this.update(cx, |this, cx| this.drain_agent_events(cx));
             if !matches!(alive, Ok(true)) {
                 break;
             }
@@ -28131,6 +28372,13 @@ impl Storm {
         let (imgs, kept) = split_images(self.agent_imgs.drain(..).collect());
         // the transcript shows your words; the wire carries the briefing too
         let shown = label.unwrap_or_else(|| text.clone());
+        // a tab opened with the last conversation's bearings carries them in
+        // front of its first question, and only that one: after it, the
+        // conversation is its own
+        let text = match self.agent_handoff.take() {
+            Some(h) => format!("{h}\n\n{text}"),
+            None => text,
+        };
         // …and the adapter replays the wire, so how this reads in the pane is
         // written down now or lost at the next restart
         jobs::remember(&text, &shown, job.as_deref().unwrap_or_default(), by == Sender::Tide);
@@ -30592,8 +30840,9 @@ impl Storm {
                     .into_any_element();
             }
             // the line a fresh session opens with
-            if let AgentMsg::Fresh { prev } = m {
+            if let AgentMsg::Fresh { prev, tab } = m {
                 let prev = prev.clone();
+                let head = if *tab { "New tab" } else { "New session" };
                 return div()
                     .px_3()
                     .py_1()
@@ -30610,9 +30859,7 @@ impl Storm {
                             .text_color(rgb(COMMENT_MARK))
                             .child(IC_AGENT),
                     )
-                    .child(
-                        div().flex_shrink_0().text_color(rgb(COMMENT_MARK)).child("New session"),
-                    )
+                    .child(div().flex_shrink_0().text_color(rgb(COMMENT_MARK)).child(head))
                     .child(div().flex_grow(1.0).min_w(px(0.)).truncate().child(
                         "the branch, the pull request and the last few questions came across",
                     ))
@@ -30908,6 +31155,12 @@ impl Storm {
         let Queued { text, label, imgs, by, job } = self.agent_queue.remove(0);
         if let Some(acp) = self.acp.clone() {
             let shown = label.unwrap_or_else(|| text.clone());
+            // held before it could carry the tab's handoff (the window was
+            // spent, or a turn was running): it still goes in front of it
+            let text = match self.agent_handoff.take() {
+                Some(h) => format!("{h}\n\n{text}"),
+                None => text,
+            };
             jobs::remember(&text, &shown, job.as_deref().unwrap_or_default(), by == Sender::Tide);
             let sent = if self.agent_briefed {
                 text.clone()
@@ -30928,12 +31181,14 @@ impl Storm {
         }
     }
 
-    /// The tab strip at the top of the agent pane: the conversation, then a tab
-    /// per reviewer while one is working (and after, until you close it).
+    /// The tab strip at the top of the agent pane: a tab per conversation,
+    /// then one per reviewer while one is working (and after, until you close
+    /// it), and at the end the two ways to open another conversation.
+    ///
+    /// It is drawn even when there is only one conversation. A tab strip you
+    /// can't see is a feature nobody uses, and the two buttons at its end are
+    /// where the second conversation comes from.
     fn render_agent_tabs(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        if self.reviewers.is_empty() {
-            return None;
-        }
         let mut strip = div()
             .h(px(26.))
             .flex_shrink_0()
@@ -30945,24 +31200,68 @@ impl Storm {
             .bg(rgb(PANEL_BG))
             .border_b_1()
             .border_color(rgb(BORDER))
-            .text_size(px(11.))
-            .child(
+            .overflow_hidden()
+            .text_size(px(11.));
+        // one tab per conversation. The one on screen reads its title and its
+        // state off the live fields; the rest carry their own
+        let many = self.convs.len() > 1;
+        for i in 0..self.convs.len() {
+            let live = i == self.conv;
+            let (title, busy) = if live {
+                (self.agent_title.as_deref(), self.agent_busy)
+            } else {
+                (self.convs[i].title.as_deref(), self.convs[i].busy)
+            };
+            let on = live && self.agent_tab == 0;
+            let label = conv_label(title, i);
+            strip = strip.child(
                 div()
-                    .id("agent-tab-main")
+                    .id(("agent-conv", i))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
                     .px_2()
                     .py(px(2.))
                     .rounded_md()
                     .cursor_pointer()
-                    .when(self.agent_tab == 0, |d| d.bg(rgb(SELECTED_BG)).text_color(rgb(SEL_TEXT)))
-                    .when(self.agent_tab != 0, |d| {
+                    .when(on, |d| d.bg(rgb(SELECTED_BG)).text_color(rgb(SEL_TEXT)))
+                    .when(!on, |d| {
                         d.text_color(rgb(MUTED)).hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
                     })
-                    .child("Main")
-                    .on_click(cx.listener(|this, _e, _w, cx| {
-                        this.agent_tab = 0;
-                        cx.notify();
-                    })),
+                    // a turn running in a tab you are not watching is the one
+                    // thing the strip has to say on its own
+                    .when(busy, |d| {
+                        d.child(
+                            div()
+                                .w(px(6.))
+                                .h(px(6.))
+                                .rounded_full()
+                                .flex_shrink_0()
+                                .bg(rgb(ACCENT)),
+                        )
+                    })
+                    .child(label)
+                    .when(many, |d| {
+                        d.child(
+                            div()
+                                .id(("agent-conv-close", i))
+                                .px(px(2.))
+                                .text_size(px(10.))
+                                .text_color(rgb(LINE_NUMBER))
+                                .hover(|s| s.text_color(rgb(GIT_DELETED)))
+                                .child("\u{2715}")
+                                .on_mouse_down(MouseButton::Left, |_e, _w, cx| {
+                                    cx.stop_propagation()
+                                })
+                                .on_click(cx.listener(move |this, _e, _w, cx| {
+                                    this.close_conv(i, cx)
+                                })),
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _e, _w, cx| this.switch_conv(i, cx))),
             );
+        }
         for (i, r) in self.reviewers.iter().enumerate() {
             let tab = i + 1;
             let on = self.agent_tab == tab;
@@ -30992,7 +31291,7 @@ impl Storm {
                             .text_size(px(10.))
                             .text_color(rgb(LINE_NUMBER))
                             .hover(|s| s.text_color(rgb(GIT_DELETED)))
-                            .child("✕")
+                            .child("\u{2715}")
                             .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
                             .on_click(cx.listener(move |this, _e, _w, cx| {
                                 if i < this.reviewers.len() {
@@ -31010,7 +31309,43 @@ impl Storm {
                     })),
             );
         }
-        Some(strip)
+        // and the two ways to open another one, at the end of the strip where
+        // a new tab lives everywhere else
+        Some(
+            strip
+                .child(div().flex_grow(1.0).min_w(px(0.)))
+                .child(
+                    div()
+                        .id("agent-conv-new")
+                        .flex_shrink_0()
+                        .px_1p5()
+                        .py(px(2.))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_color(rgb(MUTED))
+                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                        .child("+ Tab")
+                        .tooltip(tip("Another conversation, empty  (\u{2318}T)"))
+                        .on_click(cx.listener(|this, _e, w, cx| this.new_conv(false, w, cx))),
+                )
+                .child(
+                    div()
+                        .id("agent-conv-new-ctx")
+                        .flex_shrink_0()
+                        .px_1p5()
+                        .py(px(2.))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_color(rgb(MUTED))
+                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                        .child("+ with context")
+                        .tooltip(tip(
+                            "Another conversation, carrying this one's workspace, branch, \
+                             pull request and last few questions  (\u{2325}\u{2318}T)",
+                        ))
+                        .on_click(cx.listener(|this, _e, w, cx| this.new_conv(true, w, cx))),
+                ),
+        )
     }
 
     /// One reviewer's session, in place of the conversation: what it has run and
@@ -32095,6 +32430,8 @@ impl Storm {
             .bg(rgb(PANEL_BG))
             .track_focus(&self.agent_focus)
             .key_context("Agent")
+            .on_action(cx.listener(|this, _: &NewAgentTab, w, cx| this.new_conv(false, w, cx)))
+            .on_action(cx.listener(|this, _: &NewAgentTabCtx, w, cx| this.new_conv(true, w, cx)))
             .on_key_down(cx.listener(Self::agent_key))
             .relative()
             // tabs first, then the header: a reviewer is a tab beside the
@@ -40772,6 +41109,12 @@ fn main() {
             // terminal tab management (when terminal focused)
             // global, not Terminal-scoped: the first ⌘T is what opens the thing
             KeyBinding::new("cmd-t", NewTerminal, None),
+            // …but with the agent focused it opens a conversation instead: the
+            // same key, the same meaning, in the thing you are looking at.
+            // Registered after the global one, which is how a tie at the same
+            // depth is broken
+            KeyBinding::new("cmd-t", NewAgentTab, Some("Agent")),
+            KeyBinding::new("alt-cmd-t", NewAgentTabCtx, Some("Agent")),
             KeyBinding::new("cmd-w", CloseTerminalTab, Some("Terminal")),
             KeyBinding::new("cmd-shift-w", CloseOtherTerminals, Some("Terminal")),
             // fuzzy file finder (global)
@@ -43893,6 +44236,19 @@ mod comment_thread_tests {
 #[cfg(test)]
 mod handoff_tests {
     use super::*;
+
+    #[test]
+    fn a_tab_is_named_after_the_session_once_it_has_a_name() {
+        assert_eq!(conv_label(Some("Reading the merge queue"), 1), "Reading the merge\u{2026}");
+        assert_eq!(conv_label(Some("Short one"), 3), "Short one");
+    }
+
+    #[test]
+    fn a_tab_with_nothing_in_it_is_named_after_where_it_sits() {
+        assert_eq!(conv_label(None, 0), "Main");
+        assert_eq!(conv_label(Some("  "), 0), "Main");
+        assert_eq!(conv_label(None, 2), "Tab 3");
+    }
 
     #[test]
     fn a_handoff_line_is_one_line() {

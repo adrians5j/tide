@@ -99,6 +99,12 @@ you do it that way?" arrives in a session that never did it; with them, that
 costs a few thousand tokens instead of the hundreds of thousands the
 transcript costs.
 
+**A question that belongs beside this one gets a tab instead.** `+ with
+context` in the agent pane opens a second conversation carrying the same
+handoff, and leaves this one where it is. The arithmetic is the same: the new
+question pays for a few hundred tokens of bearings instead of everything said
+so far. See [agent-tabs.md](agent-tabs.md).
+
 **A session that opened this way says so**, on its first line, along with what
 came across and a button that opens the conversation it started from. Nothing
 is deleted: that one is also under ↻ Resume, with every other session in the
