@@ -7019,8 +7019,14 @@ const TOUR_CARD_COLS: usize = 96;
 /// One wrapped row of the description.
 const TOUR_LINE_H: f32 = 20.0;
 /// Rows before the description scrolls inside the card instead of pushing the
-/// file further apart.
-const TOUR_CARD_ROWS: usize = 8;
+/// file further apart. The note is what you stopped to read, so this is
+/// generous: at 20px a row it is 280px of card, and the file parts by that
+/// much only at the stops whose note fills it.
+const TOUR_CARD_ROWS: usize = 14;
+/// The same for the thread under the note. It stays at eight: the thread grows
+/// with every question and the note does not, and a card that is mostly
+/// transcript has pushed the code it is about off the screen.
+const TOUR_THREAD_ROWS: usize = 8;
 
 /// How much of a change the card will draw before it stops trying. Past this
 /// the before/after is a diff, not a snippet, and the diff window is the thing
@@ -26209,7 +26215,7 @@ impl Storm {
                         div()
                             .id("card-thread")
                             .w_full()
-                            .max_h(px(TOUR_CARD_ROWS as f32 * TOUR_LINE_H))
+                            .max_h(px(TOUR_THREAD_ROWS as f32 * TOUR_LINE_H))
                             .overflow_y_scroll()
                             .flex()
                             .flex_col()
