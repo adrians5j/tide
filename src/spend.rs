@@ -300,6 +300,8 @@ mod tests {
     fn a_row_survives_the_round_trip() {
         let mut r = row(STOP_ASK, 120);
         r.job = "Brief of #6176".into();
+        // the key the brief on screen looks itself up by
+        r.tag = "brief:6176".into();
         r.by_tide = true;
         assert_eq!(from_line(&to_line(&r)), Some(r));
         assert_eq!(from_line("not json"), None);

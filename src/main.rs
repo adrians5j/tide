@@ -10062,20 +10062,27 @@ impl Storm {
 
     /// Re-read the live session's context every 15s, so the `ctx` chip follows
     /// the conversation. The reading is a tail of the session's own log.
+    ///
+    /// The spend log's tail is read on the same beat, for the same reason: a
+    /// brief and a slide's thread each say what they cost, and the turns that
+    /// answer that are written to one file as they end.
     fn start_usage_poll(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| loop {
             // which session to read, asked on the UI thread; the reading itself
             // is a file tail and goes to the background with the limits
-            let Ok(live) = this.update(cx, |this, _cx| {
-                (this.root.clone(), this.acp.as_ref().and_then(|a| a.session_id()))
+            let Ok((live, spend_at)) = this.update(cx, |this, _cx| {
+                (
+                    (this.root.clone(), this.acp.as_ref().and_then(|a| a.session_id())),
+                    this.spend_at,
+                )
             }) else {
                 break;
             };
-            let ctx = cx
+            let (ctx, spent) = cx
                 .background_executor()
                 .spawn(async move {
                     let (root, id) = live;
-                    id.and_then(|id| tokens::live_context(&root, &id))
+                    (id.and_then(|id| tokens::live_context(&root, &id)), spend::tail(spend_at))
                 })
                 .await;
             if this
@@ -10084,6 +10091,7 @@ impl Storm {
                         this.agent_context = ctx;
                         cx.notify();
                     }
+                    this.fold_spend(spent, cx);
                 })
                 .is_err()
             {
@@ -10092,6 +10100,29 @@ impl Storm {
             cx.background_executor().timer(Duration::from_secs(15)).await;
         })
         .detach();
+    }
+
+    /// Add the turns written since the last read to what each tagged thing on
+    /// screen has cost. A turn with no tag belongs to the pane and nothing on
+    /// screen asks about it.
+    fn fold_spend(&mut self, (rows, at): (Vec<spend::Row>, u64), cx: &mut Context<Self>) {
+        self.spend_at = at;
+        let mut moved = false;
+        for r in rows.into_iter().filter(|r| !r.tag.is_empty()) {
+            let slot = self.spend_tags.entry(r.tag).or_insert((tokens::Use::default(), 0));
+            slot.0.add(&r.used);
+            slot.1 += 1;
+            moved = true;
+        }
+        if moved {
+            cx.notify();
+        }
+    }
+
+    /// What the thing under this tag has cost so far, as the chip says it:
+    /// the weighted number and how many turns went into it.
+    fn spent_on(&self, tag: &str) -> Option<(u64, u32)> {
+        self.spend_tags.get(tag).map(|(u, turns)| (u.weighted(), *turns))
     }
 
     /// Spin the admin button while a build we started is coming up. Runs only for
@@ -25949,6 +25980,11 @@ impl Storm {
             }
         }
         let has_thread = !thread.is_empty();
+        // what the questions asked at this stop have cost between them
+        let thread_cost = cost_chip(
+            "stop-ask-cost",
+            self.spent_on(&format!("stop:{}:{}", w.id.clone().unwrap_or_default(), w.at)),
+        );
         let arrow = |id: &'static str, glyph: &'static str, hint: &'static str, dir: i32, cx: &mut Context<Self>| {
             div()
                 .id(id)
@@ -26278,6 +26314,15 @@ impl Storm {
                             .pt_1()
                             .border_t_1()
                             .border_color(rgb(BORDER))
+                            .children(thread_cost.map(|c| {
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(div().flex_grow(1.0))
+                                    .child(c)
+                            }))
                             .children(thread.into_iter().map(|(mine, text)| {
                                 div()
                                     .flex()
@@ -26790,6 +26835,32 @@ impl Render for TooltipView {
 
 fn tip(text: &'static str) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
     move |_w, cx| cx.new(|_| TooltipView { text: text.into() }).into()
+}
+
+/// What a thing on screen cost, as a chip: the weighted tokens the turns it
+/// started have spent so far. Nothing is drawn when the log has no turn under
+/// that tag, which is every brief written before TIDE kept this and every
+/// question still being answered.
+///
+/// It is deliberately one number. The breakdown is `tide --spend`, and a
+/// header that carries four figures is a header nobody reads.
+fn cost_chip(id: &'static str, spent: Option<(u64, u32)>) -> Option<AnyElement> {
+    let (weighted, turns) = spent?;
+    Some(
+        div()
+            .id(id)
+            .flex_shrink_0()
+            .text_size(px(11.))
+            .text_color(rgb(LINE_NUMBER))
+            .child(usage::short(weighted))
+            .tooltip(tip_owned(format!(
+                "What this cost: {} weighted tokens over {turns} turn{}, at the published \
+                 price ratios. `tide --spend` breaks it down",
+                usage::short(weighted),
+                if turns == 1 { "" } else { "s" },
+            )))
+            .into_any_element(),
+    )
 }
 
 /// The same for a tooltip built at runtime — a step's own title, say.
@@ -29477,6 +29548,7 @@ impl Storm {
             .unwrap_or_default();
         let label = format!("Asked for a brief and a code tour of #{number}");
         self.job_next = Some(format!("Explain #{number}"));
+        self.spend_tag = Some(format!("brief:{number}"));
         self.agent_open = true;
         self.send_agent_prompt_as(
             pr_explain_request(number, &base, &brief_read, &tour_read),
@@ -29500,6 +29572,7 @@ impl Storm {
         }
         let label = format!("Asked for a brief of #{number}");
         self.job_next = Some(format!("Brief of #{number}"));
+        self.spend_tag = Some(format!("brief:{number}"));
         // the slides already read ride along, so a rewrite isn't eight slides
         // to read from the top again
         let read = brief_cached(number)
@@ -30040,6 +30113,7 @@ impl Storm {
         let Some(stop) = w.stops.get(w.at).cloned() else { return };
         let (tour, at, total) = (w.tour.clone().unwrap_or_default(), w.at + 1, w.stops.len());
         let key = (w.id.clone().unwrap_or_default(), w.at);
+        let tag = format!("stop:{}:{}", key.0, key.1);
         let id = random_id();
         let text = tour_question(&tour, at, total, &stop, &q, &id);
         // the question goes up on the card before it has an answer, so the
@@ -30051,6 +30125,7 @@ impl Storm {
         // question itself is already on the card you typed it on
         self.job_next = Some(format!("Question on stop {at}"));
         self.spend_next = Some(spend::STOP_ASK);
+        self.spend_tag = Some(tag);
         self.send_agent_prompt_by(text, Some(q), Sender::You, cx);
         self.agent_list.scroll_to_end();
         // the answer lands in the pane; typing carries on in the editor
@@ -30084,6 +30159,7 @@ impl Storm {
         // the tool calls, and the long version of the answer under it
         self.job_next = Some(format!("Question on slide {}", ix + 1));
         self.spend_next = Some(spend::SLIDE_ASK);
+        self.spend_tag = Some(format!("slide:{}:{ix}", brief.pr.unwrap_or(0)));
         self.send_agent_prompt_by(text, Some(q), Sender::You, cx);
         self.agent_list.scroll_to_end();
         cx.notify();
@@ -36264,6 +36340,11 @@ impl Storm {
         let pr = brief.pr;
         let base = self.pr_base.clone();
         let made = (brief.made > 0).then(|| todo::age(brief.made)).unwrap_or_default();
+        // what the turn that wrote this deck cost, when TIDE was watching when
+        // it was written
+        let cost = brief
+            .pr
+            .and_then(|p| cost_chip("brief-cost", self.spent_on(&format!("brief:{p}"))));
         // the branch has moved since this was written, so some of what it says
         // is about code that is no longer there
         let stale = !brief.oid.is_empty()
@@ -36330,6 +36411,7 @@ impl Storm {
                         .child(format!("written {made}")),
                 )
             })
+            .children(cost)
             // watching it is the same deck read out loud, so the button to do
             // that belongs beside the one that writes it again. Every deck can
             // be watched, including one made out of a conversation
@@ -36820,6 +36902,8 @@ impl Storm {
                 .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
                 .child(label)
         };
+        // what the questions under this slide have cost between them
+        let cost = cost_chip("slide-ask-cost", self.spent_on(&format!("slide:{pr}:{ix}")));
         let head = div()
             .id(("brief-thread-head", ix))
             .flex()
@@ -36832,6 +36916,7 @@ impl Storm {
             .child(div().flex_shrink_0().child(if folded { "▸" } else { "▾" }))
             .child(div().flex_shrink_0().child(count))
             .when(!when.is_empty(), |d| d.child(div().flex_shrink_0().child(when)))
+            .children(cost)
             .when(waiting, |d| {
                 d.child(div().flex_shrink_0().text_color(rgb(MUTED)).child("waiting…"))
             })
