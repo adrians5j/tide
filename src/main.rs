@@ -36205,7 +36205,12 @@ impl Storm {
                 div()
                     .flex()
                     .flex_row()
-                    .items_start()
+                    // open, the gutter hangs off the title's first line, which
+                    // is where a number belongs on a heading three lines deep.
+                    // Folded, the row is one line of its own and the number,
+                    // the tick and the title sit on it together
+                    .when(folded, |d| d.items_center())
+                    .when(!folded, |d| d.items_start())
                     .gap_3()
                     .child(
                         // the gutter number sits on the title's first line, not
@@ -36214,11 +36219,10 @@ impl Storm {
                         div()
                             .flex_shrink_0()
                             .w(px(28.))
-                            .pt(px(if folded { 1. } else { 7. }))
+                            .when(!folded, |d| d.pt(px(7.)))
                             .flex()
-                            .flex_col()
-                            .items_start()
-                            .gap_1p5()
+                            .when(folded, |d| d.flex_row().items_center().gap(px(3.)))
+                            .when(!folded, |d| d.flex_col().items_start().gap_1p5())
                             .child(
                                 div()
                                     .text_size(px(11.))
