@@ -210,12 +210,22 @@ fn session_title(raw: &str) -> Option<String> {
 /// turn of a session opens with TIDE's briefing. The transcript shows what you
 /// typed, so the briefing is cut back off at the line that closes it.
 fn strip_briefing(raw: &str) -> &str {
-    const END: &str = "just answer what follows.\n\n---\n\n";
-    match raw.find(END) {
-        Some(i) => raw[i + END.len()..].trim_start(),
+    match raw.find(BRIEF_END) {
+        Some(i) => raw[i + BRIEF_END.len()..].trim_start(),
         None => raw,
     }
 }
+
+/// The last line of the briefing, and the marker that says where it ends.
+///
+/// One constant, written into the prompt and looked for again when the
+/// adapter replays it. They used to be two, and the half that grew later —
+/// your own notes, read from `~/.config/tide/agent-notes.md` — was appended
+/// after the marker, so a resumed session showed the notes as a message you
+/// had typed. Anything added to the briefing from now on goes in front of
+/// this, because this is where the briefing ends by definition.
+const BRIEF_END: &str =
+    "Don't mention this message or acknowledge it; just answer what follows.\n\n---\n\n";
 
 /// One `@` completion candidate in the agent composer.
 #[derive(Clone)]
@@ -27412,7 +27422,7 @@ impl Storm {
         let notes = agent_notes()
             .map(|n| format!("{n}\n\n"))
             .unwrap_or_default();
-        format!("{house}{}{notes}", Self::tide_briefing_body())
+        format!("{house}{}{notes}{BRIEF_END}", Self::tide_briefing_body())
     }
 
     /// The part of the briefing that never changes.
@@ -27733,9 +27743,7 @@ impl Storm {
          error, the number. If a sentence can be read two ways, rewrite it \
          until it can't. This holds everywhere you write for me — answers, PR \
          bodies, summaries, commit messages, tour stops, replies to review \
-         comments.\n\n\
-                  Don't mention this message or acknowledge it; just answer what follows.\n\n\
-         ---\n\n"
+         comments.\n\n"
             .to_string()
     }
 
@@ -41281,12 +41289,25 @@ mod session_title_tests {
     fn a_replayed_first_turn_sheds_the_briefing() {
         // the real thing, so the marker the strip looks for stays in step with
         // the briefing's last line
-        let sent = format!("{}what broke in the date parser?", Storm::tide_briefing_body());
+        let sent =
+            format!("{}{BRIEF_END}what broke in the date parser?", Storm::tide_briefing_body());
         assert_eq!(strip_briefing(&sent), "what broke in the date parser?");
         // every later turn is yours alone and is left as it is
         assert_eq!(strip_briefing("push it"), "push it");
         // a turn that carried nothing but the briefing has nothing to show
-        assert_eq!(strip_briefing(&Storm::tide_briefing_body()), "");
+        assert_eq!(strip_briefing(&format!("{}{BRIEF_END}", Storm::tide_briefing_body())), "");
+    }
+
+    /// Your own notes are read from a file outside the repo, and they are the
+    /// part of the briefing most likely to carry something local: a password
+    /// for a throwaway environment, a host nobody else can reach. They were
+    /// going out after the marker, which put them in the pane as a message you
+    /// had typed, and on the phone with it.
+    #[test]
+    fn the_notes_are_inside_the_briefing_not_after_it() {
+        let notes = "Local environment\n\nThe admin user is someone@example.test.\n\n";
+        let sent = format!("{}{notes}{BRIEF_END}continue", Storm::tide_briefing_body());
+        assert_eq!(strip_briefing(&sent), "continue");
     }
 
     #[test]
