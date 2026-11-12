@@ -5565,6 +5565,61 @@ fn exe_ran() -> i64 {
     *RAN.get_or_init(exe_built)
 }
 
+/// The repo the running binary was built in: the first folder above it with a
+/// `.git` in it. `target/debug/tide` is two deep, so this finds the checkout
+/// TIDE is built from whatever it has open.
+fn exe_repo() -> Option<&'static Path> {
+    static REPO: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    REPO.get_or_init(|| {
+        let exe = std::env::current_exe().ok()?;
+        exe.ancestors().find(|d| d.join(".git").exists()).map(|d| d.to_path_buf())
+    })
+    .as_deref()
+}
+
+/// The commit that checkout was on when this process started.
+///
+/// Read once, at startup, which is the moment it is true: TIDE is launched by
+/// a shell function that builds first, so the binary that comes up is this
+/// commit plus whatever was uncommitted at the time.
+fn git_ran() -> &'static str {
+    static SHA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SHA.get_or_init(|| {
+        let Some(repo) = exe_repo() else { return String::new() };
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    })
+}
+
+/// What has been committed to TIDE since this window started: one subject line
+/// per commit, newest first.
+///
+/// Not "what is in the new build" to the letter — a build taken before its
+/// commit lands carries work no line here names yet — but it is the list of
+/// what changed, in the words the changes were written down in.
+fn built_since() -> Vec<String> {
+    let (Some(repo), sha) = (exe_repo(), git_ran()) else { return Vec::new() };
+    if sha.is_empty() {
+        return Vec::new();
+    }
+    Command::new("git")
+        .args(["log", "--format=%s", &format!("{sha}..HEAD")])
+        .current_dir(repo)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.lines().map(str::to_string).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default()
+}
+
 /// One argument, safe to hand to `sh -c`.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -37924,6 +37979,10 @@ struct Workspace {
     /// A newer build is sitting in `target/`, as its mtime. `Some` puts the
     /// restart prompt up. Only ever set while nothing is working.
     restart_at: Option<i64>,
+    /// What has been committed since this window started, newest first. Read
+    /// when the prompt goes up; it is a `git log`, not something to do per
+    /// frame.
+    restart_log: Vec<String>,
     /// The newest build the prompt has been dismissed for, so "later" means
     /// later and not "in ten seconds".
     restart_skip: i64,
@@ -37960,6 +38019,7 @@ impl Workspace {
             switcher_scroll: ScrollHandle::new(),
             quit_busy: None,
             restart_at: None,
+            restart_log: Vec::new(),
             restart_skip: 0,
             restart_focus: cx.focus_handle(),
             restart_focus_pending: false,
@@ -38410,6 +38470,7 @@ impl Workspace {
                         return;
                     }
                     this.restart_at = Some(built);
+                    this.restart_log = built_since();
                     this.restart_focus_pending = true;
                     cx.notify();
                 })
@@ -38533,6 +38594,54 @@ impl Workspace {
             let _ = Command::new("/bin/sh").arg("-c").arg(line).spawn();
         }
         cx.quit();
+    }
+
+    /// The commits made while this window has been up, as a list for the
+    /// prompt. `None` when there are none: a build taken before its commit
+    /// lands is still worth taking, and an empty box says less than no box.
+    fn restart_changes(&self) -> Option<Div> {
+        if self.restart_log.is_empty() {
+            return None;
+        }
+        const SHOWN: usize = 8;
+        let more = self.restart_log.len().saturating_sub(SHOWN);
+        let mut list = div()
+            .mt_1()
+            .p_2()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .rounded_md()
+            .bg(rgb(BG))
+            .border_1()
+            .border_color(rgb(BORDER));
+        for line in self.restart_log.iter().take(SHOWN) {
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .min_w(px(0.))
+                    .text_size(px(11.))
+                    .child(div().flex_shrink_0().text_color(rgb(GIT_NEW)).child("+"))
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_color(rgb(TEXT))
+                            .child(line.clone()),
+                    ),
+            );
+        }
+        if more > 0 {
+            list = list.child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(rgb(LINE_NUMBER))
+                    .child(format!("and {more} more")),
+            );
+        }
+        Some(list)
     }
 
     /// Keys while the restart prompt is up: ↩ restarts, esc leaves it.
@@ -38717,17 +38826,22 @@ impl Workspace {
                     .shadow_lg()
                     .track_focus(&self.restart_focus)
                     .on_key_down(cx.listener(Self::restart_key))
-                    .child(
-                        div()
-                            .text_size(px(14.))
-                            .text_color(rgb(TEXT))
-                            .child("A newer TIDE is built"),
-                    )
+                    .child(div().text_size(px(14.)).text_color(rgb(TEXT)).child(
+                        match self.restart_log.len() {
+                            0 => "A newer TIDE is built".to_string(),
+                            1 => "A newer TIDE is built, with one change in it".to_string(),
+                            n => format!("A newer TIDE is built, with {n} changes in it"),
+                        },
+                    ))
                     .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(
                         "This window is running the build it started with. Nothing is \
                          working right now, so this is the cheap moment to take the new \
                          one: it comes back up with these workspaces open.",
                     ))
+                    // what came in while this window was up, in the words the
+                    // commits were written down in. A restart with nothing to
+                    // show for it is one you put off
+                    .children(self.restart_changes())
                     .child(
                         div()
                             .flex()
