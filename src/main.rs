@@ -36689,7 +36689,11 @@ impl Storm {
                         .min_w(px(0.))
                         .border_l_2()
                         .border_color(rgb(ACCENT))
-                        .child(md_text(&body, 15., TEXT).line_height(px(24.))),
+                        // no `line_height` over the top of it: the rows are
+                        // measured with the metrics `md_text` gave them, and a
+                        // taller line set from out here paints past the height
+                        // the deck reserved, over the first slide
+                        .child(md_text(&body, 15., TEXT)),
                 ),
         )
     }
