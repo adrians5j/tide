@@ -3776,6 +3776,33 @@ fn context_color(per_call: u64) -> u32 {
 /// How a context size reads: quiet while a session is cheap to carry, amber
 /// once every turn is paying for a few hundred thousand tokens of history, red
 
+/// A stop that wants something from you, as a tag beside its title.
+///
+/// Three words and no others, so the tag means something: a tour where every
+/// stop carries a different word of warning has no warnings in it. `look` is
+/// worth your eyes, `decide` is a call the agent won't make for you, `risk` is
+/// what could bite.
+fn stop_flag_chip(flag: &str) -> Option<Div> {
+    let (label, color) = match flag {
+        "look" => ("worth a look", GIT_MODIFIED),
+        "decide" => ("your call", COMMENT_MARK),
+        "risk" => ("careful", GIT_DELETED),
+        _ => return None,
+    };
+    Some(
+        div()
+            .flex_shrink_0()
+            .px_1p5()
+            .rounded_md()
+            .bg(rgb(BG))
+            .border_1()
+            .border_color(rgb(color))
+            .text_size(px(10.))
+            .text_color(rgb(color))
+            .child(label),
+    )
+}
+
 /// How a spend reads on the thing that spent it: quiet while it is the price
 /// of an answer, amber where it is the price of an afternoon, red where one
 /// question cost more than most pull requests do.
@@ -5121,6 +5148,13 @@ fn tour_request(about: Option<&str>, answer: Option<&str>) -> String {
          the stretch with `group` on each stop in it (\"The AWS side\", \
          \"Standalone\") — consecutive stops sharing one become a section with \
          a heading. Two to five of them; skip it if the tour is one run.\n\n\
+         A stop that wants something from me rather than only telling me \
+         something gets a `flag`, and it draws as a tag beside the title. \
+         Three words and no others: `look` for something worth my eyes, \
+         `decide` for a call you won't make for me, `risk` for what could \
+         bite. Most stops have none. Put one on two or three at most — a tour \
+         where every stop is flagged has no flags in it, and I will stop \
+         reading them.\n\n\
          Check every file and line before you send it: a stop that lands in the \
          wrong place costs me more than a missing one. Ten to twenty stops is a \
          flow. Then say in one line what the tour covers and stop — don't \
@@ -7391,6 +7425,10 @@ struct Stop {
     /// The prose the reference sat in, so the code and the explanation are on
     /// screen together rather than a scroll apart.
     said: String,
+    /// `look`, `decide` or `risk` on a stop that wants something from you,
+    /// empty on the rest. A walk through an answer never has one: it is the
+    /// tour's own word about its own stop.
+    flag: String,
 }
 
 /// One visit to a file on a tour's map: the run of stops the tour spends there
@@ -25974,6 +26012,7 @@ impl Storm {
         let tour = w.tour.clone();
         let accent = if tour.is_some() { TOUR_MARK } else { COMMENT_MARK };
         let title = stop.title.trim().to_string();
+        let flag = stop.flag.clone();
         let said = stop.said.trim().to_string();
         let group = stop.group.trim().to_string();
         // the stop a part begins on, so the cue is still there once the flash
@@ -26135,17 +26174,18 @@ impl Storm {
                                 .text_color(rgb(LINE_NUMBER))
                                 .child(format!("{at}/{total}")),
                         )
+                        // the tour's name, not the stop's. The stop's own
+                        // title sits against the prose it heads, down the
+                        // card: up here it was four rows away from the
+                        // sentence it belonged to and went unread
                         .child(
                             div()
                                 .flex_grow(1.0)
                                 .min_w(px(0.))
                                 .truncate()
-                                .text_color(rgb(accent))
-                                .child(if title.is_empty() {
-                                    tour.clone().unwrap_or_else(|| "This answer".to_string())
-                                } else {
-                                    title
-                                }),
+                                .text_size(px(11.))
+                                .text_color(rgb(MUTED))
+                                .child(tour.clone().unwrap_or_else(|| "This answer".to_string())),
                         )
                         .when(!group.is_empty() && !group_starts, |d| {
                             // which part of the tour this is, the same name the
@@ -26265,6 +26305,25 @@ impl Storm {
                                         this.goto_walk_stop(i, window, cx)
                                     }))
                             })),
+                    )
+                })
+                .when(!title.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .pt_1()
+                            .children(stop_flag_chip(&flag))
+                            .child(
+                                div()
+                                    .flex_grow(1.0)
+                                    .min_w(px(0.))
+                                    .text_color(rgb(accent))
+                                    .child(title.clone()),
+                            ),
                     )
                 })
                 .when(!said.is_empty(), |d| {
@@ -29424,6 +29483,7 @@ impl Storm {
                     title: String::new(),
                     group: String::new(),
                     said: line.trim().trim_start_matches(['#', '-', '*', ' ']).to_string(),
+                    flag: String::new(),
                 });
             }
         }
@@ -30033,6 +30093,7 @@ impl Storm {
                 title: st.title.clone(),
                 group: st.group.clone(),
                 said: st.text.clone(),
+                flag: st.flag.clone(),
             });
         }
         if stops.is_empty() {
@@ -43850,6 +43911,7 @@ mod tour_group_tests {
             title: "t".into(),
             group: group.into(),
             said: String::new(),
+            flag: String::new(),
         }
     }
 
@@ -43906,6 +43968,7 @@ mod tour_end_tests {
                     title: format!("step {i}"),
                     group: String::new(),
                     said: String::new(),
+                    flag: String::new(),
                 })
                 .collect(),
             at: 0,
@@ -43995,6 +44058,7 @@ mod tour_map_tests {
             title: title.into(),
             group: String::new(),
             said: String::new(),
+            flag: String::new(),
         }
     }
 
@@ -44059,6 +44123,7 @@ mod code_tour_tests {
             title: title.into(),
             group: String::new(),
             said: "because".into(),
+            flag: String::new(),
         }
     }
 

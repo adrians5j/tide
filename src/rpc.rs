@@ -125,6 +125,24 @@ pub struct TourStep {
     pub group: String,
     /// What happens here and why it matters, in the agent's words.
     pub text: String,
+    /// A stop that wants something from the reader rather than only telling
+    /// them something: `look` (worth your eyes), `decide` (a call only you can
+    /// make), `risk` (this could bite). Empty on an ordinary stop, which is
+    /// most of them.
+    pub flag: String,
+}
+
+/// The three words a stop's `flag` can be, or empty. Anything else the agent
+/// writes is dropped rather than drawn: a tour where every stop carries a
+/// different word of warning is a tour with no warnings in it.
+pub fn stop_flag(raw: &str) -> String {
+    match raw.trim().to_lowercase().as_str() {
+        "look" | "check" | "review" => "look",
+        "decide" | "decision" | "choice" => "decide",
+        "risk" | "danger" | "warning" | "careful" => "risk",
+        _ => "",
+    }
+    .to_string()
 }
 
 /// A walkthrough an agent prepared: ordered stops through code that isn't
@@ -978,6 +996,12 @@ fn parse_tour(body: &str) -> Option<Tour> {
                     .and_then(|t| t.as_str())
                     .unwrap_or(""),
                 2000,
+            ),
+            flag: stop_flag(
+                item.get("flag")
+                    .or_else(|| item.get("mark"))
+                    .and_then(|f| f.as_str())
+                    .unwrap_or(""),
             ),
         });
     }
