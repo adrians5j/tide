@@ -11231,6 +11231,31 @@ impl Storm {
     /// Whole-project roll-up: the loudest agent state across every pane of every
     /// terminal tab. Drives the status screen row and the project switcher dot.
     /// Only live panes count, so a closed pane's leftover state never shows.
+    /// Is anything in this workspace working right now?
+    ///
+    /// Not the question `agent_rollup` answers. That one picks the single
+    /// state worth showing, and `blocked` outranks `working` there, because a
+    /// pane waiting on you is the one you want to see. So a workspace with one
+    /// agent waiting and another mid-turn reported `blocked`, and whoever
+    /// asked whether it was safe to restart was told yes while a turn ran.
+    ///
+    /// Everything that can be working is asked: the pane, the tabs behind it,
+    /// the terminals, and the reviewers, which have no state of their own.
+    fn working_here(&self) -> bool {
+        self.agent_busy
+            || self.reviewers.iter().any(|r| !r.done)
+            || live_state(self.acp_state, self.acp_seen) == Some(AgentState::Working)
+            || self
+                .convs
+                .iter()
+                .any(|c| live_state(c.state, c.seen) == Some(AgentState::Working))
+            || self
+                .term_tabs
+                .iter()
+                .flat_map(|t| t.terminals())
+                .any(|t| matches!(self.pane_state(&t), Some((AgentState::Working, _))))
+    }
+
     fn agent_rollup(&self) -> Option<(AgentState, String)> {
         self.term_tabs
             .iter()
@@ -36627,40 +36652,23 @@ impl Storm {
     /// It sits inside the scroll rather than over it: it is the first thing
     /// you read and then it is behind you, and a banner pinned to the top of a
     /// deck you have read four slides of is a banner in the way.
+    ///
+    /// The lines go through the markdown renderer as a list rather than being
+    /// laid out here. A hand-built row of a dot and a text box has to get the
+    /// flex sizing exactly right or a line longer than the pane is wide
+    /// collapses to its minimum width and comes out one character per row,
+    /// which is what happened twice. `md_hang` already solves it, for every
+    /// list in the app.
     fn brief_tldr(lines: &[String]) -> Option<Div> {
         if lines.is_empty() {
             return None;
         }
-        let mut body = div().flex().flex_col().gap_2().min_w(px(0.));
-        for line in lines {
-            body = body.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_start()
-                    .gap_2p5()
-                    .min_w(px(0.))
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .mt(px(7.))
-                            .size(px(5.))
-                            .rounded_full()
-                            .bg(rgb(ACCENT)),
-                    )
-                    .child(
-                        div()
-                            .min_w(px(0.))
-                            .text_size(px(15.))
-                            .line_height(px(24.))
-                            .text_color(rgb(TEXT))
-                            .child(line.clone()),
-                    ),
-            );
-        }
+        let body: String =
+            lines.iter().map(|l| format!("- {l}")).collect::<Vec<_>>().join("\n");
         Some(
             div()
                 .flex_shrink_0()
+                .w_full()
                 .pt(px(28.))
                 .pb(px(8.))
                 .max_w(px(680.))
@@ -36678,10 +36686,10 @@ impl Storm {
                     div()
                         .pl_3()
                         .w_full()
+                        .min_w(px(0.))
                         .border_l_2()
                         .border_color(rgb(ACCENT))
-                        .min_w(px(0.))
-                        .child(body),
+                        .child(md_text(&body, 15., TEXT).line_height(px(24.))),
                 ),
         )
     }
@@ -38882,14 +38890,24 @@ impl Workspace {
             let built = cx.background_executor().spawn(async { exe_built() }).await;
             if this
                 .update(cx, |this, cx| {
+                    // mid-turn the answer would be lost with the session it is
+                    // running in. It will still be a new build when the turn
+                    // ends
+                    if !this.busy_workspaces(cx).is_empty() {
+                        // and if the prompt is already up, it is now saying
+                        // something untrue: it claims nothing is working. Take
+                        // it down rather than leave it to be clicked, and
+                        // offer again when the work stops
+                        if this.restart_at.take().is_some() {
+                            this.restart_log.clear();
+                            cx.notify();
+                        }
+                        return;
+                    }
                     if this.restart_at.is_some()
                         || this.quit_busy.is_some()
                         || built <= exe_ran()
                         || built == this.restart_skip
-                        // mid-turn the answer would be lost with the session
-                        // it is running in. It will still be a new build when
-                        // the turn ends
-                        || !this.busy_workspaces(cx).is_empty()
                     {
                         return;
                     }
@@ -39086,10 +39104,7 @@ impl Workspace {
         self.projects
             .iter()
             .enumerate()
-            .filter(|(_, p)| {
-                let s = p.read(cx);
-                s.agent_busy || matches!(s.agent_rollup(), Some((AgentState::Working, _)))
-            })
+            .filter(|(_, p)| p.read(cx).working_here())
             .map(|(i, _)| i)
             .collect()
     }
