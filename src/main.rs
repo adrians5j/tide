@@ -3776,6 +3776,23 @@ fn context_color(per_call: u64) -> u32 {
 /// How a context size reads: quiet while a session is cheap to carry, amber
 /// once every turn is paying for a few hundred thousand tokens of history, red
 
+/// How a spend reads on the thing that spent it: quiet while it is the price
+/// of an answer, amber where it is the price of an afternoon, red where one
+/// question cost more than most pull requests do.
+///
+/// The steps are off a week of this log. A question answered without much
+/// reading comes in under 150k; a brief runs 200k to 400k; past a million is
+/// a turn that went and did a piece of work, which is worth seeing as that
+/// rather than as a number in the same grey as the clock beside it.
+fn spend_color(weighted: u64) -> u32 {
+    match weighted {
+        0..=149_999 => LINE_NUMBER,
+        150_000..=399_999 => MUTED,
+        400_000..=999_999 => GIT_MODIFIED,
+        _ => GIT_DELETED,
+    }
+}
+
 /// A short random lowercase-alphanumeric id (e.g. for `wip: <id>` commits),
 /// seeded from the system clock and mixed so successive calls differ.
 /// A category as the list stores it: one of TIDE's conventional-commit keys,
@@ -26887,11 +26904,12 @@ fn cost_chip(id: &'static str, spent: Option<(u64, u32)>) -> Option<AnyElement> 
             .id(id)
             .flex_shrink_0()
             .text_size(px(11.))
-            .text_color(rgb(LINE_NUMBER))
+            .text_color(rgb(spend_color(weighted)))
             .child(usage::short(weighted))
             .tooltip(tip_owned(format!(
                 "What this cost: {} weighted tokens over {turns} turn{}, at the published \
-                 price ratios. `tide --spend` breaks it down",
+                 price ratios. Amber past 400k, red past a million. `tide --spend` breaks \
+                 it down",
                 usage::short(weighted),
                 if turns == 1 { "" } else { "s" },
             )))
@@ -45192,6 +45210,17 @@ mod handoff_tests {
             path: PathBuf::from("/tmp/a.png"),
             dims: None,
         }
+    }
+
+    /// The steps a spend reads at. A question that cost half a million is not
+    /// the same news as one that cost forty thousand, and the chip says so
+    /// before the number is read.
+    #[test]
+    fn a_spend_is_coloured_by_what_it_came_to() {
+        assert_eq!(spend_color(40_000), LINE_NUMBER);
+        assert_eq!(spend_color(250_000), MUTED);
+        assert_eq!(spend_color(504_900), GIT_MODIFIED, "amber past 400k");
+        assert_eq!(spend_color(2_467_000), GIT_DELETED, "red past a million");
     }
 
     #[test]
