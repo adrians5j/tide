@@ -2217,12 +2217,14 @@ fn pr_links(
     pr_refs(text)
         .into_iter()
         .filter_map(|(range, repo, num)| {
-            let base = if repo.is_empty() {
-                repo_web?.to_string()
-            } else {
-                format!("https://github.com/{repo}")
-            };
-            Some((range, LinkTarget::Url(format!("{base}/pull/{num}"))))
+            // a bare number is this checkout's, and TIDE can open that itself.
+            // `owner/repo#5619` names a repo that isn't open here, so it stays
+            // a link to GitHub
+            if repo.is_empty() {
+                repo_web?; // only when we know where "here" is
+                return Some((range, LinkTarget::Pr(num)));
+            }
+            Some((range, LinkTarget::Url(format!("https://github.com/{repo}/pull/{num}"))))
         })
         .collect()
 }
@@ -2453,6 +2455,12 @@ fn md_links(
                 })
                 .on_click(ranges, move |ix, window, cx| match targets.get(ix) {
                     Some(LinkTarget::Url(u)) => open_browser(u),
+                    Some(LinkTarget::Pr(n)) => {
+                        let n = *n;
+                        if let Some(me) = me.upgrade() {
+                            me.update(cx, |this, cx| this.open_pr_number(Some(n), cx));
+                        }
+                    }
                     Some(LinkTarget::File(path, line)) => {
                         let (path, line) = (path.clone(), *line);
                         if let Some(me) = me.upgrade() {
@@ -7972,6 +7980,9 @@ enum LinkTarget {
     /// A line on the todo list, by id. An answer that backlogs something
     /// names the id it filed it under, and that id is worth a click.
     Todo(String),
+    /// A pull request of this checkout, by number. It opens as a tab here,
+    /// the way \u{2318}P opens one: the browser is for somebody else's repo.
+    Pr(u64),
 }
 
 /// Every todo id that appears as a word in `text`. Ids are slugs made of the
@@ -28523,6 +28534,14 @@ impl Storm {
                                 .on_click(ranges, move |ix, window, cx| {
                                     match targets.get(ix) {
                                         Some(LinkTarget::Url(u)) => open_browser(u),
+                                        Some(LinkTarget::Pr(n)) => {
+                                            let n = *n;
+                                            if let Some(me) = me.upgrade() {
+                                                me.update(cx, |this, cx| {
+                                                    this.open_pr_number(Some(n), cx)
+                                                });
+                                            }
+                                        }
                                         Some(LinkTarget::File(path, line)) => {
                                             let (path, line) = (path.clone(), *line);
                                             if let Some(me) = me.upgrade() {
@@ -31118,8 +31137,12 @@ impl Storm {
             // ↻ Resume, which is where you go when you want it back.
             if let AgentMsg::Fresh { tab } = m {
                 let head = if *tab { "New tab" } else { "New session" };
-                let rule = || div().flex_grow(1.0).h(px(1.)).bg(rgb(BORDER));
+                // a width of its own as well as `flex_grow`: a transcript row
+                // is sized by what is in it, so a rule with nothing in it and
+                // only a growth factor comes out as nothing at all
+                let rule = || div().w(px(80.)).flex_grow(1.0).h(px(1.)).bg(rgb(SEPARATOR));
                 return div()
+                    .w_full()
                     .px_3()
                     .pt_3()
                     .pb_2()
@@ -43064,10 +43087,8 @@ mod pr_ref_tests {
     fn a_link_needs_somewhere_to_point() {
         let base = Some("https://github.com/webiny/webiny-js");
         let links = pr_links("fixed in #5619", base);
-        assert!(matches!(
-            &links[0].1,
-            LinkTarget::Url(u) if u == "https://github.com/webiny/webiny-js/pull/5619"
-        ));
+        // this checkout's own pull request: TIDE opens it, the browser doesn't
+        assert!(matches!(&links[0].1, LinkTarget::Pr(5619)));
         // no origin to resolve against: a bare number stays plain text
         assert!(pr_links("fixed in #5619", None).is_empty());
         // one that names its own repo doesn't need ours
