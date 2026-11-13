@@ -3776,6 +3776,20 @@ fn context_color(per_call: u64) -> u32 {
 /// How a context size reads: quiet while a session is cheap to carry, amber
 /// once every turn is paying for a few hundred thousand tokens of history, red
 
+/// Which tab an arrival belongs to: `None` for the live one, `Some(i)` for the
+/// tab at `i`. The rule is in `Storm::arrival_conv`; this is the arithmetic of
+/// it, so it can be pinned by a test.
+fn arrival_target(live_busy: bool, live_ix: usize, busy: &[bool]) -> Option<usize> {
+    if live_busy {
+        return None;
+    }
+    let mut working = busy.iter().enumerate().filter(|(i, b)| *i != live_ix && **b);
+    match (working.next(), working.next()) {
+        (Some((i, _)), None) => Some(i),
+        _ => None,
+    }
+}
+
 /// A stop that wants something from you, as a tag beside its title.
 ///
 /// Three words and no others, so the tag means something: a tour where every
@@ -10795,6 +10809,38 @@ impl Storm {
         .detach();
     }
 
+    /// Which conversation an arrival over `$TIDE_RPC` belongs to.
+    ///
+    /// The adapters are one per tab, but the control channel is one per
+    /// workspace: a screenshot or a summary arrives over HTTP carrying nothing
+    /// that says which tab's agent posted it. It used to land in whichever tab
+    /// was on screen, which is how a picture asked for in one tab turned up in
+    /// another.
+    ///
+    /// Only an agent mid-turn posts anything, so the turn that is running is
+    /// the sender. `None` means the live transcript: either it is the one
+    /// working, or nothing is, or two tabs are working at once and there is
+    /// nothing here to tell them apart. Routing by the adapter's own session
+    /// would settle that last case, and would need a token per tab.
+    fn arrival_conv(&self) -> Option<usize> {
+        let busy: Vec<bool> = self.convs.iter().map(|c| c.busy).collect();
+        arrival_target(self.agent_busy, self.conv, &busy)
+    }
+
+    /// Put a message in the transcript it belongs to: the live one, or a tab
+    /// behind it. A tab's list is spliced up to its message count when you
+    /// switch to it, so there is nothing else to keep in step here.
+    fn push_to_conv(&mut self, at: Option<usize>, msg: AgentMsg, cx: &mut Context<Self>) {
+        match at.and_then(|i| self.convs.get_mut(i)) {
+            Some(c) => c.msgs.push(msg),
+            None => {
+                self.agent_msgs.push(msg);
+                self.agent_list.scroll_to_end();
+            }
+        }
+        cx.notify();
+    }
+
     /// A screenshot the agent posted to `/shot`: read it off disk and put it in
     /// the transcript, next to whatever it was saying about it.
     fn show_agent_shot(&mut self, shot: &rpc::Shot, cx: &mut Context<Self>) {
@@ -10816,14 +10862,17 @@ impl Storm {
             "webp" => gpui::ImageFormat::Webp,
             _ => gpui::ImageFormat::Png,
         };
-        self.agent_msgs.push(AgentMsg::Shot {
-            note: shot.note.clone(),
-            dims: image_size(&bytes).map(|(w, h)| (w as f32, h as f32)),
-            image: Arc::new(gpui::Image::from_bytes(format, bytes)),
-            path,
-        });
-        self.agent_list.scroll_to_end();
-        cx.notify();
+        let at = self.arrival_conv();
+        self.push_to_conv(
+            at,
+            AgentMsg::Shot {
+                note: shot.note.clone(),
+                dims: image_size(&bytes).map(|(w, h)| (w as f32, h as f32)),
+                image: Arc::new(gpui::Image::from_bytes(format, bytes)),
+                path,
+            },
+            cx,
+        );
     }
 
     /// Tasks the agent filed through `/todo`. A batch out of one session belongs
@@ -11065,11 +11114,15 @@ impl Storm {
                     let summaries =
                         this.agent_rpc.as_ref().map(|s| s.drain_summaries()).unwrap_or_default();
                     for summary in summaries {
-                        this.agent_msgs
-                            .push(AgentMsg::Summary { title: summary.title, text: summary.text });
-                        this.agent_cur = None; // anything after it is a new bubble
-                        this.agent_list.scroll_to_end();
-                        cx.notify();
+                        let at = this.arrival_conv();
+                        if at.is_none() {
+                            this.agent_cur = None; // anything after it is a new bubble
+                        }
+                        this.push_to_conv(
+                            at,
+                            AgentMsg::Summary { title: summary.title, text: summary.text },
+                            cx,
+                        );
                     }
                     for batch in viewed {
                         this.apply_agent_viewed(&batch, false, cx);
@@ -45341,6 +45394,24 @@ mod handoff_tests {
             path: PathBuf::from("/tmp/a.png"),
             dims: None,
         }
+    }
+
+    /// A picture asked for in one tab turned up in another, because the
+    /// control channel is one per workspace and the arrival carried nothing
+    /// saying which agent posted it.
+    #[test]
+    fn an_arrival_goes_to_the_tab_that_is_working() {
+        // the live tab is mid-turn: it posted it
+        assert_eq!(arrival_target(true, 0, &[false, true]), None);
+        // the live tab is idle and one behind it is working: that one did
+        assert_eq!(arrival_target(false, 0, &[false, true, false]), Some(1));
+        assert_eq!(arrival_target(false, 2, &[true, false, false]), Some(0));
+        // nothing is working, or two are: nothing here tells them apart, so it
+        // lands where you are looking
+        assert_eq!(arrival_target(false, 0, &[false, false]), None);
+        assert_eq!(arrival_target(false, 0, &[false, true, true]), None);
+        // the live tab's own slot is the empty placeholder and never the target
+        assert_eq!(arrival_target(false, 1, &[false, true]), None);
     }
 
     /// The steps a spend reads at. A question that cost half a million is not
