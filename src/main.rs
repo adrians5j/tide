@@ -8625,6 +8625,9 @@ struct Storm {
     brief_w: f32,
     ws_idle: bool,   // persisted "nobody is on this workspace" marker
     ws_paused: bool, // persisted "skip me in ⌥Tab" marker
+    /// Whether this checkout has a `.codegraph` index. Read on the git poll,
+    /// because the topbar says so and the topbar is drawn every frame.
+    codegraph: bool,
     show_terminal: bool,
     term_width: f32,
     resizing_term: bool,
@@ -9430,6 +9433,7 @@ impl Storm {
         let ws_subtitle = load_ws_subtitle(&root);
         let ws_idle = load_ws_idle(&root);
         let ws_paused = load_ws_paused(&root);
+        let codegraph = root.join(".codegraph").is_dir();
         let ws_client = load_ws_client(&root);
         let agent_fresh = load_ws_fresh(&root);
         let agent_titled = load_agent_titled(&root);
@@ -9497,6 +9501,7 @@ impl Storm {
             brief_w: 0.,
             ws_idle,
             ws_paused,
+            codegraph,
             active_term: 0,
             show_terminal: true,
             term_width: 900.,
@@ -11653,6 +11658,10 @@ impl Storm {
                     this.mem_mb = mem;
                     this.ws_idle = idle;
                     this.ws_paused = paused;
+                    // one stat every five seconds, rather than one per frame:
+                    // an index that appears mid-session is worth noticing, and
+                    // the topbar is drawn sixty times a second
+                    this.codegraph = root.join(".codegraph").is_dir();
                     if let Some(parent) = parent_update {
                         this.branch_parent = parent;
                     }
@@ -18798,6 +18807,7 @@ impl Storm {
                 .flex_row()
                 .items_center()
                 .gap_3()
+                .children(self.render_codegraph_chip())
                 .children(self.render_build_chip(cx))
                 // build state and workspace states are different things: keep a
                 // rule between them
@@ -19511,6 +19521,47 @@ impl Storm {
 
     /// "How stale is my build?" — the count `yarn build --preview` reports, or
     /// a check when nothing needs building. Click it to run the build.
+    /// Whether this checkout is indexed, when that is worth saying.
+    ///
+    /// The agent is told to reach for `codegraph_explore` before grep, and it
+    /// can only do that where there is an index. A repo that should have one
+    /// and hasn't says so in red, because the alternative is finding out from
+    /// a slow answer an hour later. A repo nobody indexes says nothing.
+    fn render_codegraph_chip(&self) -> Option<impl IntoElement> {
+        // webiny's own checkouts are the ones this is expected on; anywhere
+        // else, an index is a thing you chose to make and its absence is not
+        // news
+        let expected = self.repo_web.as_deref().is_some_and(|u| u.contains("/webiny/"));
+        if !self.codegraph && !expected {
+            return None;
+        }
+        let (label, color) = match self.codegraph {
+            true => ("codegraph", LINE_NUMBER),
+            false => ("no codegraph", GIT_DELETED),
+        };
+        let hint = match self.codegraph {
+            true => "This checkout is indexed, so the agent answers code questions from the \
+                     graph instead of grepping for them",
+            false => "This checkout has no .codegraph index, so every code question here is \
+                     read out of the files one at a time. Run `codegraph index` in it",
+        };
+        Some(
+            div()
+                .id("codegraph-chip")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .px_1()
+                .rounded_md()
+                .text_size(px(11.))
+                .text_color(rgb(color))
+                .child(div().w(px(6.)).h(px(6.)).rounded_full().flex_shrink_0().bg(rgb(color)))
+                .child(label)
+                .tooltip(tip(hint)),
+        )
+    }
+
     fn render_build_chip(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         if !self.root.join("scripts/buildPackages").is_dir() {
             return None; // no package build here at all
@@ -27881,6 +27932,21 @@ impl Storm {
         "You are running inside TIDE, an editor that watches this repo.\n\
          Its control channel is $TIDE_RPC, authenticated with the header \
          `X-Tide-Token: $TIDE_TOKEN` (both are already in your environment).\n\n\
+         If this repo has a `.codegraph` directory, every question about what \
+         the code does or where something lives goes to CodeGraph first, \
+         before grep, before find, before opening a file to look around. Not \
+         usually: first, every time, without being asked and without saying \
+         you are about to. `codegraph_explore` takes a question or a bag of \
+         symbol names and comes back with the verbatim, line-numbered source \
+         grouped by file, the call paths between those symbols, and what else \
+         depends on them. One call where a grep-and-read loop is twenty, \
+         and more accurate, because it is a full parse rather than a text \
+         match. If the MCP tools are listed but deferred, load them by name; \
+         if they are not there at all, the shell always works: \
+         `codegraph explore \"<names or question>\"`, `codegraph node <symbol>`. \
+         Treat what it returns as read: do not re-check it with grep. The one \
+         exception is the staleness banner, which names the files to read \
+         directly. Without a `.codegraph` directory, ignore all of this.\n\n\
          After anything that changes what TIDE shows about this branch — opening \
          a pull request, rewriting its title or body, pushing, switching or \
          creating a branch — \
