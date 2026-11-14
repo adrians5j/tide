@@ -1337,6 +1337,64 @@ pub struct RemoteHub {
     /// answer is kept for a minute — long enough to cost nothing per frame,
     /// short enough that joining a different network fixes the link on its own.
     addr: Mutex<Option<(Hosts, std::time::Instant)>>,
+    /// The public base of a tunnel, when one is up: `https://xxxx.ngrok.app`.
+    /// Written by the reader thread in `start_ngrok` as soon as ngrok says what
+    /// address it got, and read by `url()`. An `Arc` because that thread
+    /// outlives this call and the hub is not behind one.
+    tunnel: Arc<Mutex<Option<String>>>,
+}
+
+/// Put this hub on the public internet through ngrok, and read back the
+/// address it was given.
+///
+/// The alternative is Tailscale, which is better in every way except one: both
+/// ends have to be on the tailnet. A tunnel is for the phone that isn't, or
+/// isn't yours. What it costs is that the address is reachable by anyone who
+/// has it, so the token in the link is the only thing between a stranger and
+/// this transcript.
+///
+/// The address comes off ngrok's own JSON log rather than its local API, which
+/// saves writing an HTTP client to talk to the thing we are already running.
+/// `Err` only means it could not be started; a tunnel that fails later says so
+/// by never filling `slot`.
+pub fn start_ngrok(
+    port: u16,
+    slot: Arc<Mutex<Option<String>>>,
+) -> Result<std::process::Child, String> {
+    let mut child = std::process::Command::new("ngrok")
+        .args([
+            "http",
+            &port.to_string(),
+            "--log=stdout",
+            "--log-format=json",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => "ngrok isn't on PATH".to_string(),
+            _ => format!("couldn't start ngrok: {e}"),
+        })?;
+    let Some(out) = child.stdout.take() else {
+        let _ = child.kill();
+        return Err("ngrok gave nothing to read".into());
+    };
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+            let Some(url) = v.get("url").and_then(|u| u.as_str()) else { continue };
+            if !url.starts_with("http") {
+                continue;
+            }
+            if let Ok(mut t) = slot.lock() {
+                *t = Some(url.trim_end_matches('/').to_string());
+            }
+            // the rest of the log is request lines, and nothing reads them
+            break;
+        }
+    });
+    Ok(child)
 }
 
 /// Something typed on the phone, on its way to a workspace.
@@ -1398,20 +1456,57 @@ impl RemoteHub {
                 }
             });
         }
-        Some(RemoteHub { token, port, snapshot, wanted, said, seen, imgs, addr: Mutex::new(None) })
+        Some(RemoteHub {
+            token,
+            port,
+            snapshot,
+            wanted,
+            said,
+            seen,
+            imgs,
+            addr: Mutex::new(None),
+            tunnel: Arc::new(Mutex::new(None)),
+        })
     }
 
     /// The address to open on a phone. The tailnet name wins when there is one,
     /// because it is the only one that still works when you leave; the Bonjour
     /// name next, since it survives a new DHCP lease; the address last.
     pub fn url(&self) -> Option<String> {
+        // a tunnel outranks everything: it is the one you asked for, and it is
+        // the only one that works from a phone that is not yours
+        if let Some(base) = self.tunnel() {
+            return Some(format!("{base}/m?t={}", self.token));
+        }
         let h = self.hosts();
         self.link(h.tailnet.or(h.mdns).or(h.ip)?)
     }
 
+    /// The port the phone's listener is on, which is what a tunnel points at.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// The slot `start_ngrok` fills, and what it has in it.
+    pub fn tunnel_slot(&self) -> Arc<Mutex<Option<String>>> {
+        self.tunnel.clone()
+    }
+
+    pub fn tunnel(&self) -> Option<String> {
+        self.tunnel.lock().ok().and_then(|t| t.clone())
+    }
+
+    /// Forget the tunnel. The caller kills the process; this is the half the
+    /// link reads.
+    pub fn clear_tunnel(&self) {
+        if let Ok(mut t) = self.tunnel.lock() {
+            *t = None;
+        }
+    }
+
     /// True when the link works from outside the house.
     pub fn is_far(&self) -> bool {
-        self.hosts().tailnet.is_some()
+        self.tunnel().is_some() || self.hosts().tailnet.is_some()
     }
 
     /// The same page by IP address, for a phone that won't resolve `.local`.

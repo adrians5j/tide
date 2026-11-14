@@ -6349,6 +6349,7 @@ enum Cmd {
     AgentBriefing,
     PhoneLink,
     PhoneLinkIp,
+    PhoneTunnel,
     ProcessManager,
     ToggleReadOnly,
     ResolveConflicts,
@@ -6403,6 +6404,12 @@ const PALETTE: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::AgentBriefing, "Show the Agent Briefing", IC_GEAR, ""),
     (Cmd::PhoneLink, "Copy the Phone Link", IC_BROWSER, ""),
     (Cmd::PhoneLinkIp, "Copy the Phone Link  (by IP)", IC_BROWSER, ""),
+    (
+        Cmd::PhoneTunnel,
+        "Phone Link over the Internet  (ngrok tunnel \u{b7} anyone with the link is in)",
+        IC_BROWSER,
+        "",
+    ),
     (Cmd::ProcessManager, "Process Manager", IC_TOOLS, ""),
     (Cmd::ToggleReadOnly, "Toggle Read-Only / Edit Mode", IC_HOME, ""),
     (Cmd::ResolveConflicts, "Resolve Merge Conflicts", IC_BRANCH, ""),
@@ -9371,9 +9378,17 @@ struct Storm {
     pr_cmd_posting: Option<&'static str>,
     /// The window's phone link, pushed down from the Workspace so the agent
     /// pane can hand it to you. Read-only here.
+    /// Start (`true`) or stop (`false`) the ngrok tunnel. The hub belongs to
+    /// the workspace and the command palette runs here, so the ask is left for
+    /// the workspace's own poll to pick up, the way `remote_url` comes back
+    /// the other way.
+    tunnel_want: Option<bool>,
     remote_url: Option<String>,
     /// The same page by IP address, for a phone that won't resolve `.local`.
     remote_url_ip: Option<String>,
+    /// The tunnel's public base while one is up, so the command knows which
+    /// way it is toggling and the topbar can say the link is public.
+    remote_tunnel: Option<String>,
     /// Whether the link still works once you leave the house.
     remote_far: bool,
     /// PRs whose body is being re-read right now, so the header can say so
@@ -9904,8 +9919,10 @@ impl Storm {
             md_focus: cx.focus_handle(),
             pr_merging: None,
             pr_cmd_posting: None,
+            tunnel_want: None,
             remote_url: None,
             remote_url_ip: None,
+            remote_tunnel: None,
             remote_far: false,
             pr_syncing: HashSet::new(),
             pr_merged_as: None,
@@ -16265,6 +16282,18 @@ impl Storm {
                         self.show_flash(&format!("Copied {url} — open it on your phone"), cx);
                     }
                     None => self.show_flash("No phone link: the remote hub isn't up", cx),
+                }
+            }
+            Cmd::PhoneTunnel => {
+                let on = self.remote_tunnel.is_some();
+                self.tunnel_want = Some(!on);
+                match on {
+                    true => self.show_flash("Closing the tunnel…", cx),
+                    false => self.show_flash(
+                        "Opening an ngrok tunnel… the link is public: anyone who has it \
+                         can read this transcript and message the agent",
+                        cx,
+                    ),
                 }
             }
             Cmd::ProcessManager => self.open_process_manager(window, cx),
@@ -38633,6 +38662,12 @@ struct Workspace {
     /// read any workspace. Always on: it costs a bound socket, and the work of
     /// building a transcript only happens while a phone is actually polling.
     remote: Option<rpc::RemoteHub>,
+    /// The ngrok process while a tunnel is up. Held so it can be killed: a
+    /// tunnel nobody ended outlives the window that opened it.
+    ngrok: Option<std::process::Child>,
+    /// Whether this tunnel's address has been said once. The link is told when
+    /// it arrives, not every poll after that.
+    tunnel_told: bool,
     quit_focus: FocusHandle,
 }
 
@@ -38661,6 +38696,8 @@ impl Workspace {
             pause_focus: cx.focus_handle(),
             pause_focus_pending: false,
             remote: None,
+            ngrok: None,
+            tunnel_told: false,
             quit_focus: cx.focus_handle(),
         };
         // open every passed root as its own workspace
@@ -39329,6 +39366,12 @@ impl Workspace {
         if let Some(p) = self.projects.get(self.active) {
             p.update(cx, |s, cx| s.save_tab(s.active, cx));
         }
+        // a tunnel is a public address on this machine: it goes when the window
+        // that opened it does, rather than being left behind by a quit
+        if let Some(mut child) = self.ngrok.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         cx.quit();
     }
 
@@ -39668,6 +39711,103 @@ impl Workspace {
 }
 
 impl Workspace {
+    /// Start or stop the ngrok tunnel, when a pane asked for one.
+    ///
+    /// The hub is the workspace's and the palette runs in a pane, so the ask
+    /// arrives as a flag on whichever pane was asked. The answer goes back the
+    /// way every other piece of hub state does: `remote_url` and friends, on
+    /// the next frame.
+    fn serve_tunnel_ask(&mut self, cx: &mut Context<Self>) {
+        self.watch_tunnel(cx);
+        let asked = self.projects.iter().enumerate().find_map(|(i, p)| {
+            p.read(cx).tunnel_want.map(|want| (i, want))
+        });
+        let Some((at, want)) = asked else { return };
+        let project = self.projects[at].clone();
+        project.update(cx, |s, _| s.tunnel_want = None);
+        if !want {
+            if let Some(mut child) = self.ngrok.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            if let Some(hub) = self.remote.as_ref() {
+                hub.clear_tunnel();
+            }
+            project.update(cx, |s, cx| s.show_flash("Tunnel closed", cx));
+            return;
+        }
+        if self.ngrok.is_some() {
+            return; // already up
+        }
+        let Some(hub) = self.remote.as_ref() else {
+            project.update(cx, |s, cx| {
+                s.show_flash("No phone hub to put on the internet", cx)
+            });
+            return;
+        };
+        let (port, slot) = (hub.port(), hub.tunnel_slot());
+        match rpc::start_ngrok(port, slot) {
+            Ok(child) => {
+                self.ngrok = Some(child);
+                self.tunnel_told = false;
+                project.update(cx, |s, cx| {
+                    s.show_flash("ngrok is starting — the link appears in a moment", cx)
+                });
+            }
+            Err(why) => project.update(cx, |s, cx| {
+                s.show_flash(
+                    &format!("{why}. `brew install ngrok`, then `ngrok config add-authtoken …`"),
+                    cx,
+                )
+            }),
+        }
+    }
+
+    /// Follow the tunnel: say the address once it has one, and say so if the
+    /// process gave up.
+    ///
+    /// ngrok exits rather than retries when it is not signed in, which is the
+    /// usual reason this fails on a machine that has never used it. Without
+    /// this the link simply never appears and nothing says why.
+    fn watch_tunnel(&mut self, cx: &mut Context<Self>) {
+        let Some(child) = self.ngrok.as_mut() else { return };
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            self.ngrok = None;
+            let had = self.remote.as_ref().and_then(|h| h.tunnel()).is_some();
+            if let Some(hub) = self.remote.as_ref() {
+                hub.clear_tunnel();
+            }
+            let said = match had {
+                true => "The tunnel closed".to_string(),
+                false => "ngrok stopped before it opened a tunnel — run \
+                          `ngrok config add-authtoken <token>` once, then try again"
+                    .to_string(),
+            };
+            self.flash_here(&said, cx);
+            return;
+        }
+        if self.tunnel_told {
+            return;
+        }
+        let Some(url) = self.remote.as_ref().and_then(|h| h.url()) else { return };
+        if self.remote.as_ref().and_then(|h| h.tunnel()).is_none() {
+            return;
+        }
+        self.tunnel_told = true;
+        cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
+        self.flash_here(
+            &format!("{url} — copied. Public: the token in the link is the only lock on it"),
+            cx,
+        );
+    }
+
+    /// Say something in the pane the human is looking at.
+    fn flash_here(&self, text: &str, cx: &mut Context<Self>) {
+        if let Some(p) = self.projects.get(self.active) {
+            p.update(cx, |s, cx| s.show_flash(text, cx));
+        }
+    }
+
     /// Feed the phone and take what it types. Twice a second while someone is
     /// looking, once every three seconds when nobody is — the snapshot is only
     /// built when there is something to build it for.
@@ -39675,6 +39815,7 @@ impl Workspace {
         cx.spawn(async move |this, cx| loop {
             let watched = this
                 .update(cx, |this, cx| {
+                    this.serve_tunnel_ask(cx);
                     let Some(hub) = this.remote.as_ref() else { return None };
                     // anything typed on the phone goes to the workspace it was
                     // typed in, as if it had been typed in that pane
@@ -39779,6 +39920,7 @@ impl Render for Workspace {
         let remote_url = self.remote.as_ref().and_then(|h| h.url());
         let remote_url_ip = self.remote.as_ref().and_then(|h| h.url_ip());
         let remote_far = self.remote.as_ref().is_some_and(|h| h.is_far());
+        let remote_tunnel = self.remote.as_ref().and_then(|h| h.tunnel());
         self.projects[active].update(cx, |s, _| {
             s.ws_names = names;
             s.ws_roots = roots;
@@ -39787,6 +39929,7 @@ impl Render for Workspace {
             s.remote_url = remote_url;
             s.remote_url_ip = remote_url_ip;
             s.remote_far = remote_far;
+            s.remote_tunnel = remote_tunnel;
             s.ws_active = active;
         });
         // focus the active project after a switch (render has the Window)
