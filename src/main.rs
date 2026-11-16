@@ -171,6 +171,30 @@ fn job_at(turns: &[JobTurn], ix: usize) -> Option<&JobTurn> {
     turns.iter().find(|q| ix >= q.at && q.end.is_none_or(|e| ix < e))
 }
 
+/// Where the last thing the agent said in a finished job is, when the job
+/// posted no card.
+///
+/// A closed job folds its working away on the understanding that the summary
+/// card is its closing word. Not every job asks for one: the note after a
+/// merge asks what to do next and gets an answer in prose. Folding that away
+/// leaves a line with a tick on it and the answer nowhere, which is how an
+/// answer to "#6257 is merged, what next?" went missing behind a job called
+/// `Merged #6257`.
+///
+/// Only once the turn has ended. While it is running the fold is doing its
+/// job, and the prose streaming past is the working, not the answer.
+fn job_last_word(msgs: &[AgentMsg], q: &JobTurn) -> Option<usize> {
+    let end = q.end?.min(msgs.len());
+    let span = msgs.get(q.at..end)?;
+    // a card is its closing word, and the fold already lets that through
+    if span.iter().any(|m| matches!(m, AgentMsg::Summary { .. } | AgentMsg::Shot { .. })) {
+        return None;
+    }
+    span.iter()
+        .rposition(|m| matches!(m, AgentMsg::Agent(t) if !t.trim().is_empty()))
+        .map(|i| q.at + i)
+}
+
 /// The live `@` mention in front of the caret: where its `@` sits and what has
 /// been typed after it. A mention starts a word (never an e-mail's `a@b`) and
 /// ends at the first space, so `@wby` is live and `@wby next` is plain text
@@ -31068,7 +31092,13 @@ impl Storm {
             this.agent_msgs.get(ix),
             Some(AgentMsg::Summary { .. } | AgentMsg::Shot { .. })
         );
-        if !result && this.job_turn(ix).is_some_and(|q| !q.open && ix > q.at) {
+        // …and when the job ended without a card, its closing word is
+        // whatever it last said, which the fold must not eat either
+        let last_word = match this.job_turn(ix) {
+            Some(q) => job_last_word(&this.agent_msgs, q) == Some(ix),
+            None => false,
+        };
+        if !result && !last_word && this.job_turn(ix).is_some_and(|q| !q.open && ix > q.at) {
             return div().into_any_element();
         }
         if let Some(m) = this.agent_msgs.get(ix) {
@@ -44192,6 +44222,66 @@ mod code_tour_tests {
         // and nothing before the first fold
         assert!(job_at(&turns, 0).is_none());
         assert!(job_at(&[], 3).is_none());
+    }
+
+    fn msgs(kinds: &[&str]) -> Vec<AgentMsg> {
+        kinds
+            .iter()
+            .map(|k| match *k {
+                "user" => AgentMsg::User { text: "q".into(), imgs: vec![], by: Sender::Tide },
+                "said" => AgentMsg::Agent("an answer".into()),
+                "blank" => AgentMsg::Agent("   ".into()),
+                "card" => AgentMsg::Summary { title: "t".into(), text: "x".into() },
+                _ => AgentMsg::Tool {
+                    id: "1".into(),
+                    title: "ls".into(),
+                    status: "done".into(),
+                    detail: String::new(),
+                    started: std::time::Instant::now(),
+                },
+            })
+            .collect()
+    }
+
+    /// A job that ended without a card keeps its last word on screen. This is
+    /// the merge note: it asks what to do next, the answer comes back as
+    /// prose, and the fold used to swallow it.
+    #[test]
+    fn a_job_with_no_card_shows_what_it_last_said() {
+        let q = JobTurn { at: 0, end: Some(4), open: false, job: "Merged #1".into(), began: 0, took: None };
+        let m = msgs(&["user", "tool", "said", "tool"]);
+        assert_eq!(job_last_word(&m, &q), Some(2));
+        // the tail of it, not the first thing it said
+        let m = msgs(&["user", "said", "tool", "said"]);
+        assert_eq!(job_last_word(&m, &q), Some(3));
+        // an empty streamed message is not an answer
+        let m = msgs(&["user", "said", "tool", "blank"]);
+        assert_eq!(job_last_word(&m, &q), Some(1));
+    }
+
+    /// A job that posted one keeps nothing else: the card is the closing word
+    /// and the fold already lets it through.
+    #[test]
+    fn a_job_with_a_card_keeps_its_working_folded() {
+        let q = JobTurn { at: 0, end: Some(4), open: false, job: "Brief of #1".into(), began: 0, took: None };
+        assert_eq!(job_last_word(&msgs(&["user", "said", "card", "tool"]), &q), None);
+    }
+
+    /// While the turn is still running the fold is doing its job: the prose
+    /// going past is the working, not the answer.
+    #[test]
+    fn a_running_job_keeps_everything_folded() {
+        let q = JobTurn { at: 0, end: None, open: false, job: "Merged #1".into(), began: 0, took: None };
+        assert_eq!(job_last_word(&msgs(&["user", "said", "tool"]), &q), None);
+    }
+
+    /// A span that says nothing, and one that ran off the end of the list.
+    #[test]
+    fn nothing_said_and_nothing_there() {
+        let q = JobTurn { at: 0, end: Some(2), open: false, job: "j".into(), began: 0, took: None };
+        assert_eq!(job_last_word(&msgs(&["user", "tool"]), &q), None);
+        let past = JobTurn { at: 0, end: Some(99), open: false, job: "j".into(), began: 0, took: None };
+        assert_eq!(job_last_word(&msgs(&["user", "said"]), &past), Some(1));
     }
 
     /// Explain PR is one prompt: both halves, in the order they are read, and
