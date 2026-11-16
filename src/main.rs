@@ -3789,13 +3789,44 @@ fn arrival_target(live_busy: bool, live_ix: usize, busy: &[bool]) -> Option<usiz
     }
 }
 
+/// Blend `fg` over `bg` at `t` (0..=1); both are 0xRRGGBB and so is the result.
+///
+/// Opaque on purpose. A translucent wash composites against whatever is behind
+/// it, and the things that animate here sit on a card over the editor, so the
+/// colour under them is the code on that stop rather than one known surface.
+fn blend(bg: u32, fg: u32, t: f32) -> u32 {
+    let t = t.clamp(0., 1.);
+    let ch = |shift: u32| {
+        let (a, b) = (((bg >> shift) & 0xff) as f32, ((fg >> shift) & 0xff) as f32);
+        ((a + (b - a) * t).round() as u32).min(0xff) << shift
+    };
+    ch(16) | ch(8) | ch(0)
+}
+
+/// How hard the flag tag is lit at `t` through its blink, 0 at rest and 1 at
+/// the brightest.
+///
+/// Five half-cycles of a sine with the negatives dropped: three humps, each
+/// quieter than the last, the third ending exactly at zero. Landing at zero is
+/// the point — the last frame of the animation has to be the chip as it sits
+/// for the rest of the stop, or the tag keeps a tint nothing explains.
+fn flag_pulse(t: f32) -> f32 {
+    (t * std::f32::consts::PI * 5.).sin().max(0.) * (1. - 0.75 * t)
+}
+
 /// A stop that wants something from you, as a tag beside its title.
 ///
 /// Three words and no others, so the tag means something: a tour where every
 /// stop carries a different word of warning has no warnings in it. `look` is
 /// worth your eyes, `decide` is a call the agent won't make for you, `risk` is
 /// what could bite.
-fn stop_flag_chip(flag: &str) -> Option<Div> {
+///
+/// It blinks three times when you arrive and then sits still. The card lands
+/// under your eyes on the code, not on itself, so the tag has to say it is
+/// there; a pulse that never stopped would be read once and then be something
+/// flashing beside the paragraph you are trying to read. `at` keys the
+/// animation to the stop, so stepping to the next one runs it again.
+fn stop_flag_chip(flag: &str, at: usize) -> Option<AnyElement> {
     let (label, color) = match flag {
         "look" => ("worth a look", GIT_MODIFIED),
         "decide" => ("your call", COMMENT_MARK),
@@ -3807,12 +3838,20 @@ fn stop_flag_chip(flag: &str) -> Option<Div> {
             .flex_shrink_0()
             .px_1p5()
             .rounded_md()
-            .bg(rgb(BG))
             .border_1()
             .border_color(rgb(color))
             .text_size(px(10.))
-            .text_color(rgb(color))
-            .child(label),
+            .child(label)
+            .with_animation(
+                ("stop-flag", at),
+                Animation::new(Duration::from_millis(FLAG_BLINK_MS)),
+                move |d, t| {
+                    let pulse = flag_pulse(t);
+                    d.bg(rgb(blend(BG, color, pulse * 0.45)))
+                        .text_color(rgb(blend(color, SEL_TEXT, pulse * 0.8)))
+                },
+            )
+            .into_any_element(),
     )
 }
 
@@ -7086,6 +7125,11 @@ const TOUR_CARD_W: f32 = 760.0;
 const TOUR_CARD_COLS: usize = 96;
 /// One wrapped row of the description.
 const TOUR_LINE_H: f32 = 20.0;
+/// How long the `worth a look` / `your call` / `careful` tag blinks for when a
+/// stop with one on it opens. Three blinks fit in it, so each is 800ms: slow
+/// enough to read as a pulse rather than a flicker, short enough to be over
+/// before you have finished the first sentence of the note.
+const FLAG_BLINK_MS: u64 = 2400;
 /// Rows before the description scrolls inside the card instead of pushing the
 /// file further apart. The note is what you stopped to read, so this is
 /// generous: at 20px a row it is 280px of card, and the file parts by that
@@ -26447,7 +26491,7 @@ impl Storm {
                             .items_center()
                             .gap_2()
                             .pt_1()
-                            .children(stop_flag_chip(&flag))
+                            .children(stop_flag_chip(&flag, at))
                             .child(
                                 div()
                                     .flex_grow(1.0)
@@ -45188,5 +45232,42 @@ mod handoff_tests {
     fn a_short_one_is_left_alone() {
         assert_eq!(one_line("done", 300), "done");
         assert_eq!(one_line("", 300), "");
+    }
+}
+
+#[cfg(test)]
+mod flag_chip_tests {
+    use super::*;
+
+    /// The blink starts dark, lights up, and is back to nothing at the end:
+    /// whatever it does in between, the chip it leaves behind is the plain one.
+    #[test]
+    fn the_blink_starts_and_ends_at_rest() {
+        assert!(flag_pulse(0.).abs() < 0.001);
+        assert!(flag_pulse(1.).abs() < 0.001);
+        assert!(flag_pulse(0.1) > 0.8, "{}", flag_pulse(0.1));
+    }
+
+    /// Three humps, and each one is lower than the one before it.
+    #[test]
+    fn three_blinks_each_quieter_than_the_last() {
+        let peaks: Vec<f32> = [0.1_f32, 0.5, 0.9].iter().map(|t| flag_pulse(*t)).collect();
+        assert!(peaks[0] > peaks[1] && peaks[1] > peaks[2], "{peaks:?}");
+        assert!(peaks[2] > 0.2, "the third blink still has to be visible: {peaks:?}");
+        // the troughs between them are dark
+        for t in [0.3_f32, 0.7] {
+            assert!(flag_pulse(t).abs() < 0.001, "{t} -> {}", flag_pulse(t));
+        }
+    }
+
+    /// At rest the blend gives back the resting colours, so an un-animated
+    /// frame and the chip's own styling cannot drift apart.
+    #[test]
+    fn blending_at_nothing_is_the_colour_it_started_from() {
+        assert_eq!(blend(BG, COMMENT_MARK, 0.), BG);
+        assert_eq!(blend(BG, COMMENT_MARK, 1.), COMMENT_MARK);
+        // halfway is between the two on every channel
+        let mid = blend(0x000000, 0xffffff, 0.5);
+        assert_eq!(mid, 0x808080);
     }
 }
