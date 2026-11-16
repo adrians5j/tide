@@ -7324,6 +7324,9 @@ struct Conv {
     job_next: Option<String>,
     turn_start: Option<std::time::Instant>,
     mark: Option<spend::Mark>,
+    /// What this tab's control-channel token is filed under, so a screenshot
+    /// posted by its agent comes back to it. See `rpc::Server::add_tab`.
+    rpc_tab: String,
     sel: Option<(usize, usize, usize)>,
     sel_ch: Option<(usize, usize, usize, usize, usize)>,
     sel_anchor: Option<(usize, usize, usize)>,
@@ -9063,6 +9066,9 @@ struct Storm {
     /// agent pane, which is where a prompt comes from when nothing says
     /// otherwise. See `spend.rs`.
     spend_next: Option<&'static str>,
+    /// The live conversation's id on the control channel. Swapped with the tab
+    /// it belongs to, like everything else in this block.
+    agent_rpc_tab: String,
     /// What on screen the next prompt belongs to, so the brief or the slide
     /// that sent it can say what it cost. Set beside `spend_next`.
     spend_tag: Option<String>,
@@ -9775,6 +9781,7 @@ impl Storm {
             agent_spin: 0,
             agent_turn_start: None,
             spend_next: None,
+            agent_rpc_tab: String::new(),
             spend_tag: None,
             spend_tags: HashMap::new(),
             spend_at: 0,
@@ -10395,6 +10402,27 @@ impl Storm {
         self.agent_rpc.as_ref().map(|s| (s.url(), s.token.clone()))
     }
 
+    /// The same, for an agent tab: its own token, so what it posts says which
+    /// tab posted it.
+    ///
+    /// The briefing already has every agent send `$TIDE_TOKEN`, and TIDE sets
+    /// that per adapter, so this costs the agent nothing and can't be got
+    /// wrong by one. A tab that somehow has no token of its own falls back to
+    /// the workspace's, which is where this was before: an arrival with no
+    /// sender, guessed at by which tab is working.
+    fn tab_rpc_env(&mut self) -> Option<(String, String)> {
+        let url = self.agent_rpc.as_ref()?.url();
+        if self.agent_rpc_tab.is_empty() {
+            self.agent_rpc_tab = random_id() + &random_id();
+        }
+        let token = random_id() + &random_id();
+        let id = self.agent_rpc_tab.clone();
+        if let Some(s) = self.agent_rpc.as_ref() {
+            s.add_tab(&token, &id);
+        }
+        Some((url, token))
+    }
+
     /// Hand a task to this workspace's agent and mark it in progress. The
     /// point is not having to copy the thing you already wrote down.
     fn start_todo(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -10844,6 +10872,24 @@ impl Storm {
         arrival_target(self.agent_busy, self.conv, &busy)
     }
 
+    /// The same, when the arrival said which tab it came from. `from` is the
+    /// id its token is filed under, and it is exact: no guessing, and right
+    /// even with every tab working at once.
+    fn arrival_conv_from(&self, from: &str) -> Option<usize> {
+        if from.is_empty() {
+            return self.arrival_conv();
+        }
+        if from == self.agent_rpc_tab {
+            return None; // the live transcript
+        }
+        match self.convs.iter().position(|c| c.rpc_tab == from) {
+            Some(i) => Some(i),
+            // a token from a tab that has since been closed: it has nowhere of
+            // its own to land, so it lands where you are looking
+            None => None,
+        }
+    }
+
     /// Put a message in the transcript it belongs to: the live one, or a tab
     /// behind it. A tab's list is spliced up to its message count when you
     /// switch to it, so there is nothing else to keep in step here.
@@ -10879,7 +10925,7 @@ impl Storm {
             "webp" => gpui::ImageFormat::Webp,
             _ => gpui::ImageFormat::Png,
         };
-        let at = self.arrival_conv();
+        let at = self.arrival_conv_from(&shot.from);
         self.push_to_conv(
             at,
             AgentMsg::Shot {
@@ -11131,7 +11177,7 @@ impl Storm {
                     let summaries =
                         this.agent_rpc.as_ref().map(|s| s.drain_summaries()).unwrap_or_default();
                     for summary in summaries {
-                        let at = this.arrival_conv();
+                        let at = this.arrival_conv_from(&summary.from);
                         if at.is_none() {
                             this.agent_cur = None; // anything after it is a new bubble
                         }
@@ -27342,6 +27388,7 @@ impl Storm {
         std::mem::swap(&mut self.job_next, &mut c.job_next);
         std::mem::swap(&mut self.agent_turn_start, &mut c.turn_start);
         std::mem::swap(&mut self.turn_mark, &mut c.mark);
+        std::mem::swap(&mut self.agent_rpc_tab, &mut c.rpc_tab);
         std::mem::swap(&mut self.agent_sel, &mut c.sel);
         std::mem::swap(&mut self.agent_sel_ch, &mut c.sel_ch);
         std::mem::swap(&mut self.agent_sel_anchor, &mut c.sel_anchor);
@@ -27426,6 +27473,10 @@ impl Storm {
         if let Some(acp) = c.acp {
             acp.shutdown();
         }
+        // its agent is gone, so its way in goes with it
+        if let (Some(s), false) = (self.agent_rpc.as_ref(), c.rpc_tab.is_empty()) {
+            s.drop_tab(&c.rpc_tab);
+        }
         if self.conv > i {
             self.conv -= 1;
         }
@@ -27468,7 +27519,8 @@ impl Storm {
     /// Spawn the ACP adapter on first use and start the event drain poll.
     fn ensure_acp(&mut self, cx: &mut Context<Self>) {
         if self.acp.is_none() {
-            self.acp = acp::Acp::new(&self.root, self.rpc_env());
+            let env = self.tab_rpc_env();
+            self.acp = acp::Acp::new(&self.root, env);
             if self.acp.is_none() {
                 self.agent_msgs.push(AgentMsg::Tool {
                     id: String::new(),

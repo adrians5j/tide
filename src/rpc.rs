@@ -73,6 +73,10 @@ pub struct Shot {
     pub path: String,
     /// One line about what it shows.
     pub note: String,
+    /// Which conversation's agent posted it, by the id its token is filed
+    /// under. Empty when it came in on the workspace's own token, which is
+    /// everything but an agent tab.
+    pub from: String,
 }
 
 /// A closing summary for a job TIDE handed over: what was done, in the agent's
@@ -81,6 +85,8 @@ pub struct Summary {
     /// What the card is about, in a few words. Empty falls back to "Summary".
     pub title: String,
     pub text: String,
+    /// Which conversation's agent posted it. See `Shot::from`.
+    pub from: String,
 }
 
 /// A task an agent filed on the todo list.
@@ -293,6 +299,13 @@ pub struct Server {
     /// title TIDE shows for it, the branch. Kept up to date by the UI, since the
     /// server thread can't see any of it.
     info: Arc<Mutex<String>>,
+    /// A token per agent tab, filed under that tab's id.
+    ///
+    /// One workspace, one control channel, several tabs: a `curl` arriving
+    /// here carries nothing saying which tab's agent ran it. But the briefing
+    /// has every agent send `$TIDE_TOKEN`, and TIDE sets that per adapter, so
+    /// the token it came in on names the tab without the agent doing anything.
+    tabs: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl Server {
@@ -314,10 +327,11 @@ impl Server {
         let summaries = Arc::new(Mutex::new(Vec::new()));
         let tours = Arc::new(Mutex::new(Vec::new()));
         let briefs = Arc::new(Mutex::new(Vec::new()));
+        let tabs: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
         {
             let (queue, replies, dirty, token) =
                 (queue.clone(), replies.clone(), dirty.clone(), token.clone());
-            let (refresh, reviewers, titles, viewed, info, todos, shots, summaries, tours, briefs) = (
+            let (refresh, reviewers, titles, viewed, info, todos, shots, summaries, tours, briefs, tabs) = (
                 refresh.clone(),
                 reviewers.clone(),
                 titles.clone(),
@@ -328,6 +342,7 @@ impl Server {
                 summaries.clone(),
                 tours.clone(),
                 briefs.clone(),
+                tabs.clone(),
             );
             std::thread::spawn(move || {
                 for stream in listener.incoming().flatten() {
@@ -336,7 +351,7 @@ impl Server {
                     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
                     handle(
                         stream, &token, &queue, &replies, &dirty, &refresh, &reviewers, &titles,
-                        &viewed, &info, &todos, &shots, &summaries, &tours, &briefs,
+                        &viewed, &info, &todos, &shots, &summaries, &tours, &briefs, &tabs,
                     );
                 }
             });
@@ -357,7 +372,25 @@ impl Server {
             summaries,
             tours,
             briefs,
+            tabs,
         })
+    }
+
+    /// File a token for one agent tab. The adapter started with it in its env
+    /// as `TIDE_TOKEN`, so everything that tab's agent posts arrives under it.
+    pub fn add_tab(&self, token: &str, id: &str) {
+        if let Ok(mut t) = self.tabs.lock() {
+            t.retain(|(_, had)| had != id);
+            t.push((token.to_string(), id.to_string()));
+        }
+    }
+
+    /// Forget a tab's token when its conversation is closed, so a token no
+    /// window can reach stops being accepted.
+    pub fn drop_tab(&self, id: &str) {
+        if let Ok(mut t) = self.tabs.lock() {
+            t.retain(|(_, had)| had != id);
+        }
     }
 
     /// Take everything reported since the last call.
@@ -450,6 +483,7 @@ fn handle(
     summaries: &Mutex<Vec<Summary>>,
     tours: &Mutex<Vec<Tour>>,
     briefs: &Mutex<Vec<Brief>>,
+    tabs: &Mutex<Vec<(String, String)>>,
 ) {
     let Some((method, path, headers, body)) = read_request(&mut stream) else {
         respond(&mut stream, 400, "{\"error\":\"bad request\"}");
@@ -478,10 +512,26 @@ fn handle(
         .find(|(k, _)| k == "x-tide-token")
         .map(|(_, v)| v.as_str())
         .unwrap_or(&query_token);
-    if !constant_eq(given, token) {
-        respond(&mut stream, 403, "{\"error\":\"bad token\"}");
-        return;
-    }
+    // the workspace's own token, or one minted for an agent tab. Which one it
+    // was is how an arrival knows where it belongs
+    let from = match constant_eq(given, token) {
+        true => String::new(),
+        false => {
+            let found = tabs
+                .lock()
+                .ok()
+                .and_then(|t| {
+                    t.iter().find(|(tok, _)| constant_eq(given, tok)).map(|(_, id)| id.clone())
+                });
+            match found {
+                Some(id) => id,
+                None => {
+                    respond(&mut stream, 403, "{\"error\":\"bad token\"}");
+                    return;
+                }
+            }
+        }
+    };
     // answers to review comments the agent was handed
     if path == "/comment" {
         match parse_reply(&body) {
@@ -567,7 +617,7 @@ fn handle(
             if q.len() > 32 {
                 q.remove(0);
             }
-            q.push(Summary { title, text });
+            q.push(Summary { title, text, from: from.clone() });
         }
         dirty.store(true, Ordering::Relaxed);
         respond(&mut stream, 200, "{\"ok\":true}");
@@ -636,7 +686,7 @@ fn handle(
                 q.remove(0);
             }
             let note = parse_field(&body, "note").unwrap_or_default();
-            q.push(Shot { path: file, note: note.trim().to_string() });
+            q.push(Shot { path: file, note: note.trim().to_string(), from: from.clone() });
         }
         dirty.store(true, Ordering::Relaxed);
         respond(&mut stream, 200, "{\"ok\":true}");
@@ -2701,6 +2751,41 @@ mod tests {
     /// A browser extension is a cross-origin caller: without the headers the
     /// browser drops the answer, and without an answer to the preflight it
     /// never sends the post at all.
+    /// One workspace, one control channel, several agent tabs: the token a
+    /// post arrives on is what says which tab's agent ran it. Without this a
+    /// screenshot asked for in one tab turned up in another.
+    #[test]
+    fn a_tabs_token_says_which_tab_posted() {
+        let s = Server::start("ws-token".into()).unwrap();
+        s.add_tab("tab-one-token", "one");
+        s.add_tab("tab-two-token", "two");
+        let shot = |token: &str| {
+            let got = post(
+                s.port,
+                "/shot",
+                Some(token),
+                "{\"path\":\"./a.png\",\"note\":\"n\"}",
+            );
+            assert!(got.starts_with("HTTP/1.1 200"), "{got}");
+        };
+        shot("tab-two-token");
+        shot("ws-token");
+        shot("tab-one-token");
+        let got = s.drain_shots();
+        assert_eq!(
+            got.iter().map(|s| s.from.as_str()).collect::<Vec<_>>(),
+            vec!["two", "", "one"],
+            "each one carries the tab it came in under; the workspace's own token carries none"
+        );
+        // a tab that has been closed can't post any more
+        s.drop_tab("one");
+        let got = post(s.port, "/shot", Some("tab-one-token"), "{\"path\":\"./a.png\"}");
+        assert!(got.starts_with("HTTP/1.1 403"), "{got}");
+        // …and the workspace's own token still works
+        let got = post(s.port, "/shot", Some("ws-token"), "{\"path\":\"./a.png\"}");
+        assert!(got.starts_with("HTTP/1.1 200"), "{got}");
+    }
+
     #[test]
     fn the_hub_answers_a_browser() {
         let hub = RemoteHub::start("tok".into()).unwrap();
