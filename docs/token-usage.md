@@ -85,6 +85,13 @@ workspaces, spent 62% of its weighted total on requests carrying more than
 a third less, and that is the conservative reading: after a reset the context
 starts at nothing rather than sitting at the cap.
 
+That was the day before this shipped. The day after it, on 37% more requests,
+the share riding over 400k was 6%, and it has stayed between 4% and 14% since.
+What is left is mostly the turn that crosses the line, which is over it by the
+time it ends, and the jobs TIDE sends itself: those still land in whatever
+session is open, because the off-ramp is read in `send_composer` and nothing
+else.
+
 **The questions that start new work start new sessions.** "What next? ↺" and
 the note TIDE sends after a merge both open a session of their own. Neither
 does it while a turn is running or while the reviewers are reading, because
