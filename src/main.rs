@@ -5544,6 +5544,17 @@ fn pr_tour_request(number: u64, base: &str, read: &str) -> String {
 /// What the transcript shows in place of the path list. A hundred paths in the
 /// reader's own thread is noise: they are looking at the tree the list came
 /// from.
+/// A todo's first line, cut to fit a job header and the `by job` column of
+/// `tide --spend`. The details under it are the prompt's business, not a name's.
+fn todo_job_name(text: &str) -> String {
+    let line = text.lines().next().unwrap_or_default().trim();
+    let short: String = line.chars().take(44).collect();
+    match short.chars().count() < line.chars().count() {
+        true => format!("Todo · {}…", short.trim_end()),
+        false => format!("Todo · {short}"),
+    }
+}
+
 fn ask_changed_label(paths: &[String]) -> String {
     match paths {
         [one] => format!("What changed in {one}?"),
@@ -10415,6 +10426,9 @@ impl Storm {
         }
         self.focus_agent(window, cx);
         self.spend_next = Some(spend::TODO);
+        // which todo, not just that one was started: the report's `by job`
+        // column is where a todo that ate an afternoon shows up
+        self.job_next = Some(todo_job_name(&t.text));
         self.send_agent_prompt_as(prompt, None, cx);
         self.show_flash("Handed to the agent — marked in progress", cx);
         cx.notify();
@@ -10753,11 +10767,12 @@ impl Storm {
         // this branch has now been read, which is what the merge button asks
         mark_reviewed(&self.root, &self.branch, &self.head_oid, &names.join(" + "));
         self.reviewed = reviewed_all(&self.root);
-        self.send_agent_prompt_as(
-            prompt,
-            Some(format!("Reviewers · {}", names.join(" + "))),
-            cx,
-        );
+        // the reports are the longest prompt TIDE sends, and they land in
+        // whichever session asked for the review: name the turn so it folds in
+        // the pane and so `tide --spend` says "Reviewers · …" rather than "job"
+        let label = format!("Reviewers · {}", names.join(" + "));
+        self.job_next = Some(label.clone());
+        self.send_agent_prompt_as(prompt, Some(label), cx);
         self.show_flash("Reviews handed to the agent", cx);
         cx.notify();
     }
@@ -10804,6 +10819,7 @@ impl Storm {
                      say why rather than changing code to satisfy it. Don't paste the report \
                      back at me.\n\n{out}"
                 );
+                this.job_next = Some("Local review · CodeRabbit".into());
                 this.send_agent_prompt_as(prompt, Some("Local review · CodeRabbit".into()), cx);
                 this.show_flash("Review handed to the agent", cx);
                 cx.notify();
@@ -15127,6 +15143,7 @@ impl Storm {
         // the merge is the end of the work, so the question after it starts a
         // session of its own; mid-turn it goes here, like any other prompt
         let note = merged_note(number, about.as_ref());
+        self.job_next = Some(format!("Merged #{number}"));
         match self.agent_busy {
             true => self.send_agent_prompt_as(note, None, cx),
             false => self.ask_fresh(note, None, cx),
@@ -26810,6 +26827,9 @@ impl Storm {
             format!("Asked whether #{number}'s description is still true")
         };
         self.agent_open = true;
+        // the transcript label is a sentence; the job name is what fits a
+        // header and a report column
+        self.job_next = Some(format!("Description of #{number}"));
         self.send_agent_prompt_as(pr_body_check(number, &base, update), Some(label), cx);
         self.agent_list.scroll_to_end();
         cx.notify();
@@ -36023,6 +36043,7 @@ impl Storm {
         let text = ask_changed_note(&list, &self.pr_base, all);
         let label = ask_changed_label(&list);
         self.agent_open = true;
+        self.job_next = Some(label.clone());
         self.send_agent_prompt_as(text, Some(label), cx);
         self.agent_list.scroll_to_end();
         cx.notify();
@@ -44599,6 +44620,40 @@ mod code_tour_tests {
         assert!(from.contains("of the answer at the end of this message"), "{from}");
         assert!(from.contains("--- the answer ---\n1. it starts at src/a.ts:12"), "{from}");
         assert!(tour_request(None, Some("   ")).contains("of what we have been talking about"));
+    }
+}
+
+#[cfg(test)]
+mod todo_job_name_tests {
+    use super::*;
+
+    /// The name is the first line and nothing under it, so a todo with a
+    /// paragraph of detail still reads as one row in the spend report.
+    #[test]
+    fn only_the_first_line_names_the_job() {
+        assert_eq!(
+            todo_job_name("Fix the lease race\n\nIt only shows up under load"),
+            "Todo · Fix the lease race"
+        );
+        assert_eq!(todo_job_name("  Trim the deck  "), "Todo · Trim the deck");
+        assert_eq!(todo_job_name(""), "Todo · ");
+    }
+
+    /// A long one is cut and says so, and the cut doesn't leave a space
+    /// hanging in front of the ellipsis.
+    #[test]
+    fn a_long_one_is_cut_and_says_so() {
+        let long = "Work out why the recovery handler re-queues a lease that is already held";
+        let out = todo_job_name(long);
+        assert!(out.ends_with('…'), "{out}");
+        assert!(!out.ends_with(" …"), "{out}");
+        assert!(out.chars().count() <= 44 + "Todo · ".chars().count() + 1, "{out}");
+        // one that fits is not cut, and the line is trimmed before it is
+        // measured, so a cut landing on a space doesn't leave one behind
+        let exact: String = long.chars().take(44).collect();
+        let trimmed = exact.trim();
+        assert_eq!(todo_job_name(&exact), format!("Todo · {trimmed}"));
+        assert!(!out.contains("re-queues  "), "{out}");
     }
 }
 
