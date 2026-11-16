@@ -39537,14 +39537,6 @@ impl Render for Workspace {
                 let sel = pos == self.switcher_sel;
                 let multi = self.projects.len() > 1;
                 let idx = i;
-                // quick-jump key label: 1-9, then 0, -, = for rows 10-12
-                let num = match pos {
-                    0..=8 => (pos + 1).to_string(),
-                    9 => "0".to_string(),
-                    10 => "-".to_string(),
-                    11 => "=".to_string(),
-                    _ => String::new(),
-                };
                 let free = agent.as_ref().is_some_and(|(s, _)| s.is_idle());
                 // free workspaces sit together at the end; a rule marks where
                 // "what's in flight" stops and "what's available" starts
@@ -39590,18 +39582,10 @@ impl Render for Workspace {
                         .on_drop(cx.listener(move |this, d: &DraggedProject, _w, cx| {
                             this.reorder_projects(d.0, idx, cx);
                         }))
-                        // quick-jump key (sequential over the filtered list) — same
-                        // key-cap as the workspace number in the top-left topbar
-                        .child(key_cap(num.clone(), !sel))
-                        // folder icon
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .font_family(ICON_FONT)
-                                .text_size(px(13.))
-                                .text_color(rgb(if sel { SEL_TEXT } else { FOLDER_ICON }))
-                                .child(IC_FOLDER),
-                        )
+                        // No key cap and no folder icon: the cap repeated a number
+                        // nobody reads off the row (1-9 / 0 - = still jump), and
+                        // the folder glyph was the same on all twelve rows. What
+                        // tells the rows apart is the name, so it starts the row.
                         // name + branch, taking the remaining width
                         .child(
                             div()
