@@ -3781,10 +3781,11 @@ fn handoff_tail(msgs: &[AgentMsg]) -> Option<String> {
 /// weighted total on the requests carrying more than 400k; had nothing carried
 /// more than 250k, the same day's work would have cost a third less. The line
 /// sat at 250k for its first five days and took the share of weighted spend
-/// riding requests over 400k from 51% to between 4% and 14%. It sits at 350k
-/// now, still under where the colour turns amber: the cheap half of that win
-/// is the 400k tail, and 250k was cutting conversations that had more to give.
-const FRESH_AT: u64 = 350_000;
+/// riding requests over 400k from 51% to between 4% and 14%. It sits at 400k
+/// now, on the step where the chip turns amber rather than under it: what the
+/// reset is for is the tail above 400k, and asking earlier than that was
+/// cutting conversations that still had somewhere to go.
+const FRESH_AT: u64 = 400_000;
 
 /// How a context size reads: quiet while a session is cheap to carry, amber
 /// once every turn is paying for a few hundred thousand tokens of history, red
@@ -27641,7 +27642,7 @@ impl Storm {
                     // minutes ago; resuming into one of those drops you into a
                     // conversation you never had
                     // by when its last turn was, not by the order the
-                    // adapter listed them in: after a day of resets at 350k
+                    // adapter listed them in: after a day of resets at 400k
                     // those differ, and the one you were in last is the point
                     let newest = self
                         .agent_sessions
@@ -32689,7 +32690,7 @@ impl Storm {
                 .collect();
             // newest first, by when it was last written to. The adapter's own
             // order is near enough most of the time, and wrong exactly when it
-            // matters: after a day of resets at 350k, which of eight is the
+            // matters: after a day of resets at 400k, which of eight is the
             // one you were in
             rows.sort_by_key(|(i, .., (_, seen))| (std::cmp::Reverse(*seen), *i));
             // the first of yours, which is the one "where was I" means

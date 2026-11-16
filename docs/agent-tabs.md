@@ -27,7 +27,7 @@ session means each turn of the second one pays for the first one as well.
 That is what `+ with context` is for. The handoff is a few hundred tokens: the
 repo is right there to be read, and the three questions are what make a
 follow-up land without the transcript behind them. It is the same handoff a
-session gets when a turn ends over 350k and the next message starts a new one
+session gets when a turn ends over 400k and the next message starts a new one
 (see [token-usage.md](token-usage.md)), with the difference that the
 conversation you left is still open in the tab beside it.
 

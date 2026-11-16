@@ -331,7 +331,7 @@ pub fn session_log(root: &Path, id: &str) -> Option<PathBuf> {
 ///
 /// Both come off its log: the file is created with the session's first turn
 /// and appended to on every one after it. The adapter's session list carries
-/// neither, and after a day of resets at 350k a list of eight titles says
+/// neither, and after a day of resets at 400k a list of eight titles says
 /// nothing about which one you were in last.
 pub fn session_times(root: &Path, id: &str) -> Option<(i64, i64)> {
     let path = session_log(root, id)?;
