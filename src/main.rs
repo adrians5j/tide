@@ -40129,18 +40129,6 @@ impl Render for Workspace {
                         // quick-jump key (sequential over the filtered list) — same
                         // key-cap as the workspace number in the top-left topbar
                         .child(key_cap(num.clone(), !sel))
-                        // agent state reported from this project's terminal panes
-                        // (idle gets the loud pill on the right instead of a dot)
-                        .when_some(agent.clone().filter(|(s, _)| !s.is_idle()), |d, (s, _)| {
-                            d.child(
-                                div()
-                                    .w(px(7.))
-                                    .h(px(7.))
-                                    .rounded_full()
-                                    .flex_shrink_0()
-                                    .bg(rgb(agent_color(s))),
-                            )
-                        })
                         // folder icon
                         .child(
                             div()
@@ -40178,6 +40166,32 @@ impl Render for Workspace {
                                                 .text_color(rgb(if sel { SEL_TEXT } else { TEXT }))
                                                 .child(name),
                                         )
+                                        // what the agent is doing, as a dot against
+                                        // the name it belongs to. It used to be a
+                                        // line of its own under the branch, which is
+                                        // a third row to say one word; the word is in
+                                        // the tooltip, where it costs nothing
+                                        .when_some(
+                                            agent.clone().filter(|(s, _)| !s.is_idle()),
+                                            |d, (st, msg)| {
+                                                let said = match msg.is_empty() {
+                                                    true => agent_label(st).to_string(),
+                                                    false => {
+                                                        format!("{} · {msg}", agent_label(st))
+                                                    }
+                                                };
+                                                d.child(
+                                                    div()
+                                                        .id(("ws-state-dot", i))
+                                                        .w(px(7.))
+                                                        .h(px(7.))
+                                                        .rounded_full()
+                                                        .flex_shrink_0()
+                                                        .bg(rgb(agent_color(st)))
+                                                        .tooltip(tip_owned(said)),
+                                                )
+                                            },
+                                        )
                                         .when_some(client, |d, c| {
                                             d.child(
                                                 div()
@@ -40211,25 +40225,10 @@ impl Render for Workspace {
                                             .min_w(px(0.))
                                             .overflow_hidden()
                                             .text_size(px(10.))
-                                            // which pull request this workspace is
-                                            // on, coloured by its checks. The state
-                                            // pill only shows when it isn't a plain
-                                            // open PR: draft, merged and closed are
-                                            // the ones worth saying out loud
-                                            .when_some(pr, |d, (num, st, state)| {
-                                                d.child(
-                                                    div()
-                                                        .flex_shrink_0()
-                                                        .text_color(rgb(st.color()))
-                                                        .child(format!("#{num}")),
-                                                )
-                                                .when(
-                                                    state != PrState::Open,
-                                                    |d| d.child(pr_state_pill(state, 9.).flex_shrink_0()),
-                                                )
-                                            })
-                                            // base ← head, GitHub's order, same as
-                                            // the topbar shows for the open project
+                                            // the branch first: what this workspace
+                                            // is working on is the thing you are
+                                            // scanning the list for. base ← head is
+                                            // GitHub's order, the same as the topbar
                                             .when_some(target, |d, t| {
                                                 d.child(branch_name_el(&t).flex_shrink_0())
                                                     .child(
@@ -40240,28 +40239,28 @@ impl Render for Workspace {
                                                     )
                                             })
                                             .child(div().flex_shrink_0().text_color(rgb(MUTED)).child("⎇"))
-                                            .child(
-                                                branch_name_el(&branch)
-                                                    .flex_shrink_0(),
-                                            ),
+                                            .child(branch_name_el(&branch).flex_shrink_0())
+                                            .child(div().flex_grow(1.0).min_w(px(0.)))
+                                            // and the pull request at the other end,
+                                            // coloured by its checks. The state pill
+                                            // only shows when it isn't a plain open
+                                            // PR: draft, merged and closed are the
+                                            // ones worth saying out loud
+                                            .when_some(pr, |d, (num, st, state)| {
+                                                d.when(
+                                                    state != PrState::Open,
+                                                    |d| d.child(pr_state_pill(state, 9.).flex_shrink_0()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_shrink_0()
+                                                        .text_color(rgb(st.color()))
+                                                        .child(format!("#{num}")),
+                                                )
+                                            }),
                                     )
                                 })
-                                // what the agent last reported, so the dot's colour
-                                // isn't the only thing you have to go on
-                                .when_some(agent.clone().filter(|(s, _)| !s.is_idle()), |d, (st, msg)| {
-                                    let text = if msg.is_empty() {
-                                        format!("● {}", agent_label(st))
-                                    } else {
-                                        format!("● {} · {msg}", agent_label(st))
-                                    };
-                                    d.child(
-                                        div()
-                                            .text_size(px(10.))
-                                            .truncate()
-                                            .text_color(rgb(agent_color(st)))
-                                            .child(text),
-                                    )
-                                }),
+,
                         )
                         // idle = free to grab. A grey word doesn't carry that, so
                         // it gets a solid badge at the end of the row instead.
