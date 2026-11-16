@@ -16918,6 +16918,18 @@ impl Storm {
                 label.push_str(&format!("\n• {where_}"));
             }
             self.spend_next = Some(spend::COMMENT);
+            // One thread going out can be charged to that thread, and its box
+            // shows what it cost. A batch of several is still one turn with one
+            // usage block on it, and splitting that between threads would be a
+            // guess, so the batch goes untagged and no box claims it.
+            self.spend_tag = match ready == 1 {
+                true => self
+                    .review
+                    .iter()
+                    .find(|c| !c.draft && !c.sent && !c.resolved)
+                    .map(|c| format!("comment:{}", c.id)),
+                false => None,
+            };
             self.send_agent_prompt_as(msg, Some(label), cx);
         } else if let Some(pane) = pane.clone() {
             pane.read(cx).send_paste(&msg);
@@ -21591,6 +21603,12 @@ impl Storm {
         });
         let has_thread = comment.is_some_and(ReviewComment::threaded);
         let waiting = comment.is_some_and(ReviewComment::waiting);
+        // what the questions in this thread have cost, the same chip a slide of
+        // a brief carries. Only threads sent on their own carry one: see
+        // `send_review_to`, where a batch of several goes out untagged.
+        let cost = comment
+            .map(|c| format!("comment:{}", c.id))
+            .and_then(|tag| cost_chip("rc-cost", self.spent_on(&tag)));
         let mut replies: Vec<ReviewReply> = Vec::new();
         if has_thread {
             if let Some(c) = comment {
@@ -21663,6 +21681,7 @@ impl Storm {
                     .items_center()
                     .gap_2()
                     .child(div().text_size(px(10.)).text_color(rgb(COMMENT_MARK)).child(head))
+                    .children(cost)
                     .child(div().flex_grow(1.0))
                     .child(
                         div()
