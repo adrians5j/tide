@@ -38363,9 +38363,29 @@ impl Workspace {
         if idx >= self.projects.len() || self.projects.len() <= 1 {
             return;
         }
+        let closed_active = self.active == idx;
         self.projects.remove(idx);
-        // keep `active` pointing at a sensible project
-        if self.active > idx || self.active >= self.projects.len() {
+        if closed_active {
+            // slot `idx` now holds whatever was after the one just closed: the
+            // next workspace along, and where closing drops you. Walk on from
+            // there for one that isn't paused. A paused workspace is one you
+            // parked on purpose, and being dropped into it undoes that. The
+            // walk wraps, so closing the last row comes round to the front. If
+            // every workspace is paused there is nothing better to open, and
+            // the next one along is where you land after all.
+            let n = self.projects.len();
+            let start = idx % n;
+            let mut next = start;
+            for k in 0..n {
+                let i = (start + k) % n;
+                if !self.projects[i].read(cx).ws_paused {
+                    next = i;
+                    break;
+                }
+            }
+            self.active = next;
+        } else if self.active > idx || self.active >= self.projects.len() {
+            // closing another row: stay on the same workspace, at its new index
             self.active = self.active.saturating_sub(1);
         }
         self.switcher_sel = self.switcher_sel.min(self.projects.len() - 1);
