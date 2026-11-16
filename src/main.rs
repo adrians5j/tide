@@ -8893,6 +8893,10 @@ struct Storm {
     agent_cur: Option<usize>,        // index of the assistant text bubble being streamed
     agent_cur_thought: Option<usize>, // index of the reasoning bubble being streamed
     agent_busy: bool,                // a turn is in flight
+    /// A base merge is with the agent. One click on the behind/conflict chips
+    /// is a long turn of fetching, resolving and building, and a second click
+    /// only queues a second one behind it. Held until that turn ends.
+    merge_sent: bool,
     agent_input: Field,              // prompt input box
     agent_focus: FocusHandle,        // focus for the dock (routes typing)
     agent_ctx: Option<(u64, u64)>,   // ACP usage_update: (context used, window)
@@ -9657,6 +9661,7 @@ impl Storm {
             agent_cur: None,
             agent_cur_thought: None,
             agent_busy: false,
+            merge_sent: false,
             agent_input: Field::multiline(),
             agent_focus: cx.focus_handle(),
             agent_ctx: None,
@@ -14607,6 +14612,12 @@ impl Storm {
     /// only exist because of the commits we're missing, so resolving them and
     /// catching up are the same merge.
     fn merge_base_with_agent(&mut self, cx: &mut Context<Self>) {
+        // the chips draw themselves dead while this is set, so getting here
+        // means a click landed in the frame before that took, or a key did
+        if self.merge_sent {
+            self.show_flash("The merge is already with the agent", cx);
+            return;
+        }
         let Some(sync) = self.base_sync.clone() else { return };
         let (base, n) = (sync.base.clone(), sync.behind);
         // nothing to merge here, and GitHub still complaining, means it is
@@ -14641,6 +14652,7 @@ impl Storm {
                 )
             };
             self.job_next = Some(label.clone());
+            self.merge_sent = true;
             self.send_agent_prompt_as(p, Some(label), cx);
             return;
         }
@@ -14680,6 +14692,7 @@ impl Storm {
         // you want out of it is the summary at the end, which a closed job
         // still shows
         self.job_next = Some(label.clone());
+        self.merge_sent = true;
         self.send_agent_prompt_as(p, Some(label), cx);
     }
 
@@ -18365,6 +18378,10 @@ impl Storm {
         let (ty, rest) = split_title(&project);
         let icon = ty.and_then(|i| TITLE_TYPES.get(i)).map(|(_, emoji, _)| *emoji);
         let name = if icon.is_some() { rest } else { project.clone() };
+        // a merge handed to the agent takes the chips that start one out of
+        // service until the turn ends: the first click is the whole order, and
+        // the six after it were only ever going to queue six more merges
+        let merging = self.merge_sent;
         let mut bar = div()
             .h(px(44.)) // match the activity-bar width
             .flex_shrink_0() // never let a tall panel squeeze the top bar
@@ -18750,6 +18767,8 @@ impl Storm {
                                     "GitHub reports this PR as conflicting, but merging {base} here is clean  ·  click to have the agent work out which is right"
                                 )
                             };
+                            let merging_tip =
+                                "The merge is with the agent  ·  the chip comes back when that turn ends";
                             let conflict_tip = format!(
                                 "{} would conflict with {base}  ·  click to have the agent merge and resolve",
                                 match n {
@@ -18757,6 +18776,11 @@ impl Storm {
                                     n => format!("{n} files"),
                                 }
                             );
+                            let behind_tip =
+                                if merging { merging_tip.to_string() } else { behind_tip };
+                            let gh_tip = if merging { merging_tip.to_string() } else { gh_tip };
+                            let conflict_tip =
+                                if merging { merging_tip.to_string() } else { conflict_tip };
                             d.child(
                                 div()
                                     .flex()
@@ -18770,11 +18794,12 @@ impl Storm {
                                                 .px_1()
                                                 .rounded_sm()
                                                 .border_1()
-                                                .border_color(rgb(FOLDER_ICON))
+                                                .border_color(rgb(if merging { MUTED } else { FOLDER_ICON }))
                                                 .text_size(px(10.))
-                                                .text_color(rgb(FOLDER_ICON))
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(rgb(HOVER)))
+                                                .text_color(rgb(if merging { MUTED } else { FOLDER_ICON }))
+                                                .when(!merging, |d| {
+                                                    d.cursor_pointer().hover(|s| s.bg(rgb(HOVER)))
+                                                })
                                                 .child(format!("↓{behind} behind {base}"))
                                                 .tooltip(move |_w, cx| {
                                                     cx.new(|_| TooltipView {
@@ -18782,9 +18807,11 @@ impl Storm {
                                                     })
                                                     .into()
                                                 })
-                                                .on_click(cx.listener(|this, _e, _w, cx| {
-                                                    this.merge_base_with_agent(cx)
-                                                })),
+                                                .when(!merging, |d| {
+                                                    d.on_click(cx.listener(|this, _e, _w, cx| {
+                                                        this.merge_base_with_agent(cx)
+                                                    }))
+                                                }),
                                         )
                                     })
                                     // GitHub judging the pushed head, when the
@@ -18796,19 +18823,22 @@ impl Storm {
                                                 .px_1()
                                                 .rounded_sm()
                                                 .border_1()
-                                                .border_color(rgb(GIT_DELETED))
+                                                .border_color(rgb(if merging { MUTED } else { GIT_DELETED }))
                                                 .text_size(px(10.))
-                                                .text_color(rgb(GIT_DELETED))
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(rgb(HOVER)))
+                                                .text_color(rgb(if merging { MUTED } else { GIT_DELETED }))
+                                                .when(!merging, |d| {
+                                                    d.cursor_pointer().hover(|s| s.bg(rgb(HOVER)))
+                                                })
                                                 .child("⚠ PR conflicts")
                                                 .tooltip(move |_w, cx| {
                                                     cx.new(|_| TooltipView { text: gh_tip.clone().into() })
                                                         .into()
                                                 })
-                                                .on_click(cx.listener(|this, _e, _w, cx| {
-                                                    this.merge_base_with_agent(cx)
-                                                })),
+                                                .when(!merging, |d| {
+                                                    d.on_click(cx.listener(|this, _e, _w, cx| {
+                                                        this.merge_base_with_agent(cx)
+                                                    }))
+                                                }),
                                         )
                                     })
                                     .when(n > 0, |d| {
@@ -18818,11 +18848,12 @@ impl Storm {
                                                 .px_1()
                                                 .rounded_sm()
                                                 .border_1()
-                                                .border_color(rgb(GIT_DELETED))
+                                                .border_color(rgb(if merging { MUTED } else { GIT_DELETED }))
                                                 .text_size(px(10.))
-                                                .text_color(rgb(GIT_DELETED))
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(rgb(HOVER)))
+                                                .text_color(rgb(if merging { MUTED } else { GIT_DELETED }))
+                                                .when(!merging, |d| {
+                                                    d.cursor_pointer().hover(|s| s.bg(rgb(HOVER)))
+                                                })
                                                 .child(format!("⚠ {n} conflict{}", if n == 1 { "" } else { "s" }))
                                                 .tooltip(move |_w, cx| {
                                                     cx.new(|_| TooltipView {
@@ -18830,9 +18861,11 @@ impl Storm {
                                                     })
                                                     .into()
                                                 })
-                                                .on_click(cx.listener(|this, _e, _w, cx| {
-                                                    this.merge_base_with_agent(cx)
-                                                })),
+                                                .when(!merging, |d| {
+                                                    d.on_click(cx.listener(|this, _e, _w, cx| {
+                                                        this.merge_base_with_agent(cx)
+                                                    }))
+                                                }),
                                         )
                                     }),
                             )
@@ -27260,6 +27293,7 @@ impl Storm {
         self.agent_ctx = None;
         self.agent_title = None;
         self.agent_busy = false;
+        self.merge_sent = false;
     }
 
     /// Resume a session: the transcript is rebuilt from the adapter's replay.
@@ -27596,6 +27630,10 @@ impl Storm {
             }
             TurnEnd => {
                 self.agent_busy = false;
+                // a merge clicked while the agent was mid-turn is still in the
+                // queue when that turn ends, and its own turn hasn't run yet.
+                // Anything left queued keeps the chips out of service
+                self.merge_sent = self.merge_sent && !self.agent_queue.is_empty();
                 self.close_spend();
                 self.agent_turn_start = None;
                 self.end_job_clock();
@@ -27619,6 +27657,7 @@ impl Storm {
                 // they were typed behind actually happened
                 self.agent_queue.clear();
                 self.agent_busy = false;
+                self.merge_sent = false;
                 // a failed turn still spent what it spent before it failed
                 self.close_spend();
                 self.end_job_clock();
@@ -27940,6 +27979,7 @@ impl Storm {
             self.show_flash(&format!("Interrupted — dropped {dropped} queued message(s)"), cx);
         }
         self.agent_busy = false;
+        self.merge_sent = false;
         self.agent_turn_start = None;
         self.end_job_clock();
         self.acp_state = None;
