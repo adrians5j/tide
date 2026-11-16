@@ -36408,7 +36408,6 @@ impl Storm {
         Some(
             div()
                 .flex_shrink_0()
-                .w_full()
                 .pt(px(28.))
                 // the deck starts under it, and a folded first slide is one
                 // tight row: without this the last line of the short version
@@ -36426,17 +36425,22 @@ impl Storm {
                         .child("THE SHORT OF IT"),
                 )
                 .child(
+                    // the bar and its padding on one node, the lines on
+                    // another, and no `w_full` on either. A percentage width
+                    // sharing a node with the padding leaves the rows measured
+                    // against a width they are not painted into: each one came
+                    // out a line short, the block reserved half the height it
+                    // drew, and the first slide was laid out into the rest of
+                    // it. Same trade as the slide text below.
                     div()
                         .pl_3()
-                        .w_full()
-                        .min_w(px(0.))
                         .border_l_2()
                         .border_color(rgb(ACCENT))
-                        // no `line_height` over the top of it: the rows are
-                        // measured with the metrics `md_text` gave them, and a
-                        // taller line set from out here paints past the height
-                        // the deck reserved, over the first slide
-                        .child(md_text(&body, 15., TEXT)),
+                        // no `line_height` over the top of it either: the rows
+                        // are measured with the metrics `md_text` gave them,
+                        // and a taller line set from out here paints past the
+                        // height the deck reserved, over the first slide
+                        .child(div().min_w(px(0.)).child(md_text(&body, 15., TEXT))),
                 ),
         )
     }
