@@ -36518,7 +36518,6 @@ impl Storm {
                 // tight row: without this the last line of the short version
                 // and that row read as the same paragraph
                 .pb(px(28.))
-                .max_w(px(680.))
                 .min_w(px(0.))
                 .flex()
                 .flex_col()
@@ -36530,13 +36529,18 @@ impl Storm {
                         .child("THE SHORT OF IT"),
                 )
                 .child(
-                    // the bar and its padding on one node, the lines on
-                    // another, and no `w_full` on either. A percentage width
-                    // sharing a node with the padding leaves the rows measured
-                    // against a width they are not painted into: each one came
-                    // out a line short, the block reserved half the height it
-                    // drew, and the first slide was laid out into the rest of
-                    // it. Same trade as the slide text below.
+                    // the bar and its padding on one node, the wrap width and
+                    // the lines on another. Both halves of that matter and
+                    // they pull in opposite directions. A width sharing a node
+                    // with the padding leaves the rows measured against a
+                    // width they are not painted into: each came out a line
+                    // short, the block reserved half the height it drew, and
+                    // the first slide was laid out into the rest of it. But a
+                    // width that is not on the node holding the lines at all
+                    // leaves them nothing to wrap into: they measure at their
+                    // full single-line width and the pane clips them, which is
+                    // what fixing the first half on its own did. Same
+                    // arrangement as the slide text below, at the same 680.
                     div()
                         .pl_3()
                         .border_l_2()
@@ -36545,7 +36549,12 @@ impl Storm {
                         // are measured with the metrics `md_text` gave them,
                         // and a taller line set from out here paints past the
                         // height the deck reserved, over the first slide
-                        .child(div().min_w(px(0.)).child(md_text(&body, 15., TEXT))),
+                        .child(
+                            div()
+                                .max_w(px(680.))
+                                .min_w(px(0.))
+                                .child(md_text(&body, 15., TEXT)),
+                        ),
                 ),
         )
     }
