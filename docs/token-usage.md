@@ -70,27 +70,31 @@ Two things, both aimed at the same arithmetic.
 
 **The pane says what it is carrying.** A `ctx 612k` chip sits in the agent bar,
 read off the live session's own log every fifteen seconds, amber past 400k and
-red past 700k. Past 250k the composer grows a line saying so.
+red past 700k. Past 350k the composer grows a line saying so.
 
-**A turn that ends over 250k hands the next question to a new session.** The
+**A turn that ends over 350k hands the next question to a new session.** The
 line then reads "your next message starts a new session", and typing one opens
 it. The reset waits for the question rather than happening when the turn ends,
 so the answer you are reading stays on screen, and nothing is reset while
 messages are queued behind the turn. "stay in this one" turns it off for the
 rest of that session.
 
-250k is low on purpose. One day of these logs, 3,724 requests across nine
-workspaces, spent 62% of its weighted total on requests carrying more than
-400k. Had nothing carried more than 250k, the same day's work would have cost
-a third less, and that is the conservative reading: after a reset the context
-starts at nothing rather than sitting at the cap.
+The line is under where the colour turns amber, because by the time a session
+looks expensive it has been expensive for hours. One day of these logs, 3,724
+requests across nine workspaces, spent 62% of its weighted total on requests
+carrying more than 400k. Had nothing carried more than 250k, the same day's
+work would have cost a third less, and that is the conservative reading: after
+a reset the context starts at nothing rather than sitting at the cap.
 
 That was the day before this shipped. The day after it, on 37% more requests,
 the share riding over 400k was 6%, and it has stayed between 4% and 14% since.
-What is left is mostly the turn that crosses the line, which is over it by the
-time it ends, and the jobs TIDE sends itself: those still land in whatever
-session is open, because the off-ramp is read in `send_composer` and nothing
-else.
+The line started at 250k and ran there for five days to get that. It is 350k
+now: most of what the reset is worth is the 400k tail it stops you reaching,
+and 250k was spending a handoff on conversations that still had somewhere to
+go. What is left over is mostly the turn that crosses the line, which is over
+it by the time it ends, and the jobs TIDE sends itself: those still land in
+whatever session is open, because the off-ramp is read in `send_composer` and
+nothing else.
 
 **The questions that start new work start new sessions.** "What next? ↺" and
 the note TIDE sends after a merge both open a session of their own. Neither

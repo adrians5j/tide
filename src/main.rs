@@ -3779,10 +3779,12 @@ fn handoff_tail(msgs: &[AgentMsg]) -> Option<String> {
 /// Where a session is carrying enough history that it is worth starting again.
 /// A day of these logs, 3,724 requests across nine workspaces, spent 62% of its
 /// weighted total on the requests carrying more than 400k; had nothing carried
-/// more than 250k, the same day's work would have cost a third less. So the
-/// line sits at 250k, below where the colour turns amber, because by the time
-/// a session looks expensive it has already been expensive for hours.
-const FRESH_AT: u64 = 250_000;
+/// more than 250k, the same day's work would have cost a third less. The line
+/// sat at 250k for its first five days and took the share of weighted spend
+/// riding requests over 400k from 51% to between 4% and 14%. It sits at 350k
+/// now, still under where the colour turns amber: the cheap half of that win
+/// is the 400k tail, and 250k was cutting conversations that had more to give.
+const FRESH_AT: u64 = 350_000;
 
 /// How a context size reads: quiet while a session is cheap to carry, amber
 /// once every turn is paying for a few hundred thousand tokens of history, red
@@ -27639,7 +27641,7 @@ impl Storm {
                     // minutes ago; resuming into one of those drops you into a
                     // conversation you never had
                     // by when its last turn was, not by the order the
-                    // adapter listed them in: after a day of resets at 250k
+                    // adapter listed them in: after a day of resets at 350k
                     // those differ, and the one you were in last is the point
                     let newest = self
                         .agent_sessions
@@ -32687,7 +32689,7 @@ impl Storm {
                 .collect();
             // newest first, by when it was last written to. The adapter's own
             // order is near enough most of the time, and wrong exactly when it
-            // matters: after a day of resets at 250k, which of eight is the
+            // matters: after a day of resets at 350k, which of eight is the
             // one you were in
             rows.sort_by_key(|(i, .., (_, seen))| (std::cmp::Reverse(*seen), *i));
             // the first of yours, which is the one "where was I" means
