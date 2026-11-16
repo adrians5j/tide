@@ -5169,8 +5169,8 @@ fn tour_request(about: Option<&str>, answer: Option<&str>) -> String {
          where every stop is flagged has no flags in it, and I will stop \
          reading them.\n\n\
          Check every file and line before you send it: a stop that lands in the \
-         wrong place costs me more than a missing one. Ten to twenty stops is a \
-         flow. Then say in one line what the tour covers and stop — don't \
+         wrong place costs me more than a missing one. Keep it under fifteen \
+         stops: a tour I can hold in my head, not the diff read out. Then say in one line what the tour covers and stop — don't \
          repeat the stops in your reply, they're on screen.\n{source}"
     )
 }
@@ -5230,7 +5230,7 @@ fn brief_spec(pr: Option<u64>) -> String {
     match pr {
         Some(number) => format!(
             "A \
-         brief is five to eight slides, each one idea, each one standing on its \
+         brief is at most five slides, each one idea, each one standing on its \
          own. Post the whole thing in one call:\n\
          \x20 curl -s -X POST \"$TIDE_RPC/brief\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n\
          \x20   -d '{{\"pr\":{number},\"title\":\"Background task recovery\",\
@@ -5302,7 +5302,7 @@ fn brief_spec(pr: Option<u64>) -> String {
          off boxes that are ideas rather than code.\n\n"
         ),
         None => "A \
-         brief is five to eight slides, each one idea, each one standing on its \
+         brief is at most five slides, each one idea, each one standing on its \
          own. Post the whole thing in one call:\n\
          \x20 curl -s -X POST \"$TIDE_RPC/brief\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n\
          \x20   -d '{\"title\":\"Background task recovery\",\
@@ -7880,7 +7880,7 @@ struct Slide {
 #[derive(Clone)]
 struct Brief {
     /// Slides you have read. Kept with the brief on disk, so reopening one
-    /// doesn't hand back eight unread slides.
+    /// doesn't hand back five unread slides.
     read: HashSet<usize>,
     pr: Option<u64>,
     title: String,
@@ -28304,8 +28304,8 @@ impl Storm {
          matter, and make `text` two or three sentences about what happens \
          there and what it hands on — the code is on screen beside it, so say \
          what can't be read off it. `end` is optional and `\"file\":\"a.ts:67\"` \
-         works instead of a separate `line`. Ten to twenty stops is a flow; \
-         sixty is the cap, and stops whose file isn't in this checkout are \
+         works instead of a separate `line`. Keep it under fifteen stops; \
+         sixty is the hard cap, and stops whose file isn't in this checkout are \
          dropped. Check each file and line before you send: a stop that lands \
          in the wrong place costs more than a missing one. `{\"steps\":[]}` \
          puts the tour away.\n\n\
@@ -29814,7 +29814,7 @@ impl Storm {
         let label = format!("Asked for a brief of #{number}");
         self.job_next = Some(format!("Brief of #{number}"));
         self.spend_tag = Some(format!("brief:{number}"));
-        // the slides already read ride along, so a rewrite isn't eight slides
+        // the slides already read ride along, so a rewrite isn't five slides
         // to read from the top again
         let read = brief_cached(number)
             .map(|b| brief_read_note(&b.slides, &b.read))
@@ -36327,7 +36327,7 @@ impl Storm {
             .child(head)
             .child(progress)
             // the deck scrolls, so it says so: the same thumb the diff pane
-            // draws, over a column that is otherwise eight slides of prose
+            // draws, over a column that is otherwise five slides of prose
             // with nothing to say how much of it there is
             .child(
                 div()
@@ -44677,7 +44677,7 @@ mod brief_spec_tests {
     fn one_spec_two_subjects() {
         let pr = brief_request(6164, "origin/next", "");
         let talk = talk_brief_request();
-        for q in ["five to eight slides", "$TIDE_RPC/brief", "`tldr` is the whole deck"] {
+        for q in ["at most five slides", "$TIDE_RPC/brief", "`tldr` is the whole deck"] {
             assert!(pr.contains(q), "{q} missing from the pull request's brief");
             assert!(talk.contains(q), "{q} missing from the conversation's brief");
         }
