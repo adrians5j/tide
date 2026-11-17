@@ -6413,6 +6413,7 @@ enum Cmd {
     OpenRepository,
     OpenPrNumber,
     SendOnPaste,
+    RestartApp,
 }
 
 /// (command, label, icon glyph, shortcut hint)
@@ -6472,6 +6473,7 @@ const PALETTE: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::Reviewers, "Send In the Reviewers (footprint, style, architecture, CodeRabbit)", IC_PR, ""),
     (Cmd::Todo, "New Task…", IC_CHECK, "⌘⇧L"),
     (Cmd::OpenRepository, "Open Repository or Project…  (clones a GitHub URL into ~/dev)", IC_FILES, "⌘O"),
+    (Cmd::RestartApp, "Restart TIDE…  (comes back up on the newest build)", IC_TOOLS, ""),
 ];
 
 /// A running process row for the Process Manager dialog.
@@ -9423,6 +9425,9 @@ enum ProjectNav {
     Open,
     OpenPath(PathBuf), // open a project at a specific folder path (from the new-project dialog)
     Remove(usize),
+    /// Put the restart prompt up, asked for from the palette rather than
+    /// offered because a new build landed. The prompt lives on the parent.
+    Restart,
 }
 
 impl EventEmitter<ProjectNav> for Storm {}
@@ -16369,6 +16374,10 @@ impl Storm {
             Cmd::Reviewers => self.run_reviewers(window, cx),
             Cmd::Todo => self.open_todo(window, cx),
             Cmd::OpenRepository => self.act_new_project(&NewProject, window, cx),
+            // the prompt, not the restart: it is the one place that says what
+            // has been committed since this window started and what is still
+            // mid-turn, and that is worth reading before taking the app down
+            Cmd::RestartApp => cx.emit(ProjectNav::Restart),
             Cmd::WorkspaceHistory => self.open_ws_history(window, cx),
             Cmd::OpenPrNumber => self.open_prnum_prompt(window, cx),
             Cmd::TogglePause => self.toggle_pause(cx),
@@ -38320,6 +38329,10 @@ struct Workspace {
     /// The prompt just went up; the next render claims the keyboard for it,
     /// rather than every render taking it again.
     restart_focus_pending: bool,
+    /// The prompt is up because you asked for it, not because a build landed.
+    /// It reads differently: there may be no new build and there may be work
+    /// running, both of which the offered version can promise are not so.
+    restart_byhand: bool,
     /// A workspace nothing has happened in for `PAUSE_AFTER`, by index. `Some`
     /// puts the "park it?" prompt up.
     pause_ask: Option<usize>,
@@ -38359,6 +38372,7 @@ impl Workspace {
             restart_skip: 0,
             restart_focus: cx.focus_handle(),
             restart_focus_pending: false,
+            restart_byhand: false,
             pause_ask: None,
             pause_focus: cx.focus_handle(),
             pause_focus_pending: false,
@@ -38493,6 +38507,7 @@ impl Workspace {
             ProjectNav::Open => this.open_project(cx),
             ProjectNav::OpenPath(p) => this.add_project(p.clone(), cx),
             ProjectNav::Remove(i) => this.remove_project(*i, cx),
+            ProjectNav::Restart => this.ask_restart(cx),
         })
         .detach();
         self.projects.push(storm);
@@ -38823,7 +38838,12 @@ impl Workspace {
                         // and if the prompt is already up, it is now saying
                         // something untrue: it claims nothing is working. Take
                         // it down rather than leave it to be clicked, and
-                        // offer again when the work stops
+                        // offer again when the work stops. One you opened from
+                        // the palette stays: it counts what is working and
+                        // says so, and it was not this poll's to put up
+                        if this.restart_byhand {
+                            return;
+                        }
                         if this.restart_at.take().is_some() {
                             this.restart_log.clear();
                             cx.notify();
@@ -38839,6 +38859,7 @@ impl Workspace {
                     }
                     this.restart_at = Some(built);
                     this.restart_log = built_since();
+                    this.restart_byhand = false;
                     this.restart_focus_pending = true;
                     cx.notify();
                 })
@@ -38964,6 +38985,31 @@ impl Workspace {
         cx.quit();
     }
 
+    /// Put the restart prompt up because the palette asked for it. Same
+    /// prompt as the one a new build raises, for the same reason you would
+    /// want it: it lists what has landed since this window started, and it
+    /// says what is mid-turn. Dismissing it leaves `restart_skip` alone, so a
+    /// look that ends in "not now" doesn't swallow the offer for a build you
+    /// haven't seen yet.
+    fn ask_restart(&mut self, cx: &mut Context<Self>) {
+        self.restart_byhand = true;
+        self.restart_at = Some(exe_built());
+        self.restart_log = built_since();
+        self.restart_focus_pending = true;
+        cx.notify();
+    }
+
+    /// Leave the prompt without restarting. A build that offered itself is
+    /// noted as seen; one you opened yourself is not.
+    fn restart_dismiss(&mut self, cx: &mut Context<Self>) {
+        let at = self.restart_at.take().unwrap_or(0);
+        if !std::mem::take(&mut self.restart_byhand) {
+            self.restart_skip = at;
+        }
+        self.focus_pending = true;
+        cx.notify();
+    }
+
     /// The commits made while this window has been up, as a list for the
     /// prompt. `None` when there are none: a build taken before its commit
     /// lands is still worth taking, and an empty box says less than no box.
@@ -39017,10 +39063,8 @@ impl Workspace {
         match ev.keystroke.key.as_str() {
             "enter" => self.restart_now(cx),
             "escape" => {
-                self.restart_skip = self.restart_at.take().unwrap_or(0);
-                self.focus_pending = true;
+                self.restart_dismiss(cx);
                 window.focus(&self.focus, cx);
-                cx.notify();
             }
             _ => {}
         }
@@ -39176,6 +39220,39 @@ impl Workspace {
 
     /// The prompt that goes up when a build lands and nothing is working.
     fn render_restart_prompt(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let asked = self.restart_byhand;
+        let later = if asked { "Cancel" } else { "Later" };
+        let fresh = exe_built() > exe_ran();
+        let busy = self.busy_workspaces(cx).len();
+        let head = match (asked, self.restart_log.len()) {
+            (false, 0) => "A newer TIDE is built".to_string(),
+            (false, 1) => "A newer TIDE is built, with one change in it".to_string(),
+            (false, n) => format!("A newer TIDE is built, with {n} changes in it"),
+            (true, _) if !fresh => "Restart TIDE on the build it is already running".to_string(),
+            (true, 1) => "Restart TIDE on the newer build, with one change in it".to_string(),
+            (true, 0) => "Restart TIDE on the newer build".to_string(),
+            (true, n) => format!("Restart TIDE on the newer build, with {n} changes in it"),
+        };
+        // the offered version can say nothing is working, because it only goes
+        // up when nothing is. This one is asked for whenever you like
+        let body = match (asked, busy) {
+            (false, _) => "This window is running the build it started with. Nothing is \
+                 working right now, so this is the cheap moment to take the new \
+                 one: it comes back up with these workspaces open."
+                .to_string(),
+            (true, 0) => "Nothing is running. It comes back up with these workspaces \
+                 open, on whatever is in target/ when it goes."
+                .to_string(),
+            (true, 1) => "One workspace is mid-turn. Restarting ends that turn where it \
+                 stands: the session is on disk and resumes, the answer it was \
+                 writing does not."
+                .to_string(),
+            (true, n) => format!(
+                "{n} workspaces are mid-turn. Restarting ends those turns where they \
+                 stand: the sessions are on disk and resume, the answers they were \
+                 writing do not."
+            ),
+        };
         div()
             .absolute()
             .inset_0()
@@ -39197,18 +39274,8 @@ impl Workspace {
                     .shadow_lg()
                     .track_focus(&self.restart_focus)
                     .on_key_down(cx.listener(Self::restart_key))
-                    .child(div().text_size(px(14.)).text_color(rgb(TEXT)).child(
-                        match self.restart_log.len() {
-                            0 => "A newer TIDE is built".to_string(),
-                            1 => "A newer TIDE is built, with one change in it".to_string(),
-                            n => format!("A newer TIDE is built, with {n} changes in it"),
-                        },
-                    ))
-                    .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(
-                        "This window is running the build it started with. Nothing is \
-                         working right now, so this is the cheap moment to take the new \
-                         one: it comes back up with these workspaces open.",
-                    ))
+                    .child(div().text_size(px(14.)).text_color(rgb(TEXT)).child(head))
+                    .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(body))
                     // what came in while this window was up, in the words the
                     // commits were written down in. A restart with nothing to
                     // show for it is one you put off
@@ -39221,14 +39288,14 @@ impl Workspace {
                             .gap_2()
                             .pt_1()
                             .child(div().flex_grow(1.0))
-                            .child(rc_button("restart-later", "Later", false, false).on_click(
-                                cx.listener(|this, _e, window, cx| {
-                                    this.restart_skip = this.restart_at.take().unwrap_or(0);
-                                    this.focus_pending = true;
-                                    window.focus(&this.focus, cx);
-                                    cx.notify();
-                                }),
-                            ))
+                            .child(
+                                rc_button("restart-later", later, false, false).on_click(
+                                    cx.listener(|this, _e, window, cx| {
+                                        this.restart_dismiss(cx);
+                                        window.focus(&this.focus, cx);
+                                    }),
+                                ),
+                            )
                             .child(rc_button("restart-now", "Restart  \u{21a9}", true, false)
                                 .on_click(cx.listener(|this, _e, _w, cx| this.restart_now(cx)))),
                     ),
