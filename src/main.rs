@@ -3161,6 +3161,8 @@ fn md_hang(row: &MdRow, inner: AnyElement) -> AnyElement {
     div()
         .flex()
         .flex_row()
+        .w_full()
+        .min_w(px(0.))
         .items_start()
         .when(row.indent > 0.0, |d| d.pl(px(row.indent)))
         .when(!row.marker.is_empty(), |d| {
@@ -28864,6 +28866,8 @@ impl Storm {
             let inner = div()
                 .flex()
                 .flex_row()
+                .w_full()
+                .min_w(px(0.))
                 .items_start()
                 .child(gutter)
                 .child(
@@ -28954,13 +28958,16 @@ impl Storm {
         let has_comment =
             |i: usize| commented.iter().any(|(a, b, _)| i + 1 >= *a && i + 1 <= *b);
         let bar = |i: usize| (selected(i).is_some(), has_comment(i));
-        let mut col = div().flex().flex_col().gap(px(4.)).text_color(rgb(TEXT));
+        let mut col =
+            div().flex().flex_col().w_full().min_w(px(0.)).gap(px(4.)).text_color(rgb(TEXT));
         let mut k = 0;
         while k < built.len() {
             let (on, marked) = bar(built[k].0);
             let mut group = div()
                 .flex()
                 .flex_col()
+                .w_full()
+                .min_w(px(0.))
                 .gap(px(4.))
                 .pl_1()
                 .border_l_2()
@@ -31130,7 +31137,15 @@ impl Storm {
             // agent prose is selectable, so it can be quoted back
             if let AgentMsg::Agent(t) = m {
                 let t = t.clone();
+                // the width is the whole point: a row of the list is laid out
+                // as its own root, so a plain block sizes to its longest line
+                // and a line that can't break runs off the side of the pane.
+                // Same shape as the user bubble below
                 return div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .min_w(px(0.))
                     .px_3()
                     .py_1()
                     .child(this.render_agent_md(ix, &t, window, cx))
@@ -32254,6 +32269,7 @@ impl Storm {
                         Some(foot) => div()
                             .flex()
                             .flex_col()
+                            .w_full()
                             .min_w(px(0.))
                             .child(row)
                             .child(foot)
