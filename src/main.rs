@@ -18786,7 +18786,16 @@ impl Storm {
                                     b => b.to_string(),
                                 };
                                 let stale = reading.stale();
-                                let (colour, hint) = if stale {
+                                // already being written: the chip says so and
+                                // stops being pressable, so a second press
+                                // can't queue a second one behind the first
+                                let building = self.pr_reading_building(num).is_some();
+                                let (colour, hint) = if building {
+                                    (
+                                        LINE_NUMBER,
+                                        format!("The agent is writing the explanation of #{num} now"),
+                                    )
+                                } else if stale {
                                     (
                                         FOLDER_ICON,
                                         format!(
@@ -18829,23 +18838,32 @@ impl Storm {
                                         .gap_1()
                                         .px_1()
                                         .rounded_md()
-                                        .cursor_pointer()
+                                        .when(!building, |d| d.cursor_pointer())
                                         .text_size(px(11.))
                                         .text_color(rgb(colour))
                                         // an outdated explanation is drawn as the
                                         // warning it is, in the same amber outline
                                         // as "2 behind next" beside it
-                                        .when(stale, |d| {
+                                        .when(stale && !building, |d| {
                                             d.rounded_sm().border_1().border_color(rgb(FOLDER_ICON))
                                         })
-                                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                        .when(!building, |d| {
+                                            d.hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                        })
                                         .child(
                                             div()
                                                 .font_family(ICON_FONT)
                                                 .text_size(px(11.))
-                                                .child(if stale { "↻" } else { IC_TOUR }),
+                                                .child(if stale && !building {
+                                                    "↻"
+                                                } else {
+                                                    IC_TOUR
+                                                }),
                                         )
-                                        .child(reading.verb())
+                                        .child(match building {
+                                            true => "writing the explanation…",
+                                            false => reading.verb(),
+                                        })
                                         .tooltip(tip_owned(hint))
                                         .on_click(cx.listener(
                                             move |this, e: &gpui::ClickEvent, _w, cx| {
@@ -26388,16 +26406,19 @@ impl Storm {
                             .px_2()
                             .py_1()
                             .rounded_t_md()
-                            .bg(rgba(TOUR_TINT))
-                            .border_b_1()
-                            .border_color(rgb(accent))
+                            // filled, not tinted: the same slab the pressed
+                            // scope chips are, in the tour's own colour. A
+                            // wash of 11% amber read as a header the card
+                            // happened to have rather than as the one thing
+                            // that changed on this step
+                            .bg(rgb(accent))
                             .child(
                                 div()
                                     .flex_grow(1.0)
                                     .min_w(px(0.))
                                     .truncate()
                                     .text_size(px(13.))
-                                    .text_color(rgb(accent))
+                                    .text_color(rgb(BG))
                                     .child(group.clone()),
                             )
                             .when(at > 0 && total > 0, |d| {
@@ -26405,7 +26426,9 @@ impl Storm {
                                     div()
                                         .flex_shrink_0()
                                         .text_size(px(10.))
-                                        .text_color(rgb(MUTED))
+                                        // the same dark as the name, carried
+                                        // at 60% so it sits under it
+                                        .text_color(rgba(u32::from(BG) << 8 | 0x99))
                                         .child(format!("part {at} of {total}")),
                                 )
                             }),
@@ -26887,10 +26910,15 @@ impl Storm {
         } else {
             format!("Asked whether #{number}'s description is still true")
         };
+        let job = format!("Description of #{number}");
+        if self.job_in_flight(&job) {
+            self.show_flash(&format!("{job} is already being checked"), cx);
+            return;
+        }
         self.agent_open = true;
         // the transcript label is a sentence; the job name is what fits a
         // header and a report column
-        self.job_next = Some(format!("Description of #{number}"));
+        self.job_next = Some(job);
         self.send_agent_prompt_as(pr_body_check(number, &base, update), Some(label), cx);
         self.agent_list.scroll_to_end();
         cx.notify();
@@ -26898,6 +26926,10 @@ impl Storm {
 
     /// A tour of the pull request: its changes in the order they should be read.
     fn ask_pr_tour(&mut self, number: u64, base: String, wait: bool, cx: &mut Context<Self>) {
+        if let Some(job) = self.pr_reading_building(number) {
+            self.show_flash(&format!("{job} is already being built"), cx);
+            return;
+        }
         self.pending_tour_pr = Some(number);
         self.tour_waits = wait;
         // a tour of this pull request already read in part: the stops you have
@@ -26912,9 +26944,10 @@ impl Storm {
             true => format!("Asked for the code tour of #{number} to be built again"),
             false => format!("Asked for a code tour of #{number}"),
         };
+        let [tour, rebuilt, _, _] = pr_reading_jobs(number);
         self.job_next = Some(match again {
-            true => format!("Rebuild the tour of #{number}"),
-            false => format!("Code tour of #{number}"),
+            true => rebuilt,
+            false => tour,
         });
         self.agent_open = true;
         self.send_agent_prompt_as(pr_tour_request(number, &base, &read), Some(label), cx);
@@ -29912,6 +29945,17 @@ impl Storm {
         }
     }
 
+    /// The reading of this pull request already being built, if one is.
+    ///
+    /// A tour goes out under three of these names: on its own, as a rebuild,
+    /// and as the tour half of Explain, which writes the brief in the same
+    /// turn. Which button was pressed first doesn't matter. Pressing any of
+    /// them while one of the others is still working asks for work that is
+    /// already happening.
+    fn pr_reading_building(&self, number: u64) -> Option<String> {
+        pr_reading_jobs(number).into_iter().find(|job| self.job_in_flight(job))
+    }
+
     /// Walk the tour of a pull request: the one already built if there is
     /// one, otherwise ask for it. The brief ends with this, which is the only
     /// place the two halves of an explanation meet.
@@ -29930,6 +29974,12 @@ impl Storm {
     /// and opens the brief when there is one to open — the deck links on to
     /// the tour at the end of it, so one press is enough to start reading.
     fn explain_pr(&mut self, number: u64, base: String, force: bool, cx: &mut Context<Self>) {
+        // the halves guard themselves, but this sends two of them and would
+        // otherwise say it twice
+        if let Some(job) = self.pr_reading_building(number) {
+            self.show_flash(&format!("{job} is already being built"), cx);
+            return;
+        }
         let reading = self.pr_reading(number);
         let (brief, tour) = reading.wanted(force);
         // one button, one turn. Both halves come out of the same diff, so
@@ -29962,6 +30012,10 @@ impl Storm {
 
     /// Both halves of Explain PR in one turn, drawn as one line in the pane.
     fn ask_pr_explain(&mut self, number: u64, base: String, cx: &mut Context<Self>) {
+        if let Some(job) = self.pr_reading_building(number) {
+            self.show_flash(&format!("{job} is already being built"), cx);
+            return;
+        }
         self.pending_tour_pr = Some(number);
         self.tour_waits = true;
         let brief_read = brief_cached(number)
@@ -29972,7 +30026,8 @@ impl Storm {
             .map(|t| tour_read_note(&t.stops, &t.seen.iter().copied().collect()))
             .unwrap_or_default();
         let label = format!("Asked for a brief and a code tour of #{number}");
-        self.job_next = Some(format!("Explain #{number}"));
+        let [_, _, _, explain] = pr_reading_jobs(number);
+        self.job_next = Some(explain);
         self.spend_tag = Some(format!("brief:{number}"));
         self.agent_open = true;
         self.send_agent_prompt_as(
@@ -29985,6 +30040,14 @@ impl Storm {
     }
 
     fn ask_pr_brief(&mut self, number: u64, base: String, again: bool, cx: &mut Context<Self>) {
+        // opening the brief already on disk is free and always allowed; it is
+        // writing one that must not be asked for twice at once
+        if again {
+            if let Some(job) = self.pr_reading_building(number) {
+                self.show_flash(&format!("{job} is already being built"), cx);
+                return;
+            }
+        }
         if !again {
             if let Some(b) = brief_cached(number) {
                 let when = (b.made > 0).then(|| todo::age(b.made)).unwrap_or_default();
@@ -29996,7 +30059,8 @@ impl Storm {
             }
         }
         let label = format!("Asked for a brief of #{number}");
-        self.job_next = Some(format!("Brief of #{number}"));
+        let [_, _, brief, _] = pr_reading_jobs(number);
+        self.job_next = Some(brief);
         self.spend_tag = Some(format!("brief:{number}"));
         // the slides already read ride along, so a rewrite isn't five slides
         // to read from the top again
@@ -30799,6 +30863,17 @@ impl Storm {
     /// message is part of it: that is where the chip that unfolds it goes.
     fn job_turn(&self, ix: usize) -> Option<&JobTurn> {
         job_at(&self.job_turns, ix)
+    }
+
+    /// Is a job by this name already running, or waiting behind the turn that
+    /// is? A button that sends one gets pressed twice by accident more often
+    /// than on purpose. The second press lands while the first is still
+    /// working, and both go out, one after the other, each reading the same
+    /// diff again.
+    fn job_in_flight(&self, job: &str) -> bool {
+        self.agent_queue.iter().any(|q| q.job.as_deref() == Some(job))
+            || (self.agent_busy
+                && self.job_turns.last().is_some_and(|q| q.end.is_none() && q.job == job))
     }
 
     /// The run of screenshots `ix` belongs to, as `(first, last)` inclusive.
@@ -36457,6 +36532,8 @@ impl Storm {
             // out of date the same way
             .when_some(pr, |d, p| {
                 let base = base.clone();
+                // already being written: nothing to press until it lands
+                let building = self.pr_reading_building(p).is_some();
                 d.child(
                     div()
                         .id("brief-again")
@@ -36464,14 +36541,24 @@ impl Storm {
                         .px_1p5()
                         .py(px(1.))
                         .rounded_md()
-                        .cursor_pointer()
                         .text_size(px(11.))
                         .border_1()
-                        .border_color(rgb(BORDER))
-                        .text_color(rgb(if stale { FOLDER_ICON } else { MUTED }))
-                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                        .child("Write it again")
-                        .tooltip(tip("Ask for this brief again, from the branch as it stands now"))
+                        .border_color(rgb(if building { BG } else { BORDER }))
+                        .text_color(rgb(if building {
+                            LINE_NUMBER
+                        } else if stale {
+                            FOLDER_ICON
+                        } else {
+                            MUTED
+                        }))
+                        .when(!building, |d| {
+                            d.cursor_pointer().hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                        })
+                        .child(if building { "Writing it…" } else { "Write it again" })
+                        .tooltip(tip(match building {
+                            true => "The agent is writing it now",
+                            false => "Ask for this brief again, from the branch as it stands now",
+                        }))
                         .on_click(cx.listener(move |this, _e, _w, cx| {
                             this.ask_pr_brief(p, base.clone(), true, cx)
                         })),
@@ -36842,19 +36929,24 @@ impl Storm {
         // there is a tour of this change already, so the button walks it
         // rather than asking for another one
         let has_tour = pr.is_some_and(|p| self.tour_of(p).is_some());
-        let button = |key: &'static str, label: &'static str, lit: u32| {
+        // one is being written right now: the button stops looking like a
+        // button, the way Merge does while GitHub is merging, so the second
+        // press has nowhere to land
+        let building = pr.and_then(|p| self.pr_reading_building(p)).is_some();
+        let button = move |key: &'static str, label: &'static str, lit: u32| {
             div()
                 .id(key)
                 .flex_shrink_0()
                 .px_3()
                 .py_1()
                 .rounded_md()
-                .cursor_pointer()
                 .text_size(px(12.))
                 .border_1()
-                .border_color(rgb(BORDER))
-                .text_color(rgb(MUTED))
-                .hover(move |s| s.bg(rgb(HOVER)).text_color(rgb(lit)))
+                .border_color(rgb(if building { BG } else { BORDER }))
+                .text_color(rgb(if building { LINE_NUMBER } else { MUTED }))
+                .when(!building, |d| {
+                    d.cursor_pointer().hover(move |s| s.bg(rgb(HOVER)).text_color(rgb(lit)))
+                })
                 .child(label)
         };
         div()
@@ -36873,13 +36965,19 @@ impl Storm {
                         .items_center()
                         .gap_2()
                         .child(
-                            button("brief-end-tour", "Code tour", TOUR_MARK)
-                                .tooltip(tip(if has_tour {
-                                    "Walk the tour of this change, stop by stop"
-                                } else {
-                                    "Ask for a tour of this change: the same code, \
-                                     walked stop by stop"
-                                }))
+                            button(
+                                "brief-end-tour",
+                                if building { "Code tour…" } else { "Code tour" },
+                                TOUR_MARK,
+                            )
+                            .tooltip(tip(if building {
+                                "The agent is building it now"
+                            } else if has_tour {
+                                "Walk the tour of this change, stop by stop"
+                            } else {
+                                "Ask for a tour of this change: the same code, \
+                                 walked stop by stop"
+                            }))
                                 .on_click(cx.listener(move |this, _e, _w, cx| {
                                     this.walk_pr_tour(p, tour_base.clone(), cx)
                                 })),
@@ -37727,22 +37825,32 @@ impl Storm {
             .when(pr.state == PrState::Open || pr.state == PrState::Draft, |d| {
                 let (number, base) = (pr.number, pr.base.clone());
                 let explain_base = base.clone();
+                // each of these sends one turn, and each stops being a button
+                // while that turn is still running
+                let checking = self.job_in_flight(&format!("Description of #{number}"));
+                let building = self.pr_reading_building(number).is_some();
                 d.child(
                     div()
                         .id("pr-doc-body-check")
                         .px_1p5()
                         .py(px(1.))
                         .rounded_md()
-                        .cursor_pointer()
                         .text_size(px(11.))
                         .border_1()
-                        .border_color(rgb(BORDER))
-                        .text_color(rgb(MUTED))
-                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                        .child("Body current?")
-                        .tooltip(tip(
-                            "Ask whether the description still matches the code  ·  ⌥click to have it rewritten",
-                        ))
+                        .border_color(rgb(if checking { BG } else { BORDER }))
+                        .text_color(rgb(if checking { LINE_NUMBER } else { MUTED }))
+                        .when(!checking, |d| {
+                            d.cursor_pointer().hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                        })
+                        .child(match checking {
+                            true => "Reading it…",
+                            false => "Body current?",
+                        })
+                        .tooltip(tip(match checking {
+                            true => "The agent is reading the description now",
+                            false => "Ask whether the description still matches the code  ·  \
+                                      ⌥click to have it rewritten",
+                        }))
                         .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _w, cx| {
                             this.ask_pr_body_check(number, base.clone(), e.modifiers().alt, cx)
                         })),
@@ -37755,17 +37863,23 @@ impl Storm {
                         .px_1p5()
                         .py(px(1.))
                         .rounded_md()
-                        .cursor_pointer()
                         .text_size(px(11.))
                         .border_1()
-                        .border_color(rgb(BORDER))
-                        .text_color(rgb(MUTED))
-                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TOUR_MARK)))
-                        .child("Explain")
-                        .tooltip(tip(
-                            "The brief for what this change does and the tour for where  ·  \
-                             ⌥click to write them again",
-                        ))
+                        .border_color(rgb(if building { BG } else { BORDER }))
+                        .text_color(rgb(if building { LINE_NUMBER } else { MUTED }))
+                        .when(!building, |d| {
+                            d.cursor_pointer()
+                                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TOUR_MARK)))
+                        })
+                        .child(match building {
+                            true => "Writing it…",
+                            false => "Explain",
+                        })
+                        .tooltip(tip(match building {
+                            true => "The agent is writing the explanation now",
+                            false => "The brief for what this change does and the tour for \
+                                      where  ·  ⌥click to write them again",
+                        }))
                         .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _w, cx| {
                             this.explain_pr(number, explain_base.clone(), e.modifiers().alt, cx)
                         })),
@@ -45281,6 +45395,22 @@ mod stop_diff_side_tests {
     }
 }
 
+/// The names a pull request's reading goes out under: the tour on its own, the
+/// tour built again, the brief, and both halves in one turn.
+///
+/// One list, read by the guard that refuses a second press and by the sends
+/// themselves, so a job renamed in one place is renamed in the other. Drift
+/// here would break nothing visibly. It would quietly let the double click
+/// back in.
+fn pr_reading_jobs(number: u64) -> [String; 4] {
+    [
+        format!("Code tour of #{number}"),
+        format!("Rebuild the tour of #{number}"),
+        format!("Brief of #{number}"),
+        format!("Explain #{number}"),
+    ]
+}
+
 /// The fallback in `jobs::guess` reads a replayed prompt off its opening line.
 /// It can only do that while the openings are what these generators actually
 /// write, so the generators themselves are fed through it here: change one of
@@ -45309,6 +45439,14 @@ mod job_guess_tests {
         // opening off
         let with_read = brief_request(6176, "next", "I have read slides 1 and 2.\n\n");
         assert_eq!(jobs::guess(&with_read).unwrap().job, "Brief of #6176");
+
+        // and the guard that refuses a second press knows every one of those
+        // names, so a tour already being built is recognised whichever button
+        // asked for it
+        let guarded = pr_reading_jobs(6176);
+        for job in [brief.job, explain.job, tour.job] {
+            assert!(guarded.contains(&job), "{job} is sent but not guarded");
+        }
     }
 }
 
