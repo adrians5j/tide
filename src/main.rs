@@ -7373,6 +7373,11 @@ struct Conv {
     paste_seq: usize,
     job_turns: Vec<JobTurn>,
     job_next: Option<String>,
+    /// The next job's fold starts open. Set beside `job_next` by a job whose
+    /// answer is a conversation rather than a card: folding that leaves the
+    /// answer nowhere. Taken with the job itself, so a job that never goes
+    /// doesn't leave it set on the one after.
+    job_open_next: bool,
     turn_start: Option<std::time::Instant>,
     mark: Option<spend::Mark>,
     /// What this tab's control-channel token is filed under, so a screenshot
@@ -7477,6 +7482,8 @@ struct Queued {
     /// The job it is part of, if TIDE started it as one. `Some` folds the
     /// turn into one line when it finally goes.
     job: Option<String>,
+    /// …unless the job asked to stay open, which a conversation does.
+    job_open: bool,
     /// The part of TIDE it came from, kept so a prompt held behind a turn is
     /// still counted against what sent it.
     kind: &'static str,
@@ -9211,6 +9218,11 @@ struct Storm {
     /// lands because a prompt sent while a turn is running waits in the queue,
     /// so the message it will become has no index yet.
     job_next: Option<String>,
+    /// The next job's fold starts open. Set beside `job_next` by a job whose
+    /// answer is a conversation rather than a card: folding that leaves the
+    /// answer nowhere. Taken with the job itself, so a job that never goes
+    /// doesn't leave it set on the one after.
+    job_open_next: bool,
     /// Virtualized transcript state, and the item count it was last told about.
     agent_list: gpui::ListState,
     agent_list_len: usize,
@@ -9847,6 +9859,7 @@ impl Storm {
             agent_queue: Vec::new(),
             job_turns: Vec::new(),
             job_next: None,
+            job_open_next: false,
             agent_list: gpui::ListState::new(0, gpui::ListAlignment::Bottom, px(600.)),
             agent_list_len: 0,
             acp_state: None,
@@ -15184,6 +15197,10 @@ impl Storm {
         // session of its own; mid-turn it goes here, like any other prompt
         let note = merged_note(number, about.as_ref());
         self.job_next = Some(format!("Merged #{number}"));
+        // the merge note is a question with an answer you are waiting for, so
+        // its turn stays open. The line above it still says what the job is,
+        // and "Fold … away" under it still folds it by hand
+        self.job_open_next = true;
         match self.agent_busy {
             true => self.send_agent_prompt_as(note, None, cx),
             false => self.ask_fresh(note, None, cx),
@@ -27447,6 +27464,7 @@ impl Storm {
         std::mem::swap(&mut self.agent_paste_seq, &mut c.paste_seq);
         std::mem::swap(&mut self.job_turns, &mut c.job_turns);
         std::mem::swap(&mut self.job_next, &mut c.job_next);
+        std::mem::swap(&mut self.job_open_next, &mut c.job_open_next);
         std::mem::swap(&mut self.agent_turn_start, &mut c.turn_start);
         std::mem::swap(&mut self.turn_mark, &mut c.mark);
         std::mem::swap(&mut self.agent_rpc_tab, &mut c.rpc_tab);
@@ -27627,17 +27645,17 @@ impl Storm {
                 // the wire carries the page of instructions TIDE sent; the pane
                 // showed one line and folded the rest away, and that is only
                 // still true if TIDE wrote it down when it went out
-                let (text, job, by) = match jobs::recall(&text) {
+                let (text, job, by, job_open) = match jobs::recall(&text) {
                     Some(s) => {
                         let by = if s.by_tide { Sender::Tide } else { Sender::You };
-                        (s.label, (!s.job.is_empty()).then_some(s.job), by)
+                        (s.label, (!s.job.is_empty()).then_some(s.job), by, s.open)
                     }
-                    None => (text, None, Sender::You),
+                    None => (text, None, Sender::You, false),
                 };
                 self.agent_msgs.push(AgentMsg::User { text, imgs: Vec::new(), by });
                 // a replayed job has no clock: nothing here knows how long it
                 // took, and `began: 0` is how the chip says so
-                self.mark_turn_at(job, 0);
+                self.mark_turn_at(job, 0, job_open);
             }
             Sessions(list) => {
                 self.agent_sessions = list;
@@ -28549,6 +28567,7 @@ impl Storm {
         // before the paths that queue it, so a job started while the agent is
         // busy is still one line when it finally goes
         let job = std::mem::take(&mut self.job_next);
+        let job_open = std::mem::take(&mut self.job_open_next);
         // the same, for the part of TIDE this came from: a prompt that doesn't
         // name one is the pane when you typed it and a job when TIDE sent it
         let kind = self.spend_next.take().unwrap_or(match by {
@@ -28579,7 +28598,13 @@ impl Storm {
             if !queue && by == Sender::You && acp.can_steer() {
                 let (imgs, kept) = split_images(self.agent_imgs.drain(..).collect());
                 let shown = label.unwrap_or_else(|| text.clone());
-                jobs::remember(&text, &shown, job.as_deref().unwrap_or_default(), by == Sender::Tide);
+                jobs::remember(
+                &text,
+                &shown,
+                job.as_deref().unwrap_or_default(),
+                by == Sender::Tide,
+                job_open,
+            );
                 // no mark of its own: a steered message joins the turn that is
                 // running, and what it costs is that turn's, counted against
                 // whatever sent it
@@ -28593,7 +28618,7 @@ impl Storm {
             }
             // the attachments go with it, not with the next thing you send
             let imgs = self.agent_imgs.drain(..).collect();
-            self.agent_queue.push(Queued { text, label, imgs, by, job, kind, tag });
+            self.agent_queue.push(Queued { text, label, imgs, by, job, job_open, kind, tag });
             self.agent_list.scroll_to_end();
             cx.notify();
             return;
@@ -28613,7 +28638,13 @@ impl Storm {
         };
         // …and the adapter replays the wire, so how this reads in the pane is
         // written down now or lost at the next restart
-        jobs::remember(&text, &shown, job.as_deref().unwrap_or_default(), by == Sender::Tide);
+        jobs::remember(
+                &text,
+                &shown,
+                job.as_deref().unwrap_or_default(),
+                by == Sender::Tide,
+                job_open,
+            );
         let sent = if self.agent_briefed {
             text
         } else {
@@ -28623,7 +28654,7 @@ impl Storm {
         acp.prompt_with(&sent, &imgs);
         self.agent_msgs.push(AgentMsg::User { text: shown, imgs: kept, by });
         self.open_spend(kind, job.as_deref().unwrap_or_default(), &tag, by, &acp);
-        self.mark_turn_start(job);
+        self.mark_turn_start(job, job_open);
         self.agent_turn_start = Some(std::time::Instant::now());
         self.start_agent_spinner(cx);
         // same signal a terminal agent's UserPromptSubmit hook sends
@@ -30727,13 +30758,13 @@ impl Storm {
     /// A user message has just landed in the transcript. Whatever turn was
     /// running is over, so a fold that was still growing stops here; and when
     /// this question came from a slide or a stop, its own working folds.
-    fn mark_turn_start(&mut self, job: Option<String>) {
-        self.mark_turn_at(job, now_secs());
+    fn mark_turn_start(&mut self, job: Option<String>, open: bool) {
+        self.mark_turn_at(job, now_secs(), open);
     }
 
     /// The same, for a turn being replayed rather than sent: `began` is 0,
     /// which is how the job line knows it has no clock to show.
-    fn mark_turn_at(&mut self, job: Option<String>, began: u64) {
+    fn mark_turn_at(&mut self, job: Option<String>, began: u64, open: bool) {
         let at = self.agent_msgs.len().saturating_sub(1);
         if let Some(q) = self.job_turns.last_mut().filter(|q| q.end.is_none()) {
             q.end = Some(at);
@@ -30746,7 +30777,7 @@ impl Storm {
             self.job_turns.push(JobTurn {
                 at,
                 end: None,
-                open: false,
+                open,
                 job,
                 began,
                 // a replayed turn is over: it must not start counting up from
@@ -31591,7 +31622,7 @@ impl Storm {
         if self.agent_queue.is_empty() {
             return;
         }
-        let Queued { text, label, imgs, by, job, kind, tag } = self.agent_queue.remove(0);
+        let Queued { text, label, imgs, by, job, job_open, kind, tag } = self.agent_queue.remove(0);
         if let Some(acp) = self.acp.clone() {
             let shown = label.unwrap_or_else(|| text.clone());
             // held before it could carry the tab's handoff (the window was
@@ -31600,7 +31631,13 @@ impl Storm {
                 Some(h) => format!("{h}\n\n{text}"),
                 None => text,
             };
-            jobs::remember(&text, &shown, job.as_deref().unwrap_or_default(), by == Sender::Tide);
+            jobs::remember(
+                &text,
+                &shown,
+                job.as_deref().unwrap_or_default(),
+                by == Sender::Tide,
+                job_open,
+            );
             let sent = if self.agent_briefed {
                 text.clone()
             } else {
@@ -31611,7 +31648,7 @@ impl Storm {
             acp.prompt_with(&sent, &wire);
             self.agent_msgs.push(AgentMsg::User { text: shown, imgs: kept, by });
             self.open_spend(kind, job.as_deref().unwrap_or_default(), &tag, by, &acp);
-            self.mark_turn_start(job);
+            self.mark_turn_start(job, job_open);
             self.agent_turn_start = Some(std::time::Instant::now());
             self.acp_state = Some(AgentState::Working);
             self.agent_cur = None;
