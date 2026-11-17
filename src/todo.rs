@@ -305,11 +305,13 @@ pub fn open_count(list: &[Todo]) -> usize {
 
 /// The list as it's shown: what's still open first, newest at the top of each
 /// group, and anything matching `query` (its text, scope, client, category,
-/// group or the workspace it was written in). Returns
-/// indices into `list`, so a row can act on the real item.
-pub fn view(list: &[Todo], query: &str, origin: Option<&str>) -> Vec<usize> {
+/// group or the workspace it was written in). `open_only` drops what is
+/// already done. Returns indices into `list`, so a row can act on the real
+/// item.
+pub fn view(list: &[Todo], query: &str, origin: Option<&str>, open_only: bool) -> Vec<usize> {
     let q = query.trim().to_lowercase();
     let mut ix: Vec<usize> = (0..list.len())
+        .filter(|&i| !open_only || !list[i].done())
         // `origin` narrows the list to one workspace. A line with no origin at
         // all (written before TIDE recorded it) belongs everywhere rather than
         // nowhere — hiding it would look like losing it.
@@ -345,9 +347,14 @@ pub fn view(list: &[Todo], query: &str, origin: Option<&str>) -> Vec<usize> {
 /// The view, split into its groups: `(group name, rows)`, groups ordered by
 /// their newest line, and whatever has no group last under an empty name. The
 /// rows inside each group keep [`view`]'s order.
-pub fn grouped(list: &[Todo], query: &str, origin: Option<&str>) -> Vec<(String, Vec<usize>)> {
+pub fn grouped(
+    list: &[Todo],
+    query: &str,
+    origin: Option<&str>,
+    open_only: bool,
+) -> Vec<(String, Vec<usize>)> {
     let mut out: Vec<(String, Vec<usize>)> = Vec::new();
-    for i in view(list, query, origin) {
+    for i in view(list, query, origin, open_only) {
         let g = list[i].group.clone();
         match out.iter_mut().find(|(name, _)| *name == g) {
             Some((_, rows)) => rows.push(i),
@@ -434,8 +441,24 @@ mod tests {
     #[test]
     fn the_view_puts_open_first_and_newest_on_top() {
         let list = sample();
-        let ids: Vec<&str> = view(&list, "", None).iter().map(|&i| list[i].id.as_str()).collect();
+        let ids: Vec<&str> = view(&list, "", None, false).iter().map(|&i| list[i].id.as_str()).collect();
         assert_eq!(ids, ["c", "a", "b"]);
+    }
+
+    /// "Open only": the done lines go, and so does a group that was nothing
+    /// but done lines.
+    #[test]
+    fn open_only_drops_what_is_finished() {
+        let mut list = sample();
+        list[1].group = "shipped".into();
+        let ids: Vec<&str> =
+            view(&list, "", None, true).iter().map(|&i| list[i].id.as_str()).collect();
+        assert_eq!(ids, ["c", "a"]);
+        let open_groups = grouped(&list, "", None, true);
+        let names: Vec<&str> = open_groups.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, [""], "the group that held only the done line is gone");
+        // and the filter still applies on top of it
+        assert!(view(&list, "changelog", None, true).is_empty());
     }
 
     /// Filtering matches the way you'd search for a line: its words, or the
@@ -443,29 +466,29 @@ mod tests {
     #[test]
     fn the_filter_matches_text_or_scope() {
         let list = sample();
-        let by_text: Vec<&str> = view(&list, "proxy", None).iter().map(|&i| list[i].id.as_str()).collect();
+        let by_text: Vec<&str> = view(&list, "proxy", None, false).iter().map(|&i| list[i].id.as_str()).collect();
         assert_eq!(by_text, ["a"]);
         // what an agent wrote into the details is searchable too
         let mut with_details = list.clone();
         with_details[1].details = "the 6.4 backport needs it".into();
         let by_details: Vec<&str> =
-            view(&with_details, "backport", None).iter().map(|&i| with_details[i].id.as_str()).collect();
+            view(&with_details, "backport", None, false).iter().map(|&i| with_details[i].id.as_str()).collect();
         assert_eq!(by_details, ["b"]);
-        let by_scope: Vec<&str> = view(&list, "sdk", None).iter().map(|&i| list[i].id.as_str()).collect();
+        let by_scope: Vec<&str> = view(&list, "sdk", None, false).iter().map(|&i| list[i].id.as_str()).collect();
         assert_eq!(by_scope, ["c"]);
         let mut with_client = list.clone();
         with_client[1].client = "Acme".into();
         let by_client: Vec<&str> =
-            view(&with_client, "acme", None).iter().map(|&i| with_client[i].id.as_str()).collect();
+            view(&with_client, "acme", None, false).iter().map(|&i| with_client[i].id.as_str()).collect();
         assert_eq!(by_client, ["b"]);
         // and the workspace it came out of, which nobody types but everybody
         // wants back later
         let mut with_origin = list.clone();
         with_origin[2].origin = "wby-next4".into();
         let by_origin: Vec<&str> =
-            view(&with_origin, "next4", None).iter().map(|&i| with_origin[i].id.as_str()).collect();
+            view(&with_origin, "next4", None, false).iter().map(|&i| with_origin[i].id.as_str()).collect();
         assert_eq!(by_origin, ["c"]);
-        assert!(view(&list, "nothing here", None).is_empty());
+        assert!(view(&list, "nothing here", None, false).is_empty());
     }
 
     #[test]
@@ -518,7 +541,7 @@ mod tests {
     fn the_view_leads_with_what_is_under_way() {
         let mut list = sample();
         set_status(&mut list, "a", Status::Doing);
-        let ids: Vec<&str> = view(&list, "", None).iter().map(|&i| list[i].id.as_str()).collect();
+        let ids: Vec<&str> = view(&list, "", None, false).iter().map(|&i| list[i].id.as_str()).collect();
         assert_eq!(ids, ["a", "c", "b"]);
     }
 
@@ -538,13 +561,13 @@ mod tests {
         let mut list = sample();
         list[0].group = "license flags".into();
         list[1].group = "license flags".into();
-        let groups = grouped(&list, "", None);
+        let groups = grouped(&list, "", None, false);
         let names: Vec<&str> = groups.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["license flags", ""], "the loose line is last");
         assert_eq!(groups[0].1.len(), 2);
         assert_eq!(groups[1].1.len(), 1);
         // filtering by the group name keeps that block and drops the rest
-        assert_eq!(grouped(&list, "license", None).len(), 1);
+        assert_eq!(grouped(&list, "license", None, false).len(), 1);
     }
 
     /// "this project only": lines from elsewhere drop out, and lines from
@@ -556,10 +579,10 @@ mod tests {
         list[0].origin = "wby-next4".into();
         list[1].origin = "wby-next12".into();
         let here: Vec<&str> =
-            view(&list, "", Some("wby-next4")).iter().map(|&i| list[i].id.as_str()).collect();
+            view(&list, "", Some("wby-next4"), false).iter().map(|&i| list[i].id.as_str()).collect();
         assert_eq!(here, ["c", "a"], "this workspace's, plus the one with no origin");
         let there: Vec<&str> =
-            view(&list, "", Some("wby-next12")).iter().map(|&i| list[i].id.as_str()).collect();
+            view(&list, "", Some("wby-next12"), false).iter().map(|&i| list[i].id.as_str()).collect();
         assert_eq!(there, ["c", "b"]);
     }
 

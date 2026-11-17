@@ -8762,6 +8762,11 @@ struct Storm {
     /// Show only what was written in this workspace. On by default: most of the
     /// time the list you want is the one about what's in front of you.
     todo_here_only: bool,
+    /// The todo pane is showing only what is still open. Independent of which
+    /// scope is picked: "all of them" and "the ones I have not done" are two
+    /// different questions, and a list of 130 with 57 struck through answers
+    /// neither on its own.
+    todo_open_only: bool,
     /// The "new task" form.
     todo_open: bool,
     todo_focus: FocusHandle,
@@ -9592,6 +9597,7 @@ impl Storm {
             todo_filter: Field::default(),
             todo_filter_focus: cx.focus_handle(),
             todo_here_only: true,
+            todo_open_only: false,
             todo_open: false,
             todo_focus: cx.focus_handle(),
             todo_cat: None,
@@ -35533,7 +35539,8 @@ impl Storm {
         let filter_focused = self.todo_filter_focus.is_focused(window);
         let here = self.folder_name();
         let scope = self.todo_here_only.then_some(here.as_str());
-        let groups = todo::grouped(&self.todos, &self.todo_filter.text, scope);
+        let groups =
+            todo::grouped(&self.todos, &self.todo_filter.text, scope, self.todo_open_only);
         let open_n = todo::open_count(&self.todos);
         let done_n = self.todos.len() - open_n;
         let empty = groups.is_empty();
@@ -35626,7 +35633,15 @@ impl Storm {
             )
             // which project's list: this one, or everything
             .child({
-                let chip = |id: &'static str, label: String, on: bool, here_only: bool, cx: &mut Context<Self>| {
+                // which of the three a chip is: the two scopes pick one of
+                // each other, the third is a question of its own
+                #[derive(Clone, Copy)]
+                enum Pick {
+                    Here,
+                    All,
+                    Open,
+                }
+                let chip = |id: &'static str, label: String, on: bool, pick: Pick, cx: &mut Context<Self>| {
                     div()
                         .id(id)
                         .px_2()
@@ -35645,12 +35660,21 @@ impl Storm {
                         .when(!on, |d| d.hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT))))
                         .child(label)
                         .on_click(cx.listener(move |this, _e, _w, cx| {
-                            this.todo_here_only = here_only;
+                            match pick {
+                                Pick::Here => this.todo_here_only = true,
+                                Pick::All => this.todo_here_only = false,
+                                Pick::Open => this.todo_open_only = !this.todo_open_only,
+                            }
                             cx.notify();
                         }))
                 };
-                let all_n = self.todos.len();
-                let here_n = todo::view(&self.todos, "", Some(here.as_str())).len();
+                // the counts say what each chip would show, so the open count
+                // moves when you narrow to this workspace
+                let open = self.todo_open_only;
+                let all_n = todo::view(&self.todos, "", None, open).len();
+                let here_n = todo::view(&self.todos, "", Some(here.as_str()), open).len();
+                let here_open = todo::view(&self.todos, "", Some(here.as_str()), true).len();
+                let open_n_here = if self.todo_here_only { here_open } else { open_n };
                 div()
                     .flex()
                     .flex_row()
@@ -35660,8 +35684,10 @@ impl Storm {
                     .px_3()
                     .border_b_1()
                     .border_color(rgb(BORDER))
-                    .child(chip("todo-here", format!("{here}  {here_n}"), self.todo_here_only, true, cx))
-                    .child(chip("todo-all", format!("All  {all_n}"), !self.todo_here_only, false, cx))
+                    .child(chip("todo-here", format!("{here}  {here_n}"), self.todo_here_only, Pick::Here, cx))
+                    .child(chip("todo-all", format!("All  {all_n}"), !self.todo_here_only, Pick::All, cx))
+                    .child(div().flex_grow(1.0))
+                    .child(chip("todo-open", format!("Open  {open_n_here}"), open, Pick::Open, cx))
             })
             .child(if empty {
                 div()
@@ -35672,6 +35698,8 @@ impl Storm {
                     .text_color(rgb(MUTED))
                     .child(if !self.todo_filter.is_empty() {
                         "Nothing matches that filter.".to_string()
+                    } else if self.todo_open_only {
+                        "Nothing open. Press Open again for what is done.".to_string()
                     } else if self.todo_here_only {
                         format!("Nothing written in {here}. ⌘⇧L writes one down, or see All.")
                     } else {
