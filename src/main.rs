@@ -8840,6 +8840,9 @@ struct Storm {
     /// scope is picked: "all of them" and "the ones I have not done" are two
     /// different questions, and a list of 130 with 57 struck through answers
     /// neither on its own.
+    ///
+    /// On by default. A todo list is a list of what is left; what is done is
+    /// a thing you go and look for, and pressing Open again is how you look.
     todo_open_only: bool,
     /// The "new task" form.
     todo_open: bool,
@@ -9676,7 +9679,7 @@ impl Storm {
             todo_filter: Field::default(),
             todo_filter_focus: cx.focus_handle(),
             todo_here_only: true,
-            todo_open_only: false,
+            todo_open_only: true,
             todo_open: false,
             todo_focus: cx.focus_handle(),
             todo_cat: None,
@@ -14152,6 +14155,7 @@ impl Storm {
     fn show_todo(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.todos = todo::load(); // another workspace may have written since
         self.todo_here_only = false; // and it may have been written in one
+        self.todo_open_only = false; // and the line an answer names may be done
         self.todo_filter.set(id.to_string());
         self.left_view = LeftView::Todos;
         self.show_left = true;
