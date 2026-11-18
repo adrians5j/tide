@@ -43,12 +43,18 @@ impl AgentState {
     }
 
     /// Ranked for roll-up onto a tab: the state that most wants attention wins.
+    ///
+    /// `Working` sits above the two endings. A tab that finished an hour ago
+    /// and a tab that is mid-turn roll up to one dot, and reading that dot as
+    /// `done` says the workspace is finished while something in it is still
+    /// going. `Blocked` stays on top of everything: a pane waiting on an
+    /// answer is the one thing that cannot carry on without you.
     pub fn priority(self) -> u8 {
         match self {
             AgentState::Blocked => 5,
-            AgentState::Failed => 4,
-            AgentState::Done => 3,
-            AgentState::Working => 2,
+            AgentState::Working => 4,
+            AgentState::Failed => 3,
+            AgentState::Done => 2,
             AgentState::Idle => 1,
         }
     }
@@ -57,6 +63,26 @@ impl AgentState {
     /// workspaces, but kept out of the terminal dock so panes stay quiet.
     pub fn is_idle(self) -> bool {
         matches!(self, AgentState::Idle)
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    /// Nothing that has finished outranks something that hasn't. A workspace
+    /// with four tabs done and one still running is a workspace that is still
+    /// running, and the dot on it has to say so.
+    #[test]
+    fn working_outranks_an_ending() {
+        let loudest = |states: &[AgentState]| {
+            *states.iter().max_by_key(|s| s.priority()).unwrap()
+        };
+        assert_eq!(loudest(&[AgentState::Done, AgentState::Working]), AgentState::Working);
+        assert_eq!(loudest(&[AgentState::Failed, AgentState::Working]), AgentState::Working);
+        assert_eq!(loudest(&[AgentState::Idle, AgentState::Done]), AgentState::Done);
+        // and a pane that wants an answer still comes first
+        assert_eq!(loudest(&[AgentState::Working, AgentState::Blocked]), AgentState::Blocked);
     }
 }
 

@@ -1152,8 +1152,75 @@ fn live_state(state: Option<AgentState>, seen: u64) -> Option<AgentState> {
 /// Only `working` goes stale. `blocked` is an agent waiting for an answer and
 /// prints nothing while it waits, which is exactly the state worth keeping on
 /// screen; `done` and `failed` are endings and stand until something replaces
-/// them.
+/// them. A turn sitting inside an open command is exempt: see `waiting_on`.
 const STATE_STALE: u64 = 10 * 60;
+
+/// How long a command runs before the pane stops calling it thinking and
+/// starts calling it waiting. Most calls are a grep and are gone inside a
+/// second. Past this it is a test run, a deploy, or a poll that sleeps two
+/// minutes between tries, and what is worth knowing is what is being waited
+/// on and for how long.
+const WAITING_AFTER: u64 = 30;
+
+/// The command a turn is still inside, and how long it has been in it.
+///
+/// The agent is not doing anything while a script runs, which is why the dot
+/// on the workspace went green: nothing arrives from the adapter for twenty
+/// minutes, `STATE_STALE` decides the `working` was never taken back by a
+/// dead process, and the loudest state left is some other tab's `done`. But
+/// the turn is there and the work is not finished. An open tool call is the
+/// proof, and its own clock says how long the wait has been.
+///
+/// The longest-running open call, when several were started at once: what you
+/// want to know is when the turn will come back, which is when the slowest of
+/// them does.
+fn waiting_on(msgs: &[AgentMsg], busy: bool) -> Option<(&str, u64)> {
+    if !busy {
+        return None;
+    }
+    msgs.iter()
+        .filter_map(|m| match m {
+            AgentMsg::Tool { title, status, started, .. }
+                if matches!(status.as_str(), "pending" | "in_progress") =>
+            {
+                Some((title.as_str(), started.elapsed().as_secs()))
+            }
+            _ => None,
+        })
+        .max_by_key(|(_, secs)| *secs)
+}
+
+/// The first line of a command, short enough to sit in a tooltip beside the
+/// state it explains.
+fn cmd_head(cmd: &str) -> String {
+    let line = cmd.trim().lines().next().unwrap_or_default().trim();
+    match line.char_indices().nth(44) {
+        Some((b, _)) => format!("{}\u{2026}", line[..b].trim_end()),
+        None => line.to_string(),
+    }
+}
+
+/// A parked tab's state, with a turn stuck in a long command still counted as
+/// live, the same way `Storm::acp_live` does it for the tab on screen.
+fn conv_live(c: &Conv) -> Option<AgentState> {
+    let seen = match waiting_on(&c.msgs, c.busy) {
+        Some(_) => now_secs(),
+        None => c.seen,
+    };
+    live_state(c.state, seen)
+}
+
+/// What a pane that is working is actually doing, once it has been inside one
+/// command long enough to be worth saying. Empty while the agent itself is
+/// the thing taking the time.
+fn waiting_note(msgs: &[AgentMsg], busy: bool) -> String {
+    match waiting_on(msgs, busy) {
+        Some((cmd, secs)) if secs >= WAITING_AFTER => {
+            format!("waiting on {}  ·  {}", cmd_head(cmd), human_secs(secs))
+        }
+        _ => String::new(),
+    }
+}
 
 /// How long a workspace sits untouched before TIDE asks whether to park it.
 /// Two days: long enough that a weekend of one branch doesn't bury the others,
@@ -11448,16 +11515,30 @@ impl Storm {
     fn working_here(&self) -> bool {
         self.agent_busy
             || self.reviewers.iter().any(|r| !r.done)
-            || live_state(self.acp_state, self.acp_seen) == Some(AgentState::Working)
-            || self
-                .convs
-                .iter()
-                .any(|c| live_state(c.state, c.seen) == Some(AgentState::Working))
+            || self.acp_live() == Some(AgentState::Working)
+            || self.convs.iter().any(|c| conv_live(c) == Some(AgentState::Working))
             || self
                 .term_tabs
                 .iter()
                 .flat_map(|t| t.terminals())
                 .any(|t| matches!(self.pane_state(&t), Some((AgentState::Working, _))))
+    }
+
+    /// This tab's adapter state, with a turn stuck in a long command still
+    /// counted as live. `live_state` alone drops a `working` that nothing has
+    /// backed up for ten minutes, which is right for an adapter that died and
+    /// wrong for one waiting on a test run.
+    fn acp_live(&self) -> Option<AgentState> {
+        live_state(self.acp_state, self.waiting_seen(self.acp_seen))
+    }
+
+    /// `seen`, or now if this tab is sitting inside an open command: silence
+    /// with a call still running is not silence from a dead process.
+    fn waiting_seen(&self, seen: u64) -> u64 {
+        match waiting_on(&self.agent_msgs, self.agent_busy) {
+            Some(_) => now_secs(),
+            None => seen,
+        }
     }
 
     fn agent_rollup(&self) -> Option<(AgentState, String)> {
@@ -11468,13 +11549,17 @@ impl Storm {
             // the ACP panel counts as one more agent in this workspace —
             // one per tab, since a tab you are not looking at is still working.
             // A `working` that has gone quiet for ten minutes is not one: the
-            // adapter is a child process and it can die without saying so
-            .chain(live_state(self.acp_state, self.acp_seen).map(|s| (s, String::new())))
+            // adapter is a child process and it can die without saying so.
+            // What it is waiting on rides along, so the dot's tooltip says
+            // "waiting on npm run test · 6m" rather than only "working"
+            .chain(
+                self.acp_live()
+                    .map(|s| (s, waiting_note(&self.agent_msgs, self.agent_busy))),
+            )
             .chain(
                 self.convs
                     .iter()
-                    .filter_map(|c| live_state(c.state, c.seen))
-                    .map(|s| (s, String::new())),
+                    .filter_map(|c| conv_live(c).map(|s| (s, waiting_note(&c.msgs, c.busy)))),
             )
             .max_by_key(|(s, _)| s.priority())
             // nothing live to report → fall back to the persisted idle marker,
@@ -18586,7 +18671,18 @@ impl Storm {
                                                     .when_some(
                                                         self.agent_rollup()
                                                             .filter(|(s, _)| !s.is_idle()),
-                                                        |d, (s, _)| {
+                                                        |d, (s, msg)| {
+                                                            // a turn sitting in
+                                                            // a long command
+                                                            // says what it is
+                                                            // sitting in
+                                                            let said = match (s, msg.is_empty()) {
+                                                                (AgentState::Working, false) => format!("The agent is {msg}"),
+                                                                (AgentState::Working, true) => "The agent is working".into(),
+                                                                (AgentState::Blocked, _) => "The agent wants something from you".into(),
+                                                                (AgentState::Failed, _) => "The agent stopped on an error".into(),
+                                                                _ => "The agent is done".into(),
+                                                            };
                                                             d.child(
                                                                 div()
                                                                     .id("agent-dot")
@@ -18595,12 +18691,7 @@ impl Storm {
                                                                     .rounded_full()
                                                                     .flex_shrink_0()
                                                                     .bg(rgb(agent_color(s)))
-                                                                    .tooltip(tip(match s {
-                                                                        AgentState::Working => "The agent is working",
-                                                                        AgentState::Blocked => "The agent wants something from you",
-                                                                        AgentState::Failed => "The agent stopped on an error",
-                                                                        _ => "The agent is done",
-                                                                    })),
+                                                                    .tooltip(tip_owned(said)),
                                                             )
                                                         },
                                                     )
@@ -31469,6 +31560,12 @@ impl Storm {
             } else {
                 format!("{secs}s")
             };
+            // most of a long turn can be one command running. "thinking…"
+            // over a `npm test` that has four minutes left in it is the
+            // wrong word for it: the agent is not thinking, it is waiting,
+            // and the command it is waiting on is the row above this one
+            let waiting = waiting_on(&this.agent_msgs, true)
+                .is_some_and(|(_, secs)| secs >= WAITING_AFTER);
             return div()
                 .px_3()
                 .py_1()
@@ -31482,7 +31579,10 @@ impl Storm {
                         .text_color(rgb(ACCENT))
                         .child(SPIN[this.agent_spin % SPIN.len()]),
                 )
-                .child(div().text_color(rgb(MUTED)).child("thinking…"))
+                .child(div().text_color(rgb(MUTED)).child(match waiting {
+                    true => "waiting on the command above…",
+                    false => "thinking…",
+                }))
                 .child(div().text_color(rgb(LINE_NUMBER)).child(elapsed))
                 .into_any_element();
         }
@@ -45409,6 +45509,57 @@ fn pr_reading_jobs(number: u64) -> [String; 4] {
         format!("Brief of #{number}"),
         format!("Explain #{number}"),
     ]
+}
+
+/// A pane that has gone quiet is not a pane that has finished. It can be
+/// sitting inside a command that prints nothing for twenty minutes, and the
+/// open call is the only thing that says so.
+#[cfg(test)]
+mod waiting_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn tool(title: &str, status: &str, ago: u64) -> AgentMsg {
+        AgentMsg::Tool {
+            id: title.into(),
+            title: title.into(),
+            status: status.into(),
+            detail: String::new(),
+            started: Instant::now().checked_sub(Duration::from_secs(ago)).unwrap(),
+        }
+    }
+
+    #[test]
+    fn the_longest_open_call_is_what_the_turn_waits_on() {
+        let msgs = vec![
+            tool("grep -rn thing src/", "completed", 300),
+            tool("npm run test:e2e", "in_progress", 240),
+            tool("gh run watch 441", "in_progress", 60),
+        ];
+        let (cmd, secs) = waiting_on(&msgs, true).unwrap();
+        assert_eq!(cmd, "npm run test:e2e");
+        assert!(secs >= 240, "{secs}");
+        // a turn that has ended waits on nothing, whatever the transcript
+        // still says about a call that never closed
+        assert!(waiting_on(&msgs, false).is_none());
+        assert!(waiting_on(&[tool("ls", "completed", 10)], true).is_none());
+    }
+
+    #[test]
+    fn a_call_that_is_gone_in_a_second_is_still_thinking() {
+        assert!(waiting_note(&[tool("ls", "in_progress", 2)], true).is_empty());
+        let note = waiting_note(&[tool("npm test", "in_progress", 400)], true);
+        assert!(note.starts_with("waiting on npm test"), "{note}");
+        assert!(note.ends_with("6m 40s"), "{note}");
+    }
+
+    /// The first line of it, and not all of that: a command with a here-doc in
+    /// it is a page, and this goes in a tooltip.
+    #[test]
+    fn the_command_is_cut_to_its_first_line() {
+        assert_eq!(cmd_head("  ls -la  \n cd ..\n"), "ls -la");
+        assert_eq!(cmd_head(&"x".repeat(200)).chars().count(), 45);
+    }
 }
 
 /// The fallback in `jobs::guess` reads a replayed prompt off its opening line.
