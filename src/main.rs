@@ -7272,6 +7272,22 @@ const TOUR_CARD_CHROME: f32 = 87.0;
 /// Air above and below the card, so the code it parts doesn't touch it.
 const TOUR_CARD_VPAD: f32 = 8.0;
 
+/// What a drag on the card's bottom edge makes taller. Three parts of the
+/// card scroll inside it, and only one of them is ever the one in your way,
+/// so the drag goes to that one rather than to a fixed part that half the
+/// stops don't have.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CardGrows {
+    /// The conversation, whenever the stop has one. It is the part that grows
+    /// as you use the card, and the part an answer arrives in.
+    Thread,
+    /// The before/after, on a stop that has changed lines and nothing said
+    /// about them yet.
+    Diff,
+    /// The description, on a stop that has neither.
+    Said,
+}
+
 /// Rows the description takes at the card's width.
 fn tour_card_rows(text: &str) -> usize {
     let rows: usize =
@@ -8708,7 +8724,10 @@ struct Storm {
     /// width, a user-set height for the before/after block, and the drag in
     /// flight as `(origin x, origin y, width at grab, height at grab, corner)`.
     card_width: Option<f32>,
-    card_diff_h: Option<f32>,
+    /// Pixels the bottom-edge drag has added to the card, on top of whatever
+    /// the part being dragged is worth by default. Which part that is depends
+    /// on the stop: see `card_grows`.
+    card_grow: f32,
     card_resize: Option<(f32, f32, f32, f32, bool)>,
     /// How tall the card actually came out, measured on the frame it was
     /// drawn, with the stop it was drawn for. The gap the editor parts the
@@ -9640,7 +9659,7 @@ impl Storm {
             rc_thread_h: None,
             rc_resize: None,
             card_width: None,
-            card_diff_h: None,
+            card_grow: 0.0,
             card_resize: None,
             card_h: None,
             tool_open: HashSet::new(),
@@ -17745,9 +17764,8 @@ impl Storm {
             self.sync_comment_gutters(cx); // the editor's reserved gap grows with it
             cx.notify();
         } else if let Some((ox, oy, w0, h0, corner)) = self.card_resize {
-            // bottom edge → a taller before/after; corner → a wider card too
-            let h = (h0 + (f32::from(ev.position.y) - oy)).clamp(STOP_DIFF_ROW * 2.0, 1200.0);
-            self.card_diff_h = Some(h);
+            // bottom edge → a taller card; corner → a wider one too
+            self.card_grow = (h0 + (f32::from(ev.position.y) - oy)).clamp(0.0, 1200.0);
             if corner {
                 let w = (w0 + (f32::from(ev.position.x) - ox))
                     .clamp(320.0, (self.win_width - 40.0).max(320.0));
@@ -26402,11 +26420,17 @@ impl Storm {
                     .width,
             )
         };
-        // the height the before/after is drawn at, which is also what a drag
-        // on the card's bottom edge starts from
-        let diff_h = self.card_diff_h.unwrap_or_else(|| {
-            STOP_DIFF_H.min(changed.len() as f32 * STOP_DIFF_ROW + 4.0).max(STOP_DIFF_MIN_H)
-        });
+        // the drag on the bottom edge, on the one part of the card it is for
+        let (grow_said, grow_diff, grow_thread) = match self.card_grows() {
+            CardGrows::Said => (self.card_grow, 0.0, 0.0),
+            CardGrows::Diff => (0.0, self.card_grow, 0.0),
+            CardGrows::Thread => (0.0, 0.0, self.card_grow),
+        };
+        // the height the before/after is drawn at
+        let diff_h = STOP_DIFF_H
+            .min(changed.len() as f32 * STOP_DIFF_ROW + 4.0)
+            .max(STOP_DIFF_MIN_H)
+            + grow_diff;
         let w = self.walk.as_ref()?;
         let stop = w.stops.get(w.at)?;
         let (at, total) = (w.at + 1, w.stops.len());
@@ -26770,7 +26794,13 @@ impl Storm {
                         div()
                             .id("card-said")
                             .w_full()
-                            .max_h(px(TOUR_CARD_ROWS as f32 * TOUR_LINE_H))
+                            .max_h(px(TOUR_CARD_ROWS as f32 * TOUR_LINE_H + grow_said))
+                            // dragged, it takes the height rather than a cap
+                            // on it, so the edge follows the pointer instead
+                            // of stopping dead when the prose runs out
+                            .when(grow_said > 0.0, |d| {
+                                d.flex_shrink_0().h(px(TOUR_CARD_ROWS as f32 * TOUR_LINE_H + grow_said))
+                            })
                             .overflow_y_scroll()
                             .line_height(px(TOUR_LINE_H))
                             .child(md_text(&said, 13., TEXT)),
@@ -26857,7 +26887,11 @@ impl Storm {
                         div()
                             .id("card-thread")
                             .w_full()
-                            .max_h(px(TOUR_THREAD_ROWS as f32 * TOUR_LINE_H))
+                            .max_h(px(TOUR_THREAD_ROWS as f32 * TOUR_LINE_H + grow_thread))
+                            .when(grow_thread > 0.0, |d| {
+                                d.flex_shrink_0()
+                                    .h(px(TOUR_THREAD_ROWS as f32 * TOUR_LINE_H + grow_thread))
+                            })
                             .overflow_y_scroll()
                             .track_scroll(&self.card_thread)
                             .flex()
@@ -27003,11 +27037,11 @@ impl Storm {
                                 })),
                         ),
                 )
-                // the same grip the comment box has: the bottom edge grows the
-                // before/after, the corner widens the card as well
+                // the same grip the comment box has: the bottom edge makes the
+                // card taller, the corner widens it as well
                 .child({
                     let grabbed = self.card_resize;
-                    let (w0, h0) = (width, diff_h);
+                    let (w0, h0) = (width, self.card_grow);
                     div()
                         .flex_shrink_0()
                         .h(px(6.))
@@ -27241,14 +27275,38 @@ impl Storm {
         }
     }
 
+    /// The part of the card a drag on its bottom edge makes taller: the
+    /// thread when the stop has one, the before/after when it doesn't, and
+    /// the description when the stop has neither.
+    fn card_grows(&self) -> CardGrows {
+        let threaded = self
+            .walk
+            .as_ref()
+            .and_then(|w| Some((w, w.stops.get(w.at)?)))
+            .is_some_and(|(w, stop)| {
+                self.stop_thread(stop).is_some()
+                    || self
+                        .stop_asks
+                        .get(&(w.id.clone().unwrap_or_default(), w.at))
+                        .is_some_and(|a| !a.turns.is_empty())
+            });
+        match (threaded, self.stop_diff.is_empty()) {
+            (true, _) => CardGrows::Thread,
+            (false, false) => CardGrows::Diff,
+            (false, true) => CardGrows::Said,
+        }
+    }
+
     fn stop_diff_h(&self) -> f32 {
         if self.stop_diff.is_empty() {
             return 0.0;
         }
         // the rows, the block's own padding and border, the horizontal
-        // scrollbar along the bottom, the gap above it, and the resize grip
+        // scrollbar along the bottom, the gap above it, and the resize grip.
+        // A drag on the card isn't in here: this is the estimate the gap uses
+        // for one frame, and the card's own measurement carries the drag
         let rows = self.stop_diff.len() as f32 * STOP_DIFF_ROW + 4.0;
-        self.card_diff_h.unwrap_or(STOP_DIFF_H.min(rows).max(STOP_DIFF_MIN_H)) + 10.0 + 6.0 + 8.0
+        STOP_DIFF_H.min(rows).max(STOP_DIFF_MIN_H) + 10.0 + 6.0 + 8.0
     }
 
     fn ensure_stop_diff(&mut self) {
