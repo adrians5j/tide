@@ -4,7 +4,7 @@ use gpui::{
     KeyDownEvent, Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ScrollStrategy, SharedString,
     Animation, AnimationExt,
-    StyledText, TextRun, Window, WindowBounds, WindowOptions, actions, div, font, prelude::*, px,
+    StyledText, TextRun, Window, WindowBounds, WindowOptions, actions, canvas, div, font, prelude::*, px,
     rgb, rgba, size, uniform_list, ScrollHandle, UniformListScrollHandle,
 };
 use gpui_platform::application;
@@ -8710,6 +8710,13 @@ struct Storm {
     card_width: Option<f32>,
     card_diff_h: Option<f32>,
     card_resize: Option<(f32, f32, f32, f32, bool)>,
+    /// How tall the card actually came out, measured on the frame it was
+    /// drawn, with the stop it was drawn for. The gap the editor parts the
+    /// file by is this when it is known: `tour_gap_h` estimates the card from
+    /// its prose, and every row the card only sometimes has (the part band,
+    /// the package chip, the stops it points at, a question asked here) is a
+    /// row the estimate is short by and a line of code the card sits on.
+    card_h: Option<((PathBuf, usize, usize), f32)>,
     /// Slides of the open brief that have come up the window far enough to be
     /// drawn. Cleared when a new brief arrives, so it reveals itself again.
     /// Tool calls you have opened, by call id. A call is one line until then:
@@ -9631,6 +9638,7 @@ impl Storm {
             card_width: None,
             card_diff_h: None,
             card_resize: None,
+            card_h: None,
             tool_open: HashSet::new(),
             rc_width: None,
             brief_seen: HashSet::new(),
@@ -17015,7 +17023,7 @@ impl Storm {
                         v
                     })
                     .unwrap_or_default();
-                let h = tour_gap_h(&said) + tour_thread_h(&turns) + self.stop_diff_h();
+                let h = self.tour_gap(&(p.clone(), *start, *end), &said, &turns);
                 match gaps.iter_mut().find(|(l, _)| l == end) {
                     Some(g) => g.1 += h,
                     None => gaps.push((*end, h)),
@@ -26383,6 +26391,10 @@ impl Storm {
         let (at, total) = (w.at + 1, w.stops.len());
         let tour = w.tour.clone();
         let accent = if tour.is_some() { TOUR_MARK } else { COMMENT_MARK };
+        // the lines this card is about, so a measurement is only ever used for
+        // the stop it was taken on
+        let key = w.here.clone()?;
+        let me = cx.entity();
         let title = stop.title.trim().to_string();
         let flag = stop.flag.clone();
         let said = stop.said.trim().to_string();
@@ -26491,6 +26503,35 @@ impl Storm {
                 .border_l_2()
                 .shadow_lg()
                 .text_size(px(13.))
+                // how tall it came out, back to the editor, so the file parts
+                // by the card that was drawn rather than by the guess at it.
+                // Deferred because this runs inside the window's own prepaint
+                // and the editor the gap goes to is being drawn in it
+                .child(
+                    canvas(
+                        move |bounds, window, cx| {
+                            let h = f32::from(bounds.size.height);
+                            let same = me
+                                .read(cx)
+                                .card_h
+                                .as_ref()
+                                .is_some_and(|(k, got)| *k == key && (got - h).abs() < 0.5);
+                            if !same {
+                                window.defer(cx, move |_w, cx| {
+                                    me.update(cx, |this, cx| {
+                                        this.card_h = Some((key, h));
+                                        this.sync_comment_gutters(cx);
+                                    })
+                                });
+                            }
+                        },
+                        |_b, _s, _w, _cx| {},
+                    )
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+                )
                 // a new part of the tour gets a band rather than a word in the
                 // corner: the step that changes which part you are in is the
                 // one step that doesn't look like every other step
@@ -27165,6 +27206,19 @@ impl Storm {
     /// What the before/after block adds to the card, so the editor parts the
     /// file by as much as the card actually covers. Zero when the stop has
     /// nothing to show.
+    /// How far the editor has to part the file for the card to sit between
+    /// the lines rather than on top of them: what the card measured the last
+    /// time it was drawn for this stop, and an estimate from its prose until
+    /// a measurement arrives.
+    fn tour_gap(&self, key: &(PathBuf, usize, usize), said: &str, turns: &[ReviewReply]) -> f32 {
+        match self.card_h.as_ref().filter(|(k, _)| k == key) {
+            // the measurement covers the card inside its border, and the air
+            // above and below it is the editor's to leave
+            Some((_, got)) => got + 2.0 + TOUR_CARD_VPAD * 2.0,
+            None => tour_gap_h(said) + tour_thread_h(turns) + self.stop_diff_h(),
+        }
+    }
+
     fn stop_diff_h(&self) -> f32 {
         if self.stop_diff.is_empty() {
             return 0.0;
@@ -30641,8 +30695,8 @@ impl Storm {
                     v
                 })
                 .unwrap_or_default();
-            let room = tour_gap_h(&stop.said) + tour_thread_h(&turns) + self.stop_diff_h();
             let (a, b) = (stop.line, stop.end.max(stop.line));
+            let room = self.tour_gap(&(p.clone(), a, b), &stop.said, &turns);
             if let Some(tab) = self.tabs.get(self.active) {
                 tab.editor.update(cx, |e, cx| e.reveal_span(a, b, room, cx));
             }
