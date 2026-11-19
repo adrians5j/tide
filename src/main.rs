@@ -9248,6 +9248,10 @@ struct Storm {
     /// twenty lines, and a line of real code is wider than half a card.
     stop_diff_left: gpui::ScrollHandle,
     stop_diff_right: gpui::ScrollHandle,
+    /// The card's conversation, so a question and the answer to it land in
+    /// view. Past eleven rows the thread scrolls inside the card, and what
+    /// you just asked is the part below the fold.
+    card_thread: gpui::ScrollHandle,
     /// What each package a tour touches calls itself, by its directory:
     /// `packages/languages` → `@webiny/languages`. Read off disk once, because
     /// the map asks for it per stop and the answer doesn't move.
@@ -9927,6 +9931,7 @@ impl Storm {
             stop_diff: Vec::new(),
             stop_diff_left: gpui::ScrollHandle::new(),
             stop_diff_right: gpui::ScrollHandle::new(),
+            card_thread: gpui::ScrollHandle::new(),
             pkg_names: HashMap::new(),
             brief_scroll: gpui::ScrollHandle::new(),
             reading: None,
@@ -11383,27 +11388,43 @@ impl Storm {
                     if !replies.is_empty() {
                         let mut landed = 0usize;
                         let mut on_slides = 0usize;
+                        let mut on_stops = false;
                         for r in replies {
                             if let Some(c) = this.review.iter_mut().find(|c| c.id == r.id) {
                                 c.replies.push(ReviewReply { who: "agent".into(), text: r.text });
                                 landed += 1;
                                 continue;
                             }
-                            // the other place a thread can live: under the
+                            // the other places a thread can live: under the
                             // slide of a brief it was asked on
                             if let Some(turn) = this
                                 .slide_asks
                                 .values_mut()
-                                .chain(this.stop_asks.values_mut())
                                 .flat_map(|t| t.turns.iter_mut())
                                 .find(|t| t.id == r.id)
                             {
                                 turn.answer = r.text;
                                 on_slides += 1;
+                                continue;
+                            }
+                            // or under a tour stop, where the card's thread
+                            // follows the answer down to it
+                            if let Some(turn) = this
+                                .stop_asks
+                                .values_mut()
+                                .flat_map(|t| t.turns.iter_mut())
+                                .find(|t| t.id == r.id)
+                            {
+                                turn.answer = r.text;
+                                on_slides += 1;
+                                on_stops = true;
                             }
                         }
                         if landed > 0 {
                             this.save_review();
+                        }
+                        if on_stops {
+                            this.card_thread.scroll_to_bottom();
                         }
                         if landed + on_slides > 0 {
                             let n = landed + on_slides;
@@ -26838,6 +26859,7 @@ impl Storm {
                             .w_full()
                             .max_h(px(TOUR_THREAD_ROWS as f32 * TOUR_LINE_H))
                             .overflow_y_scroll()
+                            .track_scroll(&self.card_thread)
                             .flex()
                             .flex_col()
                             .gap_1()
@@ -30549,8 +30571,12 @@ impl Storm {
         self.spend_tag = Some(tag);
         self.send_agent_prompt_by(text, Some(q), Sender::You, cx);
         self.agent_list.scroll_to_end();
-        // the answer lands in the pane; typing carries on in the editor
-        self.focus_active(window, cx);
+        // the question you just asked, at the bottom of a thread that is
+        // taller than the card by now
+        self.card_thread.scroll_to_bottom();
+        // and the box keeps the focus: the next question is usually a
+        // follow-up to this one, the way a slide's box does it
+        window.focus(&self.tour_ask_focus, cx);
         cx.notify();
     }
 
