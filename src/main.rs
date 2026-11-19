@@ -7271,6 +7271,9 @@ const STOP_DIFF_MIN_H: f32 = 300.0;
 const TOUR_CARD_CHROME: f32 = 87.0;
 /// Air above and below the card, so the code it parts doesn't touch it.
 const TOUR_CARD_VPAD: f32 = 8.0;
+/// A minimized card: its title row (22px, the height of the step arrows in
+/// it), the card's own padding above and below, and its border.
+const TOUR_CARD_MIN_H: f32 = 22.0 + 6.0 * 2.0 + 2.0;
 
 /// What a drag on the card's bottom edge makes taller. Three parts of the
 /// card scroll inside it, and only one of them is ever the one in your way,
@@ -8725,6 +8728,10 @@ struct Storm {
     /// width, a user-set height for the before/after block, and the drag in
     /// flight as `(origin x, origin y, width at grab, height at grab, corner)`.
     card_width: Option<f32>,
+    /// The card is collapsed to its title row. A card you want out of the way
+    /// for a minute, without ending the tour: stepping, the map and the strip
+    /// all carry on, and the code under it comes back.
+    card_min: bool,
     /// Pixels the bottom-edge drag has added to the card, on top of whatever
     /// the part being dragged is worth by default. Which part that is depends
     /// on the stop: see `card_grows`.
@@ -9661,6 +9668,7 @@ impl Storm {
             rc_thread_h: None,
             rc_resize: None,
             card_width: None,
+            card_min: false,
             card_grow: 0.0,
             card_resize: None,
             card_h: None,
@@ -26426,6 +26434,7 @@ impl Storm {
                     .width,
             )
         };
+        let min = self.card_min;
         // the drag on the bottom edge, on the one part of the card it is for
         let (grow_said, grow_diff, grow_thread) = match self.card_grows() {
             CardGrows::Said => (self.card_grow, 0.0, 0.0),
@@ -26554,6 +26563,12 @@ impl Storm {
                 .border_l_2()
                 .shadow_lg()
                 .text_size(px(13.))
+                // minimized, the card is clipped to its title row. The rest is
+                // still laid out behind the clip, so opening it again is the
+                // card you left rather than one that builds itself from the
+                // top, and the measurement below reports the clipped height,
+                // which is what the editor parts the file by
+                .when(min, |d| d.max_h(px(TOUR_CARD_MIN_H)).overflow_hidden())
                 // how tall it came out, back to the editor, so the file parts
                 // by the card that was drawn rather than by the guess at it.
                 // Deferred because this runs inside the window's own prepaint
@@ -26586,7 +26601,7 @@ impl Storm {
                 // a new part of the tour gets a band rather than a word in the
                 // corner: the step that changes which part you are in is the
                 // one step that doesn't look like every other step
-                .when_some(part_of, |d, (at, total)| {
+                .when_some(part_of.filter(|_| !min), |d, (at, total)| {
                     d.child(
                         div()
                             .flex()
@@ -26669,6 +26684,31 @@ impl Storm {
                                     .child(group.clone()),
                             )
                         })
+                        .child(
+                            div()
+                                .id("card-min")
+                                .px_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .flex_shrink_0()
+                                .text_size(px(13.))
+                                .text_color(rgb(LINE_NUMBER))
+                                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                .child(if min { "+" } else { "−" })
+                                .tooltip(tip(match min {
+                                    true => "Open the card again",
+                                    false => "Collapse it to this line, and keep the tour",
+                                }))
+                                .on_click(cx.listener(|this, _e, window, cx| {
+                                    this.card_min = !this.card_min;
+                                    // a question box behind the clip still has
+                                    // the keys otherwise
+                                    if this.card_min {
+                                        this.focus_active(window, cx);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
                         .child(
                             div()
                                 .id("card-close")
@@ -26801,12 +26841,6 @@ impl Storm {
                             .id("card-said")
                             .w_full()
                             .max_h(px(TOUR_CARD_ROWS as f32 * TOUR_LINE_H + grow_said))
-                            // dragged, it takes the height rather than a cap
-                            // on it, so the edge follows the pointer instead
-                            // of stopping dead when the prose runs out
-                            .when(grow_said > 0.0, |d| {
-                                d.flex_shrink_0().h(px(TOUR_CARD_ROWS as f32 * TOUR_LINE_H + grow_said))
-                            })
                             .overflow_y_scroll()
                             .line_height(px(TOUR_LINE_H))
                             .child(md_text(&said, 13., TEXT)),
@@ -26894,10 +26928,6 @@ impl Storm {
                             .id("card-thread")
                             .w_full()
                             .max_h(px(TOUR_THREAD_ROWS as f32 * TOUR_LINE_H + grow_thread))
-                            .when(grow_thread > 0.0, |d| {
-                                d.flex_shrink_0()
-                                    .h(px(TOUR_THREAD_ROWS as f32 * TOUR_LINE_H + grow_thread))
-                            })
                             .overflow_y_scroll()
                             .track_scroll(&self.card_thread)
                             .flex()
@@ -27273,6 +27303,9 @@ impl Storm {
     /// time it was drawn for this stop, and an estimate from its prose until
     /// a measurement arrives.
     fn tour_gap(&self, key: &(PathBuf, usize, usize), said: &str, turns: &[ReviewReply]) -> f32 {
+        if self.card_min {
+            return TOUR_CARD_MIN_H + TOUR_CARD_VPAD * 2.0;
+        }
         match self.card_h.as_ref().filter(|(k, _)| k == key) {
             // the measurement covers the card inside its border, and the air
             // above and below it is the editor's to leave
@@ -30093,6 +30126,8 @@ impl Storm {
     /// Put the walk (or tour) away and take the highlight off the code with it.
     fn end_walk(&mut self, cx: &mut Context<Self>) {
         self.walk_group.clear();
+        // minimizing is for the card in front of you, not for the next tour
+        self.card_min = false;
         let Some(w) = self.walk.take() else { return };
         // closing a tour takes it off the screen, not out of the workspace:
         // the PR header still says there is one, and opening it again picks up
@@ -30771,6 +30806,9 @@ impl Storm {
         if let Some(w) = self.walk.as_mut() {
             w.here = (stop.line > 0).then(|| (p.clone(), stop.line, stop.end.max(stop.line)));
         }
+        // a drag belongs to the stop it was made on: ten rows of thread on one
+        // stop is a card of blank space on the next one
+        self.card_grow = 0.0;
         self.sync_comment_gutters(cx); // the card's gap goes in before the scroll
         if stop.line > 0 {
             // the card is drawn under the span, so the scroll has to leave it
