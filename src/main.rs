@@ -7440,10 +7440,15 @@ struct Conv {
     paste_seq: usize,
     job_turns: Vec<JobTurn>,
     job_next: Option<String>,
-    /// The next job's fold starts open. Set beside `job_next` by a job whose
-    /// answer is a conversation rather than a card: folding that leaves the
-    /// answer nowhere. Taken with the job itself, so a job that never goes
-    /// doesn't leave it set on the one after.
+    /// The next job's fold starts open. Taken with `job_next`, so a job that
+    /// never goes doesn't leave it set on the one after.
+    ///
+    /// Nothing sets it. The merge note did, on the grounds that its answer is
+    /// prose you are waiting for rather than a card, and an unfolded
+    /// conversation sitting in the middle of the pane read worse than the
+    /// fold it replaced. How a job should fold is worth coming back to; the
+    /// plumbing stays here, persisted beside the label, so turning one back
+    /// on is one line next to its `job_next`.
     job_open_next: bool,
     turn_start: Option<std::time::Instant>,
     mark: Option<spend::Mark>,
@@ -9288,10 +9293,15 @@ struct Storm {
     /// lands because a prompt sent while a turn is running waits in the queue,
     /// so the message it will become has no index yet.
     job_next: Option<String>,
-    /// The next job's fold starts open. Set beside `job_next` by a job whose
-    /// answer is a conversation rather than a card: folding that leaves the
-    /// answer nowhere. Taken with the job itself, so a job that never goes
-    /// doesn't leave it set on the one after.
+    /// The next job's fold starts open. Taken with `job_next`, so a job that
+    /// never goes doesn't leave it set on the one after.
+    ///
+    /// Nothing sets it. The merge note did, on the grounds that its answer is
+    /// prose you are waiting for rather than a card, and an unfolded
+    /// conversation sitting in the middle of the pane read worse than the
+    /// fold it replaced. How a job should fold is worth coming back to; the
+    /// plumbing stays here, persisted beside the label, so turning one back
+    /// on is one line next to its `job_next`.
     job_open_next: bool,
     /// Virtualized transcript state, and the item count it was last told about.
     agent_list: gpui::ListState,
@@ -15286,10 +15296,6 @@ impl Storm {
         // session of its own; mid-turn it goes here, like any other prompt
         let note = merged_note(number, about.as_ref());
         self.job_next = Some(format!("Merged #{number}"));
-        // the merge note is a question with an answer you are waiting for, so
-        // its turn stays open. The line above it still says what the job is,
-        // and "Fold … away" under it still folds it by hand
-        self.job_open_next = true;
         match self.agent_busy {
             true => self.send_agent_prompt_as(note, None, cx),
             false => self.ask_fresh(note, None, cx),

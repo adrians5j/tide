@@ -27,9 +27,10 @@ pub struct Shown {
     pub job: String,
     /// `true` when the prompt was TIDE's doing rather than something typed.
     pub by_tide: bool,
-    /// `true` when the fold starts open. A job whose answer is prose addressed
-    /// to you is not working to be hidden: the note after a merge asks what to
-    /// do next, and folding it leaves a tick where the answer was.
+    /// `true` when the fold starts open, so a replayed session reads the way
+    /// the live one did. No job sets it at the moment: the merge note did and
+    /// the unfolded conversation read worse than the fold. Kept because how a
+    /// job should fold is worth coming back to.
     pub open: bool,
     /// Unix seconds, so the oldest entries are the ones dropped.
     pub when: u64,
