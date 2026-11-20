@@ -202,13 +202,54 @@ pub fn since(rows: &[Row], from: i64, to: i64) -> Vec<Row> {
     rows.iter().filter(|r| r.at >= from && r.at < to).cloned().collect()
 }
 
+/// What one group of turns spent, and how the context those turns carried was
+/// spread.
+///
+/// The spread is the half a sum cannot show. Adding every turn together and
+/// dividing by the requests gives a mean, and a mean is what hid the reviewer
+/// run on 2026-11-20: it read 177k per request, mid-table, while its two
+/// biggest turns carried 387k and 341k. The turns that cost the money are the
+/// ones at the top of the group, so the group has to keep them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Group {
+    pub name: String,
+    pub turns: u64,
+    pub used: Use,
+    /// What each turn carried per request, smallest first. One entry per turn
+    /// that made a request at all.
+    pub each: Vec<u64>,
+}
+
+impl Group {
+    /// The middle turn's context per request: half the turns carried less than
+    /// this, half carried more.
+    pub fn median(&self) -> u64 {
+        match self.each.len() {
+            0 => 0,
+            n => self.each[n / 2],
+        }
+    }
+
+    /// The heaviest turn in the group.
+    pub fn worst(&self) -> u64 {
+        self.each.last().copied().unwrap_or(0)
+    }
+
+    /// How many turns carried more than `line` per request. With `line` at
+    /// `FRESH_AT` this is how often the group was in the range the fresh
+    /// session exists for.
+    pub fn over(&self, line: u64) -> usize {
+        self.each.iter().filter(|c| **c > line).count()
+    }
+}
+
 /// What each kind spent, biggest first: the turns it took, and their usage.
-pub fn by_kind(rows: &[Row]) -> Vec<(String, u64, Use)> {
+pub fn by_kind(rows: &[Row]) -> Vec<Group> {
     fold(rows, |r| r.kind.clone())
 }
 
 /// The same by job, which names the TIDE sends the way the pane does.
-pub fn by_job(rows: &[Row]) -> Vec<(String, u64, Use)> {
+pub fn by_job(rows: &[Row]) -> Vec<Group> {
     fold(rows, |r| match r.job.is_empty() {
         true => r.kind.clone(),
         false => r.job.clone(),
@@ -216,23 +257,38 @@ pub fn by_job(rows: &[Row]) -> Vec<(String, u64, Use)> {
 }
 
 /// The same by workspace.
-pub fn by_root(rows: &[Row]) -> Vec<(String, u64, Use)> {
+pub fn by_root(rows: &[Row]) -> Vec<Group> {
     fold(rows, |r| r.root.clone())
 }
 
-fn fold(rows: &[Row], key: impl Fn(&Row) -> String) -> Vec<(String, u64, Use)> {
-    let mut out: Vec<(String, u64, Use)> = Vec::new();
+fn fold(rows: &[Row], key: impl Fn(&Row) -> String) -> Vec<Group> {
+    let mut out: Vec<Group> = Vec::new();
     for r in rows {
         let k = key(r);
-        match out.iter_mut().find(|(got, _, _)| *got == k) {
-            Some((_, turns, u)) => {
-                *turns += 1;
-                u.add(&r.used);
+        let ctx = r.used.per_call();
+        match out.iter_mut().find(|g| g.name == k) {
+            Some(g) => {
+                g.turns += 1;
+                g.used.add(&r.used);
+                if r.used.calls > 0 {
+                    g.each.push(ctx);
+                }
             }
-            None => out.push((k, 1, r.used)),
+            None => out.push(Group {
+                name: k,
+                turns: 1,
+                used: r.used,
+                each: match r.used.calls > 0 {
+                    true => vec![ctx],
+                    false => Vec::new(),
+                },
+            }),
         }
     }
-    out.sort_by(|a, b| b.2.weighted().cmp(&a.2.weighted()).then_with(|| a.0.cmp(&b.0)));
+    for g in &mut out {
+        g.each.sort_unstable();
+    }
+    out.sort_by(|a, b| b.used.weighted().cmp(&a.used.weighted()).then_with(|| a.name.cmp(&b.name)));
     out
 }
 
@@ -313,11 +369,44 @@ mod tests {
     fn the_rollup_adds_up_by_kind() {
         let rows = vec![row(PANE, 100), row(STOP_ASK, 500), row(PANE, 50)];
         let by = by_kind(&rows);
-        assert_eq!(by[0].0, STOP_ASK);
-        assert_eq!(by[0].1, 1);
-        assert_eq!(by[1].0, PANE);
-        assert_eq!(by[1].1, 2, "two turns in the pane");
-        assert_eq!(by[1].2.input, 150);
+        assert_eq!(by[0].name, STOP_ASK);
+        assert_eq!(by[0].turns, 1);
+        assert_eq!(by[1].name, PANE);
+        assert_eq!(by[1].turns, 2, "two turns in the pane");
+        assert_eq!(by[1].used.input, 150);
+    }
+
+    /// The reading the mean could not give. A group of light turns with two
+    /// heavy ones in it has to report the heavy ones, because they are what
+    /// the fresh session is for.
+    #[test]
+    fn a_group_keeps_the_spread_the_sum_hides() {
+        let turn = |ctx: u64| {
+            let mut r = row(JOB, 0);
+            r.job = "Reviewers".into();
+            // one request carrying `ctx`, so per_call is ctx
+            r.used = Use { input: 0, cache_write: 0, cache_read: ctx, output: 0, calls: 1 };
+            r
+        };
+        let rows: Vec<Row> = [120_000, 130_000, 140_000, 390_000, 410_000]
+            .iter()
+            .map(|c| turn(*c))
+            .collect();
+        let g = &by_job(&rows)[0];
+        assert_eq!(g.turns, 5);
+        // the mean is dragged up by the two heavy turns and describes none of them
+        assert_eq!(g.used.per_call(), 238_000);
+        assert_eq!(g.median(), 140_000, "the middle turn, not the average");
+        assert_eq!(g.worst(), 410_000);
+        assert_eq!(g.over(400_000), 1);
+        assert_eq!(g.over(250_000), 2);
+        assert_eq!(g.over(1_000_000), 0);
+        // a turn that never reached the model is not a sample of anything
+        let mut quiet = turn(0);
+        quiet.used.calls = 0;
+        let g = &by_job(&[quiet]).clone()[0];
+        assert!(g.each.is_empty());
+        assert_eq!(g.median(), 0);
     }
 
     /// A job names itself; a turn with no job falls back to the kind, so the
@@ -328,8 +417,8 @@ mod tests {
         j.job = "Brief of #6176".into();
         let rows = vec![j, row(PANE, 100)];
         let by = by_job(&rows);
-        assert_eq!(by[0].0, "Brief of #6176");
-        assert_eq!(by[1].0, PANE);
+        assert_eq!(by[0].name, "Brief of #6176");
+        assert_eq!(by[1].name, PANE);
     }
 
     #[test]

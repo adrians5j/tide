@@ -42817,16 +42817,24 @@ fn print_spend(span: TokenSpan) {
         println!("  one line per turn, written as the turn ends.");
         return;
     }
-    let table = |title: &str, rows: Vec<(String, u64, tokens::Use)>, n: usize| {
+    let table = |title: &str, groups: Vec<spend::Group>, n: usize| {
         println!("\n  {title}");
-        for (name, turns, u) in rows.into_iter().take(n) {
-            let share = (u.weighted() as f64 / all.weighted().max(1) as f64 * 100.0).round();
+        for g in groups.into_iter().take(n) {
+            let (name, turns) = (&g.name, g.turns);
+            let share = (g.used.weighted() as f64 / all.weighted().max(1) as f64 * 100.0).round();
+            // only the rows that have any, so the eye lands on them. A row with
+            // none is a row the fresh session has nothing to do with
+            let over = match g.over(FRESH_AT) {
+                0 => String::new(),
+                k => format!("{k} over"),
+            };
             println!(
-                "    {:>7}  {share:>3}%  {turns:>4} turn{}  {:>5} req  {:>7} ctx/req   {name}",
-                usage::short(u.weighted()),
+                "    {:>7}  {share:>3}%  {turns:>4} turn{}  {:>5} req  {:>7} ctx/req  {:>7} worst  {over:>8}   {name}",
+                usage::short(g.used.weighted()),
                 if turns == 1 { " " } else { "s" },
-                u.calls,
-                usage::short(u.per_call()),
+                g.used.calls,
+                usage::short(g.median()),
+                usage::short(g.worst()),
             );
         }
     };
@@ -42839,7 +42847,14 @@ fn print_spend(span: TokenSpan) {
         "",
         "  weighted = in + 1.25 x cache written + 0.1 x cache read + 5 x out, at the",
         "  published price ratios. An estimate of what a stretch of work was worth,",
-        "  not a bill. ctx/req is what an average request in those turns carried.",
+        "  not a bill.",
+        "",
+        "  ctx/req is the middle turn of the group, not the average: a mean is pulled",
+        "  up by the heavy turns until it describes none of them. `worst` is the",
+        "  biggest single turn, and `over` counts the turns past 400k, where TIDE",
+        "  starts the next question in a session of its own. A row with turns over",
+        "  that line and nothing in the `over` column of `by what sent it` under",
+        "  \"job\" is a send that never got the offer.",
         "",
         "  Turns TIDE sent only. The reviewers run in sessions of their own, and a",
         "  terminal pane is not TIDE's doing at all: `tide --tokens` counts both.",
