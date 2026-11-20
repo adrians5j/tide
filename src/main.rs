@@ -7977,26 +7977,22 @@ struct PrReading {
 }
 
 impl PrReading {
-    fn stale(self) -> bool {
-        self.brief_stale || self.tour_stale
-    }
-    /// Nothing to build and nothing out of date.
-    fn current(self) -> bool {
-        self.has_brief && self.has_tour && !self.stale()
-    }
     /// What a click asks for: whatever is missing, plus whatever has gone out
-    /// of date. `force` is the ⌥click that rebuilds both regardless.
+    /// of date. The caller takes the brief half on a plain press and both on
+    /// ⌥click; nothing here decides that.
     fn wanted(self, force: bool) -> (bool, bool) {
         (
             force || !self.has_brief || self.brief_stale,
             force || !self.has_tour || self.tour_stale,
         )
     }
-    /// What the chip reads. An explanation the branch has moved past is a
-    /// warning, worded the way the base-branch chip next to it is worded; one
-    /// that is missing or current is a plain thing to press.
+    /// What the chip reads. A brief the branch has moved past is a warning,
+    /// worded the way the base-branch chip next to it is worded; one that is
+    /// missing or current is a plain thing to press. The tour is not in it: a
+    /// press doesn't write one, and the tour's own panel says when the branch
+    /// has moved past it.
     fn verb(self) -> &'static str {
-        if self.stale() {
+        if self.brief_stale {
             "explanation outdated"
         } else {
             "Explain PR"
@@ -15770,7 +15766,9 @@ impl Storm {
 
     /// A pull request that has just been opened for this branch. The two
     /// things that otherwise wait for a button happen by themselves: the brief
-    /// and the code tour are written, and the reviewers are sent in.
+    /// is written, and the reviewers are sent in. Not the tour. It is the one
+    /// piece of reading that costs a turn and isn't always wanted, so it waits
+    /// to be asked for.
     ///
     /// Both halves are skipped when they have already been done, so a session
     /// that asked for the reviewers before opening the pull request (the
@@ -19135,7 +19133,11 @@ impl Storm {
                                     "" => self.pr_base.clone(),
                                     b => b.to_string(),
                                 };
-                                let stale = reading.stale();
+                                // the brief, since that is what a press writes.
+                                // A tour the branch has moved past says so on
+                                // its own panel, where the button that rebuilds
+                                // it is
+                                let stale = reading.brief_stale;
                                 // already being written: the chip says so and
                                 // stops being pressable, so a second press
                                 // can't queue a second one behind the first
@@ -19149,33 +19151,24 @@ impl Storm {
                                     (
                                         FOLDER_ICON,
                                         format!(
-                                            "The branch has moved past {}  ·  click to write it \
-                                             again from the code as it stands now",
-                                            match (reading.brief_stale, reading.tour_stale) {
-                                                (true, true) => "the brief and the tour",
-                                                (true, false) => "the brief",
-                                                _ => "the tour",
-                                            }
+                                            "The branch has moved past the brief of #{num}  ·  \
+                                             click to write it again from the code as it stands \
+                                             now"
                                         ),
                                     )
-                                } else if reading.current() {
+                                } else if reading.has_brief {
                                     (
                                         MUTED,
-                                        "Read the brief, and the tour at the end of it  ·  ⌥click \
-                                         to write them again"
+                                        "Read the brief  ·  the tour is a button at the end of it \
+                                          ·  ⌥click writes both again"
                                             .to_string(),
                                     )
                                 } else {
                                     (
                                         MUTED,
                                         format!(
-                                            "Ask for {} of #{num}: the brief for what it does, the \
-                                             tour for where",
-                                            match (reading.has_brief, reading.has_tour) {
-                                                (false, false) => "a brief and a code tour",
-                                                (true, false) => "a code tour",
-                                                _ => "a brief",
-                                            }
+                                            "Ask for a brief of #{num}: what the change does. The \
+                                             tour for where it does it is a button at the end of it"
                                         ),
                                     )
                                 };
@@ -30478,13 +30471,15 @@ impl Storm {
         }
     }
 
-    /// Explain this pull request: the brief for what it does and the tour for
-    /// where it does it. One button, because wanting one and not the other is
-    /// rare enough that two were two decisions to make every time.
+    /// Explain this pull request: the brief for what it does. It writes one
+    /// when there is none or the branch has moved past the one there is, and
+    /// opens it either way, so a press always ends with something to read.
     ///
-    /// It writes whatever is missing and whatever the branch has moved past,
-    /// and opens the brief when there is one to open — the deck links on to
-    /// the tour at the end of it, so one press is enough to start reading.
+    /// The tour is not in it. The deck links on to the tour at the end, and
+    /// that button builds one if there isn't one: a tour is a turn of work,
+    /// and a turn of work that starts because you opened something to read is
+    /// a turn nobody asked for. ⌥click writes both, which is the one place
+    /// asking for the tour is a decision.
     fn explain_pr(&mut self, number: u64, base: String, force: bool, cx: &mut Context<Self>) {
         // the halves guard themselves, but this sends two of them and would
         // otherwise say it twice
@@ -30494,6 +30489,13 @@ impl Storm {
         }
         let reading = self.pr_reading(number);
         let (brief, tour) = reading.wanted(force);
+        // a plain press is the brief and nothing else. A tour building itself
+        // behind a deck you opened to read is work nobody asked for, and once
+        // the branch had moved past the tour in hand it happened on every
+        // press. ⌥click still writes both, which is the one place asking for
+        // the tour is a decision rather than a side effect, and the button at
+        // the end of the brief is the other
+        let tour = tour && force;
         // one button, one turn. Both halves come out of the same diff, so
         // asking for them separately read the change twice and left two rows
         // in the transcript for one press
@@ -45160,12 +45162,10 @@ mod code_tour_tests {
     #[test]
     fn one_button_builds_whatever_is_missing_or_stale() {
         let nothing = PrReading::default();
-        assert_eq!(nothing.wanted(false), (true, true), "neither exists: build both");
-        assert!(!nothing.current() && !nothing.stale());
+        assert_eq!(nothing.wanted(false), (true, true), "neither exists");
 
         let both = PrReading { has_brief: true, has_tour: true, ..Default::default() };
         assert_eq!(both.wanted(false), (false, false), "nothing to do");
-        assert!(both.current());
         assert_eq!(both.wanted(true), (true, true), "⌥click writes them again anyway");
         assert_eq!(both.verb(), "Explain PR");
 
@@ -45173,12 +45173,18 @@ mod code_tour_tests {
         // is written again, and the chip says something is out of date
         let half = PrReading { brief_stale: true, ..both };
         assert_eq!(half.wanted(false), (true, false));
-        assert!(half.stale() && !half.current());
         assert_eq!(half.verb(), "explanation outdated", "it reads as the warning it is");
 
         // a tour of this change but no brief yet
         let tour_only = PrReading { has_tour: true, ..Default::default() };
         assert_eq!(tour_only.wanted(false), (true, false));
+
+        // a tour the branch has moved past is the tour panel's business: the
+        // chip is about the brief, because a press writes the brief
+        let old_tour = PrReading { tour_stale: true, ..both };
+        assert_eq!(old_tour.verb(), "Explain PR");
+        // and a plain press of it asks for nothing at all
+        assert_eq!(old_tour.wanted(false).0, false);
     }
 
     /// A second question under a slide keeps the first. The answer to it is
