@@ -7933,6 +7933,27 @@ fn tour_place(stops: &[Stop], at: usize) -> (usize, usize, bool) {
     (mine.iter().position(|i| *i == at).map(|p| p + 1).unwrap_or(0), mine.len(), true)
 }
 
+/// How far along the route a walk is, 0 to 100. The route is what progress
+/// means here, so an appendix reads as finished rather than as three more
+/// stops of a tour you had already walked to the end of.
+///
+/// The panel's bar and the card's counter both ask this one function, because
+/// they are two readings of the same fact and two copies of the arithmetic is
+/// how they come to disagree.
+fn tour_pct(w: &Walk) -> usize {
+    let (place, total, extra) = tour_place(&w.stops, w.at);
+    let pos = match (w.intro, w.done) {
+        (true, _) => 0,
+        (_, true) => total,
+        _ => place,
+    };
+    match (extra, total) {
+        (true, _) => 100,
+        (_, 0) => 0,
+        _ => pos * 100 / total,
+    }
+}
+
 fn tour_groups(stops: &[Stop]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for s in stops {
@@ -26201,11 +26222,7 @@ impl Storm {
         };
         // the route is over once you are past it, whichever stop of the
         // appendix you are standing on
-        let pct = match (extra, total) {
-            (true, _) => 100,
-            (_, 0) => 0,
-            _ => pos * 100 / total,
-        };
+        let pct = tour_pct(w);
         let here = match extra {
             true => format!(
                 "{} {pos}/{total}",
@@ -26695,6 +26712,9 @@ impl Storm {
         let stop = w.stops.get(w.at)?;
         // the same count the panel keeps: an appendix numbers within itself
         let (at, total, _) = tour_place(&w.stops, w.at);
+        // and the same progress, so the bar on the right and the number on the
+        // card can't tell you two different things about one walk
+        let pct = tour_pct(w);
         // the flag's blink is keyed to the stop itself, which an appendix's
         // own numbering would collide with
         let step = w.at + 1;
@@ -26899,13 +26919,19 @@ impl Storm {
                         .gap_1()
                         .child(arrow("card-prev", "‹", "Previous stop  (⌥[)", -1, cx))
                         .child(arrow("card-next", "›", "Next stop  (⌥])", 1, cx))
+                        // red at the start through to green at the end, the
+                        // same ramp the PR pane answers "how far through this
+                        // are you" with. The number alone was a fact you had
+                        // to do arithmetic on to feel
                         .child(
                             div()
+                                .id("card-count")
                                 .flex_shrink_0()
                                 .mr_1()
                                 .text_size(px(11.))
-                                .text_color(rgb(LINE_NUMBER))
-                                .child(format!("{at}/{total}")),
+                                .text_color(rgb(progress_color(pct)))
+                                .child(format!("{at}/{total}"))
+                                .tooltip(tip_owned(format!("{pct}% of the way through"))),
                         )
                         // the tour's name, not the stop's. The stop's own
                         // title sits against the prose it heads, down the
@@ -26973,6 +26999,12 @@ impl Storm {
                                 .on_click(cx.listener(|this, _e, _w, cx| this.end_walk(cx))),
                         ),
                 )
+                // the same cells the panel draws, so the two are one bar in
+                // two places. Hidden while the card is a line, where there is
+                // only room for the number
+                .when(!min, |d| {
+                    d.child(segmented_bar_on(pct, progress_color(pct), 3., BORDER))
+                })
                 .child(
                     div()
                         .w_full()
@@ -46043,6 +46075,40 @@ mod tour_count_tests {
         // a tour with no parts at all counts every stop
         let flat: Vec<Stop> = (0..4).map(|_| stop("")).collect();
         assert_eq!(tour_place(&flat, 1), (2, 4, false));
+    }
+
+    fn walk(stops: Vec<Stop>, at: usize, intro: bool, done: bool) -> Walk {
+        Walk {
+            stops,
+            at,
+            tour: Some("A tour".into()),
+            intro,
+            done,
+            id: None,
+            list: true,
+            here: None,
+            seen: HashSet::new(),
+        }
+    }
+
+    /// The colour on the card's counter is this number, so it has to be the
+    /// route's progress and not the appendix's.
+    #[test]
+    fn progress_is_the_route_and_an_appendix_is_already_the_end() {
+        let stops: Vec<Stop> = ["Route", "Route", "Route", "Route", "Tests"]
+            .iter()
+            .map(|g| stop(g))
+            .collect();
+        // standing before the first stop is no progress, wherever `at` points
+        assert_eq!(tour_pct(&walk(stops.clone(), 2, true, false)), 0);
+        assert_eq!(tour_pct(&walk(stops.clone(), 0, false, false)), 25);
+        assert_eq!(tour_pct(&walk(stops.clone(), 3, false, false)), 100);
+        // walked off the end
+        assert_eq!(tour_pct(&walk(stops.clone(), 3, false, true)), 100);
+        // the appendix is past the route, not three quarters of the way in
+        assert_eq!(tour_pct(&walk(stops.clone(), 4, false, false)), 100);
+        // nothing to be partway through
+        assert_eq!(tour_pct(&walk(Vec::new(), 0, false, false)), 0);
     }
 }
 
