@@ -2782,6 +2782,13 @@ struct MdRow {
     table_last: bool,
     /// A blank line — pure paragraph spacing.
     gap: bool,
+    /// A `>` block this row is inside: 0 for no, 1 for a plain blockquote, and
+    /// 2 to 6 for GitHub's five alerts. See `md_note_style`.
+    note: u8,
+    /// The first and last rows of that block, which open and close the box the
+    /// rows stack into: the first carries the kind's label.
+    note_first: bool,
+    note_last: bool,
     /// `(alt, src)` for every `![…](…)` on this line. They draw under the
     /// line's text, which is where a markdown image sits in practice: on a
     /// line of its own.
@@ -2835,6 +2842,35 @@ fn md_verdict(text: &str) -> Option<u32> {
     }
 }
 
+/// What a `>` block is drawn in: the label GitHub writes above it, and the
+/// colour of its bar. A plain blockquote has no label and the muted grey, so
+/// it reads as something being quoted rather than as a sixth kind of alert.
+///
+/// The five alerts are GitHub's own, in GitHub's own order and colours, so a
+/// `> [!WARNING]` written for a pull request body reads the same in here.
+fn md_note_style(note: u8) -> (&'static str, u32) {
+    match note {
+        2 => ("Note", ACCENT),
+        3 => ("Tip", GIT_NEW),
+        4 => ("Important", COMMENT_MARK),
+        5 => ("Warning", TOUR_MARK),
+        6 => ("Caution", GIT_DELETED),
+        _ => ("", MUTED),
+    }
+}
+
+/// The kind word off a `> [!NOTE]` marker, as `md_note_style` numbers them.
+fn md_note_kind(alert: &str) -> u8 {
+    match alert {
+        "note" => 2,
+        "tip" => 3,
+        "important" => 4,
+        "warning" => 5,
+        "caution" => 6,
+        _ => 1,
+    }
+}
+
 fn md_row_blank() -> MdRow {
     MdRow {
         text: SharedString::default(),
@@ -2850,6 +2886,9 @@ fn md_row_blank() -> MdRow {
         cols: Vec::new(),
         table_last: false,
         gap: true,
+        note: 0,
+        note_first: false,
+        note_last: false,
         images: Vec::new(),
         ix: 0,
         src_line: 0,
@@ -2886,6 +2925,9 @@ fn md_flatten_at(spans: &[md::Span], at: &[usize], size: f32, prefix: &str) -> M
         cols: Vec::new(),
         table_last: false,
         gap: false,
+        note: 0,
+        note_first: false,
+        note_last: false,
         ix: 0,
         src_line: 0,
         map,
@@ -3005,6 +3047,9 @@ fn md_prepare(text: &str) -> Arc<Vec<MdRow>> {
     let mut fence: Vec<String> = Vec::new();
     let mut fence_lang = String::new();
     let mut table: Vec<MdRow> = Vec::new();
+    // the `>` block being read: its kind, and how many rows of it have been
+    // pushed, so the first one knows to carry the label
+    let (mut note, mut note_rows) = (0u8, 0usize);
 
     // A table is only measurable once all of it has been read: the columns are
     // shared out by what is actually in them, so a one-word verdict beside a
@@ -3060,6 +3105,9 @@ fn md_prepare(text: &str) -> Arc<Vec<MdRow>> {
             cols: Vec::new(),
             table_last: false,
             gap: false,
+            note: 0,
+            note_first: false,
+            note_last: false,
             images: Vec::new(),
             ix: rows.len(),
             src_line: 0,
@@ -3080,6 +3128,33 @@ fn md_prepare(text: &str) -> Arc<Vec<MdRow>> {
             continue;
         }
         flush_table(&mut table, &mut rows);
+        if line.quote {
+            // the marker line names the kind and has nothing else on it
+            if !line.alert.is_empty() {
+                note = md_note_kind(&line.alert);
+                note_rows = 0;
+                continue;
+            }
+            if note == 0 {
+                note = 1; // `>` with no marker above it: an ordinary quote
+                note_rows = 0;
+            }
+            let mut row = md_flatten_at(&line.spans, &at_of(line.line, &line.at), 14.5, "");
+            row.src_line = line.line;
+            row.note = note;
+            row.note_first = note_rows == 0;
+            note_rows += 1;
+            rows.push(row);
+            continue;
+        }
+        // anything that isn't a `>` line closes the block
+        if note > 0 {
+            if let Some(r) = rows.last_mut().filter(|r| r.note > 0) {
+                r.note_last = true;
+            }
+            note = 0;
+            note_rows = 0;
+        }
         if line.code {
             if fence.is_empty() {
                 fence_line = line.line;
@@ -3122,6 +3197,11 @@ fn md_prepare(text: &str) -> Arc<Vec<MdRow>> {
         row.indent = line.indent as f32 * 16.0;
         row.src_line = line.line;
         rows.push(row);
+    }
+    if note > 0 {
+        if let Some(r) = rows.last_mut().filter(|r| r.note > 0) {
+            r.note_last = true;
+        }
     }
     flush_table(&mut table, &mut rows);
     let had = rows.len();
@@ -3383,6 +3463,33 @@ fn md_row_el(row: &MdRow, selected: Sel) -> AnyElement {
             );
         }
         return el.into_any_element();
+    }
+    // a `>` block: GitHub's alert, drawn the way GitHub draws it. A bar down
+    // the side in the kind's colour and the kind's name above the first line,
+    // so the aside that would otherwise be a long parenthesis in the middle of
+    // a sentence is a thing beside the sentence instead
+    if row.note > 0 {
+        let (label, color) = md_note_style(row.note);
+        return div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .min_w(px(0.))
+            .pl_2()
+            .border_l_2()
+            .border_color(rgb(color))
+            .when(row.note_first, |d| d.mt_1().pt_1())
+            .when(row.note_last, |d| d.mb_1().pb_1())
+            .when(row.note_first && !label.is_empty(), |d| {
+                d.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(color))
+                        .child(label.to_uppercase()),
+                )
+            })
+            .child(md_hang(row, md_styled_sel(row, false, selected).into_any_element()))
+            .into_any_element();
     }
     if row.fence {
         if let Some(lines) = before_after(&row.text) {
@@ -5410,6 +5517,19 @@ fn brief_spec(pr: Option<u64>) -> String {
          goes for a list you waved at rather than wrote: \"and friends\", \
          \"and so on\", \"a few places\". Name them, or say how many there \
          are and where they live.\n\n\
+         An aside that runs past a clause is not a clause. When what you have to \
+         say about a noun takes a sentence of its own, it goes under the prose \
+         as an alert rather than inside it in brackets. They are lines of `text` \
+         like any other, after the paragraph they belong to, with a blank line \
+         between:\n\
+         \x20 > [!NOTE]\n\
+         \x20 > The connection registry is the table of open sockets, by tenant \
+         and user, that broadcasts are sent from.\n\
+         The five are `[!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]` and \
+         `[!CAUTION]`, and they are GitHub's own, so one written for a pull \
+         request body reads the same in here. TIDE draws the bar and the label; \
+         don't write the word yourself. At most one per slide, and most slides \
+         want none.\n\n\
          `files` is the way from a slide into the code: the two or three files \
          that slide is about, as `path/to/File.ts:84`, pointing at the line \
          worth landing on. Put them on every slide that is about code at all — \
@@ -5482,6 +5602,19 @@ fn brief_spec(pr: Option<u64>) -> String {
          goes for a list you waved at rather than wrote: \"and friends\", \
          \"and so on\", \"a few places\". Name them, or say how many there \
          are and where they live.\n\n\
+         An aside that runs past a clause is not a clause. When what you have to \
+         say about a noun takes a sentence of its own, it goes under the prose \
+         as an alert rather than inside it in brackets. They are lines of `text` \
+         like any other, after the paragraph they belong to, with a blank line \
+         between:\n\
+         \x20 > [!NOTE]\n\
+         \x20 > The connection registry is the table of open sockets, by tenant \
+         and user, that broadcasts are sent from.\n\
+         The five are `[!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]` and \
+         `[!CAUTION]`, and they are GitHub's own, so one written for a pull \
+         request body reads the same in here. TIDE draws the bar and the label; \
+         don't write the word yourself. At most one per slide, and most slides \
+         want none.\n\n\
          `files` is the way from a slide into the code: the two or three files \
          that slide is about, as `path/to/File.ts:84`, pointing at the line \
          worth landing on. Put them on every slide that is about code at all — \
@@ -8507,7 +8640,7 @@ fn format_review(items: &[ReviewItem], note: &str) -> String {
     // each comment is a thread in TIDE; answering by id puts your reply in the
     // thread instead of only in this transcript
     out.push_str(
-        "When you've handled one, post a one-or-two-sentence answer back to its thread:\n         curl -s -X POST \"$TIDE_RPC/comment\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n           -d '{\"id\":\"<id in brackets above>\",\"text\":\"<what you did>\"}'\n\nThe reply renders as markdown in TIDE, so use it where it helps: `backticks` for\nidentifiers, paths, and values, **bold** for the one thing that matters most, and\n- bullets when there's more than one point. Prose is fine for a one-liner — don't\ndress up a short answer.\n\nWhen every comment has an answer, post one summary of the batch — what you\nchanged, what you pushed back on, anything still open:\n         curl -s -X POST \"$TIDE_RPC/summary\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n           -d '{\"text\":\"<what happened, in markdown>\"}'\nIt lands as a card in the transcript, which is where I look for it.\n",
+        "When you've handled one, post a one-or-two-sentence answer back to its thread:\n         curl -s -X POST \"$TIDE_RPC/comment\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n           -d '{\"id\":\"<id in brackets above>\",\"text\":\"<what you did>\"}'\n\nThe reply renders as markdown in TIDE, so use it where it helps: `backticks` for\nidentifiers, paths, and values, **bold** for the one thing that matters most, and\n- bullets when there's more than one point. An aside too long to sit in brackets\ngoes under the paragraph as a GitHub alert, which TIDE draws wherever it draws\nmarkdown:\n\n> [!WARNING]\n> The rows written before the fix stay until the next sweep.\n\nThe five are `[!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]` and `[!CAUTION]`.\nProse is fine for a one-liner — don't dress up a short answer.\n\nWhen every comment has an answer, post one summary of the batch — what you\nchanged, what you pushed back on, anything still open:\n         curl -s -X POST \"$TIDE_RPC/summary\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n           -d '{\"text\":\"<what happened, in markdown>\"}'\nIt lands as a card in the transcript, which is where I look for it.\n",
     );
     out
 }
@@ -45701,6 +45834,60 @@ fn pr_reading_jobs(number: u64) -> [String; 4] {
         format!("Brief of #{number}"),
         format!("Explain #{number}"),
     ]
+}
+
+/// An alert is several source lines and one box on screen, so the rows have to
+/// know which of them opens it and which closes it.
+#[cfg(test)]
+mod md_note_tests {
+    use super::*;
+
+    #[test]
+    fn an_alert_block_knows_where_it_starts_and_ends() {
+        let rows = md_prepare("before\n> [!NOTE]\n> one\n> two\nafter");
+        let notes: Vec<&MdRow> = rows.iter().filter(|r| r.note > 0).collect();
+        // the marker line names the kind and is not a row of its own
+        assert_eq!(notes.len(), 2);
+        assert_eq!((notes[0].text.as_ref(), notes[1].text.as_ref()), ("one", "two"));
+        assert!(notes[0].note_first && !notes[0].note_last);
+        assert!(notes[1].note_last && !notes[1].note_first);
+        assert!(notes.iter().all(|r| r.note == 2));
+        assert_eq!(md_note_style(2).0, "Note");
+        // and the prose on either side is outside the box
+        assert!(rows.first().is_some_and(|r| r.note == 0 && r.text == "before"));
+        assert!(rows.last().is_some_and(|r| r.note == 0 && r.text == "after"));
+    }
+
+    /// Two asides in a row are two boxes. A blank line ends the first, and the
+    /// kind of the second doesn't leak into it.
+    #[test]
+    fn a_blank_line_ends_the_block() {
+        let rows = md_prepare("> [!TIP]\n> a\n\n> [!CAUTION]\n> b");
+        let notes: Vec<&MdRow> = rows.iter().filter(|r| r.note > 0).collect();
+        assert_eq!(notes.len(), 2);
+        assert_eq!((notes[0].note, notes[1].note), (3, 6));
+        assert!(notes.iter().all(|r| r.note_first && r.note_last));
+        assert_eq!(md_note_style(6).0, "Caution");
+    }
+
+    /// A `>` with no marker above it is an ordinary quote: a bar, no label.
+    #[test]
+    fn a_quote_without_a_marker_is_a_quote() {
+        let rows = md_prepare("> quoting you");
+        let note = rows.iter().find(|r| r.note > 0).expect("a quote row");
+        assert_eq!((note.note, note.text.as_ref()), (1, "quoting you"));
+        assert_eq!(md_note_style(1).0, "");
+    }
+
+    /// The box has to end at the end of the document too, or the last row
+    /// never closes it.
+    #[test]
+    fn the_last_line_of_the_document_closes_it() {
+        let rows = md_prepare("> [!IMPORTANT]\n> read this");
+        let note = rows.iter().find(|r| r.note > 0).expect("an alert row");
+        assert!(note.note_first && note.note_last);
+        assert_eq!(note.note, 4);
+    }
 }
 
 /// A pane that has gone quiet is not a pane that has finished. It can be

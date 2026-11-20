@@ -42,6 +42,27 @@ pub struct Line {
     pub cells: Option<Vec<Vec<Span>>>,
     /// True on a table row the separator marked as the header.
     pub header: bool,
+    /// A `>` line: part of a blockquote, or of one of GitHub's alerts.
+    pub quote: bool,
+    /// The kind a `> [!NOTE]` line opens: `note`, `tip`, `important`,
+    /// `warning` or `caution`. Empty on every other line, the body of the
+    /// alert included, since the kind is carried down the block by whoever
+    /// renders it.
+    pub alert: String,
+}
+
+/// `[!NOTE]` and the four others, as the kind word. GitHub matches the marker
+/// without regard to case and allows nothing else on the line, which is what
+/// keeps a quote that happens to start with a bracket from becoming an alert.
+fn alert_kind(body: &str) -> String {
+    let Some(inner) = body.trim().strip_prefix("[!").and_then(|r| r.strip_suffix(']')) else {
+        return String::new();
+    };
+    let kind = inner.to_ascii_lowercase();
+    match kind.as_str() {
+        "note" | "tip" | "important" | "warning" | "caution" => kind,
+        _ => String::new(),
+    }
 }
 
 /// Split a line's text into inline spans. Unclosed markers stay literal — a
@@ -169,6 +190,8 @@ pub fn parse(text: &str) -> Vec<Line> {
                 lang: lang.clone(),
                 cells: None,
                 header: false,
+                quote: false,
+                alert: String::new(),
             });
             continue;
         }
@@ -192,6 +215,34 @@ pub fn parse(text: &str) -> Vec<Line> {
                 lang: String::new(),
                 cells: Some(cols.iter().map(|c| spans(c)).collect()),
                 header: false,
+                quote: false,
+                alert: String::new(),
+            });
+            continue;
+        }
+        // `>` lines: a blockquote, or one of GitHub's alerts when the first of
+        // them is `> [!NOTE]`. That marker line names the kind and carries no
+        // text of its own; the lines under it are ordinary prose
+        if let Some(rest) = trimmed.strip_prefix('>') {
+            let body = rest.strip_prefix(' ').unwrap_or(rest);
+            let alert = alert_kind(body);
+            let (spans, at) = match alert.is_empty() {
+                true => split_at(body, raw.len() - body.len()),
+                false => (Vec::new(), Vec::new()),
+            };
+            out.push(Line {
+                line: ln,
+                at,
+                indent: 0,
+                bullet: None,
+                spans,
+                code: false,
+                heading: 0,
+                lang: String::new(),
+                cells: None,
+                header: false,
+                quote: true,
+                alert,
             });
             continue;
         }
@@ -215,6 +266,8 @@ pub fn parse(text: &str) -> Vec<Line> {
                 lang: String::new(),
                 cells: None,
                 header: false,
+                quote: false,
+                alert: String::new(),
             });
             continue;
         } else {
@@ -232,6 +285,8 @@ pub fn parse(text: &str) -> Vec<Line> {
             lang: String::new(),
             cells: None,
             header: false,
+            quote: false,
+            alert: String::new(),
         });
     }
     out
@@ -335,6 +390,36 @@ mod tests {
         // no inline parsing inside the fence
         assert_eq!(lines[1].spans, vec![Span::Text("const a = *b*;".into())]);
         assert!(!lines[2].code);
+    }
+
+    /// GitHub's alerts, so an aside written for a pull request body reads the
+    /// same in TIDE. The marker line carries the kind and no text; the lines
+    /// under it are prose, and the `>` never reaches the screen.
+    #[test]
+    fn a_github_alert_names_its_kind_and_keeps_its_body() {
+        let lines = parse("> [!WARNING]\n> the table of **open** sockets\n> and nothing else\nafter");
+        assert_eq!(lines.len(), 4);
+        assert_eq!((lines[0].quote, lines[0].alert.as_str()), (true, "warning"));
+        assert!(lines[0].spans.is_empty(), "the marker line is not prose");
+        assert!(lines[1].quote && lines[1].alert.is_empty());
+        assert_eq!(lines[1].spans, vec![
+            Span::Text("the table of ".into()),
+            Span::Bold("open".into()),
+            Span::Text(" sockets".into()),
+        ]);
+        assert!(lines[2].quote);
+        assert!(!lines[3].quote, "an ordinary line closes the block");
+        // the offsets still point into the source line, past the `> `
+        assert_eq!(lines[1].at[0], 2);
+        // a quote with no marker is a quote, not an alert
+        let plain = parse("> just quoting");
+        assert!(plain[0].quote && plain[0].alert.is_empty());
+        // and a bracket that isn't one of the five is left alone
+        let odd = parse("> [!SHOUT]\n> hi");
+        assert!(odd[0].alert.is_empty());
+        assert_eq!(odd[0].spans, vec![Span::Text("[!SHOUT]".into())]);
+        // case doesn't matter, the way it doesn't on GitHub
+        assert_eq!(parse("> [!tip]")[0].alert, "tip");
     }
 
     /// A table is the one construct where raw markdown is unreadable on screen,
