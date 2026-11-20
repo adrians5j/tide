@@ -5250,9 +5250,10 @@ fn tour_question(tour: &str, at: usize, total: usize, stop: &Stop, q: &str, id: 
          on, the way you answer a review comment:\n\
          \x20 curl -s -X POST \"$TIDE_RPC/comment\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n\
          \x20   -d '{{\"id\":\"{id}\",\"text\":\"<the answer, in markdown>\"}}'\n\
-         Two or three sentences there, on the card where I am reading; the \
-         working out can stay in the transcript. Don't rebuild the tour unless \
-         I ask for it.\n",
+         Two or three sentences there, on the card where I am reading, and \
+         `-` bullets rather than one sentence whenever it is three or more of \
+         anything; the working out can stay in the transcript. Don't rebuild \
+         the tour unless I ask for it.\n",
         q.trim(),
         stop_label(stop),
     )
@@ -5290,9 +5291,10 @@ fn slide_question(
          it under, the way you answer a review comment:\n\
          \x20 curl -s -X POST \"$TIDE_RPC/comment\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n\
          \x20   -d '{{\"id\":\"{id}\",\"text\":\"<the answer, in markdown>\"}}'\n\
-         Two or three sentences there, under the slide where I am reading; the \
-         working out can stay in the transcript. Don't rewrite the brief unless \
-         I ask for it.\n",
+         Two or three sentences there, under the slide where I am reading, and \
+         `-` bullets rather than one sentence whenever it is three or more of \
+         anything; the working out can stay in the transcript. Don't rewrite \
+         the brief unless I ask for it.\n",
         q.trim(),
     )
 }
@@ -7963,7 +7965,8 @@ fn dir_tail(dir: &str, parts: usize) -> String {
 /// less clearly than this.
 const CLARIFY_NOTE: &str = "This step isn't clear to me. Explain what happens \
      here and why it matters, in plainer terms, and say what I'd have to know \
-     to follow it.";
+     to follow it. If that is more than two things, give them as bullets \
+     rather than as one sentence.";
 
 /// What there is to read about a pull request, and whether it still matches
 /// the branch. Two things that go stale together and are wanted together: the
@@ -8049,7 +8052,8 @@ impl SlideThread {
 /// where to look.
 const SLIDE_CLARIFY_NOTE: &str = "This slide isn't clear to me. Say what it \
      means again in plainer terms, and tell me what I would have to know \
-     already for it to make sense.";
+     already for it to make sense. If that is more than two things, give them \
+     as bullets rather than as one sentence.";
 
 /// The route drawn small, for the cards at either end of it: three stops and
 /// the arrows between them, with the end you are standing at lit. A card that
@@ -29021,7 +29025,13 @@ impl Storm {
          error, the number. If a sentence can be read two ways, rewrite it \
          until it can't. This holds everywhere you write for me — answers, PR \
          bodies, summaries, commit messages, tour stops, replies to review \
-         comments.\n\n"
+         comments.\n\
+         A list is a list. Three or more of anything goes on `-` lines, one \
+         each, rather than strung through a sentence with commas and an `and` \
+         at the end. \"To follow it you need HTTP keep-alive, that a \
+         standalone server is a long-running process, and that a reset isn't \
+         retried for a POST\" is three things I have to count before I can \
+         read them; three bullets is three things.\n\n"
             .to_string()
     }
 
@@ -44634,6 +44644,7 @@ mod briefing_tests {
         assert!(b.contains("curl -s localhost:47400/consumers"), "the check");
         // and the line about how to write, which is easy to lose in an edit
         assert!(b.contains("Write plainly."), "the plain-language rule");
+        assert!(b.contains("A list is a list."), "three of anything is bullets, not commas");
         // and no line of it ran into the next one
         assert!(!b.contains("post.drafted\",         "), "{b}");
     }
