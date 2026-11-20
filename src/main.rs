@@ -5531,6 +5531,14 @@ fn brief_spec(pr: Option<u64>) -> String {
          goes for a list you waved at rather than wrote: \"and friends\", \
          \"and so on\", \"a few places\". Name them, or say how many there \
          are and where they live.\n\n\
+         A \"the\" is a promise that you have named the thing. \"The adapter\", \
+         \"the runner\", \"the registry\": if a slide leans on one of those, give \
+         its name the first time it comes up and then say what it is, \
+         \"`WebsocketsServerAdapter`, the thin wrapper around the `ws` library\". \
+         Saying what kind of thing it is without naming it is the same dead \
+         end as not explaining it at all: I stop and ask \"which one?\", which \
+         is what the brief was for. The name is already in your hand, on the \
+         diagram's boxes and in `files`.\n\n\
          An aside that runs past a clause is not a clause. When what you have to \
          say about a noun takes a sentence of its own, it goes under the prose \
          as an alert rather than inside it in brackets. They are lines of `text` \
@@ -5616,6 +5624,14 @@ fn brief_spec(pr: Option<u64>) -> String {
          goes for a list you waved at rather than wrote: \"and friends\", \
          \"and so on\", \"a few places\". Name them, or say how many there \
          are and where they live.\n\n\
+         A \"the\" is a promise that you have named the thing. \"The adapter\", \
+         \"the runner\", \"the registry\": if a slide leans on one of those, give \
+         its name the first time it comes up and then say what it is, \
+         \"`WebsocketsServerAdapter`, the thin wrapper around the `ws` library\". \
+         Saying what kind of thing it is without naming it is the same dead \
+         end as not explaining it at all: I stop and ask \"which one?\", which \
+         is what the brief was for. The name is already in your hand, on the \
+         diagram's boxes and in `files`.\n\n\
          An aside that runs past a clause is not a clause. When what you have to \
          say about a noun takes a sentence of its own, it goes under the prose \
          as an alert rather than inside it in brackets. They are lines of `text` \
@@ -45748,7 +45764,15 @@ mod brief_spec_tests {
     fn one_spec_two_subjects() {
         let pr = brief_request(6164, "origin/next", "");
         let talk = talk_brief_request();
-        for q in ["at most five slides", "$TIDE_RPC/brief", "`tldr` is the whole deck"] {
+        for q in [
+            "at most five slides",
+            "$TIDE_RPC/brief",
+            "`tldr` is the whole deck",
+            // a slide that leans on "the adapter" has to say which adapter
+            "is a promise that you have named the thing",
+            // and an aside too long for a clause is a GitHub alert
+            "[!NOTE]",
+        ] {
             assert!(pr.contains(q), "{q} missing from the pull request's brief");
             assert!(talk.contains(q), "{q} missing from the conversation's brief");
         }
