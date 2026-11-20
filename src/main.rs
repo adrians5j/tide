@@ -5402,7 +5402,13 @@ fn tour_request(about: Option<&str>, answer: Option<&str>) -> String {
          Where the tour moves from one stretch of the work to another, name \
          the stretch with `group` on each stop in it (\"The AWS side\", \
          \"Standalone\") — consecutive stops sharing one become a section with \
-         a heading. Two to five of them; skip it if the tour is one run.\n\n\
+         a heading. Two to five of them; skip it if the tour is one run.\n\
+         A part whose first word is `Tests`, `Appendix` or `Annex` is read as \
+         exactly that: still walked and still on the map, but ruled off at the \
+         end and left out of the count, so \"10 of 11\" is about the route \
+         through the change rather than about three test files after it. Put \
+         the tests there if you cover them, and leave the route itself for \
+         what the change does.\n\n\
          A stop that wants something from me rather than only telling me \
          something gets a `flag`, and it draws as a tag beside the title. \
          Three words and no others: `look` for something worth my eyes, \
@@ -7860,6 +7866,49 @@ fn stops_mentioned(stops: &[Stop], at: usize) -> Vec<usize> {
 /// The named parts of a tour, in the order the walk reaches them. A part the
 /// tour returns to later is one part, not two: the name is what it is about,
 /// not where it sits.
+/// A part of a tour that is there to be read but isn't part of the route: the
+/// tests the change added, an appendix, an annex. It is still walked, still on
+/// the map and still steps with the rest, but it sits outside the count: three
+/// stops of test files at the end of a tour made "10/14" read as a third of it
+/// left when the run through the change was over.
+///
+/// Named rather than flagged, because the agent already names the parts and
+/// this is the name it gives that one. The first word is what decides, so
+/// "Tests", "Tests and types" and "Appendix: the numbers" all land.
+fn tour_extra(group: &str) -> bool {
+    let first = group.trim().split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    matches!(
+        first.trim_end_matches([':', ',']),
+        "tests" | "test" | "testing" | "appendix" | "annex" | "extras"
+    )
+}
+
+/// How many stops the count is out of: the route through the change, with any
+/// appendix left out.
+fn tour_main_len(stops: &[Stop]) -> usize {
+    stops.iter().filter(|s| !tour_extra(&s.group)).count()
+}
+
+/// Where a stop sits for counting: `(position, out of, in an appendix)`. A stop
+/// on the route is numbered among the route. A stop in an appendix is numbered
+/// within that appendix, so walking into one doesn't read as three more stops
+/// of a tour you had just finished.
+fn tour_place(stops: &[Stop], at: usize) -> (usize, usize, bool) {
+    let main = tour_main_len(stops);
+    let Some(stop) = stops.get(at) else { return (0, main, false) };
+    if !tour_extra(&stop.group) {
+        return (stops.iter().take(at + 1).filter(|s| !tour_extra(&s.group)).count(), main, false);
+    }
+    let group = stop.group.trim();
+    let mine: Vec<usize> = stops
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.group.trim() == group)
+        .map(|(i, _)| i)
+        .collect();
+    (mine.iter().position(|i| *i == at).map(|p| p + 1).unwrap_or(0), mine.len(), true)
+}
+
 fn tour_groups(stops: &[Stop]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for s in stops {
@@ -25780,6 +25829,7 @@ impl Storm {
                 if !group.is_empty() {
                     let standing_in = group == cur_group;
                     let files = nodes.iter().filter(|m| m.group.trim() == group).count();
+                    let extra = tour_extra(&group);
                     let (g, cur) = (group.clone(), cur_group.clone());
                     col = col.child(
                         div()
@@ -25787,6 +25837,11 @@ impl Storm {
                             .mt_2()
                             .mb_1()
                             .px_1()
+                            // what is past the end of the route is ruled off
+                            // from it, so the map says what the count says
+                            .when(extra, |d| {
+                                d.mt_3().pt_2().border_t_1().border_color(rgb(BORDER))
+                            })
                             .flex()
                             .flex_row()
                             .items_center()
@@ -25810,6 +25865,18 @@ impl Storm {
                                     .text_color(rgb(if standing_in { accent } else { TEXT }))
                                     .child(group.clone()),
                             )
+                            .when(extra, |d| {
+                                d.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .px_1()
+                                        .rounded_sm()
+                                        .bg(rgb(HOVER))
+                                        .text_size(px(9.))
+                                        .text_color(rgb(LINE_NUMBER))
+                                        .child("appendix"),
+                                )
+                            })
                             .when(!open, |d| {
                                 d.child(
                                     div()
@@ -25819,7 +25886,13 @@ impl Storm {
                                         .child(format!("{files}")),
                                 )
                             })
-                            .tooltip(tip(if open { "Fold this part" } else { "Open this part" }))
+                            .tooltip(tip(if extra {
+                                "Part of the tour, not part of the count"
+                            } else if open {
+                                "Fold this part"
+                            } else {
+                                "Open this part"
+                            }))
                             .on_click(cx.listener(move |this, _e, _w, cx| {
                                 let now =
                                     this.tour_group_open.get(&g).copied().unwrap_or(g == cur);
@@ -26089,8 +26162,15 @@ impl Storm {
         // what you have read, which is not the same as how far the cursor has
         // got: a stop you ticked without opening counts, and one you scrolled
         // past does not
-        let total = w.stops.len();
-        let read = w.seen.len().min(total);
+        // an appendix is read, not walked through: it is out of the count, and
+        // standing in one numbers you within it rather than among the route
+        let (place, total, extra) = tour_place(&w.stops, w.at);
+        let read = w
+            .seen
+            .iter()
+            .filter(|&&i| w.stops.get(i).is_some_and(|s| !tour_extra(&s.group)))
+            .count()
+            .min(tour_main_len(&w.stops));
         // the bar is position: how far along the route the stop you are
         // standing on is. The number in front of it says the same thing, or
         // the two read as one fact disagreeing with itself — the ticks are
@@ -26098,12 +26178,25 @@ impl Storm {
         let pos = match (w.intro, w.done) {
             (true, _) => 0,
             (_, true) => total,
-            _ => w.at + 1,
+            _ => place,
         };
-        let pct = if total == 0 { 0 } else { pos * 100 / total };
+        // the route is over once you are past it, whichever stop of the
+        // appendix you are standing on
+        let pct = match (extra, total) {
+            (true, _) => 100,
+            (_, 0) => 0,
+            _ => pos * 100 / total,
+        };
+        let here = match extra {
+            true => format!(
+                "{} {pos}/{total}",
+                w.stops.get(w.at).map(|s| s.group.trim()).unwrap_or_default()
+            ),
+            false => format!("{pos}/{total}"),
+        };
         let count = match read {
-            0 => format!("{pos}/{total}"),
-            r => format!("{pos}/{total} · {r} read"),
+            0 => here,
+            r => format!("{here} · {r} read"),
         };
         let accent = if w.tour.is_some() { TOUR_MARK } else { COMMENT_MARK };
         let mut list = div()
@@ -26581,7 +26674,11 @@ impl Storm {
             + grow_diff;
         let w = self.walk.as_ref()?;
         let stop = w.stops.get(w.at)?;
-        let (at, total) = (w.at + 1, w.stops.len());
+        // the same count the panel keeps: an appendix numbers within itself
+        let (at, total, _) = tour_place(&w.stops, w.at);
+        // the flag's blink is keyed to the stop itself, which an appendix's
+        // own numbering would collide with
+        let step = w.at + 1;
         let tour = w.tour.clone();
         let accent = if tour.is_some() { TOUR_MARK } else { COMMENT_MARK };
         // the lines this card is about, so a measurement is only ever used for
@@ -26958,7 +27055,7 @@ impl Storm {
                             .items_center()
                             .gap_2()
                             .pt_1()
-                            .children(stop_flag_chip(&flag, at))
+                            .children(stop_flag_chip(&flag, step))
                             .child(
                                 div()
                                     .flex_grow(1.0)
@@ -45834,6 +45931,53 @@ fn pr_reading_jobs(number: u64) -> [String; 4] {
         format!("Brief of #{number}"),
         format!("Explain #{number}"),
     ]
+}
+
+/// A tour's count is about the route through the change. What it adds at the
+/// end, the tests above all, is read but not walked through.
+#[cfg(test)]
+mod tour_count_tests {
+    use super::*;
+
+    fn stop(group: &str) -> Stop {
+        Stop {
+            path: "a.ts".into(),
+            line: 1,
+            end: 1,
+            title: String::new(),
+            group: group.into(),
+            said: String::new(),
+            flag: String::new(),
+        }
+    }
+
+    #[test]
+    fn an_appendix_is_named_by_its_first_word() {
+        for name in ["Tests", "tests", "Test coverage", "Appendix: the numbers", "Annex"] {
+            assert!(tour_extra(name), "{name}");
+        }
+        for name in ["The AWS side", "Standalone", "", "Testing the water is not it"] {
+            assert_eq!(tour_extra(name), name.starts_with("Testing"), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_count_is_the_route_and_the_appendix_is_its_own() {
+        let stops: Vec<Stop> = ["Route", "Route", "Route", "Tests", "Tests"]
+            .iter()
+            .map(|g| stop(g))
+            .collect();
+        assert_eq!(tour_main_len(&stops), 3);
+        // on the route, numbered among the route
+        assert_eq!(tour_place(&stops, 0), (1, 3, false));
+        assert_eq!(tour_place(&stops, 2), (3, 3, false));
+        // in the appendix, numbered within it
+        assert_eq!(tour_place(&stops, 3), (1, 2, true));
+        assert_eq!(tour_place(&stops, 4), (2, 2, true));
+        // a tour with no parts at all counts every stop
+        let flat: Vec<Stop> = (0..4).map(|_| stop("")).collect();
+        assert_eq!(tour_place(&flat, 1), (2, 4, false));
+    }
 }
 
 /// An alert is several source lines and one box on screen, so the rows have to
