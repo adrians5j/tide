@@ -158,7 +158,13 @@ enum AgentMsg {
 struct JobTurn {
     at: usize,
     end: Option<usize>,
+    /// How the turn sits right now. A job that is running is open: the fold is
+    /// a summary of work that is over, and while the work is happening the
+    /// thing you want is the work. Clicking the line still folds it by hand.
     open: bool,
+    /// How it sits once the agent stops, which is where `open` goes back to.
+    /// False for every job but the merge note.
+    keep: bool,
     job: String,
     began: u64,
     took: Option<u64>,
@@ -31354,7 +31360,11 @@ impl Storm {
             self.job_turns.push(JobTurn {
                 at,
                 end: None,
-                open,
+                // `began` is 0 on a turn being replayed, which is a turn that
+                // has already finished: it sits the way it would have been
+                // left. A live one opens, and folds when the agent stops
+                open: began > 0 || open,
+                keep: open,
                 job,
                 began,
                 // a replayed turn is over: it must not start counting up from
@@ -31367,8 +31377,11 @@ impl Storm {
     /// The agent stopped: the job line's clock stops with it, whether the turn
     /// ended, failed or was interrupted.
     fn end_job_clock(&mut self) {
-        if let Some(q) = self.job_turns.last_mut().filter(|q| q.end.is_none() && q.took.is_none()) {
-            q.took = Some(now_secs().saturating_sub(q.began));
+        if let Some(q) = self.job_turns.last_mut().filter(|q| q.end.is_none()) {
+            q.took.get_or_insert(now_secs().saturating_sub(q.began));
+            // the working was worth watching while it was happening; now that
+            // it is over the line is the summary of it
+            q.open = q.keep;
         }
     }
 
@@ -31742,7 +31755,16 @@ impl Storm {
             Some(q) => job_last_word(&this.agent_msgs, q) == Some(ix),
             None => false,
         };
-        if !result && !last_word && this.job_turn(ix).is_some_and(|q| !q.open && ix > q.at) {
+        // and the fold reaches no further than the messages: the running turn
+        // has no end yet, so by index it owns every row after it, which is how
+        // a folded job swallowed the "waiting on…" line and the prompt you had
+        // just queued behind it. Those are not its working
+        let in_job = ix < this.agent_msgs.len();
+        if !result
+            && !last_word
+            && in_job
+            && this.job_turn(ix).is_some_and(|q| !q.open && ix > q.at)
+        {
             return div().into_any_element();
         }
         if let Some(m) = this.agent_msgs.get(ix) {
@@ -44994,8 +45016,8 @@ mod code_tour_tests {
     #[test]
     fn a_folded_turn_owns_its_own_rows_only() {
         let turns = vec![
-            JobTurn { at: 2, end: Some(6), open: false, job: "a".into(), began: 0, took: None },
-            JobTurn { at: 9, end: None, open: false, job: "b".into(), began: 0, took: None },
+            JobTurn { at: 2, end: Some(6), open: false, keep: false, job: "a".into(), began: 0, took: None },
+            JobTurn { at: 9, end: None, open: false, keep: false, job: "b".into(), began: 0, took: None },
         ];
         // the question itself is part of the fold: that is where the chip goes
         assert!(job_at(&turns, 2).is_some());
@@ -45003,7 +45025,10 @@ mod code_tour_tests {
         // the message that ended it belongs to the next turn
         assert!(job_at(&turns, 6).is_none());
         assert!(job_at(&turns, 8).is_none());
-        // a turn still running swallows everything after it
+        // a turn still running swallows everything after it, by index: it has
+        // no end yet, so row 400 is "inside" it. That is why `agent_row` asks
+        // only about rows that are messages. The thinking line and the queue
+        // are drawn past the end of `agent_msgs` and are nobody's working
         assert!(job_at(&turns, 9).is_some());
         assert!(job_at(&turns, 400).is_some());
         // and nothing before the first fold
@@ -45035,7 +45060,7 @@ mod code_tour_tests {
     /// prose, and the fold used to swallow it.
     #[test]
     fn a_job_with_no_card_shows_what_it_last_said() {
-        let q = JobTurn { at: 0, end: Some(4), open: false, job: "Merged #1".into(), began: 0, took: None };
+        let q = JobTurn { at: 0, end: Some(4), open: false, keep: false, job: "Merged #1".into(), began: 0, took: None };
         let m = msgs(&["user", "tool", "said", "tool"]);
         assert_eq!(job_last_word(&m, &q), Some(2));
         // the tail of it, not the first thing it said
@@ -45050,7 +45075,7 @@ mod code_tour_tests {
     /// and the fold already lets it through.
     #[test]
     fn a_job_with_a_card_keeps_its_working_folded() {
-        let q = JobTurn { at: 0, end: Some(4), open: false, job: "Brief of #1".into(), began: 0, took: None };
+        let q = JobTurn { at: 0, end: Some(4), open: false, keep: false, job: "Brief of #1".into(), began: 0, took: None };
         assert_eq!(job_last_word(&msgs(&["user", "said", "card", "tool"]), &q), None);
     }
 
@@ -45058,16 +45083,16 @@ mod code_tour_tests {
     /// going past is the working, not the answer.
     #[test]
     fn a_running_job_keeps_everything_folded() {
-        let q = JobTurn { at: 0, end: None, open: false, job: "Merged #1".into(), began: 0, took: None };
+        let q = JobTurn { at: 0, end: None, open: false, keep: false, job: "Merged #1".into(), began: 0, took: None };
         assert_eq!(job_last_word(&msgs(&["user", "said", "tool"]), &q), None);
     }
 
     /// A span that says nothing, and one that ran off the end of the list.
     #[test]
     fn nothing_said_and_nothing_there() {
-        let q = JobTurn { at: 0, end: Some(2), open: false, job: "j".into(), began: 0, took: None };
+        let q = JobTurn { at: 0, end: Some(2), open: false, keep: false, job: "j".into(), began: 0, took: None };
         assert_eq!(job_last_word(&msgs(&["user", "tool"]), &q), None);
-        let past = JobTurn { at: 0, end: Some(99), open: false, job: "j".into(), began: 0, took: None };
+        let past = JobTurn { at: 0, end: Some(99), open: false, keep: false, job: "j".into(), began: 0, took: None };
         assert_eq!(job_last_word(&msgs(&["user", "said"]), &past), Some(1));
     }
 
