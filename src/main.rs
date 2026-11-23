@@ -10980,10 +10980,13 @@ impl Storm {
             ),
         ];
         for (name, brief) in briefs {
-            let Some(acp) = acp::Acp::new(&self.root, self.rpc_env()) else {
-                self.show_flash("Can't start a reviewer — is `npx` (Node 22+) on PATH?", cx);
-                self.reviewers.clear();
-                return false;
+            let acp = match acp::Acp::new(&self.root, self.rpc_env()) {
+                Ok(acp) => acp,
+                Err(why) => {
+                    self.show_flash(&format!("Can't start a reviewer: {why}"), cx);
+                    self.reviewers.clear();
+                    return false;
+                }
             };
             self.reviewers.push(Reviewer {
                 name,
@@ -28201,15 +28204,18 @@ impl Storm {
     fn ensure_acp(&mut self, cx: &mut Context<Self>) {
         if self.acp.is_none() {
             let env = self.tab_rpc_env();
-            self.acp = acp::Acp::new(&self.root, env);
-            if self.acp.is_none() {
-                self.agent_msgs.push(AgentMsg::Tool {
+            match acp::Acp::new(&self.root, env) {
+                Ok(acp) => self.acp = Some(acp),
+                // the reason, not a guess at it: a missing node, an install that
+                // failed and a repo npm choked on read nothing alike, and the
+                // pane used to show the same sentence for all three
+                Err(why) => self.agent_msgs.push(AgentMsg::Tool {
                     id: String::new(),
-                    title: "could not start agent — is `npx` (Node 22+) on PATH?".into(),
+                    title: format!("could not start agent: {why}"),
                     status: "failed".into(),
                     detail: String::new(),
                     started: std::time::Instant::now(),
-                });
+                }),
             }
         }
         if self.acp.is_some() && !self.acp_polling {
@@ -43011,6 +43017,15 @@ fn main() {
         }
         v
     };
+
+    // Install the agent adapter if this version isn't on disk, before anyone
+    // asks for an agent. It is one npm install per version, 14 seconds on a
+    // cold cache, and the alternative is the first ⌘⇧A of the day sitting on it.
+    std::thread::spawn(|| {
+        if let Err(why) = acp::ensure_adapter() {
+            eprintln!("tide: agent adapter not ready: {why}");
+        }
+    });
 
     // the first run after this landed has no history file: build one out of the
     // titles TIDE has been keeping all along, so ⌘⇧E opens onto something

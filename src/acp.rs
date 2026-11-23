@@ -135,25 +135,97 @@ pub struct Acp {
     child: Mutex<Child>,
 }
 
+/// The adapter TIDE talks to, and the version of it.
+///
+/// Pinned. Unpinned, the installer takes whatever is newest, so a release
+/// published at 8pm changes the agent mid-session with nothing in this repo
+/// moving — and the first spawn after one races the install, which is how
+/// 0.95.0 arrived: `initialize` answered, then `session/list` reached for part
+/// of the package that wasn't on disk yet and the adapter exited. To take a
+/// newer one, change the version here, so the upgrade is a commit that can be
+/// reverted.
+///
+/// Renamed from `@zed-industries/claude-code-acp`, which is deprecated and
+/// frozen at 0.16.
+const ADAPTER: &str = "@agentclientprotocol/claude-agent-acp";
+const ADAPTER_VERSION: &str = "0.95.0";
+
+/// Where this version of the adapter is installed. One directory per version,
+/// so a bump installs beside the old one instead of over it, and a revert finds
+/// what it left behind.
+fn adapter_dir() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".config/tide/agent").join(ADAPTER_VERSION))
+}
+
+/// The file node runs, inside an install directory.
+fn adapter_entry(dir: &Path) -> PathBuf {
+    dir.join("node_modules").join(ADAPTER).join("dist").join("index.js")
+}
+
+/// The adapter's entry point, installed first if this version isn't on disk yet.
+///
+/// TIDE used to spawn `npx` in the workspace for every session, and npx is npm:
+/// before it does anything else, npm parses the repo's `package.json`, and in a
+/// workspace repo every member's manifest too. One unparseable manifest and the
+/// agent would not start at all. That is not a hypothetical — a merge of
+/// webiny-js left eleven `package.json` files with conflict markers in them, and
+/// every agent in that workspace died with `npm error JSON.parse` where the
+/// transcript should have been. Nothing about running the adapter needs npm, so
+/// the pinned version is installed once into TIDE's own directory and run with
+/// node, and what is in the repo stops mattering.
+///
+/// The install is also the only slow part, and it happens once per version
+/// rather than once per session.
+pub fn ensure_adapter() -> Result<PathBuf, String> {
+    let dir = adapter_dir().ok_or("no HOME to install the agent adapter into")?;
+    let entry = adapter_entry(&dir);
+    if entry.is_file() {
+        return Ok(entry);
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("can't make {}: {e}", dir.display()))?;
+    // npm walks up from its working directory looking for a package.json and
+    // reads whatever it finds. A manifest of our own stops the walk here, so an
+    // install can't be derailed by whatever happens to sit above ~/.config.
+    let _ = std::fs::write(
+        dir.join("package.json"),
+        "{\"name\":\"tide-agent\",\"private\":true,\"version\":\"0.0.0\"}\n",
+    );
+    let out = Command::new("npm")
+        .args([
+            "install",
+            "--no-audit",
+            "--no-fund",
+            "--no-save",
+            "--prefix",
+            &dir.to_string_lossy(),
+            &format!("{ADAPTER}@{ADAPTER_VERSION}"),
+        ])
+        .current_dir(&dir)
+        .output()
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => "npm isn't on PATH (Node 22+)".to_string(),
+            _ => format!("couldn't run npm: {e}"),
+        })?;
+    if entry.is_file() {
+        return Ok(entry);
+    }
+    // npm's last line is the one that says what went wrong; the rest is progress
+    let said = String::from_utf8_lossy(&out.stderr);
+    let why = said.lines().filter(|l| !l.trim().is_empty()).next_back().unwrap_or("npm said nothing");
+    Err(format!("couldn't install {ADAPTER}@{ADAPTER_VERSION}: {why}"))
+}
+
 impl Acp {
     /// Spawn the adapter for `root` and kick off the handshake on a background
-    /// thread. Returns None if the adapter can't be launched (no node/npx).
+    /// thread. `Err` is why it couldn't be launched, in words the pane can show.
     /// `rpc` is TIDE's control channel `(url, token)`; the adapter inherits it,
     /// so the agent's own Bash calls can post review-thread answers back to us
     /// exactly like a terminal agent does.
-    pub fn new(root: &Path, rpc: Option<(String, String)>) -> Option<Arc<Acp>> {
-        let mut cmd = Command::new("npx");
-        // renamed from @zed-industries/claude-code-acp, which is deprecated and
-        // frozen at 0.16.
-        //
-        // Pinned. Unpinned, `npx -y` takes whatever is newest, so a release
-        // published at 8pm changes the agent mid-session with nothing in this
-        // repo moving — and the first spawn after one races npx's own install
-        // of it, which is how 0.95.0 arrived: `initialize` answered, then
-        // `session/list` reached for part of the package that wasn't on disk
-        // yet and the adapter exited. To take a newer one, change the version
-        // here, so the upgrade is a commit that can be reverted.
-        cmd.args(["-y", "@agentclientprotocol/claude-agent-acp@0.95.0"])
+    pub fn new(root: &Path, rpc: Option<(String, String)>) -> Result<Arc<Acp>, String> {
+        let entry = ensure_adapter()?;
+        let mut cmd = Command::new("node");
+        cmd.arg(entry)
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -169,9 +241,15 @@ impl Acp {
             cmd.env("TIDE_ROOT", root.to_string_lossy().to_string());
         }
 
-        let mut child = cmd.spawn().ok()?;
-        let stdin = Arc::new(Mutex::new(child.stdin.take()?));
-        let stdout = child.stdout.take()?;
+        let mut child = cmd.spawn().map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => "node isn't on PATH (Node 22+)".to_string(),
+            _ => format!("couldn't start node: {e}"),
+        })?;
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            let _ = child.kill();
+            return Err("node gave no pipes to talk over".into());
+        };
+        let stdin = Arc::new(Mutex::new(stdin));
         let stderr = child.stderr.take();
 
         let acp = Arc::new(Acp {
@@ -226,7 +304,7 @@ impl Acp {
         // exits. Sending it here is what makes that ordering impossible.
         acp.handshake(root.to_path_buf());
 
-        Some(acp)
+        Ok(acp)
     }
 
     fn handshake(&self, root: PathBuf) {
@@ -770,7 +848,21 @@ fn write_text(path: &str, content: &str) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{base64, base64_decode};
+    use super::{adapter_dir, adapter_entry, base64, base64_decode, ADAPTER, ADAPTER_VERSION};
+    use std::path::Path;
+
+    /// The install lives under the pinned version, and the file node runs lives
+    /// under that. A bump that reused one directory would find the old version's
+    /// `node_modules` already in place and run it, which is the whole bug the
+    /// pin exists to prevent.
+    #[test]
+    fn the_adapter_is_installed_per_version() {
+        let dir = adapter_dir().expect("HOME");
+        assert_eq!(dir.file_name().and_then(|n| n.to_str()), Some(ADAPTER_VERSION));
+        assert!(dir.ends_with(Path::new(".config/tide/agent").join(ADAPTER_VERSION)), "{}", dir.display());
+        let entry = adapter_entry(Path::new("/x"));
+        assert_eq!(entry, Path::new("/x/node_modules").join(ADAPTER).join("dist/index.js"));
+    }
 
     /// Decoding undoes encoding for every length, including the two that pad.
     #[test]
