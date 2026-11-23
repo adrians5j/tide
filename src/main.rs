@@ -37,6 +37,7 @@ mod usage;
 mod jobs;
 mod sess;
 mod spend;
+mod steps;
 mod wshist;
 mod tokens;
 use rpc::AgentState;
@@ -5032,6 +5033,88 @@ fn pr_body_from(v: &serde_json::Value) -> Option<(String, String, PrDoc)> {
     Some((format!("PR #{number}.md"), doc, meta))
 }
 
+/// How many steps the dashboard shows. Enough to cover a morning without the
+/// card growing past the pane it sits in.
+const STEPS_ON_CARD: usize = 6;
+
+/// How many the header opens up to. Past this the card is taller than the pane
+/// it is centred in, and a list that runs off the bottom is worse than a short
+/// one that says how much it is hiding.
+const STEPS_EXPANDED: usize = 20;
+
+/// How a message to the agent reads in the step list.
+///
+/// TIDE's own sends already have a line written for them — "Asked for a brief
+/// of #6292" is the label the pane shows — so it is used as it stands. What you
+/// typed is quoted down to its first words, because "Asked: why does the DI
+/// container…" is what makes a day legible when you come back to it.
+fn step_for_send(shown: &str, by: Sender) -> String {
+    if by == Sender::Tide {
+        return shown.lines().next().unwrap_or(shown).trim().to_string();
+    }
+    let one = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+    match one.chars().count() > 60 {
+        true => format!("Asked: {}…", one.chars().take(60).collect::<String>().trim_end()),
+        false => format!("Asked: {one}"),
+    }
+}
+
+/// How a shell run reads in the workspace's step list, or `None` for the ones
+/// that aren't steps.
+///
+/// `run_command` is where TIDE's git work goes out, as the shell string it
+/// really runs, so this is the one place that sees a commit, a push and a
+/// checkout happen. It reads the command rather than being told, because the
+/// alternative is a `note_step` call beside every caller and one of them
+/// forgotten.
+///
+/// A fetch and a status are left out on purpose: a list of what you did is
+/// useless if everything is in it.
+fn command_step(cmd: &str, ok: bool) -> Option<String> {
+    let c = cmd.trim();
+    let quoted = |after: &str| {
+        let rest = c.split_once(after)?.1;
+        let msg = rest.split_once('"')?.0.trim();
+        (!msg.is_empty()).then(|| msg.chars().take(60).collect::<String>())
+    };
+    let what = match c.split_whitespace().next().unwrap_or("") {
+        // the zsh aliases the palette runs
+        "wip" => "WIP commit".to_string(),
+        "wipp" => "WIP commit, pushed".to_string(),
+        "next" => "Checked out and pulled next".to_string(),
+        _ if c.contains("git commit -m") => {
+            let pushed = c.contains("git push");
+            match (quoted("git commit -m \""), pushed) {
+                (Some(m), true) => format!("Committed \"{m}\", pushed"),
+                (Some(m), false) => format!("Committed \"{m}\""),
+                (None, true) => "Committed, pushed".to_string(),
+                (None, false) => "Committed".to_string(),
+            }
+        }
+        _ if c.starts_with("git push") => "Pushed the branch".to_string(),
+        _ if c.starts_with("git pull") => "Pulled".to_string(),
+        _ if c.contains("git merge ") => match c.split_once("git merge ") {
+            Some((_, rest)) => match rest.split_whitespace().find(|w| !w.starts_with('-')) {
+                Some(from) => format!("Merged {from} in"),
+                None => "Merged the base in".to_string(),
+            },
+            None => "Merged the base in".to_string(),
+        },
+        _ if c.starts_with("git checkout ") || c.starts_with("git switch ") => {
+            match c.split_whitespace().nth(2) {
+                Some(b) if !b.starts_with('-') => format!("Checked out {b}"),
+                _ => "Checked out a branch".to_string(),
+            }
+        }
+        _ if build::is_build_command(c) => "Built".to_string(),
+        _ => return None,
+    };
+    Some(match ok {
+        true => what,
+        false => format!("{what} (failed)"),
+    })
+}
+
 /// A pull request this branch didn't have a moment ago, or `None`. `had` and
 /// `now` are the numbers before and after a read of the branch's link.
 ///
@@ -9052,6 +9135,12 @@ struct Storm {
     tree_ctx_kind: CtxKind,
     tree_ctx_focus: FocusHandle,
     git_status: HashMap<PathBuf, GitState>,
+    /// What has been done in this workspace, oldest first. Read off disk when
+    /// the workspace opens and appended to as things happen, so the card can
+    /// draw it without touching the file on every frame.
+    steps: Vec<steps::Step>,
+    /// Whether the card shows the whole list rather than the last few.
+    steps_all: bool,
     // pull-request review
     pr_files: Vec<(PathBuf, GitState)>,
     /// Lines added and removed per changed file, for the counts on each row.
@@ -9838,6 +9927,9 @@ fn git_ignored_paths(root: &Path) -> HashSet<PathBuf> {
 
 impl Storm {
     fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
+        // before `root` is moved into the struct: the list is what was done here
+        // last time the folder was open, which is the half of it TIDE didn't see
+        let steps_at_open = steps::load(&root);
         // read once: a `#5619` in an answer is scanned per rendered row, and
         // that is no place for a `git remote` call
         let repo_web = github_base_url(&root);
@@ -9954,6 +10046,8 @@ impl Storm {
             tree_ctx_kind: CtxKind::Tree,
             tree_ctx_focus: cx.focus_handle(),
             git_status: HashMap::new(),
+            steps: steps_at_open,
+            steps_all: false,
             finder_open: false,
             finder_focus: cx.focus_handle(),
             finder_query: Field::default(),
@@ -11007,6 +11101,7 @@ impl Storm {
         self.agent_list.scroll_to_end();
         self.start_reviewer_poll(cx);
         let n = self.reviewers.len();
+        self.note_step(&format!("Sent {n} reviewers in"));
         self.show_flash(&format!("{n} reviewers reading the branch…"), cx);
         cx.notify();
         true
@@ -11200,6 +11295,7 @@ impl Storm {
     fn run_local_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let base = self.review_base();
         let root = self.root.clone();
+        self.note_step("Ran a CodeRabbit review");
         self.show_flash(&format!("CodeRabbit is reviewing against {base}…"), cx);
         self.focus_agent(window, cx);
         cx.spawn(async move |this, cx| {
@@ -12905,6 +13001,13 @@ impl Storm {
                         // a stopped run exits non-zero (SIGTERM), but that is
                         // the user's own doing, not a failure to report
                         this.run_failed = !success && !this.run_stopped;
+                        // and what the run was goes in the workspace's list of
+                        // what has been done, now that the outcome is known
+                        if !this.run_stopped {
+                            if let Some(what) = command_step(&this.run_cmd, success) {
+                                this.note_step(&what);
+                            }
+                        }
                         // after a merge/pull/rebase, auto-open the conflicts dialog
                         // if it left unresolved conflicts
                         let cl = this.run_cmd.to_lowercase();
@@ -15645,6 +15748,7 @@ impl Storm {
                 this.merge_confirm = None; // the dialog was holding the answer
                 match result {
                     Ok(out) if out.status.success() => {
+                        this.note_step(&format!("Merged PR #{number}"));
                         // everything on screen still says `open`: the topbar, the
                         // file list, and the header of the body you're reading
                         this.refresh_pr_link(cx);
@@ -15837,6 +15941,7 @@ impl Storm {
     /// pull request, and `send_agent_prompt_by` refuses to send while the
     /// reviewers are reading, so it has to go first.
     fn on_pr_opened(&mut self, number: u64, cx: &mut Context<Self>) {
+        self.note_step(&format!("Opened PR #{number}"));
         // `review_base` and not `pr_base`: the PR's own file list is still
         // loading at this point, and the link that just answered already knows
         // which branch it is against
@@ -29219,6 +29324,7 @@ impl Storm {
                 by == Sender::Tide,
                 job_open,
             );
+                self.note_step(&step_for_send(&shown, by));
                 // no mark of its own: a steered message joins the turn that is
                 // running, and what it costs is that turn's, counted against
                 // whatever sent it
@@ -29259,6 +29365,7 @@ impl Storm {
                 by == Sender::Tide,
                 job_open,
             );
+        self.note_step(&step_for_send(&shown, by));
         let sent = if self.agent_briefed {
             text
         } else {
@@ -32337,6 +32444,8 @@ impl Storm {
                 by == Sender::Tide,
                 job_open,
             );
+            // written down when it actually goes out, not when it was queued
+            self.note_step(&step_for_send(&shown, by));
             let sent = if self.agent_briefed {
                 text.clone()
             } else {
@@ -38678,6 +38787,17 @@ impl Storm {
             })
     }
 
+    /// Write down something that was done here, for the list on the card.
+    ///
+    /// The file is the record and `self.steps` is the copy the card draws, so
+    /// this re-reads rather than appending to both: two places that each decide
+    /// what counts as a duplicate is how they come to disagree. A step happens
+    /// a few times a minute at most and the file holds two hundred lines.
+    fn note_step(&mut self, what: &str) {
+        steps::note(&self.root, what);
+        self.steps = steps::load(&self.root);
+    }
+
     /// Empty-pane dashboard: a snapshot of the current work — branch, PR (with
     /// target + status, click to open), uncommitted count, and a refresh button.
     fn render_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -38924,6 +39044,75 @@ impl Storm {
                 }
             }
             card = card.child(r);
+        }
+
+        // what has been done here, oldest first. With several workspaces
+        // running at once this is the question on coming back to one, and the
+        // rest of the card answers a different one: what the branch looks like,
+        // not what you were in the middle of.
+        if !self.steps.is_empty() {
+            let (now, off) = (now_secs() as i64, tokens::local_offset());
+            let shown = steps::tail(&self.steps, match self.steps_all {
+                true => STEPS_EXPANDED,
+                false => STEPS_ON_CARD,
+            });
+            let earlier = self.steps.len() - shown.len();
+            let mut list = div().flex().flex_col().gap_1();
+            for (i, step) in shown.iter().enumerate() {
+                // the newest reads as the live one and the rest as history:
+                // "what did I last do here" is the question being answered
+                let last = i + 1 == shown.len();
+                list = list.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_baseline()
+                        .gap_2()
+                        .child(
+                            div()
+                                .w(px(58.))
+                                .flex_shrink_0()
+                                .text_size(px(11.))
+                                .text_color(rgb(LINE_NUMBER))
+                                .child(when_label(step.at, now, off)),
+                        )
+                        .child(
+                            div()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_size(px(12.))
+                                .text_color(rgb(if last { TEXT } else { MUTED }))
+                                .child(step.what.clone()),
+                        ),
+                );
+            }
+            card = card
+                .child(div().h(px(1.)).bg(rgb(SEPARATOR)))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .id("status-steps")
+                                .text_size(px(11.))
+                                .text_color(rgb(MUTED))
+                                .when(earlier > 0 || self.steps_all, |d| {
+                                    d.cursor_pointer().hover(|st| st.text_color(rgb(TEXT)))
+                                })
+                                .child(match (earlier, self.steps_all) {
+                                    (0, false) => "Here so far".to_string(),
+                                    (0, true) => "Here so far  ·  all of it".to_string(),
+                                    (n, _) => format!("Here so far  ·  {n} earlier"),
+                                })
+                                .on_click(cx.listener(|this, _e: &gpui::ClickEvent, _w, cx| {
+                                    this.steps_all = !this.steps_all;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(list),
+                );
         }
 
         div()
@@ -44469,6 +44658,59 @@ mod review_persist_tests {
 
 
 
+
+#[cfg(test)]
+mod step_tests {
+    use super::*;
+
+    /// The list is a reader's record of what was done, so a commit reads as its
+    /// message and a push as a push. A command that isn't a step stays out.
+    #[test]
+    fn a_run_reads_as_what_it_did() {
+        let step = |c: &str| command_step(c, true);
+        assert_eq!(step("wip").as_deref(), Some("WIP commit"));
+        assert_eq!(step("wipp").as_deref(), Some("WIP commit, pushed"));
+        assert_eq!(step("next").as_deref(), Some("Checked out and pulled next"));
+        assert_eq!(
+            step("git add -A && git commit -m \"fix: the lease clock\"").as_deref(),
+            Some("Committed \"fix: the lease clock\""),
+        );
+        assert_eq!(
+            step("git add -A && git commit -m \"wip: a1b2\" && git push -u origin HEAD").as_deref(),
+            Some("Committed \"wip: a1b2\", pushed"),
+        );
+        assert_eq!(step("git push -u origin HEAD").as_deref(), Some("Pushed the branch"));
+        assert_eq!(step("git merge origin/next").as_deref(), Some("Merged origin/next in"));
+        assert_eq!(step("git merge --no-ff origin/next").as_deref(), Some("Merged origin/next in"));
+        // the ones that would fill the list with nothing
+        assert!(step("git fetch origin --quiet").is_none());
+        assert!(step("git status").is_none());
+        assert!(step("").is_none());
+        // and an outcome the list shouldn't lie about
+        assert_eq!(
+            command_step("git push -u origin HEAD", false).as_deref(),
+            Some("Pushed the branch (failed)"),
+        );
+    }
+
+    /// TIDE's own sends arrive with the line the pane shows; what you typed is
+    /// quoted down to its first words, on one line.
+    #[test]
+    fn a_message_reads_as_its_first_words() {
+        assert_eq!(
+            step_for_send("Asked for a brief of #6292", Sender::Tide),
+            "Asked for a brief of #6292",
+        );
+        // a job label is one line of the pane's, whatever follows it
+        assert_eq!(step_for_send("Sent 3 comments\n\n• src/lib.rs:12", Sender::Tide), "Sent 3 comments");
+        assert_eq!(step_for_send("why is the DI container empty", Sender::You), "Asked: why is the DI container empty");
+        // a long one is cut, and a wrapped one reads as a single line
+        let long = step_for_send("why does the lease expire before the worker has finished writing the file", Sender::You);
+        assert!(long.starts_with("Asked: why does the lease expire"), "{long}");
+        assert!(long.ends_with('…'), "{long}");
+        assert_eq!(step_for_send("one\n  two", Sender::You), "Asked: one two");
+    }
+}
 
 #[cfg(test)]
 mod diff_guard_tests {
