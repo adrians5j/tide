@@ -5487,6 +5487,11 @@ fn tour_request(about: Option<&str>, answer: Option<&str>) -> String {
          \"title\":\"trigger() saves the task\",\"text\":\"The upload handler \
          calls this. It writes the task as pending and hands it to the \
          transport; nothing has run yet at this point.\"}}]}}'\n\n\
+         A tour of any length is awkward on one command line: write the payload \
+         to `$TIDE_TMP/tour.json` and post it with `-d @\"$TIDE_TMP/tour.json\"`. \
+         `$TIDE_TMP` is this workspace's own scratch directory, and a scratch \
+         file written anywhere else is one the next workspace's agent \
+         overwrites.\n\n\
          In the order the code runs, start to finish: the first stop is where \
          it begins, the last is where it ends or where the thing I asked about \
          goes wrong. `line` and `end` are the lines that matter, not the whole \
@@ -5601,6 +5606,13 @@ fn brief_spec(pr: Option<u64>) -> String {
          {{\"label\":\"Recover\",\"note\":\"every 60s\",\"mark\":\"new\",\
 \"file\":\"packages/api-tasks/src/recover.ts:17\"}}],\
          \"edges\":[\"writes pending\",\"on a stale lease\"]}}}}]}}'\n\n\
+         If that payload is long enough to be awkward on one command line, \
+         write it to `$TIDE_TMP/brief.json` and post the file: \
+         `-d @\"$TIDE_TMP/brief.json\"`. `$TIDE_TMP` is this workspace's own \
+         scratch directory and it is where a file like that goes. Several \
+         workspaces are open at once, and `/tmp/brief.json` is the name every \
+         one of them picks: the second agent to write it posts the first one's \
+         brief.\n\n\
          `tldr` is the whole deck in three or four lines, read before any of it: \
          what changed, what it replaces, and the one thing worth knowing before \
          the detail. Full sentences, no fragments, no backticks, no paths. It is \
@@ -5694,6 +5706,13 @@ fn brief_spec(pr: Option<u64>) -> String {
          {\"label\":\"Recover\",\"note\":\"every 60s\",\"mark\":\"new\",\
 \"file\":\"packages/api-tasks/src/recover.ts:17\"}],\
          \"edges\":[\"writes pending\",\"on a stale lease\"]}}]}'\n\n\
+         If that payload is long enough to be awkward on one command line, \
+         write it to `$TIDE_TMP/brief.json` and post the file: \
+         `-d @\"$TIDE_TMP/brief.json\"`. `$TIDE_TMP` is this workspace's own \
+         scratch directory and it is where a file like that goes. Several \
+         workspaces are open at once, and `/tmp/brief.json` is the name every \
+         one of them picks: the second agent to write it posts the first one's \
+         brief.\n\n\
          `tldr` is the whole deck in three or four lines, read before any of it: \
          what changed, what it replaces, and the one thing worth knowing before \
          the detail. Full sentences, no fragments, no backticks, no paths. It is \
@@ -29059,6 +29078,12 @@ impl Storm {
         "You are running inside TIDE, an editor that watches this repo.\n\
          Its control channel is $TIDE_RPC, authenticated with the header \
          `X-Tide-Token: $TIDE_TOKEN` (both are already in your environment).\n\n\
+         Any file you write that isn't part of the repo goes in $TIDE_TMP, this \
+         workspace's own scratch directory, also already in your environment. \
+         Several workspaces are open at once with an agent in each, so a \
+         payload at `/tmp/brief.json` or a screenshot at `/tmp/shot.png` is a \
+         file the next one overwrites, and that has already happened: two \
+         sessions wrote the same brief file and one posted the other's.\n\n\
          If this repo has a `.codegraph` directory, every question about what \
          the code does or where something lives goes to CodeGraph first, \
          before grep, before find, before opening a file to look around. Not \
@@ -29304,9 +29329,9 @@ impl Storm {
          You can drive a real browser and show me what you saw. `agent-browser` \
          is installed (`agent-browser skills get core` for its own guide): open \
          a page, click through it, then\n\
-         \x20 agent-browser screenshot /tmp/shot.png\n\
+         \x20 agent-browser screenshot \"$TIDE_TMP/shot.png\"\n\
          \x20 curl -s -X POST \"$TIDE_RPC/shot\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n\
-         \x20   -d '{\"path\":\"/tmp/shot.png\",\"note\":\"admin after saving the flag\"}'\n\
+         \x20   -d \"{\\\"path\\\":\\\"$TIDE_TMP/shot.png\\\",\\\"note\\\":\\\"admin after saving the flag\\\"}\"\n\
          and the picture lands in this transcript next to what you're saying \
          about it. Use it when you checked something in a browser and I'd \
          otherwise have to take your word for it: a page you fixed, a state you \
@@ -46155,6 +46180,44 @@ mod code_tour_tests {
         assert_eq!(tour_read_note(&stops, &HashSet::from([0, 1])), "");
         // an index left over from a shorter tour is not a stop
         assert_eq!(tour_read_note(&stops, &HashSet::from([9])), "");
+    }
+
+    /// A payload too long to quote gets written to a file, and left to itself
+    /// an agent picks `/tmp/brief.json`. Two sessions did, the second
+    /// overwrote the first, and the brief that reached TIDE was for the wrong
+    /// pull request. Every prompt that asks for one of those payloads has to
+    /// name the directory that can't collide.
+    #[test]
+    fn a_payload_written_to_a_file_goes_somewhere_of_its_own() {
+        let brief = brief_request(6110, "origin/next", "");
+        assert!(brief.contains("$TIDE_TMP/brief.json"), "{brief}");
+        assert!(brief.contains("-d @"), "{brief}");
+        let tour = pr_tour_request(6110, "next", "");
+        assert!(tour.contains("$TIDE_TMP/tour.json"), "{tour}");
+        // a brief of the conversation posts the same payload the same way
+        assert!(talk_brief_request().contains("$TIDE_TMP/brief.json"));
+
+        // and the briefing says it once, for every other file an agent writes
+        let general = Storm::tide_briefing_body();
+        assert!(general.contains("$TIDE_TMP"), "{general}");
+        assert!(general.contains("$TIDE_TMP/shot.png"), "{general}");
+        // the names that collided are gone from it
+        assert!(!general.contains("agent-browser screenshot /tmp/"), "{general}");
+    }
+
+    /// A scratch directory per workspace: the folder's name to recognise it by,
+    /// and a hash because two checkouts of one repo have the same leaf name.
+    #[test]
+    fn a_workspaces_scratch_is_its_own() {
+        let a = usage::scratch(Path::new("/Users/adrian/dev/wby-next14"));
+        let b = usage::scratch(Path::new("/Users/adrian/work/wby-next14"));
+        assert_ne!(a, b, "two checkouts of the same name share a directory");
+        assert!(a.starts_with("/tmp/tide"), "{}", a.display());
+        let name = a.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.starts_with("wby-next14-"), "{name}");
+        assert_eq!(a, usage::scratch(Path::new("/Users/adrian/dev/wby-next14")), "same root, same dir");
+        // a root with nothing usable in its name still gets a directory
+        assert!(usage::scratch(Path::new("/")).starts_with("/tmp/tide"));
     }
 
     /// A brief is read by somebody who has not read the code, so both halves

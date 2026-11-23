@@ -240,6 +240,12 @@ impl Acp {
             cmd.env("TIDE_TOKEN", token);
             cmd.env("TIDE_ROOT", root.to_string_lossy().to_string());
         }
+        // somewhere of this workspace's own to put a file. Without it an agent
+        // writing a payload too long to quote picks `/tmp/brief.json`, and so
+        // does the agent in the next workspace.
+        let tmp = crate::usage::scratch(root);
+        let _ = std::fs::create_dir_all(&tmp);
+        cmd.env("TIDE_TMP", tmp);
 
         let mut child = cmd.spawn().map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => "node isn't on PATH (Node 22+)".to_string(),

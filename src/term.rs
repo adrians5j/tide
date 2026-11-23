@@ -177,6 +177,11 @@ impl Terminal {
             cmd.env("TIDE_TOKEN", token);
             cmd.env("TIDE_PANE", cx.entity_id().as_u64().to_string());
             cmd.env("TIDE_ROOT", working_dir.to_string_lossy().to_string());
+            // scratch space of this workspace's own, so two panes writing the
+            // obvious filename don't write the same file
+            let tmp = crate::usage::scratch(&working_dir);
+            let _ = std::fs::create_dir_all(&tmp);
+            cmd.env("TIDE_TMP", tmp.to_string_lossy().to_string());
         }
         let child = pair.slave.spawn_command(cmd).expect("spawn shell");
         drop(pair.slave);

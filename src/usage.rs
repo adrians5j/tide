@@ -10,6 +10,29 @@ pub fn project_slug(root: &Path) -> String {
     root.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
 }
 
+/// A scratch directory of this workspace's own, handed to agents as
+/// `$TIDE_TMP`.
+///
+/// Agents write files. A brief or a code tour is a JSON payload too long to
+/// quote comfortably on a command line, so one writes it out and posts it with
+/// `-d @file` instead — and left to itself it picks the obvious name. Two
+/// sessions both chose `/tmp/brief.json`, the second overwrote the first, and
+/// the brief that reached TIDE was for the wrong pull request.
+///
+/// The folder name is in the path to be recognised in a log; the hash is there
+/// because two checkouts of the same repository have the same leaf name.
+pub fn scratch(root: &Path) -> std::path::PathBuf {
+    let leaf = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let safe: String =
+        leaf.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
+    let name = match safe.is_empty() {
+        true => "workspace".to_string(),
+        false => safe,
+    };
+    let tag: String = crate::jobs::fingerprint(&root.to_string_lossy()).chars().take(6).collect();
+    std::path::PathBuf::from("/tmp/tide").join(format!("{name}-{tag}"))
+}
+
 /// `1.2M` / `847.3k` / `912` — compact enough for a topbar chip.
 pub fn short(n: u64) -> String {
     match n {
