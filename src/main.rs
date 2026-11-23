@@ -1624,6 +1624,20 @@ struct DiffBlocked {
     changed: bool,
 }
 
+/// `194038` written `194,038`. A character count is read against your sense of
+/// how big a file is, and six unbroken digits don't read as a size at all.
+fn commas(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// The most characters of one line the diff draws. A pane sizes itself to its
 /// longest line and shapes that line as a single text run, so one long enough
 /// means a div wider than any screen and a run that takes seconds to lay out:
@@ -1638,7 +1652,7 @@ fn diff_blocked(old: &str, new: &str) -> Option<DiffBlocked> {
     let widest = |s: &str| s.split('\n').map(|l| l.chars().count()).max().unwrap_or(0);
     let cols = widest(old).max(widest(new));
     (cols > DIFF_MAX_COLS).then(|| DiffBlocked {
-        why: format!("one line of {cols} characters"),
+        why: format!("one line of {} characters", commas(cols)),
         changed: old != new,
     })
 }
@@ -41648,6 +41662,35 @@ impl DiffWindow {
         (line, col + 1)
     }
 
+    /// Close the diff and open the real file in the main window, at the line and
+    /// column the caret was on here.
+    ///
+    /// F4 does this, and so does the card drawn in place of a file too wide to
+    /// diff: that card has nothing else to offer, so the sentence naming the key
+    /// is also the button.
+    fn open_in_editor(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let path = self.files[self.idx].clone();
+        let (line, col) = self.cursor_file_pos();
+        window.remove_window();
+        if !path.is_file() {
+            return;
+        }
+        let Some(handle) = self.main_window else { return };
+        let storm = self.storm.clone();
+        cx.update_window(handle, move |_, window, cx| {
+            window.activate_window();
+            storm
+                .update(cx, |s, cx| {
+                    s.open_file(path, window, cx);
+                    if let Some(tab) = s.tabs.get(s.active) {
+                        tab.editor.update(cx, |e, cx| e.goto(line, col, cx));
+                    }
+                })
+                .ok();
+        })
+        .ok();
+    }
+
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         // alt+c comments on the caret's line — checked before the input-focus
@@ -41706,26 +41749,7 @@ impl DiffWindow {
         // F4: close the diff and open the real file in the main app window, at
         // the same line/column the caret was on here (centered in view)
         if ks.key == "f4" {
-            let path = self.files[self.idx].clone();
-            let (line, col) = self.cursor_file_pos();
-            window.remove_window();
-            if path.is_file() {
-                if let Some(handle) = self.main_window {
-                    let storm = self.storm.clone();
-                    cx.update_window(handle, move |_, window, cx| {
-                        window.activate_window();
-                        storm
-                            .update(cx, |s, cx| {
-                                s.open_file(path, window, cx);
-                                if let Some(tab) = s.tabs.get(s.active) {
-                                    tab.editor.update(cx, |e, cx| e.goto(line, col, cx));
-                                }
-                            })
-                            .ok();
-                    })
-                    .ok();
-                }
-            }
+            self.open_in_editor(window, cx);
             return;
         }
         match ks.key.as_str() {
@@ -42044,46 +42068,148 @@ impl Render for DiffWindow {
         let body = match &self.blocked {
             // a card in place of the panes: the file is still walked past with
             // the arrows and still ticked off as viewed, it just isn't drawn
-            Some(b) => div()
-                .flex()
-                .flex_grow(1.0)
-                .min_h(px(0.))
-                .items_center()
-                .justify_center()
-                .bg(rgb(BG))
-                .child(
-                    div()
-                        .max_w(px(520.))
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .px_4()
-                        .py_3()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(rgb(BORDER))
-                        .bg(rgb(PANEL_BG))
-                        .child(div().text_size(px(13.)).text_color(rgb(TEXT)).child(rel))
-                        .child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(rgb(MUTED))
-                                .child(format!("Not drawn: {}.", b.why)),
-                        )
-                        .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(
-                            "Generated, minified or a lock file. A diff pane is as wide as its \
-                             longest line, so drawing this one takes the window with it.",
-                        ))
-                        .child(div().text_size(px(12.)).text_color(rgb(TEXT)).child(
-                            if b.changed { "It changed in this diff." } else { "Both sides are identical." },
-                        ))
-                        .child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(rgb(LINE_NUMBER))
-                                .child("F4 opens it in the editor, which wraps the line and draws only what fits."),
-                        ),
-                ),
+            Some(b) => {
+                // the folder is what gets long, so it is the half that truncates;
+                // the name is the part you are identifying the file by
+                let (dir, name) = match rel.rsplit_once('/') {
+                    Some((d, n)) => (format!("{d}/"), n.to_string()),
+                    None => (String::new(), rel.clone()),
+                };
+                // the one fact a reviewer wants from a file nobody reads line by
+                // line, so it leads instead of sitting fourth in a paragraph
+                let (dot, said) = match b.changed {
+                    true => (GIT_MODIFIED, "Changed in this diff"),
+                    false => (MUTED, "Both sides are identical"),
+                };
+                let rule = || div().h(px(1.)).flex_shrink_0().bg(rgb(BORDER));
+                div()
+                    .flex()
+                    .flex_grow(1.0)
+                    .min_h(px(0.))
+                    .items_center()
+                    .justify_center()
+                    .bg(rgb(BG))
+                    .child(
+                        div()
+                            // fixed rather than max: a card that resizes with the
+                            // length of a path is a card that moves when you walk
+                            // the file list
+                            .w(px(460.))
+                            .flex_shrink_0()
+                            .flex()
+                            .flex_col()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .bg(rgb(PANEL_BG))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .px_4()
+                                    .py_3()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .size(px(7.))
+                                                    .flex_shrink_0()
+                                                    .rounded_full()
+                                                    .bg(rgb(dot)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(12.))
+                                                    .text_color(rgb(if b.changed { TEXT } else { MUTED }))
+                                                    .child(said),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_baseline()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .flex_shrink(1.0)
+                                                    .min_w(px(0.))
+                                                    .truncate()
+                                                    .text_size(px(13.))
+                                                    .text_color(rgb(MUTED))
+                                                    .child(dir),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .text_size(px(13.))
+                                                    .text_color(rgb(TEXT))
+                                                    .child(name),
+                                            ),
+                                    ),
+                            )
+                            .child(rule())
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .px_4()
+                                    .py_3()
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .text_color(rgb(TEXT))
+                                            .child(format!("Not drawn: {}.", b.why)),
+                                    )
+                                    .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(
+                                        "Generated, minified or a lock file. A diff pane is as wide \
+                                         as its longest line, so drawing this one takes the window \
+                                         with it.",
+                                    )),
+                            )
+                            .child(rule())
+                            .child(
+                                div()
+                                    .id("blocked-open")
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .px_4()
+                                    .py_2()
+                                    .rounded_b_lg()
+                                    .cursor_pointer()
+                                    .hover(|st| st.bg(rgb(HOVER)))
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .px(px(5.))
+                                            .rounded_sm()
+                                            .border_1()
+                                            .border_color(rgb(SEPARATOR))
+                                            .bg(rgb(BG))
+                                            .text_size(px(10.))
+                                            .text_color(rgb(MUTED))
+                                            .child("F4"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .text_color(rgb(MUTED))
+                                            .child("Open it in the editor, which wraps the line"),
+                                    )
+                                    .on_click(cx.listener(|this, _e: &gpui::ClickEvent, window, cx| {
+                                        this.open_in_editor(window, cx)
+                                    })),
+                            ),
+                    )
+            }
             None => div()
                 .flex()
                 .flex_row()
@@ -44345,6 +44471,19 @@ mod diff_guard_tests {
         assert!(!same.changed, "the same text on both sides has not changed");
         // the one thing still worth knowing about a file nobody will read
         assert!(diff_blocked(&minified, "{}").expect("not drawn").changed);
+        // and the count reads as a size: the card says 194,038, not 194038
+        assert!(same.why.contains(','), "{}", same.why);
+    }
+
+    /// The digits are grouped from the right, so a number that doesn't divide
+    /// into threes doesn't open with a comma.
+    #[test]
+    fn a_character_count_is_grouped_in_threes() {
+        assert_eq!(commas(0), "0");
+        assert_eq!(commas(999), "999");
+        assert_eq!(commas(1_000), "1,000");
+        assert_eq!(commas(194_038), "194,038");
+        assert_eq!(commas(1_234_567), "1,234,567");
     }
 
     /// Ordinary source is drawn, however many lines of it there are: the cap is
