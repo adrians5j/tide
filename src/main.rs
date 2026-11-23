@@ -5037,10 +5037,6 @@ fn pr_body_from(v: &serde_json::Value) -> Option<(String, String, PrDoc)> {
 /// card growing past the pane it sits in.
 const STEPS_ON_CARD: usize = 6;
 
-/// How many the header opens up to. Past this the card is taller than the pane
-/// it is centred in, and a list that runs off the bottom is worse than a short
-/// one that says how much it is hiding.
-const STEPS_EXPANDED: usize = 20;
 
 /// How a message to the agent reads in the step list.
 ///
@@ -6124,16 +6120,49 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// Day 0 of unix time was a Thursday, so a day number mod 7 indexes from there.
+const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// The clock alone, in local time: `14:32`. For a list that says which day it
+/// is somewhere else, like the heading over a run of steps.
+fn clock_label(at: i64, off: i64) -> String {
+    if at <= 0 {
+        return String::new();
+    }
+    let local = at + off;
+    format!("{:02}:{:02}", local.rem_euclid(86_400) / 3600, local.rem_euclid(3600) / 60)
+}
+
+/// Which day something happened on, as a heading: `Today`, `Yesterday`,
+/// `Thu 20 Nov` further back.
+fn when_day(at: i64, now: i64, off: i64) -> String {
+    if at <= 0 {
+        return String::new();
+    }
+    let day = (at + off).div_euclid(86_400);
+    match (now + off).div_euclid(86_400) - day {
+        0 => "Today".to_string(),
+        1 => "Yesterday".to_string(),
+        _ => {
+            let (_, m, d) = civil_from_days(day);
+            format!(
+                "{} {d} {}",
+                DAYS[day.rem_euclid(7) as usize],
+                MONTHS[(m - 1).clamp(0, 11) as usize],
+            )
+        }
+    }
+}
+
 /// When something happened, at the detail the distance deserves: `14:32`
 /// today, `Thu 14:32` within the week, `6 Nov 14:32` further back. Local time.
 fn when_label(at: i64, now: i64, off: i64) -> String {
     if at <= 0 {
         return String::new();
     }
-    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
     let local = at + off;
     let hm = format!(
         "{:02}:{:02}",
@@ -6739,6 +6768,7 @@ enum Cmd {
     LocalReview,
     Reviewers,
     Todo,
+    Steps,
     OpenRepository,
     OpenPrNumber,
     SendOnPaste,
@@ -6791,6 +6821,7 @@ const PALETTE: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::CloseWorkspace, "Close Workspace  (leaves the checkout as it is)", IC_HOME, ""),
     (Cmd::ResetWorkspaceClose, "Reset Workspace & Close", IC_HOME, ""),
     (Cmd::ResetWorkspacePause, "Reset Workspace & Pause", IC_HOME, ""),
+    (Cmd::Steps, "Here So Far…  (every step taken in this workspace)", IC_HISTORY, ""),
     (Cmd::WorkspaceHistory, "Workspace History…  (every folder, and what it was for)", IC_HISTORY, "⌘⇧E"),
     (Cmd::TogglePause, "Pause / Resume Workspace  (⌥Tab skips paused)", IC_HOME, ""),
     (Cmd::SendOnPaste, "Send Dictation on Paste (no ↩)", IC_HOME, ""),
@@ -9139,8 +9170,6 @@ struct Storm {
     /// the workspace opens and appended to as things happen, so the card can
     /// draw it without touching the file on every frame.
     steps: Vec<steps::Step>,
-    /// Whether the card shows the whole list rather than the last few.
-    steps_all: bool,
     // pull-request review
     pr_files: Vec<(PathBuf, GitState)>,
     /// Lines added and removed per changed file, for the counts on each row.
@@ -9292,6 +9321,12 @@ struct Storm {
     /// free is the question being asked.
     newproj_idle: HashSet<String>,
     newproj_sel: usize,            // highlighted row in the filtered recents list
+    // ── the step list: everything done in this workspace, as its own dialog ──
+    /// Open, and read off disk when it opens: the card shows the end of the
+    /// list, this shows the whole of it.
+    stepd_open: bool,
+    stepd_focus: FocusHandle,
+    stepd_rows: Vec<steps::Step>,
     // ── workspace history (⌘⇧E): every folder and what it has been used for ──
     hist_open: bool,
     hist_focus: FocusHandle,
@@ -10047,7 +10082,6 @@ impl Storm {
             tree_ctx_focus: cx.focus_handle(),
             git_status: HashMap::new(),
             steps: steps_at_open,
-            steps_all: false,
             finder_open: false,
             finder_focus: cx.focus_handle(),
             finder_query: Field::default(),
@@ -10118,6 +10152,9 @@ impl Storm {
             newproj_last_titles: HashMap::new(),
             newproj_idle: HashSet::new(),
             newproj_sel: 0,
+            stepd_open: false,
+            stepd_focus: cx.focus_handle(),
+            stepd_rows: Vec::new(),
             hist_open: false,
             hist_focus: cx.focus_handle(),
             hist_query: Field::default(),
@@ -10461,6 +10498,7 @@ impl Storm {
             || self.runc_open
             || self.newproj_open
             || self.hist_open
+            || self.stepd_open
             || self.find_open
             || self.gitp_open
             || self.palette_open
@@ -12466,6 +12504,7 @@ impl Storm {
             || self.runc_open
             || self.newproj_open
             || self.hist_open
+            || self.stepd_open
             || self.find_open
             || self.gitp_open
             || self.mc_open
@@ -12485,6 +12524,7 @@ impl Storm {
             self.runc_open = false;
             self.newproj_open = false;
             self.hist_open = false;
+            self.stepd_open = false;
             self.find_open = false;
             self.gitp_open = false;
             self.ws_open = false;
@@ -14741,6 +14781,44 @@ impl Storm {
         self.open_ws_history(window, cx);
     }
 
+    /// The whole step list, as its own dialog. The card shows the last six,
+    /// which answers "what was I doing"; this answers "what happened today",
+    /// which is the one you want in front of you when writing it up.
+    fn open_steps(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // off disk on open: another workspace on the same folder may have
+        // written to it since this one loaded, and nothing here changes while
+        // you read it
+        self.stepd_rows = steps::load(&self.root);
+        self.stepd_open = true;
+        window.focus(&self.stepd_focus, cx);
+        cx.notify();
+    }
+
+    fn steps_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        match ks.key.as_str() {
+            "escape" => {
+                self.stepd_open = false;
+                self.focus_active(window, cx);
+                cx.notify();
+            }
+            // the list as text, which is what a stand-up note is made of
+            "c" if ks.modifiers.platform => {
+                let off = tokens::local_offset();
+                let now = now_secs() as i64;
+                let text: String = self
+                    .stepd_rows
+                    .iter()
+                    .map(|s| format!("{}  {}\n", when_label(s.at, now, off), s.what))
+                    .collect();
+                let n = self.stepd_rows.len();
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.show_flash(&format!("Copied {n} step{}", if n == 1 { "" } else { "s" }), cx);
+            }
+            _ => {}
+        }
+    }
+
     fn open_ws_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.hist_open = true;
         self.hist_query.clear();
@@ -16909,6 +16987,7 @@ impl Storm {
             // has been committed since this window started and what is still
             // mid-turn, and that is worth reading before taking the app down
             Cmd::RestartApp => cx.emit(ProjectNav::Restart),
+            Cmd::Steps => self.open_steps(window, cx),
             Cmd::WorkspaceHistory => self.open_ws_history(window, cx),
             Cmd::OpenPrNumber => self.open_prnum_prompt(window, cx),
             Cmd::TogglePause => self.toggle_pause(cx),
@@ -18836,6 +18915,9 @@ impl Render for Storm {
         }
         if self.hist_open {
             root = root.child(self.render_ws_history(cx));
+        }
+        if self.stepd_open {
+            root = root.child(self.render_steps(cx));
         }
         if self.find_open {
             root = root.child(self.render_find(cx));
@@ -25292,6 +25374,119 @@ impl Storm {
     /// has to answer is "which folder was that in, and is it still there" —
     /// so every row carries the folder and the branch, not only the name of the
     /// work.
+    /// Every step, oldest first, in a scrolling list. No filter and no
+    /// selection: there is nothing here to act on, only to read, and the newest
+    /// is the one you came for so the list opens at the bottom.
+    fn render_steps(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let w = 620.0_f32;
+        let left = ((self.win_width - w) / 2.0).max(0.);
+        let (now, off) = (now_secs() as i64, tokens::local_offset());
+        let total = self.stepd_rows.len();
+
+        let mut rows = div()
+            .id("steps-rows")
+            .flex()
+            .flex_col()
+            .max_h(px(460.))
+            .overflow_y_scroll()
+            .py_1();
+        let mut day = String::new();
+        for (i, step) in self.stepd_rows.iter().enumerate() {
+            // a heading when the date changes, so a list spanning three days
+            // doesn't read as one long afternoon
+            let its_day = when_day(step.at, now, off);
+            if its_day != day {
+                day = its_day.clone();
+                rows = rows.child(
+                    div()
+                        .px_3()
+                        .pt_2()
+                        .pb_1()
+                        .text_size(px(10.))
+                        .text_color(rgb(LINE_NUMBER))
+                        .child(its_day),
+                );
+            }
+            let last = i + 1 == total;
+            rows = rows.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_baseline()
+                    .gap_2()
+                    .px_3()
+                    .py(px(2.))
+                    .hover(|st| st.bg(rgb(HOVER)))
+                    .child(
+                        div()
+                            .w(px(44.))
+                            .flex_shrink_0()
+                            .text_size(px(10.))
+                            .text_color(rgb(LINE_NUMBER))
+                            .child(clock_label(step.at, off)),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .text_size(px(12.))
+                            .text_color(rgb(if last { TEXT } else { MUTED }))
+                            .child(step.what.clone()),
+                    ),
+            );
+        }
+        if total == 0 {
+            rows = rows.child(
+                div()
+                    .px_3()
+                    .py_3()
+                    .text_size(px(12.))
+                    .text_color(rgb(MUTED))
+                    .child(
+                        "Nothing yet. A commit, a push, a merge, a message to the agent and a \
+                         review all write a line here as they happen.",
+                    ),
+            );
+        }
+
+        div()
+            .absolute()
+            .top(px(100.))
+            .left(px(left))
+            .w(px(w))
+            .bg(rgb(PANEL_BG))
+            .border_1()
+            .border_color(rgb(ACCENT))
+            .rounded_md()
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .track_focus(&self.stepd_focus)
+            .on_key_down(cx.listener(Self::steps_key))
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .child(match total {
+                        1 => "Here so far — 1 step".to_string(),
+                        n => format!("Here so far — {n} steps"),
+                    }),
+            )
+            .child(div().h(px(1.)).bg(rgb(BORDER)))
+            .child(rows)
+            .child(
+                div()
+                    .px_3()
+                    .py_1p5()
+                    .border_t_1()
+                    .border_color(rgb(BORDER))
+                    .text_size(px(10.))
+                    .text_color(rgb(MUTED))
+                    .child("⌘C copies the list · Esc closes"),
+            )
+    }
+
     fn render_ws_history(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let w = 760.0_f32;
         let left = ((self.win_width - w) / 2.0).max(0.);
@@ -39052,10 +39247,7 @@ impl Storm {
         // not what you were in the middle of.
         if !self.steps.is_empty() {
             let (now, off) = (now_secs() as i64, tokens::local_offset());
-            let shown = steps::tail(&self.steps, match self.steps_all {
-                true => STEPS_EXPANDED,
-                false => STEPS_ON_CARD,
-            });
+            let shown = steps::tail(&self.steps, STEPS_ON_CARD);
             let earlier = self.steps.len() - shown.len();
             let mut list = div().flex().flex_col().gap_1();
             for (i, step) in shown.iter().enumerate() {
@@ -39098,17 +39290,15 @@ impl Storm {
                                 .id("status-steps")
                                 .text_size(px(11.))
                                 .text_color(rgb(MUTED))
-                                .when(earlier > 0 || self.steps_all, |d| {
-                                    d.cursor_pointer().hover(|st| st.text_color(rgb(TEXT)))
+                                .cursor_pointer()
+                                .hover(|st| st.text_color(rgb(TEXT)))
+                                .child(match earlier {
+                                    0 => "Here so far".to_string(),
+                                    n => format!("Here so far  ·  {n} earlier"),
                                 })
-                                .child(match (earlier, self.steps_all) {
-                                    (0, false) => "Here so far".to_string(),
-                                    (0, true) => "Here so far  ·  all of it".to_string(),
-                                    (n, _) => format!("Here so far  ·  {n} earlier"),
-                                })
-                                .on_click(cx.listener(|this, _e: &gpui::ClickEvent, _w, cx| {
-                                    this.steps_all = !this.steps_all;
-                                    cx.notify();
+                                .tooltip(tip("Open the whole list"))
+                                .on_click(cx.listener(|this, _e: &gpui::ClickEvent, window, cx| {
+                                    this.open_steps(window, cx)
                                 })),
                         )
                         .child(list),
@@ -46872,6 +47062,14 @@ mod handoff_tests {
         assert_eq!(when_label(at, at + 2 * 86_400, 0), "Thu 10:05", "this week, the day");
         assert_eq!(when_label(at, at + 30 * 86_400, 0), "12 Nov 10:05", "older, the date");
         assert!(when_label(0, at, 0).is_empty(), "no reading, no label");
+        // the step dialog splits the two: a heading per day, a clock per row
+        assert_eq!(clock_label(at, 0), "10:05");
+        assert_eq!(clock_label(at, 3600), "11:05", "the offset is local time");
+        assert!(clock_label(0, 0).is_empty());
+        assert_eq!(when_day(at, at, 0), "Today");
+        assert_eq!(when_day(at, at + 86_400, 0), "Yesterday");
+        assert_eq!(when_day(at, at + 2 * 86_400, 0), "Thu 12 Nov");
+        assert!(when_day(0, at, 0).is_empty());
     }
 
     #[test]
