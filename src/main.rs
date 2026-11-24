@@ -147,59 +147,23 @@ enum AgentMsg {
 }
 
 /// A turn TIDE started as a named job: Explain PR, a brief, a tour, a question
-/// asked under a slide. The whole turn draws as one line that says how the job
-/// is going, because what it has to say is going somewhere else — onto the
-/// slide, into the deck — and the prompt behind it is a page of instructions
-/// written for the agent. `at` is the user message that started it, `end` the
-/// user message that ended it (`None` while it is still the last turn), and
-/// `job` the name on the line. `began` is unix seconds at the prompt and
-/// `took` the seconds the turn ran, filled in when the agent stops; until then
-/// the line counts up from `began`.
+/// asked under a slide. It draws a line above the turn saying what the job is
+/// and how it is going, and the turn itself reads like any other: the prompt
+/// behind it is a page of instructions written for the agent, so that line
+/// stands in for it and everything the agent did is on screen.
+///
+/// `at` is the user message that started it, `end` the user message that ended
+/// it (`None` while it is still the last turn), and `job` the name on the
+/// line. `began` is unix seconds at the prompt and `took` the seconds the turn
+/// ran, filled in when the agent stops; until then the line counts up from
+/// `began`.
 #[derive(Clone)]
 struct JobTurn {
     at: usize,
     end: Option<usize>,
-    /// How the turn sits right now. A job that is running is open: the fold is
-    /// a summary of work that is over, and while the work is happening the
-    /// thing you want is the work. Clicking the line still folds it by hand.
-    open: bool,
-    /// How it sits once the agent stops, which is where `open` goes back to.
-    /// False for every job but the merge note.
-    keep: bool,
     job: String,
     began: u64,
     took: Option<u64>,
-}
-
-/// Which folded turn a transcript row belongs to. A turn runs from the user
-/// message that started it up to the user message that ended it, and a turn
-/// still waiting for its last word has no end yet.
-fn job_at(turns: &[JobTurn], ix: usize) -> Option<&JobTurn> {
-    turns.iter().find(|q| ix >= q.at && q.end.is_none_or(|e| ix < e))
-}
-
-/// Where the last thing the agent said in a finished job is, when the job
-/// posted no card.
-///
-/// A closed job folds its working away on the understanding that the summary
-/// card is its closing word. Not every job asks for one: the note after a
-/// merge asks what to do next and gets an answer in prose. Folding that away
-/// leaves a line with a tick on it and the answer nowhere, which is how an
-/// answer to "#6257 is merged, what next?" went missing behind a job called
-/// `Merged #6257`.
-///
-/// Only once the turn has ended. While it is running the fold is doing its
-/// job, and the prose streaming past is the working, not the answer.
-fn job_last_word(msgs: &[AgentMsg], q: &JobTurn) -> Option<usize> {
-    let end = q.end?.min(msgs.len());
-    let span = msgs.get(q.at..end)?;
-    // a card is its closing word, and the fold already lets that through
-    if span.iter().any(|m| matches!(m, AgentMsg::Summary { .. } | AgentMsg::Shot { .. })) {
-        return None;
-    }
-    span.iter()
-        .rposition(|m| matches!(m, AgentMsg::Agent(t) if !t.trim().is_empty()))
-        .map(|i| q.at + i)
 }
 
 /// The live `@` mention in front of the caret: where its `@` sits and what has
@@ -7849,17 +7813,6 @@ struct Conv {
     paste_seq: usize,
     job_turns: Vec<JobTurn>,
     job_next: Option<String>,
-    /// The next job's fold starts open. Set beside `job_next` by a job whose
-    /// answer is a conversation rather than a card: folding that leaves the
-    /// answer nowhere. Taken with the job itself, so a job that never goes
-    /// doesn't leave it set on the one after.
-    ///
-    /// Only the merge note sets it. It was turned off once, on the grounds
-    /// that a conversation unrolled in the middle of the transcript reads
-    /// worse than a fold, and turned back on at Adrian's ask: the answer to
-    /// "what's next?" is the reason that note is sent, and behind a fold it
-    /// is a tick.
-    job_open_next: bool,
     turn_start: Option<std::time::Instant>,
     mark: Option<spend::Mark>,
     /// What this tab's control-channel token is filed under, so a screenshot
@@ -7961,11 +7914,9 @@ struct Queued {
     /// What the transcript shows in place of the prompt, when they differ.
     label: Option<String>,
     imgs: Vec<PastedImage>,
-    /// The job it is part of, if TIDE started it as one. `Some` folds the
-    /// turn into one line when it finally goes.
+    /// The job it is part of, if TIDE started it as one. `Some` puts the job's
+    /// line above the turn when it finally goes.
     job: Option<String>,
-    /// …unless the job asked to stay open, which a conversation does.
-    job_open: bool,
     /// The part of TIDE it came from, kept so a prompt held behind a turn is
     /// still counted against what sent it.
     kind: &'static str,
@@ -9785,25 +9736,15 @@ struct Storm {
     /// Prompts typed while a turn was still running, sent in order as each turn
     /// ends — the same queueing Claude Code does in the terminal.
     agent_queue: Vec<Queued>,
-    /// Turns whose working is folded in the transcript, oldest first.
+    /// Turns TIDE started as a named job, oldest first. Each one draws its
+    /// line above the turn.
     job_turns: Vec<JobTurn>,
     /// The name of the job the next prompt belongs to, set by the asker just
-    /// before it sends and taken by the send. `Some` means that turn draws as
-    /// one line in the pane. It is set here rather than where the user message
+    /// before it sends and taken by the send. `Some` puts the job's line above
+    /// that turn in the pane. It is set here rather than where the user message
     /// lands because a prompt sent while a turn is running waits in the queue,
     /// so the message it will become has no index yet.
     job_next: Option<String>,
-    /// The next job's fold starts open. Set beside `job_next` by a job whose
-    /// answer is a conversation rather than a card: folding that leaves the
-    /// answer nowhere. Taken with the job itself, so a job that never goes
-    /// doesn't leave it set on the one after.
-    ///
-    /// Only the merge note sets it. It was turned off once, on the grounds
-    /// that a conversation unrolled in the middle of the transcript reads
-    /// worse than a fold, and turned back on at Adrian's ask: the answer to
-    /// "what's next?" is the reason that note is sent, and behind a fold it
-    /// is a tick.
-    job_open_next: bool,
     /// Virtualized transcript state, and the item count it was last told about.
     agent_list: gpui::ListState,
     agent_list_len: usize,
@@ -10450,7 +10391,6 @@ impl Storm {
             agent_queue: Vec::new(),
             job_turns: Vec::new(),
             job_next: None,
-            job_open_next: false,
             agent_list: gpui::ListState::new(0, gpui::ListAlignment::Bottom, px(600.)),
             agent_list_len: 0,
             acp_state: None,
@@ -15876,10 +15816,6 @@ impl Storm {
         // session of its own; mid-turn it goes here, like any other prompt
         let note = merged_note(number, about.as_ref());
         self.job_next = Some(format!("Merged #{number}"));
-        // the merge note is a question with an answer you are waiting for, so
-        // its turn stays open. The line above it still says what the job is,
-        // and "Fold … away" under it still folds it by hand
-        self.job_open_next = true;
         match self.agent_busy {
             true => self.send_agent_prompt_as(note, None, cx),
             false => self.ask_fresh(note, None, cx),
@@ -28486,7 +28422,6 @@ impl Storm {
         std::mem::swap(&mut self.agent_paste_seq, &mut c.paste_seq);
         std::mem::swap(&mut self.job_turns, &mut c.job_turns);
         std::mem::swap(&mut self.job_next, &mut c.job_next);
-        std::mem::swap(&mut self.job_open_next, &mut c.job_open_next);
         std::mem::swap(&mut self.agent_turn_start, &mut c.turn_start);
         std::mem::swap(&mut self.turn_mark, &mut c.mark);
         std::mem::swap(&mut self.agent_rpc_tab, &mut c.rpc_tab);
@@ -28668,19 +28603,19 @@ impl Storm {
                 self.agent_cur = None;
                 self.agent_cur_thought = None;
                 // the wire carries the page of instructions TIDE sent; the pane
-                // showed one line and folded the rest away, and that is only
-                // still true if TIDE wrote it down when it went out
-                let (text, job, by, job_open) = match jobs::recall(&text) {
+                // showed one line in its place, and that is only still true if
+                // TIDE wrote it down when it went out
+                let (text, job, by) = match jobs::recall(&text) {
                     Some(s) => {
                         let by = if s.by_tide { Sender::Tide } else { Sender::You };
-                        (s.label, (!s.job.is_empty()).then_some(s.job), by, s.open)
+                        (s.label, (!s.job.is_empty()).then_some(s.job), by)
                     }
-                    None => (text, None, Sender::You, false),
+                    None => (text, None, Sender::You),
                 };
                 self.agent_msgs.push(AgentMsg::User { text, imgs: Vec::new(), by });
                 // a replayed job has no clock: nothing here knows how long it
                 // took, and `began: 0` is how the chip says so
-                self.mark_turn_at(job, 0, job_open);
+                self.mark_turn_at(job, 0);
             }
             Sessions(list) => {
                 self.agent_sessions = list;
@@ -29539,9 +29474,9 @@ impl Storm {
     /// `prompt` is built when the button is pressed rather than held as a
     /// constant, because one of them is a page of instructions assembled from
     /// pieces. `shown` is what the transcript prints in its place when the
-    /// prompt is too long to read as a message you typed, and `job` folds the
-    /// whole turn to one line when what it produces goes somewhere else — a
-    /// deck, a tour — rather than into the answer.
+    /// prompt is too long to read as a message you typed, and `job` names the
+    /// turn when what it produces goes somewhere else — a deck, a tour —
+    /// rather than into the answer.
     #[allow(clippy::too_many_arguments)]
     fn quick_prompt(
         &self,
@@ -29610,7 +29545,6 @@ impl Storm {
         // before the paths that queue it, so a job started while the agent is
         // busy is still one line when it finally goes
         let job = std::mem::take(&mut self.job_next);
-        let job_open = std::mem::take(&mut self.job_open_next);
         // the same, for the part of TIDE this came from: a prompt that doesn't
         // name one is the pane when you typed it and a job when TIDE sent it
         let kind = self.spend_next.take().unwrap_or(match by {
@@ -29642,12 +29576,11 @@ impl Storm {
                 let (imgs, kept) = split_images(self.agent_imgs.drain(..).collect());
                 let shown = label.unwrap_or_else(|| text.clone());
                 jobs::remember(
-                &text,
-                &shown,
-                job.as_deref().unwrap_or_default(),
-                by == Sender::Tide,
-                job_open,
-            );
+                    &text,
+                    &shown,
+                    job.as_deref().unwrap_or_default(),
+                    by == Sender::Tide,
+                );
                 self.note_step(&step_for_send(&shown, by));
                 // no mark of its own: a steered message joins the turn that is
                 // running, and what it costs is that turn's, counted against
@@ -29662,7 +29595,7 @@ impl Storm {
             }
             // the attachments go with it, not with the next thing you send
             let imgs = self.agent_imgs.drain(..).collect();
-            self.agent_queue.push(Queued { text, label, imgs, by, job, job_open, kind, tag });
+            self.agent_queue.push(Queued { text, label, imgs, by, job, kind, tag });
             self.agent_list.scroll_to_end();
             cx.notify();
             return;
@@ -29683,12 +29616,11 @@ impl Storm {
         // …and the adapter replays the wire, so how this reads in the pane is
         // written down now or lost at the next restart
         jobs::remember(
-                &text,
-                &shown,
-                job.as_deref().unwrap_or_default(),
-                by == Sender::Tide,
-                job_open,
-            );
+            &text,
+            &shown,
+            job.as_deref().unwrap_or_default(),
+            by == Sender::Tide,
+        );
         self.note_step(&step_for_send(&shown, by));
         let sent = if self.agent_briefed {
             text
@@ -29699,7 +29631,7 @@ impl Storm {
         acp.prompt_with(&sent, &imgs);
         self.agent_msgs.push(AgentMsg::User { text: shown, imgs: kept, by });
         self.open_spend(kind, job.as_deref().unwrap_or_default(), &tag, by, &acp);
-        self.mark_turn_start(job, job_open);
+        self.mark_turn_start(job);
         self.agent_turn_start = Some(std::time::Instant::now());
         self.start_agent_spinner(cx);
         // same signal a terminal agent's UserPromptSubmit hook sends
@@ -31850,15 +31782,14 @@ impl Storm {
     }
 
     /// A user message has just landed in the transcript. Whatever turn was
-    /// running is over, so a fold that was still growing stops here; and when
-    /// this question came from a slide or a stop, its own working folds.
-    fn mark_turn_start(&mut self, job: Option<String>, open: bool) {
-        self.mark_turn_at(job, now_secs(), open);
+    /// running is over, so the job line above it stops counting here.
+    fn mark_turn_start(&mut self, job: Option<String>) {
+        self.mark_turn_at(job, now_secs());
     }
 
     /// The same, for a turn being replayed rather than sent: `began` is 0,
     /// which is how the job line knows it has no clock to show.
-    fn mark_turn_at(&mut self, job: Option<String>, began: u64, open: bool) {
+    fn mark_turn_at(&mut self, job: Option<String>, began: u64) {
         let at = self.agent_msgs.len().saturating_sub(1);
         if let Some(q) = self.job_turns.last_mut().filter(|q| q.end.is_none()) {
             q.end = Some(at);
@@ -31871,11 +31802,6 @@ impl Storm {
             self.job_turns.push(JobTurn {
                 at,
                 end: None,
-                // `began` is 0 on a turn being replayed, which is a turn that
-                // has already finished: it sits the way it would have been
-                // left. A live one opens, and folds when the agent stops
-                open: began > 0 || open,
-                keep: open,
                 job,
                 began,
                 // a replayed turn is over: it must not start counting up from
@@ -31890,16 +31816,7 @@ impl Storm {
     fn end_job_clock(&mut self) {
         if let Some(q) = self.job_turns.last_mut().filter(|q| q.end.is_none()) {
             q.took.get_or_insert(now_secs().saturating_sub(q.began));
-            // the working was worth watching while it was happening; now that
-            // it is over the line is the summary of it
-            q.open = q.keep;
         }
-    }
-
-    /// The folded turn this message falls inside, if any. The turn's own user
-    /// message is part of it: that is where the chip that unfolds it goes.
-    fn job_turn(&self, ix: usize) -> Option<&JobTurn> {
-        job_at(&self.job_turns, ix)
     }
 
     /// Is a job by this name already running, or waiting behind the turn that
@@ -32253,31 +32170,6 @@ impl Storm {
         // `this` rather than `self`: the listeners in here each have a `this`
         // of their own, and the body reads as it did inside the list's closure
         let this = self;
-        // a closed job hides its working, not what came of it: a
-        // summary card is the agent's closing word on the job, and
-        // a screenshot is something it meant you to see
-        let result = matches!(
-            this.agent_msgs.get(ix),
-            Some(AgentMsg::Summary { .. } | AgentMsg::Shot { .. })
-        );
-        // …and when the job ended without a card, its closing word is
-        // whatever it last said, which the fold must not eat either
-        let last_word = match this.job_turn(ix) {
-            Some(q) => job_last_word(&this.agent_msgs, q) == Some(ix),
-            None => false,
-        };
-        // and the fold reaches no further than the messages: the running turn
-        // has no end yet, so by index it owns every row after it, which is how
-        // a folded job swallowed the "waiting on…" line and the prompt you had
-        // just queued behind it. Those are not its working
-        let in_job = ix < this.agent_msgs.len();
-        if !result
-            && !last_word
-            && in_job
-            && this.job_turn(ix).is_some_and(|q| !q.open && ix > q.at)
-        {
-            return div().into_any_element();
-        }
         if let Some(m) = this.agent_msgs.get(ix) {
             // the closing summary, in its own card
             if matches!(m, AgentMsg::Reviewing) {
@@ -32392,11 +32284,10 @@ impl Storm {
                 let (text, imgs) = (text.clone(), imgs.clone());
                 let by = *by;
                 let tide = by == Sender::Tide;
-                // a job TIDE started is one line until you open it:
-                // the prompt behind it is a page of instructions
-                // written for the agent, not for you
-                let shut =
-                    this.job_turns.iter().any(|q| q.at == ix && !q.open);
+                // a job TIDE started shows its line and not its prompt:
+                // what was sent is a page of instructions written for
+                // the agent, and the line above says what it was for
+                let shut = this.job_turns.iter().any(|q| q.at == ix);
                 let body = (!shut).then(|| {
                     div()
                     .flex()
@@ -32443,7 +32334,7 @@ impl Storm {
                     .w_full()
                     .min_w(px(0.))
                     .gap_1()
-                    .children(this.job_chip(ix, cx))
+                    .children(this.job_chip(ix))
                     .children(body)
                     .into_any_element();
             }
@@ -32618,11 +32509,14 @@ impl Storm {
         }
     }
 
-    /// How a named job is going, as the one line it draws in the transcript:
-    /// its name, its state, and the arrow that opens the working behind it.
+    /// How a named job is going, as the line it draws above the turn: its
+    /// name, its state, how many steps it took and how long it ran. It stands
+    /// in for the prompt, which is a page of instructions written for the
+    /// agent; everything the agent then did is below it, in full.
+    ///
     /// Failure is an error row inside the turn — that is the shape an adapter
     /// error takes, and it is the only one that outlives the turn.
-    fn job_chip(&self, ix: usize, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn job_chip(&self, ix: usize) -> Option<impl IntoElement> {
         const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let q = self.job_turns.iter().find(|q| q.at == ix)?;
         // a job named after what was asked ("Code tour of how sends reach the
@@ -32644,17 +32538,15 @@ impl Storm {
         } else {
             ("✓".to_string(), "done", GIT_NEW)
         };
-        let open = q.open;
         let count = (steps > 0)
             .then(|| format!("  ·  {steps} step{}", if steps == 1 { "" } else { "s" }))
             .unwrap_or_default();
-        // a job line is the only thing a folded turn shows, so it carries the
-        // clock too: counting up while it runs, the total once it stops
+        // the clock counts up while the job runs and holds the total once it
+        // stops
         let took = q.took.unwrap_or_else(|| now_secs().saturating_sub(q.began));
         let elapsed = (q.began > 0).then(|| human_secs(took)).unwrap_or_default();
         Some(
             div()
-                .id(("job-fold", ix))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -32662,13 +32554,10 @@ impl Storm {
                 .px_2()
                 .py_1()
                 .rounded_md()
-                .cursor_pointer()
                 .border_1()
                 .border_color(rgb(BORDER))
                 .text_size(px(12.5))
                 .text_color(rgb(MUTED))
-                .hover(|s| s.bg(rgb(HOVER)))
-                .child(div().text_size(px(10.)).child(if open { "▾" } else { "▸" }))
                 .child(div().flex_shrink_0().text_color(rgb(color)).child(glyph))
                 .child(div().text_color(rgb(TEXT)).child(name))
                 .child(div().text_color(rgb(color)).child(state))
@@ -32680,70 +32569,7 @@ impl Storm {
                         .pl_2()
                         .text_color(rgb(LINE_NUMBER))
                         .child(elapsed),
-                )
-                .tooltip(tip(if open {
-                    "Fold the job away again"
-                } else {
-                    "Show what the agent did"
-                }))
-                .on_click(cx.listener(move |this, _e, _w, cx| {
-                    if let Some(q) = this.job_turns.iter_mut().find(|q| q.at == ix) {
-                        q.open = !q.open;
-                    }
-                    cx.notify();
-                })),
-        )
-    }
-
-    /// The line that folds an open job away again, under the last row of it.
-    ///
-    /// The chip that opened it is at the top of the turn, which on anything
-    /// worth opening is a long way back up: the way to fold a job away was to
-    /// scroll until you found the line you clicked. This is that line again, at
-    /// the end, and folding from here scrolls back to it.
-    fn job_foot(&self, ix: usize, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let last = self.agent_msgs.len().saturating_sub(1);
-        let q = self
-            .job_turns
-            .iter()
-            .find(|q| q.open && q.end.map_or(ix == last, |e| ix + 1 == e))?;
-        // a turn of two or three rows shows its own opening line already
-        if q.end.unwrap_or(self.agent_msgs.len()).saturating_sub(q.at) < 4 {
-            return None;
-        }
-        let at = q.at;
-        let name = match q.job.char_indices().nth(46) {
-            Some((b, _)) => format!("{}\u{2026}", q.job[..b].trim_end()),
-            None => q.job.clone(),
-        };
-        Some(
-            div()
-                .id(("job-foot", ix))
-                .mx_3()
-                .mt_1()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_1p5()
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .cursor_pointer()
-                .text_size(px(11.5))
-                .text_color(rgb(LINE_NUMBER))
-                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                .child(div().text_size(px(10.)).child("\u{25b4}"))
-                .child(format!("Fold {name} away"))
-                .tooltip(tip("Fold the job away and go back to its line"))
-                .on_click(cx.listener(move |this, _e, _w, cx| {
-                    if let Some(q) = this.job_turns.iter_mut().find(|q| q.at == at) {
-                        q.open = false;
-                    }
-                    // everything between here and the job line has just gone:
-                    // without this the view lands wherever that left it
-                    this.agent_list.scroll_to_reveal_item(at);
-                    cx.notify();
-                })),
+                ),
         )
     }
 
@@ -32752,7 +32578,7 @@ impl Storm {
         if self.agent_queue.is_empty() {
             return;
         }
-        let Queued { text, label, imgs, by, job, job_open, kind, tag } = self.agent_queue.remove(0);
+        let Queued { text, label, imgs, by, job, kind, tag } = self.agent_queue.remove(0);
         if let Some(acp) = self.acp.clone() {
             let shown = label.unwrap_or_else(|| text.clone());
             // held before it could carry the tab's handoff (the window was
@@ -32766,7 +32592,6 @@ impl Storm {
                 &shown,
                 job.as_deref().unwrap_or_default(),
                 by == Sender::Tide,
-                job_open,
             );
             // written down when it actually goes out, not when it was queued
             self.note_step(&step_for_send(&shown, by));
@@ -32780,7 +32605,7 @@ impl Storm {
             acp.prompt_with(&sent, &wire);
             self.agent_msgs.push(AgentMsg::User { text: shown, imgs: kept, by });
             self.open_spend(kind, job.as_deref().unwrap_or_default(), &tag, by, &acp);
-            self.mark_turn_start(job, job_open);
+            self.mark_turn_start(job);
             self.agent_turn_start = Some(std::time::Instant::now());
             self.acp_state = Some(AgentState::Working);
             self.agent_cur = None;
@@ -33439,18 +33264,7 @@ impl Storm {
             gpui::list(
                 self.agent_list.clone(),
                 cx.processor(|this: &mut Self, ix: usize, window: &mut Window, cx: &mut Context<Self>| {
-                    let row = this.agent_row(ix, window, cx);
-                    match this.job_foot(ix, cx) {
-                        Some(foot) => div()
-                            .flex()
-                            .flex_col()
-                            .w_full()
-                            .min_w(px(0.))
-                            .child(row)
-                            .child(foot)
-                            .into_any_element(),
-                        None => row,
-                    }
+                    this.agent_row(ix, window, cx)
                 }),
             )
             .flex_grow(1.0)
@@ -45836,91 +45650,6 @@ mod code_tour_tests {
         assert!(q.contains("$TIDE_RPC/comment"), "{q}");
         assert!(q.contains("\"id\":\"q7x2b\""), "{q}");
         assert!(q.contains("Don't rebuild the tour"), "{q}");
-    }
-
-    /// A question asked from a slide folds its own working and nothing else:
-    /// the turn before it and the turn after it are somebody else's rows.
-    #[test]
-    fn a_folded_turn_owns_its_own_rows_only() {
-        let turns = vec![
-            JobTurn { at: 2, end: Some(6), open: false, keep: false, job: "a".into(), began: 0, took: None },
-            JobTurn { at: 9, end: None, open: false, keep: false, job: "b".into(), began: 0, took: None },
-        ];
-        // the question itself is part of the fold: that is where the chip goes
-        assert!(job_at(&turns, 2).is_some());
-        assert!(job_at(&turns, 5).is_some());
-        // the message that ended it belongs to the next turn
-        assert!(job_at(&turns, 6).is_none());
-        assert!(job_at(&turns, 8).is_none());
-        // a turn still running swallows everything after it, by index: it has
-        // no end yet, so row 400 is "inside" it. That is why `agent_row` asks
-        // only about rows that are messages. The thinking line and the queue
-        // are drawn past the end of `agent_msgs` and are nobody's working
-        assert!(job_at(&turns, 9).is_some());
-        assert!(job_at(&turns, 400).is_some());
-        // and nothing before the first fold
-        assert!(job_at(&turns, 0).is_none());
-        assert!(job_at(&[], 3).is_none());
-    }
-
-    fn msgs(kinds: &[&str]) -> Vec<AgentMsg> {
-        kinds
-            .iter()
-            .map(|k| match *k {
-                "user" => AgentMsg::User { text: "q".into(), imgs: vec![], by: Sender::Tide },
-                "said" => AgentMsg::Agent("an answer".into()),
-                "blank" => AgentMsg::Agent("   ".into()),
-                "card" => AgentMsg::Summary { title: "t".into(), text: "x".into() },
-                _ => AgentMsg::Tool {
-                    id: "1".into(),
-                    title: "ls".into(),
-                    status: "done".into(),
-                    detail: String::new(),
-                    started: std::time::Instant::now(),
-                },
-            })
-            .collect()
-    }
-
-    /// A job that ended without a card keeps its last word on screen. This is
-    /// the merge note: it asks what to do next, the answer comes back as
-    /// prose, and the fold used to swallow it.
-    #[test]
-    fn a_job_with_no_card_shows_what_it_last_said() {
-        let q = JobTurn { at: 0, end: Some(4), open: false, keep: false, job: "Merged #1".into(), began: 0, took: None };
-        let m = msgs(&["user", "tool", "said", "tool"]);
-        assert_eq!(job_last_word(&m, &q), Some(2));
-        // the tail of it, not the first thing it said
-        let m = msgs(&["user", "said", "tool", "said"]);
-        assert_eq!(job_last_word(&m, &q), Some(3));
-        // an empty streamed message is not an answer
-        let m = msgs(&["user", "said", "tool", "blank"]);
-        assert_eq!(job_last_word(&m, &q), Some(1));
-    }
-
-    /// A job that posted one keeps nothing else: the card is the closing word
-    /// and the fold already lets it through.
-    #[test]
-    fn a_job_with_a_card_keeps_its_working_folded() {
-        let q = JobTurn { at: 0, end: Some(4), open: false, keep: false, job: "Brief of #1".into(), began: 0, took: None };
-        assert_eq!(job_last_word(&msgs(&["user", "said", "card", "tool"]), &q), None);
-    }
-
-    /// While the turn is still running the fold is doing its job: the prose
-    /// going past is the working, not the answer.
-    #[test]
-    fn a_running_job_keeps_everything_folded() {
-        let q = JobTurn { at: 0, end: None, open: false, keep: false, job: "Merged #1".into(), began: 0, took: None };
-        assert_eq!(job_last_word(&msgs(&["user", "said", "tool"]), &q), None);
-    }
-
-    /// A span that says nothing, and one that ran off the end of the list.
-    #[test]
-    fn nothing_said_and_nothing_there() {
-        let q = JobTurn { at: 0, end: Some(2), open: false, keep: false, job: "j".into(), began: 0, took: None };
-        assert_eq!(job_last_word(&msgs(&["user", "tool"]), &q), None);
-        let past = JobTurn { at: 0, end: Some(99), open: false, keep: false, job: "j".into(), began: 0, took: None };
-        assert_eq!(job_last_word(&msgs(&["user", "said"]), &past), Some(1));
     }
 
     /// Explain PR is one prompt: both halves, in the order they are read, and

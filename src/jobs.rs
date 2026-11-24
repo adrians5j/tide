@@ -22,17 +22,11 @@ use std::path::PathBuf;
 pub struct Shown {
     /// The one line that stands in for the prompt.
     pub label: String,
-    /// The name on the fold, when the turn is a named job. Empty when the
-    /// prompt only had a short form and nothing to fold.
+    /// The name on the job's line, when the turn is a named job. Empty when
+    /// the prompt only had a short form and no job behind it.
     pub job: String,
     /// `true` when the prompt was TIDE's doing rather than something typed.
     pub by_tide: bool,
-    /// `true` when the fold starts open, so a replayed session reads the way
-    /// the live one did. A job whose answer is prose addressed to you is not
-    /// working to be hidden: the note after a merge asks what to do next, and
-    /// folding it leaves a tick where the answer was. That note is the only
-    /// job that sets it.
-    pub open: bool,
     /// Unix seconds, so the oldest entries are the ones dropped.
     pub when: u64,
 }
@@ -82,8 +76,8 @@ pub fn save(list: &[(String, Shown)]) {
 
 /// Write down how this prompt should read. `sent` is the prompt without TIDE's
 /// briefing, which is the form the adapter replays.
-pub fn remember(sent: &str, label: &str, job: &str, by_tide: bool, open: bool) {
-    // a prompt that reads as itself and folds into nothing has nothing to say
+pub fn remember(sent: &str, label: &str, job: &str, by_tide: bool) {
+    // a prompt that reads as itself and names no job has nothing to say
     if sent == label && job.is_empty() {
         return;
     }
@@ -92,7 +86,6 @@ pub fn remember(sent: &str, label: &str, job: &str, by_tide: bool, open: bool) {
         label: label.to_string(),
         job: job.to_string(),
         by_tide,
-        open,
         when: now(),
     });
     save(&list);
@@ -145,7 +138,7 @@ pub fn guess(sent: &str) -> Option<Shown> {
     } else {
         return None;
     };
-    Some(Shown { label, job, by_tide: true, open: false, when: 0 })
+    Some(Shown { label, job, by_tide: true, when: 0 })
 }
 
 /// The pull request number straight after `prefix`.
@@ -167,7 +160,6 @@ pub fn to_json(list: &[(String, Shown)]) -> String {
                 "label": s.label,
                 "job": s.job,
                 "tide": s.by_tide,
-                "open": s.open,
                 "when": s.when,
             })
         })
@@ -189,7 +181,6 @@ pub fn from_json(body: &str) -> Vec<(String, Shown)> {
                 label,
                 job: v.get("job").and_then(|j| j.as_str()).unwrap_or_default().to_string(),
                 by_tide: v.get("tide").and_then(|t| t.as_bool()).unwrap_or(true),
-                open: v.get("open").and_then(|o| o.as_bool()).unwrap_or(false),
                 when: v.get("when").and_then(|w| w.as_u64()).unwrap_or(0),
             }))
         })
@@ -201,7 +192,7 @@ mod tests {
     use super::*;
 
     fn shown(label: &str, job: &str, when: u64) -> Shown {
-        Shown { label: label.into(), job: job.into(), by_tide: true, open: false, when }
+        Shown { label: label.into(), job: job.into(), by_tide: true, when }
     }
 
     /// The fingerprint is of the whole prompt, so two sends of the same job
@@ -294,7 +285,6 @@ mod tests {
             label: "why does the lease expire?".into(),
             job: "Question on slide 3".into(),
             by_tide: false,
-            open: true,
             when: 200,
         });
         assert_eq!(from_json(&to_json(&list)), list);
