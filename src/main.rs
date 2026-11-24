@@ -5055,6 +5055,86 @@ fn step_for_send(shown: &str, by: Sender) -> String {
     }
 }
 
+/// How a finished agent turn reads in the timeline, or `None` when the turn
+/// left nothing worth a line.
+///
+/// The agent's closing message is where it says what it did, so that is what
+/// is read. Asking it for a one-line summary instead would cost a turn of its
+/// own, every turn, to write down what it had already written.
+fn turn_step(msgs: &[AgentMsg]) -> Option<String> {
+    for m in msgs.iter().rev() {
+        match m {
+            // walked back to the prompt without finding prose: the turn was
+            // tool calls and nothing else, and there is nothing to quote
+            AgentMsg::User { .. } | AgentMsg::Fresh { .. } => return None,
+            AgentMsg::Summary { title, text } => {
+                return step_for_agent(text).or_else(|| step_for_agent(title))
+            }
+            AgentMsg::Agent(t) => return step_for_agent(t),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The first line of what the agent said, as one line of timeline.
+///
+/// Markdown is stripped, because `**All 115 are removed**` is not a sentence,
+/// and the cut falls on a sentence end when one is near the limit: half a
+/// sentence with an ellipsis reads as a crash, a whole short one reads as an
+/// answer.
+fn step_for_agent(text: &str) -> Option<String> {
+    const CAP: usize = 72;
+    let mut fence = false;
+    let mut pick = String::new();
+    for l in text.lines() {
+        let t = l.trim();
+        if t.starts_with("```") {
+            fence = !fence;
+            continue;
+        }
+        if fence {
+            continue;
+        }
+        // a heading, a bullet or a quote still carries the sentence
+        let t = t.trim_start_matches(['#', '>', '-', '*', ' ']).trim();
+        // "1. Removed the files" — the number is not the first sentence
+        let t = match t.split_once(". ") {
+            Some((head, rest)) if !head.is_empty() && head.chars().all(|c| c.is_ascii_digit()) => {
+                rest
+            }
+            _ => t,
+        };
+        if t.chars().any(|c| c.is_alphanumeric()) {
+            pick = t.replace("**", "").replace('`', "");
+            break;
+        }
+    }
+    let one = pick.split_whitespace().collect::<Vec<_>>().join(" ");
+    let chars: Vec<char> = one.chars().collect();
+    let said = match chars.len() > CAP {
+        false => one.trim_end_matches('.').to_string(),
+        true => {
+            // the last sentence that ends inside the limit, if it isn't a
+            // "Done." that says nothing on its own
+            let mut end = None;
+            for i in 24..CAP.min(chars.len()) {
+                if chars[i] == '.' && chars.get(i + 1).is_some_and(|c| c.is_whitespace()) {
+                    end = Some(i);
+                }
+            }
+            match end {
+                Some(i) => chars[..i].iter().collect(),
+                None => {
+                    format!("{}…", chars[..CAP].iter().collect::<String>().trim_end())
+                }
+            }
+        }
+    };
+    let said = said.trim();
+    (!said.is_empty()).then(|| format!("Agent: {said}"))
+}
+
 /// How a shell run reads in the workspace's step list, or `None` for the ones
 /// that aren't steps.
 ///
@@ -6840,7 +6920,7 @@ const PALETTE: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::CloseWorkspace, "Close Workspace  (leaves the checkout as it is)", IC_HOME, ""),
     (Cmd::ResetWorkspaceClose, "Reset Workspace & Close", IC_HOME, ""),
     (Cmd::ResetWorkspacePause, "Reset Workspace & Pause", IC_HOME, ""),
-    (Cmd::Steps, "Here So Far…  (every step taken in this workspace)", IC_HISTORY, ""),
+    (Cmd::Steps, "Timeline…  (every step taken in this workspace)", IC_HISTORY, ""),
     (Cmd::WorkspaceHistory, "Workspace History…  (every folder, and what it was for)", IC_HISTORY, "⌘⇧E"),
     (Cmd::TogglePause, "Pause / Resume Workspace  (⌥Tab skips paused)", IC_HOME, ""),
     (Cmd::SendOnPaste, "Send Dictation on Paste (no ↩)", IC_HOME, ""),
@@ -17122,6 +17202,11 @@ impl Storm {
         self.mark_agent_fresh(true);
         self.review.clear();
         self.save_review();
+        // the timeline described the work being put down. The checkout this
+        // reset runs is the first line of the next one
+        steps::clear(&self.root);
+        self.steps.clear();
+        self.stepd_rows.clear();
         self.ws_idle = true;
         save_ws_idle(&self.root, true);
         self.pr_link = None;
@@ -19904,6 +19989,18 @@ impl Storm {
                     this.show_left = true;
                 }
                 cx.notify();
+            })))
+            // no badge either: a count of everything that has happened today
+            // is a number nobody acts on
+            .child(activity_icon("act-steps", IC_HISTORY, "Timeline  (what has happened here)", self.stepd_open, 0, cx.listener(|this, _ev, window, cx| {
+                match this.stepd_open {
+                    true => {
+                        this.stepd_open = false;
+                        this.focus_active(window, cx);
+                        cx.notify();
+                    }
+                    false => this.open_steps(window, cx),
+                }
             })))
             // push the docks to the bottom-left corner: the terminal used to
             // have a bar of its own on the right, 44px of chrome for one icon
@@ -25461,8 +25558,9 @@ impl Storm {
                     .text_size(px(12.))
                     .text_color(rgb(MUTED))
                     .child(
-                        "Nothing yet. A commit, a push, a merge, a message to the agent and a \
-                         review all write a line here as they happen.",
+                        "Nothing yet. A commit, a push, a merge, a message to the agent, \
+                         what the agent said back and a review all write a line here as they \
+                         happen.",
                     ),
             );
         }
@@ -25488,8 +25586,8 @@ impl Storm {
                     .text_size(px(11.))
                     .text_color(rgb(MUTED))
                     .child(match total {
-                        1 => "Here so far — 1 step".to_string(),
-                        n => format!("Here so far — {n} steps"),
+                        1 => "Timeline — 1 step".to_string(),
+                        n => format!("Timeline — {n} steps"),
                     }),
             )
             .child(div().h(px(1.)).bg(rgb(BORDER)))
@@ -28683,6 +28781,12 @@ impl Storm {
             }
             TurnEnd => {
                 self.agent_busy = false;
+                // what the agent did, in its own closing words — the other
+                // half of the timeline, which until now held only what was
+                // asked of it
+                if let Some(what) = turn_step(&self.agent_msgs) {
+                    self.note_step(&what);
+                }
                 // a merge clicked while the agent was mid-turn is still in the
                 // queue when that turn ends, and its own turn hasn't run yet.
                 // Anything left queued keeps the chips out of service
@@ -39318,8 +39422,8 @@ impl Storm {
                                 .cursor_pointer()
                                 .hover(|st| st.text_color(rgb(TEXT)))
                                 .child(match earlier {
-                                    0 => "Here so far".to_string(),
-                                    n => format!("Here so far  ·  {n} earlier"),
+                                    0 => "Timeline".to_string(),
+                                    n => format!("Timeline  ·  {n} earlier"),
                                 })
                                 .tooltip(tip("Open the whole list"))
                                 .on_click(cx.listener(|this, _e: &gpui::ClickEvent, window, cx| {
@@ -44924,6 +45028,42 @@ mod step_tests {
         assert!(long.starts_with("Asked: why does the lease expire"), "{long}");
         assert!(long.ends_with('…'), "{long}");
         assert_eq!(step_for_send("one\n  two", Sender::You), "Asked: one two");
+
+        // the agent's own closing words, markdown and all
+        assert_eq!(
+            step_for_agent("**All 115 are removed** and `yarn build` passes."),
+            Some("Agent: All 115 are removed and yarn build passes".into())
+        );
+        // the first line is the line: what follows is the working
+        assert_eq!(
+            step_for_agent("Fixed the failing job.\n\nIt was the lockfile, which…"),
+            Some("Agent: Fixed the failing job".into())
+        );
+        // a fenced block is not a sentence, and nor is a bullet's dash
+        assert_eq!(
+            step_for_agent("```\nnpm error JSON.parse\n```\n- Removed the conflict markers"),
+            Some("Agent: Removed the conflict markers".into())
+        );
+        // a numbered list keeps its item, not its number
+        assert_eq!(
+            step_for_agent("1. Removed the extra files"),
+            Some("Agent: Removed the extra files".into())
+        );
+        // too long: cut on the last sentence that ends inside the limit
+        let two = step_for_agent(
+            "The build is green again. The failure was eleven package manifests with \
+             conflict markers in them.",
+        );
+        assert_eq!(two, Some("Agent: The build is green again".into()));
+        // …and with no sentence to cut on, an ellipsis
+        let run_on = step_for_agent(
+            "removed the eleven conflict markers and reran the whole build from a clean \
+             checkout to be sure",
+        );
+        assert!(run_on.unwrap().ends_with('…'));
+        // a turn that said nothing leaves no line
+        assert_eq!(step_for_agent("```\nonly a block\n```"), None);
+        assert_eq!(step_for_agent("   "), None);
     }
 }
 

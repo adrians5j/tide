@@ -1,4 +1,4 @@
-//! What has been done in a workspace, in the order it happened.
+//! The workspace timeline: what has been done here, in the order it happened.
 //!
 //! With five workspaces running at once, the question on coming back to one is
 //! not what the branch looks like. The card already answers that. It is what you
@@ -83,6 +83,19 @@ pub fn note(root: &Path, what: &str) {
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
         let _ = f.write_all(line(&step).as_bytes());
+    }
+}
+
+/// Forget everything this workspace has done.
+///
+/// A reset hands back the default branch, a fresh agent session and no title:
+/// the steps belong to the work being put down, not to the work that follows,
+/// and a timeline that carried yesterday's merge into tomorrow's branch would
+/// be answering the wrong question. The first line of the new list is the
+/// checkout the reset itself runs.
+pub fn clear(root: &Path) {
+    if let Some(p) = path(root) {
+        let _ = std::fs::remove_file(p);
     }
 }
 
