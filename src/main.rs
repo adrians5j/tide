@@ -5492,11 +5492,10 @@ change as well.\n\n\
 Go and get it — run the commands again now and show what they print. Don't \
 change any code for this. Where a claim can't be proved, say which one in a \
 line and say what would prove it.";
-const STATUS_PROMPT: &str = "What's the status? Three lines at most: what you \
-are on right now, what is already finished, and what is left of what I asked. \
-Name the file or the command you are in, not the plan. If you are waiting on \
-something — a build, a check, an answer from me — say what. Don't change \
-anything for this.";
+/// The Status chip, in full. It used to carry four sentences of rules about
+/// how to answer, which is a page of instructions to ask a question anyone can
+/// type in four words.
+const STATUS_PROMPT: &str = "What's the current status?";
 
 fn tour_request(about: Option<&str>, answer: Option<&str>) -> String {
     // the answer is the route: it already has the references, in the order it
