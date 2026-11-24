@@ -2252,6 +2252,8 @@ enum LeftView {
     Review,
     /// The scratch todo list, shared by every workspace.
     Todos,
+    /// What has been done in this workspace, newest last.
+    Timeline,
 }
 
 /// PR review file filter by viewed-state.
@@ -5832,12 +5834,41 @@ fn brief_spec(pr: Option<u64>) -> String {
 
 /// The last word of either brief: where line numbers are allowed, and not to
 /// repeat the deck in the reply.
-const BRIEF_TAIL: &str = "         No line \
+const BRIEF_TAIL: &str = "No line \
          numbers anywhere in the prose — `file` is where a line number goes; a \
          slide that needs one in its text wants a code tour instead. Then say in one line that it is up, and stop — don't \
          repeat the slides in your reply, I'm about to read them.\n";
 
+/// How to read the change, for the jobs whose whole purpose is to read it.
+///
+/// The patch of a hundred-file pull request is half a megabyte, and every
+/// request the turn makes carries all of it again: #6303's brief ran at 397k
+/// of context per request. The lockfile and the snapshots in that patch never
+/// reach a slide, so they are paid for and thrown away.
+///
+/// `base` is a ref when there is one. Without it there is no command to give,
+/// only the rule.
+fn diff_read_note(base: &str) -> String {
+    let base = base.trim().trim_start_matches("origin/");
+    let how = match base.is_empty() {
+        true => String::new(),
+        false => format!(
+            "`git diff {base}...HEAD --stat` first, then the patch of the files \
+             that carry it: `git diff {base}...HEAD -- . ':!*.lock' \
+             ':!*-lock.json' ':!*.snap' ':!**/dist/**' ':!**/__snapshots__/**'`. "
+        ),
+    };
+    format!(
+        "Read it once and cheaply. {how}Lockfiles, snapshots, generated and \
+         built files cost more to read than anything they could add to this. \
+         Don't open a whole file where the hunk says enough, and don't read the \
+         same thing twice: everything you read is re-sent with every step of \
+         this turn. "
+    )
+}
+
 fn brief_request(number: u64, base: &str, read: &str) -> String {
+    let raw_base = base;
     let base = match base.trim().strip_prefix("origin/").unwrap_or(base.trim()) {
         "" => "the base branch".to_string(),
         b => b.to_string(),
@@ -5848,8 +5879,9 @@ fn brief_request(number: u64, base: &str, read: &str) -> String {
          I already have the pull request body and a code tour. The body is the \
          problem: by the time I have read it I am holding too much at once. \
          {spec}\
-         Read the diff against {base} before you write any of it. {tail}",
+         Read the diff against {base} before you write any of it. {how}{tail}",
         spec = brief_spec(Some(number)),
+        how = diff_read_note(raw_base),
         tail = BRIEF_TAIL,
     )
 }
@@ -5940,8 +5972,8 @@ fn pr_tour_request(number: u64, base: &str, read: &str) -> String {
     };
     format!(
         "{}\n\
-         Build it from the change itself: `gh pr diff {number}`, and the diff \
-         against {against} where you need more than the patch shows. Order the \
+         Build it from the change itself: the diff against {against}, and the \
+         files it touches where you need more than the patch shows. {how}Order the \
          stops the way the change wants to be read — the entry point first, \
          then what it calls, then what it changed underneath, then the tests. \
          Every stop points at the new code, and its text says what changed \
@@ -5953,6 +5985,7 @@ fn pr_tour_request(number: u64, base: &str, read: &str) -> String {
          If something in the diff looks wrong to you, make it a stop and say \
          so.\n",
         tour_request(Some(&about), None),
+        how = diff_read_note(base),
     )
 }
 
@@ -9374,9 +9407,6 @@ struct Storm {
     // ── the step list: everything done in this workspace, as its own dialog ──
     /// Open, and read off disk when it opens: the card shows the end of the
     /// list, this shows the whole of it.
-    stepd_open: bool,
-    stepd_focus: FocusHandle,
-    stepd_rows: Vec<steps::Step>,
     // ── workspace history (⌘⇧E): every folder and what it has been used for ──
     hist_open: bool,
     hist_focus: FocusHandle,
@@ -10192,9 +10222,6 @@ impl Storm {
             newproj_last_titles: HashMap::new(),
             newproj_idle: HashSet::new(),
             newproj_sel: 0,
-            stepd_open: false,
-            stepd_focus: cx.focus_handle(),
-            stepd_rows: Vec::new(),
             hist_open: false,
             hist_focus: cx.focus_handle(),
             hist_query: Field::default(),
@@ -10537,7 +10564,6 @@ impl Storm {
             || self.runc_open
             || self.newproj_open
             || self.hist_open
-            || self.stepd_open
             || self.find_open
             || self.gitp_open
             || self.palette_open
@@ -12543,7 +12569,6 @@ impl Storm {
             || self.runc_open
             || self.newproj_open
             || self.hist_open
-            || self.stepd_open
             || self.find_open
             || self.gitp_open
             || self.mc_open
@@ -12563,7 +12588,6 @@ impl Storm {
             self.runc_open = false;
             self.newproj_open = false;
             self.hist_open = false;
-            self.stepd_open = false;
             self.find_open = false;
             self.gitp_open = false;
             self.ws_open = false;
@@ -14820,42 +14844,17 @@ impl Storm {
         self.open_ws_history(window, cx);
     }
 
-    /// The whole step list, as its own dialog. The card shows the last six,
-    /// which answers "what was I doing"; this answers "what happened today",
-    /// which is the one you want in front of you when writing it up.
-    fn open_steps(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // off disk on open: another workspace on the same folder may have
-        // written to it since this one loaded, and nothing here changes while
-        // you read it
-        self.stepd_rows = steps::load(&self.root);
-        self.stepd_open = true;
-        window.focus(&self.stepd_focus, cx);
+    /// The whole timeline, in the left dock. The status card shows the last
+    /// six, which answers "what was I doing"; this answers "what happened
+    /// today", which is the one you want open beside the work while you write
+    /// it up.
+    fn open_steps(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        // off disk on open: another TIDE on the same folder may have written
+        // to it since this one loaded
+        self.steps = steps::load(&self.root);
+        self.left_view = LeftView::Timeline;
+        self.show_left = true;
         cx.notify();
-    }
-
-    fn steps_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let ks = &ev.keystroke;
-        match ks.key.as_str() {
-            "escape" => {
-                self.stepd_open = false;
-                self.focus_active(window, cx);
-                cx.notify();
-            }
-            // the list as text, which is what a stand-up note is made of
-            "c" if ks.modifiers.platform => {
-                let off = tokens::local_offset();
-                let now = now_secs() as i64;
-                let text: String = self
-                    .stepd_rows
-                    .iter()
-                    .map(|s| format!("{}  {}\n", when_label(s.at, now, off), s.what))
-                    .collect();
-                let n = self.stepd_rows.len();
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
-                self.show_flash(&format!("Copied {n} step{}", if n == 1 { "" } else { "s" }), cx);
-            }
-            _ => {}
-        }
     }
 
     fn open_ws_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -17142,7 +17141,6 @@ impl Storm {
         // reset runs is the first line of the next one
         steps::clear(&self.root);
         self.steps.clear();
-        self.stepd_rows.clear();
         self.ws_idle = true;
         save_ws_idle(&self.root, true);
         self.pr_link = None;
@@ -18700,6 +18698,7 @@ impl Render for Storm {
                 LeftView::PullRequest => self.render_pr(window, cx).into_any_element(),
                 LeftView::Review => self.render_review_pane(window, cx).into_any_element(),
                 LeftView::Todos => self.render_todo_pane(window, cx).into_any_element(),
+                LeftView::Timeline => self.render_timeline_pane(cx).into_any_element(),
             })
         } else {
             None
@@ -18955,9 +18954,6 @@ impl Render for Storm {
         }
         if self.hist_open {
             root = root.child(self.render_ws_history(cx));
-        }
-        if self.stepd_open {
-            root = root.child(self.render_steps(cx));
         }
         if self.find_open {
             root = root.child(self.render_find(cx));
@@ -19866,6 +19862,7 @@ impl Storm {
         let pr_active = self.show_left && self.left_view == LeftView::PullRequest;
         let review_active = self.show_left && self.left_view == LeftView::Review;
         let todos_active = self.show_left && self.left_view == LeftView::Todos;
+        let timeline_active = self.show_left && self.left_view == LeftView::Timeline;
         div()
             .w(px(44.))
             .flex_shrink_0()
@@ -19928,14 +19925,12 @@ impl Storm {
             })))
             // no badge either: a count of everything that has happened today
             // is a number nobody acts on
-            .child(activity_icon("act-steps", IC_HISTORY, "Timeline  (what has happened here)", self.stepd_open, 0, cx.listener(|this, _ev, window, cx| {
-                match this.stepd_open {
-                    true => {
-                        this.stepd_open = false;
-                        this.focus_active(window, cx);
-                        cx.notify();
-                    }
-                    false => this.open_steps(window, cx),
+            .child(activity_icon("act-steps", IC_HISTORY, "Timeline  (what has happened here)", timeline_active, 0, cx.listener(|this, _ev, window, cx| {
+                if this.show_left && this.left_view == LeftView::Timeline {
+                    this.show_left = false;
+                    cx.notify();
+                } else {
+                    this.open_steps(window, cx);
                 }
             })))
             // push the docks to the bottom-left corner: the terminal used to
@@ -25426,41 +25421,42 @@ impl Storm {
     /// has to answer is "which folder was that in, and is it still there" —
     /// so every row carries the folder and the branch, not only the name of the
     /// work.
-    /// Every step, oldest first, in a scrolling list. No filter and no
-    /// selection: there is nothing here to act on, only to read, and the newest
-    /// is the one you came for so the list opens at the bottom.
-    fn render_steps(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let w = 620.0_f32;
-        let left = ((self.win_width - w) / 2.0).max(0.);
+    /// The timeline, in the left dock: every step this workspace has taken,
+    /// oldest first, under a heading per day. Nothing here is a control. It is
+    /// read while the work is on screen beside it, which is why it is a panel
+    /// and not a dialog.
+    fn render_timeline_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let width = px(self.tree_width);
         let (now, off) = (now_secs() as i64, tokens::local_offset());
-        let total = self.stepd_rows.len();
+        let total = self.steps.len();
 
-        let mut rows = div()
-            .id("steps-rows")
+        let mut list = div()
+            .id("timeline-rows")
             .flex()
             .flex_col()
-            .max_h(px(460.))
+            .min_h(px(0.))
             .overflow_y_scroll()
-            .py_1();
+            .pb_2();
         let mut day = String::new();
-        for (i, step) in self.stepd_rows.iter().enumerate() {
+        for (i, step) in self.steps.iter().enumerate() {
             // a heading when the date changes, so a list spanning three days
             // doesn't read as one long afternoon
             let its_day = when_day(step.at, now, off);
             if its_day != day {
                 day = its_day.clone();
-                rows = rows.child(
+                list = list.child(
                     div()
                         .px_3()
                         .pt_2()
                         .pb_1()
                         .text_size(px(10.))
-                        .text_color(rgb(LINE_NUMBER))
+                        .text_color(rgb(COMMENT_MARK))
                         .child(its_day),
                 );
             }
+            // the newest reads as the live one and the rest as history
             let last = i + 1 == total;
-            rows = rows.child(
+            list = list.child(
                 div()
                     .flex()
                     .flex_row()
@@ -25471,15 +25467,19 @@ impl Storm {
                     .hover(|st| st.bg(rgb(HOVER)))
                     .child(
                         div()
-                            .w(px(44.))
+                            .w(px(34.))
                             .flex_shrink_0()
                             .text_size(px(10.))
                             .text_color(rgb(LINE_NUMBER))
                             .child(clock_label(step.at, off)),
                     )
                     .child(
+                        // the pane is narrow, so a step wraps rather than
+                        // being cut: the end of a sentence is where the
+                        // informative half of it usually is
                         div()
                             .min_w(px(0.))
+                            .flex_grow(1.0)
                             .text_size(px(12.))
                             .text_color(rgb(if last { TEXT } else { MUTED }))
                             .child(step.what.clone()),
@@ -25487,57 +25487,69 @@ impl Storm {
             );
         }
         if total == 0 {
-            rows = rows.child(
-                div()
-                    .px_3()
-                    .py_3()
-                    .text_size(px(12.))
-                    .text_color(rgb(MUTED))
-                    .child(
-                        "Nothing yet. A commit, a push, a merge, a message to the agent, \
-                         what the agent said back and a review all write a line here as they \
-                         happen.",
-                    ),
+            list = list.child(
+                div().px_3().py_3().text_size(px(12.)).text_color(rgb(MUTED)).child(
+                    "Nothing yet. A commit, a push, a merge, a message to the agent, what \
+                     the agent said back and a review all write a line here as they happen.",
+                ),
             );
         }
 
         div()
-            .absolute()
-            .top(px(100.))
-            .left(px(left))
-            .w(px(w))
-            .bg(rgb(PANEL_BG))
-            .border_1()
-            .border_color(rgb(ACCENT))
-            .rounded_md()
-            .shadow_lg()
             .flex()
             .flex_col()
-            .track_focus(&self.stepd_focus)
-            .on_key_down(cx.listener(Self::steps_key))
+            .w(width)
+            .h_full()
+            .bg(rgb(BG))
             .child(
                 div()
+                    .h(px(32.))
                     .px_3()
-                    .py_2()
-                    .text_size(px(11.))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(12.))
                     .text_color(rgb(MUTED))
-                    .child(match total {
-                        1 => "Timeline — 1 step".to_string(),
-                        n => format!("Timeline — {n} steps"),
-                    }),
+                    .child(div().flex_grow(1.0).child(match total {
+                        1 => "TIMELINE  ·  1 step".to_string(),
+                        n => format!("TIMELINE  ·  {n} steps"),
+                    }))
+                    // the list as text, which is what a stand-up note is made of
+                    .when(total > 0, |d| {
+                        d.child(
+                            div()
+                                .id("timeline-copy")
+                                .px_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .text_size(px(11.))
+                                .hover(|st| st.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                .child("copy")
+                                .tooltip(tip("Copy every step as text"))
+                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                    let off = tokens::local_offset();
+                                    let now = now_secs() as i64;
+                                    let text: String = this
+                                        .steps
+                                        .iter()
+                                        .map(|s| {
+                                            format!("{}  {}\n", when_label(s.at, now, off), s.what)
+                                        })
+                                        .collect();
+                                    let n = this.steps.len();
+                                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                                    this.show_flash(
+                                        &format!("Copied {n} step{}", if n == 1 { "" } else { "s" }),
+                                        cx,
+                                    );
+                                })),
+                        )
+                    })
+                    .child(self.collapse_left_btn(cx)),
             )
-            .child(div().h(px(1.)).bg(rgb(BORDER)))
-            .child(rows)
-            .child(
-                div()
-                    .px_3()
-                    .py_1p5()
-                    .border_t_1()
-                    .border_color(rgb(BORDER))
-                    .text_size(px(10.))
-                    .text_color(rgb(MUTED))
-                    .child("⌘C copies the list · Esc closes"),
-            )
+            .child(div().h(px(1.)).flex_shrink_0().bg(rgb(BORDER)))
+            .child(list)
     }
 
     fn render_ws_history(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -27835,7 +27847,7 @@ impl Storm {
             false => tour,
         });
         self.agent_open = true;
-        self.send_agent_prompt_as(pr_tour_request(number, &base, &read), Some(label), cx);
+        self.ask_fresh_by(pr_tour_request(number, &base, &read), Some(label), Sender::Tide, cx);
         self.agent_list.scroll_to_end();
         cx.notify();
     }
@@ -28322,6 +28334,26 @@ impl Storm {
     /// request re-sends the whole conversation, so the turns after this one all
     /// pay for whatever is still in the context when they run.
     fn ask_fresh(&mut self, text: String, label: Option<String>, cx: &mut Context<Self>) {
+        self.ask_fresh_by(text, label, Sender::You, cx);
+    }
+
+    /// The same for a job TIDE sends itself.
+    ///
+    /// A reading of a pull request is self-contained: it says read the diff,
+    /// post the slides or the stops, say one line. Nothing in the conversation
+    /// it happens to land in helps it, and all of it is re-sent on every
+    /// request the turn makes. Brief of #6303 came to 1.45M weighted tokens
+    /// over 13 requests, and the brief's own work was 13 tool calls and 18k of
+    /// output: the rest was a pane that had been talking since the morning,
+    /// 397k of context per request, re-written from cold when the second turn
+    /// ran the next day.
+    fn ask_fresh_by(
+        &mut self,
+        text: String,
+        label: Option<String>,
+        by: Sender,
+        cx: &mut Context<Self>,
+    ) {
         // never over the top of work in flight: the turn running now would be
         // dropped with the session it is running in. The reviewers are the same
         // case from the other side — `send_agent_prompt_by` refuses to send
@@ -28329,7 +28361,7 @@ impl Storm {
         // pane and no question in it
         let reviewing = self.reviewers.iter().any(|r| !r.done);
         if self.agent_busy || reviewing || self.acp.is_none() {
-            self.send_agent_prompt_by(text, label, Sender::You, cx);
+            self.send_agent_prompt_by(text, label, by, cx);
             return;
         }
         let prompt = format!("{}\n\n{text}", self.fresh_handoff());
@@ -28337,7 +28369,7 @@ impl Storm {
         // a link somebody posted four answers ago is still four answers up
         // rather than something to ask for again
         self.new_agent_session_keeping(cx);
-        self.send_agent_prompt_by(prompt, label.or(Some(text)), Sender::You, cx);
+        self.send_agent_prompt_by(prompt, label.or(Some(text)), by, cx);
     }
 
     /// Remember (on disk, per workspace) whether the agent here was started over
@@ -30985,9 +31017,10 @@ impl Storm {
         self.job_next = Some(explain);
         self.spend_tag = Some(format!("brief:{number}"));
         self.agent_open = true;
-        self.send_agent_prompt_as(
+        self.ask_fresh_by(
             pr_explain_request(number, &base, &brief_read, &tour_read),
             Some(label),
+            Sender::Tide,
             cx,
         );
         self.agent_list.scroll_to_end();
@@ -31023,7 +31056,7 @@ impl Storm {
             .map(|b| brief_read_note(&b.slides, &b.read))
             .unwrap_or_default();
         self.agent_open = true;
-        self.send_agent_prompt_as(brief_request(number, &base, &read), Some(label), cx);
+        self.ask_fresh_by(brief_request(number, &base, &read), Some(label), Sender::Tide, cx);
         self.agent_list.scroll_to_end();
         cx.notify();
     }
@@ -45179,8 +45212,11 @@ mod pr_body_check_tests {
         assert!(q.contains("\"steps\""), "{q}");
         // and it is this PR's
         assert!(q.contains("of #6080 — what it changes"), "{q}");
-        assert!(q.contains("gh pr diff 6080"), "{q}");
         assert!(q.contains("against `next`"), "{q}");
+        // and it says how to read it: the stat, then the patch without the
+        // lockfiles and snapshots nothing in a tour is ever built from
+        assert!(q.contains("git diff next...HEAD --stat"), "{q}");
+        assert!(q.contains("':!*.snap'"), "{q}");
         assert!(q.contains("the entry point first"), "{q}");
         assert!(q.contains("version bumps"), "{q}");
         // no base read yet: still a usable ask
