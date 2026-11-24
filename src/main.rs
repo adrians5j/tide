@@ -4915,6 +4915,194 @@ fn brief_cached(number: u64) -> Option<Brief> {
     Some(brief_from(rpc::parse_brief(&raw)?))
 }
 
+/// Where this workspace's tour is kept between runs.
+///
+/// A tour used to live only as long as the app did, which made restarting TIDE
+/// something to put off: the stops went, and so did everything asked under
+/// them. It is one file per workspace because there is one tour per workspace.
+fn tour_path(root: &Path) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(format!(".config/tide/tour/{}.json", usage::project_slug(root))))
+}
+
+/// A thread under a slide or a stop, as JSON. The ids go with it: an answer
+/// that was still in flight when TIDE closed comes back to the turn it
+/// belongs to when the agent posts it.
+fn thread_to_json(t: &SlideThread) -> serde_json::Value {
+    serde_json::json!({
+        "folded": t.folded,
+        "turns": t
+            .turns
+            .iter()
+            .map(|x| serde_json::json!({ "id": x.id, "q": x.q, "a": x.answer, "when": x.when }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn thread_from_json(v: &serde_json::Value) -> SlideThread {
+    let turns = v
+        .get("turns")
+        .and_then(|t| t.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|t| {
+                    Some(SlideTurn {
+                        id: t.get("id")?.as_str()?.to_string(),
+                        q: t.get("q")?.as_str()?.to_string(),
+                        answer: t.get("a").and_then(|a| a.as_str()).unwrap_or_default().to_string(),
+                        when: t.get("when").and_then(|w| w.as_u64()).unwrap_or(0),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    SlideThread { turns, folded: v.get("folded").and_then(|f| f.as_bool()).unwrap_or(false) }
+}
+
+/// Threads by index, the shape both stores keep them in.
+fn threads_to_json<K: Eq + std::hash::Hash, F: Fn(&K) -> Option<usize>>(
+    asks: &HashMap<K, SlideThread>,
+    ix: F,
+) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for (k, t) in asks {
+        if t.turns.is_empty() {
+            continue;
+        }
+        if let Some(i) = ix(k) {
+            out.insert(i.to_string(), thread_to_json(t));
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
+fn threads_from_json(v: Option<&serde_json::Value>) -> Vec<(usize, SlideThread)> {
+    v.and_then(|v| v.as_object())
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, t)| Some((k.parse::<usize>().ok()?, thread_from_json(t))))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The tour and everything asked on it, written where the next run will find
+/// it. `None` deletes: a tour that was discarded must not come back.
+fn save_tour_rec(
+    root: &Path,
+    rec: Option<&TourRec>,
+    asks: &HashMap<(String, usize), SlideThread>,
+) {
+    let Some(path) = tour_path(root) else { return };
+    let Some(rec) = rec else {
+        let _ = std::fs::remove_file(path);
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, tour_to_json(rec, asks).to_string());
+}
+
+/// The tour as it goes to disk.
+fn tour_to_json(
+    rec: &TourRec,
+    asks: &HashMap<(String, usize), SlideThread>,
+) -> serde_json::Value {
+    let id = rec.id.clone();
+    serde_json::json!({
+        "id": rec.id,
+        "title": rec.title,
+        "at": rec.at,
+        "pr": rec.pr,
+        "oid": rec.oid,
+        "seen": rec.seen,
+        "stops": rec
+            .stops
+            .iter()
+            .map(|s| serde_json::json!({
+                "path": s.path,
+                "line": s.line,
+                "end": s.end,
+                "title": s.title,
+                "group": s.group,
+                "said": s.said,
+                "flag": s.flag,
+            }))
+            .collect::<Vec<_>>(),
+        // only this tour's threads: the map is keyed by tour id, and a thread
+        // from the tour before this one is not part of it
+        "asks": threads_to_json(asks, |(tid, i)| (*tid == id).then_some(*i)),
+    })
+}
+
+/// What `save_tour_rec` wrote, if anything.
+fn load_tour_rec(root: &Path) -> Option<(TourRec, HashMap<(String, usize), SlideThread>)> {
+    let raw = std::fs::read_to_string(tour_path(root)?).ok()?;
+    tour_from_json(&serde_json::from_str(&raw).ok()?)
+}
+
+fn tour_from_json(
+    v: &serde_json::Value,
+) -> Option<(TourRec, HashMap<(String, usize), SlideThread>)> {
+    let stops: Vec<Stop> = v
+        .get("stops")?
+        .as_array()?
+        .iter()
+        .filter_map(|s| {
+            Some(Stop {
+                path: s.get("path")?.as_str()?.to_string(),
+                line: s.get("line").and_then(|l| l.as_u64()).unwrap_or(0) as usize,
+                end: s.get("end").and_then(|e| e.as_u64()).unwrap_or(0) as usize,
+                title: s.get("title").and_then(|t| t.as_str()).unwrap_or_default().to_string(),
+                group: s.get("group").and_then(|g| g.as_str()).unwrap_or_default().to_string(),
+                said: s.get("said").and_then(|t| t.as_str()).unwrap_or_default().to_string(),
+                flag: s.get("flag").and_then(|f| f.as_str()).unwrap_or_default().to_string(),
+            })
+        })
+        .collect();
+    if stops.is_empty() {
+        return None; // a tour with no stops is not a tour
+    }
+    let id = v.get("id")?.as_str()?.to_string();
+    let rec = TourRec {
+        id: id.clone(),
+        title: v.get("title").and_then(|t| t.as_str()).unwrap_or_default().to_string(),
+        at: v.get("at").and_then(|a| a.as_u64()).unwrap_or(0) as usize,
+        pr: v.get("pr").and_then(|p| p.as_u64()),
+        oid: v.get("oid").and_then(|o| o.as_str()).unwrap_or_default().to_string(),
+        seen: v
+            .get("seen")
+            .and_then(|s| s.as_array())
+            .map(|l| l.iter().filter_map(|i| i.as_u64().map(|i| i as usize)).collect())
+            .unwrap_or_default(),
+        stops,
+    };
+    let asks = threads_from_json(v.get("asks"))
+        .into_iter()
+        .map(|(i, t)| ((id.clone(), i), t))
+        .collect();
+    Some((rec, asks))
+}
+
+/// The questions asked under a brief's slides, kept in the brief's own cache
+/// file. A brief outlives the app already; what was asked of it should too.
+fn save_slide_asks(number: u64, asks: &HashMap<(u64, usize), SlideThread>) {
+    let Some(path) = brief_cache_path(number) else { return };
+    let Ok(raw) = std::fs::read_to_string(&path) else { return };
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) else { return };
+    let Some(obj) = v.as_object_mut() else { return };
+    obj.insert("asks".into(), threads_to_json(asks, |(p, i)| (*p == number).then_some(*i)));
+    let _ = std::fs::write(path, v.to_string());
+}
+
+fn load_slide_asks(number: u64) -> Vec<((u64, usize), SlideThread)> {
+    let Some(path) = brief_cache_path(number) else { return Vec::new() };
+    let Ok(raw) = std::fs::read_to_string(&path) else { return Vec::new() };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else { return Vec::new() };
+    threads_from_json(v.get("asks")).into_iter().map(|(i, t)| ((number, i), t)).collect()
+}
+
 /// Where a PR's last-read JSON lives, so reopening it is instant and offline.
 fn pr_cache_path(number: u64) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
@@ -5622,12 +5810,9 @@ fn brief_read_carried(old: &Brief, fresh: &[Slide]) -> HashSet<usize> {
         .collect()
 }
 
-/// How a brief is written and posted. Shared by the brief of a pull request
-/// and the one made out of a conversation, so a slide is described in one
-/// place rather than in two that drift apart.
-fn brief_spec(pr: Option<u64>) -> String {
-    match pr {
-        Some(number) => format!(
+/// How a brief is written and posted.
+fn brief_spec(number: u64) -> String {
+    format!(
             "A \
          brief is at most five slides, each one idea, each one standing on its \
          own. Post the whole thing in one call:\n\
@@ -5727,112 +5912,9 @@ fn brief_spec(pr: Option<u64>) -> String {
          after, and put one on every box that is really a place in the code — \
          seeing where a box lives is half of what the picture is for. Leave it \
          off boxes that are ideas rather than code.\n\n"
-        ),
-        None => "A \
-         brief is at most five slides, each one idea, each one standing on its \
-         own. Post the whole thing in one call:\n\
-         \x20 curl -s -X POST \"$TIDE_RPC/brief\" -H \"X-Tide-Token: $TIDE_TOKEN\" \\\n\
-         \x20   -d '{\"title\":\"Background task recovery\",\
-         \"tldr\":[\"A task whose worker died used to stay marked running for ever.\",\
-         \"A sweep every 60s re-queues anything holding a stale claim.\",\
-         \"Nothing else changed: the queue, the store and the API are as they were.\"],\
-         \"slides\":[\
-         {\"title\":\"Tasks that die halfway now get picked up\",\
-         \"text\":\"A task whose worker crashed mid-run used to sit as `running` \
-         for ever, because nothing ever looked at it again. The loop now treats \
-         a stale lease as a failure and re-queues it.\",\
-         \"files\":[\"packages/api-tasks/src/TaskService.ts:84\",\
-         \"packages/api-tasks/src/recover.ts:17\"],\
-         \"diagram\":{\"kind\":\"flow\",\"caption\":\"one task, start to finish\",\
-         \"nodes\":[\
-         {\"label\":\"trigger()\",\"note\":\"api-tasks\",\
-\"file\":\"packages/api-tasks/src/TaskService.ts:84\"},\
-         {\"label\":\"TaskStore\",\"note\":\"DynamoDB\"},\
-         {\"label\":\"Recover\",\"note\":\"every 60s\",\"mark\":\"new\",\
-\"file\":\"packages/api-tasks/src/recover.ts:17\"}],\
-         \"edges\":[\"writes pending\",\"on a stale lease\"]}}]}'\n\n\
-         If that payload is long enough to be awkward on one command line, \
-         write it to `$TIDE_TMP/brief.json` and post the file: \
-         `-d @\"$TIDE_TMP/brief.json\"`. `$TIDE_TMP` is this workspace's own \
-         scratch directory and it is where a file like that goes. Several \
-         workspaces are open at once, and `/tmp/brief.json` is the name every \
-         one of them picks: the second agent to write it posts the first one's \
-         brief.\n\n\
-         `tldr` is the whole deck in three or four lines, read before any of it: \
-         what changed, what it replaces, and the one thing worth knowing before \
-         the detail. Full sentences, no fragments, no backticks, no paths. It is \
-         the answer to \"what is this?\" for somebody who will not read the \
-         slides at all, and it has to stand without them. Write it last, out of \
-         the deck you ended up with, rather than first out of the one you \
-         planned.\n\n\
-         `title` on a slide is a sentence that says something — “Tasks that die \
-         halfway now get picked up”, never “Recovery” or “Background”. `text` is \
-         two or three sentences: what changed, what it was before, and the one \
-         thing I would get wrong if nobody told me. Backticks for identifiers.\n\n\
-         A brief is read by somebody who has not read the code, so a word that \
-         only means something inside this repository has to be paid for the \
-         first time it is used: a send, a lease, a connection row, a stale \
-         worker. Say what it is in the same sentence, in a clause, in the \
-         plainest terms that are still true — “a send (the server pushing a \
-         message down a websocket the browser is holding open)”. The test is \
-         whether I could ask “what do you mean by that?” about any noun on the \
-         slide. If I could, the slide isn't written yet, and I have to stop \
-         reading and ask, which is the thing a brief exists to save me. The same \
-         goes for a list you waved at rather than wrote: \"and friends\", \
-         \"and so on\", \"a few places\". Name them, or say how many there \
-         are and where they live.\n\n\
-         A \"the\" is a promise that you have named the thing. \"The adapter\", \
-         \"the runner\", \"the registry\": if a slide leans on one of those, give \
-         its name the first time it comes up and then say what it is, \
-         \"`WebsocketsServerAdapter`, the thin wrapper around the `ws` library\". \
-         Saying what kind of thing it is without naming it is the same dead \
-         end as not explaining it at all: I stop and ask \"which one?\", which \
-         is what the brief was for. The name is already in your hand, on the \
-         diagram's boxes and in `files`.\n\n\
-         An aside that runs past a clause is not a clause. When what you have to \
-         say about a noun takes a sentence of its own, it goes under the prose \
-         as an alert rather than inside it in brackets. They are lines of `text` \
-         like any other, after the paragraph they belong to, with a blank line \
-         between:\n\
-         \x20 > [!NOTE]\n\
-         \x20 > The connection registry is the table of open sockets, by tenant \
-         and user, that broadcasts are sent from.\n\
-         The five are `[!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]` and \
-         `[!CAUTION]`, and they are GitHub's own, so one written for a pull \
-         request body reads the same in here. TIDE draws the bar and the label; \
-         don't write the word yourself. At most one per slide, and most slides \
-         want none.\n\n\
-         `files` is the way from a slide into the code: the two or three files \
-         that slide is about, as `path/to/File.ts:84`, pointing at the line \
-         worth landing on. Put them on every slide that is about code at all — \
-         they draw as links under the prose, and they are the only line numbers \
-         in a brief.\n\n\
-         The first slide is what the change is for, in the terms of whoever asked \
-         for it. The last is what to watch now that it has landed — what could \
-         still bite, what is deliberately left undone. The ones in between are \
-         the moving parts, in the order they would happen.\n\n\
-         `diagram` is optional and most slides are better without one; put one on \
-         the two or three where a picture genuinely carries the idea. Three \
-         shapes, and no others:\n\
-         \x20 • `flow` — a chain, left to right, an arrow between each pair. \
-         `edges` writes on the arrows, one entry fewer than there are nodes.\n\
-         \x20 • `split` — the first node on top, the rest fanning out underneath.\n\
-         \x20 • `parts` — a grid of boxes with no arrows: the pieces of a thing \
-         rather than a path through it.\n\
-         Up to six boxes. `label` is a few words, `note` the smaller line under \
-         it. `mark` is `new`, `changed` or `gone` and goes only on the boxes this \
-         change actually touched — a diagram where every box is lit says nothing. \
-         `file` is printed on the box and opens the file when I click it. Write \
-         it as `path/to/File.ts:84`, pointing at the line the box is named \
-         after, and put one on every box that is really a place in the code — \
-         seeing where a box lives is half of what the picture is for. Leave it \
-         off boxes that are ideas rather than code.\n\n"
-            .to_string(),
-    }
+        )
 }
 
-/// The last word of either brief: where line numbers are allowed, and not to
-/// repeat the deck in the reply.
 const BRIEF_TAIL: &str = "No line \
          numbers anywhere in the prose — `file` is where a line number goes; a \
          slide that needs one in its text wants a code tour instead. Then say in one line that it is up, and stop — don't \
@@ -5879,29 +5961,8 @@ fn brief_request(number: u64, base: &str, read: &str) -> String {
          problem: by the time I have read it I am holding too much at once. \
          {spec}\
          Read the diff against {base} before you write any of it. {how}{tail}",
-        spec = brief_spec(Some(number)),
+        spec = brief_spec(number),
         how = diff_read_note(raw_base),
-        tail = BRIEF_TAIL,
-    )
-}
-
-/// A presentation of the conversation itself: the question we have been on and
-/// what we worked out, as a deck rather than a wall of answers to scroll back
-/// through. The same slides a pull request's brief is made of, about whatever
-/// we were talking about.
-fn talk_brief_request() -> String {
-    format!(
-        "Turn what we have been talking about into a presentation: slides I can \
-         look through, instead of scrolling back through your answers. The \
-         subject is this conversation — the question I came in with, what we \
-         found, and how the thing actually works. \
-         {spec}\
-         Build it out of what we have already worked out here, in the order it \
-         makes sense to somebody who wasn't in the conversation rather than the \
-         order we happened to find it in. Where you are not sure a detail is \
-         still right, read the code again instead of writing it from memory. \
-         {tail}",
-        spec = brief_spec(None),
         tail = BRIEF_TAIL,
     )
 }
@@ -10034,6 +10095,13 @@ impl Storm {
         // before `root` is moved into the struct: the list is what was done here
         // last time the folder was open, which is the half of it TIDE didn't see
         let steps_at_open = steps::load(&root);
+        // the tour this folder was on, and everything asked at its stops. A
+        // tour is read over days and TIDE is restarted inside them, which
+        // used to be a reason to put the restart off
+        let (tour_at_open, stop_asks_at_open) = match load_tour_rec(&root) {
+            Some((rec, asks)) => (Some(rec), asks),
+            None => (None, HashMap::new()),
+        };
         // read once: a `#5619` in an answer is scanned per rendered row, and
         // that is no place for a `git remote` call
         let repo_web = github_base_url(&root);
@@ -10378,7 +10446,7 @@ impl Storm {
             shots: None,
             shots_focus: cx.focus_handle(),
             shots_focus_pending: false,
-            tour: None,
+            tour: tour_at_open,
             md_find: Field::default(),
             md_find_focus: cx.focus_handle(),
             md_find_open: false,
@@ -10391,7 +10459,7 @@ impl Storm {
             brief_ask: Field::multiline(),
             brief_ask_at: None,
             slide_asks: HashMap::new(),
-            stop_asks: HashMap::new(),
+            stop_asks: stop_asks_at_open,
             stop_diff_key: None,
             stop_diff: Vec::new(),
             stop_diff_left: gpui::ScrollHandle::new(),
@@ -11858,6 +11926,7 @@ impl Storm {
                         let mut landed = 0usize;
                         let mut on_slides = 0usize;
                         let mut on_stops = false;
+                        let mut answered_briefs: HashSet<u64> = HashSet::new();
                         for r in replies {
                             if let Some(c) = this.review.iter_mut().find(|c| c.id == r.id) {
                                 c.replies.push(ReviewReply { who: "agent".into(), text: r.text });
@@ -11866,14 +11935,17 @@ impl Storm {
                             }
                             // the other places a thread can live: under the
                             // slide of a brief it was asked on
-                            if let Some(turn) = this
+                            if let Some((pr, turn)) = this
                                 .slide_asks
-                                .values_mut()
-                                .flat_map(|t| t.turns.iter_mut())
-                                .find(|t| t.id == r.id)
+                                .iter_mut()
+                                .flat_map(|((pr, _), t)| {
+                                    t.turns.iter_mut().map(move |turn| (*pr, turn))
+                                })
+                                .find(|(_, t)| t.id == r.id)
                             {
                                 turn.answer = r.text;
                                 on_slides += 1;
+                                answered_briefs.insert(pr);
                                 continue;
                             }
                             // or under a tour stop, where the card's thread
@@ -11892,8 +11964,14 @@ impl Storm {
                         if landed > 0 {
                             this.save_review();
                         }
+                        // an answer is the half of a thread worth keeping:
+                        // write it down where it will be found again
+                        for pr in answered_briefs {
+                            this.keep_slide_asks(pr);
+                        }
                         if on_stops {
                             this.card_thread.scroll_to_bottom();
+                            this.keep_tour();
                         }
                         if landed + on_slides > 0 {
                             let n = landed + on_slides;
@@ -28107,6 +28185,9 @@ impl Storm {
         if !asked && !noted {
             return;
         }
+        if asked {
+            self.keep_tour();
+        }
         if noted {
             self.sync_comment_gutters(cx);
             self.save_review();
@@ -31113,6 +31194,13 @@ impl Storm {
         self.brief_seen.clear(); // a new deck reveals itself again
         self.brief_unfold.clear();
         self.brief_ask_at = None;
+        // what was asked under these slides before TIDE was last closed. The
+        // live map wins where both have a thread: it is this run's
+        if let Some(pr) = brief.pr {
+            for (k, t) in load_slide_asks(pr) {
+                self.slide_asks.entry(k).or_insert(t);
+            }
+        }
         // the poll that received this had no Window to focus with, and the
         // deck holds the key context for ⌘W and the rest
         self.md_focus_pending = true;
@@ -31267,6 +31355,7 @@ impl Storm {
         let live = rec.id.clone();
         self.tour = Some(rec);
         self.stop_asks.retain(|(id, _), _| *id == live);
+        self.keep_tour();
         let note = if dropped > 0 { format!(" · {dropped} skipped") } else { String::new() };
         // a tour that came with a brief waits: it lands while you are still on
         // slide two, and jumping the editor to its first stop takes the screen
@@ -31296,6 +31385,7 @@ impl Storm {
         let Some(rec) = self.tour.as_mut().filter(|t| t.id == id) else { return };
         rec.at = at;
         rec.seen = seen;
+        self.keep_tour();
     }
 
     /// Mark stops read, or unread, without walking to them. `on` is what they
@@ -31344,12 +31434,25 @@ impl Storm {
         self.tour.as_ref().filter(|t| t.pr == Some(number))
     }
 
+    /// Write the tour and the threads asked on it down, wherever either has
+    /// changed. A tour is read over days; TIDE is restarted inside them.
+    fn keep_tour(&self) {
+        save_tour_rec(&self.root, self.tour.as_ref(), &self.stop_asks);
+    }
+
+    /// The same for what was asked under a brief's slides, which goes in the
+    /// brief's own cache file beside the slides it is about.
+    fn keep_slide_asks(&self, pr: u64) {
+        save_slide_asks(pr, &self.slide_asks);
+    }
+
     /// Throw the tour away. The open one goes off the screen with it.
     fn discard_tour(&mut self, cx: &mut Context<Self>) {
         if self.tour.take().is_none() {
             return;
         }
         self.walk = None;
+        self.keep_tour();
         self.sync_comment_gutters(cx);
         self.show_flash("Tour deleted", cx);
         cx.notify();
@@ -31372,6 +31475,7 @@ impl Storm {
         // the question goes up on the card before it has an answer, so the
         // card shows you asked rather than looking like nothing happened
         self.stop_asks.entry(key).or_default().ask(id, q.clone(), now_secs());
+        self.keep_tour();
         self.tour_ask.clear();
         self.agent_open = true;
         // same bargain as a slide's question: one line in the pane, and the
@@ -31409,6 +31513,7 @@ impl Storm {
             .entry((brief.pr.unwrap_or(0), ix))
             .or_default()
             .ask(id, q.clone(), now_secs());
+        self.keep_slide_asks(brief.pr.unwrap_or(0));
         self.brief_ask.clear();
         self.agent_open = true;
         // the question is on the slide and the answer is coming back there, so
@@ -33649,19 +33754,6 @@ impl Storm {
                         || PROVE_IT_PROMPT.to_string(),
                         None,
                         None,
-                        false,
-                        cx,
-                    ))
-                    // the deck it builds opens in its own tab, so the turn
-                    // behind it is one line in the pane rather than a wall
-                    .child(self.quick_prompt(
-                        "quick-deck",
-                        "Presentation",
-                        MUTED,
-                        "Ask for this conversation as slides you can read or watch",
-                        talk_brief_request,
-                        Some("Asked for a presentation of this conversation"),
-                        Some("Presentation of this conversation"),
                         false,
                         cx,
                     ))
@@ -37946,6 +38038,7 @@ impl Storm {
                     .tooltip(tip("Clear this thread off the slide"))
                     .on_click(cx.listener(move |this, _e, _w, cx| {
                         this.slide_asks.remove(&(pr, ix));
+                        this.keep_slide_asks(pr);
                         cx.notify();
                     })),
             )
@@ -37953,6 +38046,7 @@ impl Storm {
                 if let Some(t) = this.slide_asks.get_mut(&(pr, ix)) {
                     t.folded = !t.folded;
                 }
+                this.keep_slide_asks(pr);
                 cx.notify();
             }));
 
@@ -46098,9 +46192,6 @@ mod code_tour_tests {
         assert!(brief.contains("-d @"), "{brief}");
         let tour = pr_tour_request(6110, "next", "");
         assert!(tour.contains("$TIDE_TMP/tour.json"), "{tour}");
-        // a brief of the conversation posts the same payload the same way
-        assert!(talk_brief_request().contains("$TIDE_TMP/brief.json"));
-
         // and the briefing says it once, for every other file an agent writes
         let general = Storm::tide_briefing_body();
         assert!(general.contains("$TIDE_TMP"), "{general}");
@@ -46355,15 +46446,94 @@ mod evidence_tests {
 }
 
 #[cfg(test)]
+mod tour_store_tests {
+    use super::*;
+
+    fn stop(path: &str, line: usize) -> Stop {
+        Stop {
+            path: path.into(),
+            line,
+            end: line + 4,
+            title: "Catch a rejected token".into(),
+            group: "Standalone".into(),
+            said: "`establish()` used to be awaited bare.".into(),
+            flag: "look".into(),
+        }
+    }
+
+    fn thread(q: &str, a: &str) -> SlideThread {
+        SlideThread {
+            turns: vec![SlideTurn { id: "q7x2b".into(), q: q.into(), answer: a.into(), when: 170 }],
+            folded: false,
+        }
+    }
+
+    /// The tour and the questions asked on it come back the way they went: a
+    /// restart used to lose both, which made restarting TIDE a thing to put
+    /// off.
+    #[test]
+    fn a_tour_and_its_threads_survive_a_restart() {
+        let rec = TourRec {
+            id: "t1".into(),
+            title: "Standalone 401 for rejected tokens".into(),
+            at: 2,
+            pr: Some(6183),
+            oid: "abc123".into(),
+            seen: vec![0, 1],
+            stops: vec![stop("packages/a/src/A.ts", 64), stop("packages/b/src/B.ts", 12)],
+        };
+        let mut asks = HashMap::new();
+        asks.insert(("t1".to_string(), 1), thread("what is 401?", "Unauthorized."));
+        // a thread left over from the tour before this one is not this tour's
+        asks.insert(("t0".to_string(), 0), thread("old", "older"));
+        // and an empty thread is not a thread
+        asks.insert(("t1".to_string(), 5), SlideThread::default());
+
+        let (back, kept) = tour_from_json(&tour_to_json(&rec, &asks)).expect("a tour");
+        assert_eq!(back.id, "t1");
+        assert_eq!(back.at, 2);
+        assert_eq!(back.pr, Some(6183));
+        assert_eq!(back.seen, vec![0, 1]);
+        assert_eq!(back.stops.len(), 2);
+        assert_eq!(back.stops[0].title, "Catch a rejected token");
+        assert_eq!(back.stops[0].end, 68);
+        assert_eq!(back.stops[1].flag, "look");
+        assert_eq!(kept.len(), 1, "only this tour's threads, and only the ones with turns");
+        let t = kept.get(&("t1".to_string(), 1)).expect("the thread under stop 2");
+        assert_eq!(t.turns[0].q, "what is 401?");
+        assert_eq!(t.turns[0].answer, "Unauthorized.");
+        assert_eq!(t.turns[0].id, "q7x2b", "the id goes too: an answer still in flight finds it");
+    }
+
+    /// A file somebody has broken, or one from a version that wrote something
+    /// else, reads as no tour rather than taking the window down.
+    #[test]
+    fn a_broken_file_is_no_tour() {
+        assert!(tour_from_json(&serde_json::json!({})).is_none());
+        assert!(tour_from_json(&serde_json::json!({ "id": "t1", "stops": [] })).is_none());
+        // a stop with no path is dropped, and a tour of nothing else with it
+        let v = serde_json::json!({ "id": "t1", "stops": [{ "line": 4 }] });
+        assert!(tour_from_json(&v).is_none());
+    }
+
+    /// A question whose answer hadn't arrived is kept as a question.
+    #[test]
+    fn a_thread_still_waiting_comes_back_waiting() {
+        let v = thread_to_json(&thread("why?", ""));
+        let back = thread_from_json(&v);
+        assert!(back.waiting());
+        assert_eq!(back.turns.len(), 1);
+    }
+}
+
+#[cfg(test)]
 mod brief_spec_tests {
     use super::*;
 
-    /// Both briefs are written to the same spec, and only the pull request's
-    /// carries a number in the call it is posted with.
+    /// The spec a brief is written to, in the prompt that asks for one.
     #[test]
-    fn one_spec_two_subjects() {
+    fn one_spec_one_subject() {
         let pr = brief_request(6164, "origin/next", "");
-        let talk = talk_brief_request();
         for q in [
             "at most five slides",
             "$TIDE_RPC/brief",
@@ -46373,16 +46543,12 @@ mod brief_spec_tests {
             // and an aside too long for a clause is a GitHub alert
             "[!NOTE]",
         ] {
-            assert!(pr.contains(q), "{q} missing from the pull request's brief");
-            assert!(talk.contains(q), "{q} missing from the conversation's brief");
+            assert!(pr.contains(q), "{q} missing from the brief");
         }
         assert!(pr.contains("\"pr\":6164"), "{pr}");
-        assert!(!talk.contains("\"pr\":"), "a conversation has no number to post");
         assert!(pr.contains("Read the diff against next"), "{pr}");
-        assert!(talk.contains("this conversation"), "{talk}");
-        // neither repeats the deck back at me
+        // it doesn't repeat the deck back at me
         assert!(pr.contains("I'm about to read them"));
-        assert!(talk.contains("I'm about to read them"));
     }
 }
 
