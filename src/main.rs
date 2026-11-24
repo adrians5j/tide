@@ -5738,6 +5738,11 @@ fn tour_request(about: Option<&str>, answer: Option<&str>) -> String {
          callers, or say \"four callers, all in `api-websockets`\". If the list \
          is too long to write, that is the useful fact — say how many and where \
          they live.\n\n\
+         A stop is read on its own, an hour after the one before it. When a \
+         stop leans on something an earlier stop was about, say so in the \
+         sentence — \"the `rejectsToken()` we walked through earlier\" — \
+         rather than using the name as if I had it in hand. Don't number the \
+         stop; TIDE puts the number on it.\n\n\
          Where the tour moves from one stretch of the work to another, name \
          the stretch with `group` on each stop in it (\"The AWS side\", \
          \"Standalone\") — consecutive stops sharing one become a section with \
@@ -8407,6 +8412,74 @@ fn stop_label(s: &Stop) -> String {
     } else {
         s.path.clone()
     }
+}
+
+/// Names in backticks, as the text wrote them.
+fn code_spans(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find('`') {
+        let after = &rest[i + 1..];
+        let Some(j) = after.find('`') else { break };
+        let span = after[..j].trim();
+        if !span.is_empty() {
+            out.push(span.to_string());
+        }
+        rest = &after[j + 1..];
+    }
+    out
+}
+
+/// Is this backticked span a name the tour could have introduced earlier, or
+/// a word in code font? `rejectsToken()` and `InvalidTokenError` are names;
+/// `Error`, `true` and `401` are not, and pointing at an earlier stop for
+/// every one of those would be noise over the thing worth seeing.
+fn looks_like_a_name(tok: &str) -> bool {
+    let bare = tok.trim_end_matches("()");
+    if bare.chars().count() < 5 || !bare.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return false;
+    }
+    // camelCase, PascalCase with a second word, snake_case, or a call
+    bare.chars().skip(1).any(|c| c.is_ascii_uppercase() || c == '_') || tok.ends_with("()")
+}
+
+/// What this stop leans on that an earlier stop already covered, as
+/// `(name, stop index)`.
+///
+/// A tour is read a stop at a time, sometimes hours apart. By stop 7,
+/// `rejectsToken()` in the prose reads as a name you are supposed to know
+/// already, and the useful half of the sentence — that stop 4 was about it —
+/// is nowhere on screen.
+///
+/// The earliest stop whose title names it wins, because that is where the
+/// tour introduced it; failing that, the earliest that mentions it at all. At
+/// most three, so the row stays something you read rather than skip.
+fn earlier_mentions(stops: &[Stop], at: usize) -> Vec<(String, usize)> {
+    let Some(here) = stops.get(at) else { return Vec::new() };
+    let mut out: Vec<(String, usize)> = Vec::new();
+    let mut taken: HashSet<String> = HashSet::new();
+    for tok in code_spans(&here.said) {
+        if !looks_like_a_name(&tok) {
+            continue;
+        }
+        let bare = tok.trim_end_matches("()").to_string();
+        if !taken.insert(bare.clone()) {
+            continue;
+        }
+        let names = |s: &Stop| s.title.contains(&bare);
+        let mentions = |s: &Stop| s.said.contains(&bare) || s.path.contains(&bare);
+        let found = stops[..at]
+            .iter()
+            .position(names)
+            .or_else(|| stops[..at].iter().position(mentions));
+        if let Some(j) = found {
+            out.push((tok, j));
+        }
+        if out.len() == 3 {
+            break;
+        }
+    }
+    out
 }
 
 /// The one tour this workspace is holding: the stops, where you had got to,
@@ -27187,6 +27260,9 @@ impl Storm {
         let flag = stop.flag.clone();
         let said = stop.said.trim().to_string();
         let group = stop.group.trim().to_string();
+        // what this stop names that an earlier one was about
+        let mentions = earlier_mentions(&w.stops, w.at);
+        let stops_for_mentions = w.stops.clone();
         // the stop a part begins on, so the cue is still there once the flash
         // has gone
         let group_starts = !group.is_empty()
@@ -27585,6 +27661,41 @@ impl Storm {
                             .line_height(px(TOUR_LINE_H))
                             .child(md_text(&said, 13., TEXT)),
                     )
+                })
+                // the names in this stop's prose that the tour has already
+                // been through, and where it was: a click goes back to it
+                .when(!mentions.is_empty(), |d| {
+                    let mut row = div()
+                        .w_full()
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_1p5()
+                        .pt(px(2.))
+                        .text_size(px(10.5))
+                        .text_color(rgb(LINE_NUMBER))
+                        .child(div().flex_shrink_0().child("already seen:"));
+                    for (name, j) in mentions {
+                        let (no, _, _) = tour_place(&stops_for_mentions, j);
+                        row = row.child(
+                            div()
+                                .id(("card-seen", j))
+                                .flex_shrink_0()
+                                .px_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .border_1()
+                                .border_color(rgb(BORDER))
+                                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                                .child(format!("{name}  ·  stop {no}"))
+                                .tooltip(tip_owned(format!("Go back to stop {no}")))
+                                .on_click(cx.listener(move |this, _e, window, cx| {
+                                    this.goto_walk_stop(j, window, cx)
+                                })),
+                        );
+                    }
+                    d.child(row)
                 })
                 // what the stop's own lines used to say, when that is a line
                 // or three: the card is about a change, and half of a change
@@ -46235,6 +46346,8 @@ mod code_tour_tests {
         // a different way: "SendToIdentity and friends" cost a round trip
         assert!(tour.contains("Name things."), "{tour}");
         assert!(tour.contains("say how many and where"), "{tour}");
+        // and a name the tour has already been through is said to be one
+        assert!(tour.contains("we walked through earlier"), "{tour}");
         assert!(brief.contains("a list you waved at rather than wrote"), "{brief}");
     }
 
@@ -46442,6 +46555,91 @@ mod evidence_tests {
         // and both say what to do when there is no proof to be had
         assert!(brief.contains("cannot prove"), "{brief}");
         assert!(PROVE_IT_PROMPT.contains("can't be proved"));
+    }
+}
+
+#[cfg(test)]
+mod earlier_mention_tests {
+    use super::*;
+
+    fn stop(path: &str, title: &str, said: &str) -> Stop {
+        Stop {
+            path: path.into(),
+            line: 1,
+            end: 2,
+            title: title.into(),
+            group: String::new(),
+            said: said.into(),
+            flag: String::new(),
+        }
+    }
+
+    /// Stop 3 leans on a function stop 1 was about. The card says where it
+    /// was, which is the half of the sentence that was missing.
+    #[test]
+    fn a_name_from_an_earlier_stop_is_pointed_back_at() {
+        let stops = vec![
+            stop("a.ts", "rejectsToken counts the error", "The rule lives here."),
+            stop("b.ts", "Unrelated", "Nothing to do with it."),
+            stop(
+                "c.ts",
+                "verifyTokenClaims always rejects",
+                "A plain `Error` would make `rejectsToken()` return a 500, so this \
+                 converts it to `InvalidTokenError` at the source.",
+            ),
+        ];
+        let got = earlier_mentions(&stops, 2);
+        assert_eq!(got, vec![("rejectsToken()".to_string(), 0)]);
+        // `Error` is a word in code font, not a name the tour introduced, and
+        // `InvalidTokenError` is new here
+        assert!(!got.iter().any(|(n, _)| n == "Error" || n == "InvalidTokenError"));
+    }
+
+    /// The stop whose title names it wins over one that only mentions it: the
+    /// title is where the tour was about it.
+    #[test]
+    fn the_stop_it_was_about_wins_over_one_that_mentions_it() {
+        let stops = vec![
+            stop("a.ts", "The entry point", "It calls `verifyTokenClaims` and moves on."),
+            stop("b.ts", "verifyTokenClaims in full", "The hook itself."),
+            stop("c.ts", "Later", "Back to `verifyTokenClaims` again."),
+        ];
+        assert_eq!(earlier_mentions(&stops, 2), vec![("verifyTokenClaims".to_string(), 1)]);
+    }
+
+    /// Nothing to point at, and nothing pointing forward.
+    #[test]
+    fn a_name_nobody_has_seen_yet_gets_no_chip() {
+        let stops = vec![
+            stop("a.ts", "First", "Here is `OidcJwtIdentityProvider` for the first time."),
+            stop("b.ts", "Second", "Plain prose, no names."),
+        ];
+        assert!(earlier_mentions(&stops, 0).is_empty());
+        assert!(earlier_mentions(&stops, 1).is_empty());
+        assert!(earlier_mentions(&stops, 9).is_empty(), "a stop past the end");
+    }
+
+    /// What counts as a name, and what is a word that happens to be in code
+    /// font.
+    #[test]
+    fn a_name_is_not_every_word_in_backticks() {
+        assert!(looks_like_a_name("rejectsToken()"));
+        assert!(looks_like_a_name("InvalidTokenError"));
+        assert!(looks_like_a_name("tour_place"));
+        assert!(!looks_like_a_name("Error"), "one word, no second half");
+        assert!(!looks_like_a_name("true"));
+        assert!(!looks_like_a_name("401"));
+        assert!(!looks_like_a_name("yarn test --all"), "a command is not a name");
+    }
+
+    /// Spans come out as they were written, and an unclosed backtick ends the
+    /// scan rather than eating the rest of the text.
+    #[test]
+    fn backticked_spans_come_out_whole() {
+        assert_eq!(code_spans("a `one` b `two()` c"), vec!["one", "two()"]);
+        assert_eq!(code_spans("a `one` and `unclosed"), vec!["one"]);
+        assert!(code_spans("nothing here").is_empty());
+        assert!(code_spans("`  `").is_empty(), "an empty span is not a name");
     }
 }
 
