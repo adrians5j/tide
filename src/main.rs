@@ -29606,6 +29606,26 @@ impl Storm {
          them. `agent-browser console` and \
          `agent-browser errors` are worth reading before you say a page works. \
          The local sign-in details are above.\n\n\
+         A diagram is a picture. Asked to show how something fits together, \
+         whether that is an architecture, a request path, a sequence, a state \
+         machine or a data model, draw it and post it as an image. Never \
+         boxes typed out of `+`, `-` and `|`, and never Mermaid, PlantUML, \
+         DOT or any other diagram markup in your answer. That is source for \
+         a picture, not a picture, and nothing on this end renders it.\n\
+         Draw it dark, because dark is what it will be read on: background \
+         `#18191a`, boxes `#222426` with a `#2b2d30` border, text `#bcbec4`, \
+         arrows and their labels `#7a7e85`, and `#3574f0` on the one or two \
+         boxes the answer is actually about. Never a transparent background; \
+         it comes out as whatever happens to be behind it.\n\
+         Write the drawing as an HTML page or an SVG in $TIDE_TMP, render it, \
+         and screenshot that:\n\
+         \x20 agent-browser viewport 1200 760\n\
+         \x20 agent-browser open \"file://$TIDE_TMP/diagram.html\"\n\
+         \x20 agent-browser screenshot \"$TIDE_TMP/diagram.png\"\n\
+         then post the PNG with the same `/shot` call as above, with a `note` \
+         saying what it shows. TIDE decodes PNG, JPEG, GIF and WebP; an SVG \
+         handed to it opens as text, so the file that reaches `/shot` is \
+         always the PNG.\n\n\
          Evidence, not a description. When you tell me something works, is \
          fixed, or is faster, what you owe me is the thing that would \
          convince somebody who does not trust you. These are not evidence: \
@@ -45515,6 +45535,21 @@ mod briefing_tests {
         assert!(b.contains("A list is a list."), "three of anything is bullets, not commas");
         // and no line of it ran into the next one
         assert!(!b.contains("post.drafted\",         "), "{b}");
+    }
+
+    /// A diagram is drawn and posted as a picture, dark, never typed out as
+    /// text. The rule is only useful if all three halves of it survive.
+    #[test]
+    fn a_diagram_is_an_image_a_dark_one() {
+        let b = Storm::tide_briefing_body();
+        assert!(b.contains("A diagram is a picture."), "the rule itself");
+        assert!(b.contains("never Mermaid, PlantUML, DOT"), "no markup to render");
+        assert!(b.contains("`+`, `-` and `|`"), "no ascii art either");
+        assert!(b.contains("Draw it dark"), "the theme");
+        assert!(b.contains("`#18191a`"), "the background it is read on");
+        assert!(b.contains("agent-browser screenshot \"$TIDE_TMP/diagram.png\""), "{b}");
+        // and the picture that reaches TIDE is one it can decode
+        assert!(b.contains("an SVG handed to it opens as text"), "{b}");
     }
 }
 
