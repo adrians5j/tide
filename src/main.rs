@@ -706,6 +706,71 @@ fn save_session(roots: &[PathBuf]) {
     let _ = std::fs::write(path, body);
 }
 
+/// How many commands the palette remembers using. There are about fifty, so
+/// this is all of them: the list ends up being the whole palette in the order
+/// it was last used.
+const PALETTE_RECENT: usize = 64;
+
+/// The palette's order of use, most recent first, one `Cmd` name a line in
+/// `~/.config/tide/palette-recent.txt`. Every window shares the file: the
+/// commands reached for are the same wherever the palette is opened.
+fn palette_recent_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".config/tide/palette-recent.txt"))
+}
+
+fn load_palette_recent() -> Vec<String> {
+    palette_recent_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|body| palette_recent_from_text(&body))
+        .unwrap_or_default()
+}
+
+fn palette_recent_from_text(body: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    body.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .filter(|l| seen.insert(l.to_string()))
+        .map(str::to_string)
+        .take(PALETTE_RECENT)
+        .collect()
+}
+
+/// Put `cmd` at the front and write the list back, returning what is now on
+/// disk. The list is re-read here rather than taken from the open palette:
+/// another window may have run something since this one opened, and writing
+/// the stale copy would undo it.
+fn note_palette_use(cmd: Cmd) -> Vec<String> {
+    let key = format!("{cmd:?}");
+    let mut list = load_palette_recent();
+    list.retain(|k| *k != key);
+    list.insert(0, key);
+    list.truncate(PALETTE_RECENT);
+    if let Some(path) = palette_recent_path() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let body: String = list.iter().map(|k| format!("{k}\n")).collect();
+        let _ = std::fs::write(path, body);
+    }
+    list
+}
+
+/// Where a command sits in the order of use: 0 is the one run last, and one
+/// never run is behind all of them.
+fn palette_rank(recent: &[String], cmd: Cmd) -> usize {
+    let key = format!("{cmd:?}");
+    recent.iter().position(|k| *k == key).unwrap_or(usize::MAX)
+}
+
+/// Best match first, and between equal matches the one used most recently.
+/// Stable, so commands that match equally and have never been run keep the
+/// order `PALETTE` declares them in.
+fn palette_sort<T>(scored: &mut [(i32, usize, T)]) {
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+}
+
 /// File holding the recent-projects list (most-recent first, one path per line).
 fn recents_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
@@ -6880,7 +6945,11 @@ enum BranchAction {
 
 
 /// Commands available in the command palette (cmd+shift+p).
-#[derive(Clone, Copy, PartialEq)]
+///
+/// `Debug` is what the recency list is keyed on: the variant's own name, which
+/// is stable across a relabel and only forgets a command when it is renamed in
+/// the source.
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Cmd {
     WipCommit,
     WipPush,
@@ -9639,6 +9708,8 @@ struct Storm {
     palette_sel: usize,
     palette_results: Vec<(Cmd, String, &'static str, &'static str)>,
     palette_gen: u64,
+    /// Command names, most recently used first. Read when the palette opens.
+    palette_recent: Vec<String>,
     // merge-conflicts dialog
     mc_open: bool,
     mc_focus: FocusHandle,
@@ -10433,6 +10504,7 @@ impl Storm {
             palette_sel: 0,
             palette_results: Vec::new(),
             palette_gen: 0,
+            palette_recent: load_palette_recent(),
             mc_open: false,
             mc_focus: cx.focus_handle(),
             mc_files: Vec::new(),
@@ -17014,6 +17086,8 @@ impl Storm {
         self.palette_open = true;
         self.palette_query.clear();
         self.palette_sel = 0;
+        // another window may have run something since this one last looked
+        self.palette_recent = load_palette_recent();
         self.palette_results = self.palette_items(); // full list, instant on open
         window.focus(&self.palette_focus, cx);
         cx.notify();
@@ -17038,9 +17112,17 @@ impl Storm {
     }
 
     /// Fuzzy-filtered, ranked command list.
+    ///
+    /// Two keys, in this order: how well the label matches what has been typed,
+    /// then how recently the command was run. With an empty query every label
+    /// scores the same, so the whole palette reads as a most-recently-used
+    /// list; with a query the match still decides and recency only separates
+    /// commands that matched equally well. Commands never run sit at the back
+    /// in the order `PALETTE` declares them, which `sort_by` keeps because it
+    /// is stable.
     fn palette_items(&self) -> Vec<(Cmd, String, &'static str, &'static str)> {
         let admin = self.app_url();
-        let mut scored: Vec<(i32, (Cmd, String, &'static str, &'static str))> = Vec::new();
+        let mut scored: Vec<(i32, usize, (Cmd, String, &'static str, &'static str))> = Vec::new();
         for &(c, label, icon, hint) in PALETTE {
             // Open Admin: wby-next* only, and show the target URL in the label
             let label = if c == Cmd::OpenAdmin {
@@ -17052,15 +17134,17 @@ impl Storm {
                 label.to_string()
             };
             if let Some(s) = fuzzy_score(&self.palette_query.text, &label) {
-                scored.push((s, (c, label, icon, hint)));
+                scored.push((s, palette_rank(&self.palette_recent, c), (c, label, icon, hint)));
             }
         }
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
-        scored.into_iter().map(|(_, it)| it).collect()
+        palette_sort(&mut scored);
+        scored.into_iter().map(|(.., it)| it).collect()
     }
 
     fn palette_execute(&mut self, cmd: Cmd, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = false;
+        // what was just run is what the palette opens on next time
+        self.palette_recent = note_palette_use(cmd);
         // The palette's focus handle belongs to an element that is now gone. A
         // command that doesn't claim focus itself would leave focus dangling,
         // and a dangling focus has no dispatch path — which is how ⌘K stopped
@@ -45506,6 +45590,62 @@ mod image_tab_tests {
         assert_eq!(size_label(940), "940 B");
         assert_eq!(size_label(254_000), "248 KB");
         assert_eq!(size_label(3_565_158), "3.4 MB");
+    }
+}
+
+#[cfg(test)]
+mod palette_recent_tests {
+    use super::*;
+
+    fn recent(list: &[Cmd]) -> Vec<String> {
+        list.iter().map(|c| format!("{c:?}")).collect()
+    }
+
+    /// With nothing typed every label scores 0, so the palette is the order
+    /// things were last used, and what was never used stays where PALETTE put
+    /// it.
+    #[test]
+    fn an_empty_query_reads_as_a_most_recently_used_list() {
+        let used = recent(&[Cmd::Fetch, Cmd::Build]);
+        let mut rows: Vec<(i32, usize, Cmd)> = [Cmd::WipCommit, Cmd::Build, Cmd::Pull, Cmd::Fetch]
+            .into_iter()
+            .map(|c| (0, palette_rank(&used, c), c))
+            .collect();
+        palette_sort(&mut rows);
+        let order: Vec<Cmd> = rows.into_iter().map(|(.., c)| c).collect();
+        assert_eq!(order, vec![Cmd::Fetch, Cmd::Build, Cmd::WipCommit, Cmd::Pull]);
+    }
+
+    /// Typing still decides. A better match beats a command run five minutes
+    /// ago, or searching would hand back whatever was last run.
+    #[test]
+    fn a_better_match_beats_a_recent_one() {
+        let used = recent(&[Cmd::Fetch]);
+        let mut rows = vec![
+            (-9, palette_rank(&used, Cmd::Fetch), Cmd::Fetch),
+            (0, palette_rank(&used, Cmd::Build), Cmd::Build),
+        ];
+        palette_sort(&mut rows);
+        assert_eq!(rows[0].2, Cmd::Build);
+    }
+
+    /// The file is read as written: most recent first, no blanks, no command
+    /// twice, and never longer than the cap.
+    #[test]
+    fn the_file_is_read_back_in_order() {
+        let body = "Fetch\n\n  Build  \nFetch\n";
+        assert_eq!(palette_recent_from_text(body), vec!["Fetch", "Build"]);
+        let long: String = (0..PALETTE_RECENT + 20).map(|i| format!("c{i}\n")).collect();
+        assert_eq!(palette_recent_from_text(&long).len(), PALETTE_RECENT);
+        assert!(palette_recent_from_text("").is_empty());
+    }
+
+    /// A command that has never been run ranks behind every one that has.
+    #[test]
+    fn a_command_never_run_is_last() {
+        let used = recent(&[Cmd::Fetch]);
+        assert_eq!(palette_rank(&used, Cmd::Fetch), 0);
+        assert!(palette_rank(&used, Cmd::Build) > palette_rank(&used, Cmd::Fetch));
     }
 }
 
