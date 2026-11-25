@@ -3293,6 +3293,37 @@ fn char_floor(text: &str, at: usize) -> usize {
     at
 }
 
+/// The part of `text` a (row, byte) span covers, as text. Rows are joined with
+/// newlines, which is what a paste of several lines should be. The span may run
+/// either way, and its bytes come from a text layout, so they can land
+/// mid-character; both are sorted out here.
+fn md_span_text(text: &str, span: (usize, usize, usize, usize)) -> Option<String> {
+    let (ra, ba, rb, bb) = span;
+    let ((ra, ba), (rb, bb)) =
+        if (ra, ba) <= (rb, bb) { ((ra, ba), (rb, bb)) } else { ((rb, bb), (ra, ba)) };
+    let rows = md_prepare(text);
+    let mut out = String::new();
+    for i in ra..=rb.min(rows.len().saturating_sub(1)) {
+        let Some(row) = rows.get(i) else { break };
+        let t = row.text.as_ref();
+        let clamp = |b: usize| {
+            let b = b.min(t.len());
+            (0..=b).rev().find(|&i| t.is_char_boundary(i)).unwrap_or(0)
+        };
+        let piece = match (i == ra, i == rb) {
+            (true, true) => &t[clamp(ba.min(bb))..clamp(ba.max(bb))],
+            (true, false) => &t[clamp(ba)..],
+            (false, true) => &t[..clamp(bb)],
+            _ => t,
+        };
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(piece);
+    }
+    (!out.trim().is_empty()).then_some(out)
+}
+
 /// The word around `at` in `text`, as a byte range — what a double-click in
 /// the rendered document takes. Letters, digits and the joiners that read as
 /// part of a word in prose and in code alike.
@@ -9382,6 +9413,19 @@ struct Storm {
     /// the package chip, the stops it points at, a question asked here) is a
     /// row the estimate is short by and a line of code the card sits on.
     card_h: Option<((PathBuf, usize, usize), f32)>,
+    /// What is selected in the card's prose: which block of it (0 is the
+    /// stop's own text, 1 and up are the turns of its thread), then the row
+    /// and byte the selection runs between. Its own field rather than
+    /// `md_sel`, so a rendered document and the card can both hold a
+    /// selection without one standing for the other.
+    card_sel: Option<(usize, usize, usize, usize, usize)>,
+    /// The markdown that block was drawn from, so ⌘C has something to cut the
+    /// selection out of once the rows are gone.
+    card_sel_src: String,
+    card_sel_drag: bool,
+    /// Focus while a selection is being made on the card. The editor keeps the
+    /// caret otherwise, and its own ⌘C would copy the line the caret is on.
+    card_focus: FocusHandle,
     /// Slides of the open brief that have come up the window far enough to be
     /// drawn. Cleared when a new brief arrives, so it reveals itself again.
     /// Tool calls you have opened, by call id. A call is one line until then:
@@ -10319,6 +10363,10 @@ impl Storm {
             card_grow: 0.0,
             card_resize: None,
             card_h: None,
+            card_sel: None,
+            card_sel_src: String::new(),
+            card_sel_drag: false,
+            card_focus: cx.focus_handle(),
             tool_open: HashSet::new(),
             rc_width: None,
             brief_seen: HashSet::new(),
@@ -18518,6 +18566,7 @@ impl Storm {
             || self.card_resize.is_some()
             || self.agent_sel_drag
             || self.md_sel_drag
+            || self.card_sel_drag
         {
             self.resizing = false;
             self.resizing_term = false;
@@ -18539,6 +18588,12 @@ impl Storm {
                 self.md_sel = None;
             }
             self.md_sel_drag = false;
+            if self.card_sel_drag
+                && self.card_sel.is_some_and(|(_, ra, ba, rb, bb)| (ra, ba) == (rb, bb))
+            {
+                self.card_sel = None;
+            }
+            self.card_sel_drag = false;
             self.agent_sel_drag = false;
             self.agent_sel_moved = false;
             self.agent_sel_armed = None;
@@ -27404,6 +27459,15 @@ impl Storm {
             }
         }
         let has_thread = !thread.is_empty();
+        // the prose, drawn selectable: built here because the chain below is
+        // one expression, and each block needs the entity to hang its mouse
+        // handlers on. Block 0 is the stop's own text, the turns follow it.
+        let said_body = self.card_text_sel(&said, 0, 13., cx);
+        let thread_bodies: Vec<(bool, Div)> = thread
+            .iter()
+            .enumerate()
+            .map(|(i, (mine, text))| (*mine, self.card_text_sel(text, i + 1, 13., cx)))
+            .collect();
         // what the questions asked at this stop have cost between them
         let thread_cost = cost_chip(
             "stop-ask-cost",
@@ -27429,6 +27493,17 @@ impl Storm {
             div()
                 .id("tour-card")
                 .occlude()
+                .track_focus(&self.card_focus)
+                .on_key_down(cx.listener(Self::card_key))
+                // a selection belongs to the card it was made on: clicking
+                // anywhere else is done with it, and ⌘C goes back to meaning
+                // whatever the editor holds
+                .on_mouse_down_out(cx.listener(|this, _e: &MouseDownEvent, _w, cx| {
+                    if this.card_sel.is_some() {
+                        this.card_sel = None;
+                        cx.notify();
+                    }
+                }))
                 // `occlude` hides the root's drag handlers from anything over
                 // the card, which left a resize drag stuck on mouse-up: the
                 // grip grows the card under the pointer, so the release lands
@@ -27615,7 +27690,13 @@ impl Storm {
                                 .hover(|s| s.text_color(rgb(GIT_DELETED)))
                                 .child("✕")
                                 .tooltip(tip("End the tour  (esc)"))
-                                .on_click(cx.listener(|this, _e, _w, cx| this.end_walk(cx))),
+                                // the card is about to be gone, and its focus handle with
+                                // it: a focus whose element has been dropped leaves ⌘K
+                                // nowhere to dispatch
+                                .on_click(cx.listener(|this, _e, window, cx| {
+                                    this.focus_active(window, cx);
+                                    this.end_walk(cx)
+                                })),
                         ),
                 )
                 // the same cells the panel draws, so the two are one bar in
@@ -27743,7 +27824,7 @@ impl Storm {
                             .max_h(px(TOUR_CARD_ROWS as f32 * TOUR_LINE_H + grow_said))
                             .overflow_y_scroll()
                             .line_height(px(TOUR_LINE_H))
-                            .child(md_text(&said, 13., TEXT)),
+                            .child(said_body),
                     )
                 })
                 // the names in this stop's prose that the tour has already
@@ -27880,7 +27961,7 @@ impl Storm {
                                     .child(div().flex_grow(1.0))
                                     .child(c)
                             }))
-                            .children(thread.into_iter().map(|(mine, text)| {
+                            .children(thread_bodies.into_iter().map(|(mine, body)| {
                                 div()
                                     .flex()
                                     .flex_col()
@@ -27894,11 +27975,7 @@ impl Storm {
                                     // in: the answer is the half of the card
                                     // you actually read, and at 12 it was the
                                     // smallest text on screen
-                                    .child(
-                                        div()
-                                            .line_height(px(TOUR_LINE_H))
-                                            .child(md_text(&text, 13., TEXT)),
-                                    )
+                                    .child(div().line_height(px(TOUR_LINE_H)).child(body))
                             })),
                     )
                 })
@@ -30507,31 +30584,140 @@ impl Storm {
     /// What a drag over the rendered document covers, as text. Rows are joined
     /// with newlines, which is what a paste of several lines should be.
     fn md_selection(&self, text: &str) -> Option<String> {
-        let (ra, ba, rb, bb) = self.md_sel?;
-        let ((ra, ba), (rb, bb)) =
-            if (ra, ba) <= (rb, bb) { ((ra, ba), (rb, bb)) } else { ((rb, bb), (ra, ba)) };
+        md_span_text(text, self.md_sel?)
+    }
+
+    /// Prose on the tour card, drawn as rows you can select in: drag for a
+    /// range, double-click for the word under the pointer, triple for the
+    /// line. `block` keeps one block's rows apart from another's, so the
+    /// stop's text and each turn of its thread are selected one at a time.
+    ///
+    /// `md_text` draws the same rows without any of this; the handlers need an
+    /// entity to hang on, which is why it isn't a free function.
+    fn card_text_sel(&self, text: &str, block: usize, size: f32, cx: &mut Context<Self>) -> Div {
         let rows = md_prepare(text);
-        let mut out = String::new();
-        for i in ra..=rb.min(rows.len().saturating_sub(1)) {
-            let Some(row) = rows.get(i) else { break };
-            let t = row.text.as_ref();
-            // byte offsets come from the layout, so they may land mid-character
-            let clamp = |b: usize| {
-                let b = b.min(t.len());
-                (0..=b).rev().find(|&i| t.is_char_boundary(i)).unwrap_or(0)
-            };
-            let piece = match (i == ra, i == rb) {
-                (true, true) => &t[clamp(ba.min(bb))..clamp(ba.max(bb))],
-                (true, false) => &t[clamp(ba)..],
-                (false, true) => &t[..clamp(bb)],
-                _ => t,
-            };
-            if !out.is_empty() {
-                out.push('\n');
+        // normalised so the first end is the earlier one, whichever way it was dragged
+        let span = self.card_sel.filter(|(b, ..)| *b == block).map(|(_, ra, ba, rb, bb)| {
+            if (ra, ba) <= (rb, bb) { ((ra, ba), (rb, bb)) } else { ((rb, bb), (ra, ba)) }
+        });
+        let selected = move |i: usize| match span {
+            Some(((ra, ba), (rb, bb))) if i >= ra && i <= rb => {
+                if ra == rb {
+                    Sel::Range(ba.min(bb), ba.max(bb))
+                } else if i == ra {
+                    Sel::Range(ba, usize::MAX)
+                } else if i == rb {
+                    Sel::Range(0, bb)
+                } else {
+                    Sel::All
+                }
             }
-            out.push_str(piece);
+            _ => Sel::None,
+        };
+        let mut col = div().flex().flex_col().min_w(px(0.)).text_color(rgb(TEXT));
+        for (i, row) in rows.iter().enumerate() {
+            let mut layout: Option<gpui::TextLayout> = None;
+            let inner = match md_row_text(row, selected(i)) {
+                Some(t) => {
+                    layout = Some(t.layout().clone());
+                    md_hang(row, t.into_any_element())
+                }
+                None => md_row_el(row, selected(i)),
+            };
+            // `index_for_position` answers in bytes; `Err` is "past the end of
+            // the line", which is where a drag off the right edge lands
+            let at = |layout: Option<gpui::TextLayout>| {
+                move |pos: gpui::Point<gpui::Pixels>| -> Option<usize> {
+                    let l = layout.as_ref()?;
+                    Some(match l.index_for_position(pos) {
+                        Ok(b) => b,
+                        Err(b) => b,
+                    })
+                }
+            };
+            let (down, mv) = (at(layout.clone()), at(layout));
+            let words = row.text.clone();
+            let src = text.to_string();
+            col = col.child(
+                div()
+                    .text_size(px(size))
+                    .child(inner)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                            let b = down(ev.position).unwrap_or(0);
+                            // once starts a drag, twice takes the word under
+                            // the pointer, three times the line
+                            let (a, z) = match ev.click_count {
+                                1 => (b, b),
+                                2 => {
+                                    let r = word_at(&words, b);
+                                    (r.start, r.end)
+                                }
+                                _ => (0, words.len()),
+                            };
+                            this.card_sel = Some((block, i, a, i, z));
+                            this.card_sel_src = src.clone();
+                            this.card_sel_drag = a == z;
+                            window.focus(&this.card_focus, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _w, cx| {
+                        if !this.card_sel_drag {
+                            return;
+                        }
+                        if let (Some((b0, ra, ba, ..)), Some(b)) = (this.card_sel, mv(ev.position))
+                        {
+                            if b0 == block {
+                                this.card_sel = Some((b0, ra, ba, i, b));
+                                cx.notify();
+                            }
+                        }
+                    })),
+            );
         }
-        (!out.trim().is_empty()).then_some(out)
+        col
+    }
+
+    /// What is selected on the card, as text.
+    fn card_selection(&self) -> Option<String> {
+        let (_, ra, ba, rb, bb) = self.card_sel?;
+        md_span_text(&self.card_sel_src, (ra, ba, rb, bb))
+    }
+
+    /// Keys while a selection is held on the card. ⌘C takes it; escape drops
+    /// it and hands the caret back to the file underneath, which is where it
+    /// was before the drag.
+    ///
+    /// The question box inside the card has its own focus and its own handler,
+    /// so typing a question is unaffected: this only runs when the card itself
+    /// holds the focus, which only a drag over its prose does.
+    fn card_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.card_focus.is_focused(window) {
+            return;
+        }
+        let ks = &ev.keystroke;
+        match ks.key.as_str() {
+            "c" if ks.modifiers.platform => {
+                match self.card_selection() {
+                    Some(text) => {
+                        let n = text.chars().count();
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        self.show_flash(&format!("Copied {n} characters"), cx);
+                    }
+                    None => self.show_flash("Nothing selected", cx),
+                }
+                cx.stop_propagation();
+            }
+            "escape" => {
+                self.card_sel = None;
+                self.focus_active(window, cx);
+                cx.notify();
+            }
+            _ => return,
+        }
+        cx.notify();
     }
 
     /// ⌘F over the rendered document. The query runs against the markdown
@@ -31818,6 +32004,8 @@ impl Storm {
     }
 
     fn open_walk_stop(&mut self, stop: &Stop, window: &mut Window, cx: &mut Context<Self>) {
+        // the prose about to be drawn is not the prose that was selected
+        self.card_sel = None;
         let Some(p) = self.file_ref_target(&stop.path, cx) else {
             self.show_flash(&format!("Can't find {} in this project", stop.path), cx);
             return;
@@ -45590,6 +45778,60 @@ mod image_tab_tests {
         assert_eq!(size_label(940), "940 B");
         assert_eq!(size_label(254_000), "248 KB");
         assert_eq!(size_label(3_565_158), "3.4 MB");
+    }
+}
+
+#[cfg(test)]
+mod card_selection_tests {
+    use super::*;
+
+    /// `md_prepare` is what both the card and the rendered document draw from,
+    /// so a span is taken out of the same rows that were on screen.
+    fn rows(text: &str) -> Vec<String> {
+        md_prepare(text).iter().map(|r| r.text.to_string()).collect()
+    }
+
+    /// One row, part of it, taken in either direction.
+    #[test]
+    fn a_span_inside_one_row_is_the_text_between_its_ends() {
+        let text = "canAccessEntry runs as if that user made the request.";
+        let row = &rows(text)[0];
+        let a = row.find("runs").unwrap();
+        let z = a + "runs".len();
+        assert_eq!(md_span_text(text, (0, a, 0, z)).as_deref(), Some("runs"));
+        // dragged right to left, which is the same selection
+        assert_eq!(md_span_text(text, (0, z, 0, a)).as_deref(), Some("runs"));
+    }
+
+    /// Several rows join with newlines: what is pasted is what was read.
+    #[test]
+    fn a_span_over_rows_pastes_as_lines() {
+        let text = "first line here\n\nsecond line here";
+        let rows = rows(text);
+        assert!(rows.len() >= 2, "{rows:?}");
+        let last = rows.len() - 1;
+        let got = md_span_text(text, (0, 6, last, 6)).expect("a selection");
+        assert!(got.starts_with("line here"), "{got}");
+        assert!(got.contains('\n'), "{got}");
+        assert!(got.ends_with("second"), "{got}");
+    }
+
+    /// A drag off the end of a line lands past the last byte, and a byte from
+    /// a text layout can land inside a character. Neither is allowed to panic.
+    #[test]
+    fn a_span_past_the_end_is_clamped() {
+        let text = "héllo wörld";
+        assert_eq!(md_span_text(text, (0, 0, 0, 9_999)).as_deref(), Some(text));
+        // byte 2 is inside the é, so it rounds back to the character's start
+        assert_eq!(md_span_text(text, (0, 0, 0, 2)).as_deref(), Some("h"));
+        assert_eq!(md_span_text(text, (0, 0, 9_999, 0)).as_deref(), Some(text));
+    }
+
+    /// An empty drag selects nothing, and nothing is not something to copy.
+    #[test]
+    fn an_empty_span_is_no_selection() {
+        assert_eq!(md_span_text("some prose", (0, 4, 0, 4)), None);
+        assert_eq!(md_span_text("", (0, 0, 0, 0)), None);
     }
 }
 
