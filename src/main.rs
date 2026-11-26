@@ -7788,6 +7788,13 @@ const RC_BOX_VPAD: f32 = 12.0;
 const RC_MIN_LINES: usize = 3;
 const RC_MAX_LINES: usize = 20;
 
+/// One row of the model picker over the composer.
+const MODEL_ROW_H: f32 = 22.0;
+/// Rows the picker shows before it scrolls. An account with the older families
+/// switched on offers sixteen models, and a list that long drawn upwards out of
+/// the composer runs the height of the transcript.
+const MODEL_ROWS: usize = 9;
+
 /// The tour card that sits under the stop you're standing on. Wide enough for
 /// a paragraph at 13px without running the width of a 4K window.
 const TOUR_CARD_W: f32 = 760.0;
@@ -9891,6 +9898,9 @@ struct Storm {
     model_now: String,
     /// Whether the picker over the composer is open.
     model_open: bool,
+    /// Scroll of the open picker. Settings can offer a dozen models and more,
+    /// so the list is a window onto them rather than the whole thing.
+    model_scroll: ScrollHandle,
     // merge-conflicts dialog
     mc_open: bool,
     mc_focus: FocusHandle,
@@ -10693,6 +10703,7 @@ impl Storm {
             models: Vec::new(),
             model_now: String::new(),
             model_open: false,
+            model_scroll: ScrollHandle::new(),
             mc_open: false,
             mc_focus: cx.focus_handle(),
             mc_files: Vec::new(),
@@ -32367,6 +32378,9 @@ impl Storm {
                         ))
                         .on_click(cx.listener(|this, _e, _w, cx| {
                             this.model_open = !this.model_open;
+                            if this.model_open {
+                                this.model_scroll_into_view();
+                            }
                             cx.notify();
                         })),
                 )
@@ -32375,14 +32389,21 @@ impl Storm {
     }
 
     /// The models to pick from, growing upwards out of the chip.
+    ///
+    /// Capped at `MODEL_ROWS` rows and scrolled past that. Uncapped it grew to
+    /// whatever the settings offer, which on an account with the older families
+    /// turned on is sixteen rows: a column up the middle of the transcript.
     fn model_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut panel = div()
+            .id("agent-model-list")
             .absolute()
             .right_0()
             .bottom(relative(1.))
             .mb_1()
             .w(px(220.))
-            .overflow_hidden()
+            .max_h(px(MODEL_ROWS as f32 * MODEL_ROW_H + 8.0))
+            .overflow_y_scroll()
+            .track_scroll(&self.model_scroll)
             .bg(rgb(POPUP_BG))
             .border_1()
             .border_color(rgb(BORDER))
@@ -32403,7 +32424,7 @@ impl Storm {
                     .items_center()
                     .gap_2()
                     .px_2()
-                    .py_0p5()
+                    .h(px(MODEL_ROW_H))
                     .cursor_pointer()
                     .when(on, |d| d.bg(rgb(SELECTED_BG)))
                     .hover(|s| s.bg(rgb(if on { SELECTED_BG } else { HOVER })))
@@ -32432,6 +32453,19 @@ impl Storm {
             );
         }
         panel
+    }
+
+    /// Put the model the session is on inside the window the list shows, one
+    /// row down from the top edge so the one above it is still reachable.
+    ///
+    /// The offset is worked out from the row count rather than from the handle's
+    /// bounds, because on the first open the list has never been laid out and
+    /// its bounds are zero.
+    fn model_scroll_into_view(&self) {
+        let ix = self.models.iter().position(|(id, _)| *id == self.model_now).unwrap_or(0);
+        let max = (self.models.len() as f32 * MODEL_ROW_H - MODEL_ROWS as f32 * MODEL_ROW_H).max(0.0);
+        let want = ((ix as f32 - 1.0) * MODEL_ROW_H).clamp(0.0, max);
+        self.model_scroll.set_offset(gpui::point(px(0.), px(-want)));
     }
 
     /// Run this session on `id` from the next turn.
