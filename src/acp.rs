@@ -106,8 +106,43 @@ pub enum AcpEvent {
     Usage { used: u64, size: u64 },
     /// The adapter's title for the session (its summary of the first prompt).
     Title(String),
+    /// The models this session can run on, as `(id, name)`, and the id of the
+    /// one it is running on now. The adapter sends them with every answer that
+    /// carries the session's config, so this arrives on `session/new`, on
+    /// `session/load`, and again as the confirmation of a switch.
+    Models { list: Vec<(String, String)>, current: String },
     /// Something went wrong (handshake failed, prompt errored, adapter died).
     Error(String),
+}
+
+/// The model picker out of an answer's `configOptions`, as `(id, name)` rows
+/// and the id in force.
+///
+/// `session/new`, `session/load` and the answer to a switch all carry the
+/// session's config options. The model option's rows may be grouped a level
+/// deep (the adapter groups by provider when there is more than one), so one
+/// level is flattened out; a group's own entry is not a model.
+fn model_config(result: &Value) -> Option<(Vec<(String, String)>, String)> {
+    let opt = result
+        .get("configOptions")?
+        .as_array()?
+        .iter()
+        .find(|o| o.get("id").and_then(|i| i.as_str()) == Some("model"))?;
+    let row = |o: &Value| -> Option<(String, String)> {
+        let id = o.get("value")?.as_str()?.to_string();
+        let name = o.get("name").and_then(|n| n.as_str()).unwrap_or(&id).to_string();
+        Some((id, name))
+    };
+    let mut list = Vec::new();
+    for o in opt.get("options")?.as_array()? {
+        match o.get("options").and_then(|g| g.as_array()) {
+            Some(group) => list.extend(group.iter().filter_map(row)),
+            None => list.extend(row(o)),
+        }
+    }
+    let current =
+        opt.get("currentValue").and_then(|c| c.as_str()).unwrap_or_default().to_string();
+    (!list.is_empty()).then_some((list, current))
 }
 
 /// A live ACP session against one project root.
@@ -493,6 +528,22 @@ impl Acp {
         }));
     }
 
+    /// Run this session on another model. The adapter takes a model id, and
+    /// also the family aliases (`opus`, `sonnet`, `haiku`); it answers with the
+    /// session's config options, which come back as `Models`.
+    ///
+    /// It is the session that changes, not the message: the next turn and
+    /// every turn after it run on what was picked here.
+    pub fn set_model(&self, model: &str) {
+        let Some(sid) = self.session.lock().ok().and_then(|s| s.clone()) else { return };
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "id": self.take_id_for("session/set_config_option"),
+            "method": "session/set_config_option",
+            "params": { "sessionId": sid, "configId": "model", "value": model }
+        }));
+    }
+
     /// Resume `session_id`: the adapter replays its history as `User`/`Text`
     /// events, then the session accepts new prompts as usual.
     pub fn load_session(&self, root: &Path, session_id: &str) {
@@ -776,6 +827,9 @@ impl Acp {
             self.push(AcpEvent::Sessions(sessions));
             return;
         }
+        if let Some((list, current)) = model_config(result) {
+            self.push(AcpEvent::Models { list, current });
+        }
         if let Some(sid) = result.get("sessionId").and_then(|s| s.as_str()) {
             *self.session.lock().unwrap() = Some(sid.to_string());
             self.ready.store(true, Ordering::Relaxed);
@@ -854,7 +908,9 @@ fn write_text(path: &str, content: &str) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{adapter_dir, adapter_entry, base64, base64_decode, ADAPTER, ADAPTER_VERSION};
+    use super::{
+        adapter_dir, adapter_entry, base64, base64_decode, model_config, ADAPTER, ADAPTER_VERSION,
+    };
     use std::path::Path;
 
     /// The install lives under the pinned version, and the file node runs lives
@@ -868,6 +924,62 @@ mod tests {
         assert!(dir.ends_with(Path::new(".config/tide/agent").join(ADAPTER_VERSION)), "{}", dir.display());
         let entry = adapter_entry(Path::new("/x"));
         assert_eq!(entry, Path::new("/x/node_modules").join(ADAPTER).join("dist/index.js"));
+    }
+
+    /// The session's answer carries what it can run on. Flat rows and rows
+    /// grouped a level deep both read as a list of models.
+    #[test]
+    fn the_models_come_out_of_the_session_config() {
+        let flat = serde_json::json!({
+            "sessionId": "s1",
+            "configOptions": [
+                { "id": "mode", "currentValue": "default", "options": [] },
+                {
+                    "id": "model",
+                    "currentValue": "claude-opus-5",
+                    "options": [
+                        { "value": "default", "name": "Default" },
+                        { "value": "claude-opus-5", "name": "Opus 5" },
+                        { "value": "claude-sonnet-5", "name": "Sonnet 5" }
+                    ]
+                }
+            ]
+        });
+        let (list, current) = model_config(&flat).expect("a model option");
+        assert_eq!(current, "claude-opus-5");
+        assert_eq!(
+            list,
+            vec![
+                ("default".to_string(), "Default".to_string()),
+                ("claude-opus-5".to_string(), "Opus 5".to_string()),
+                ("claude-sonnet-5".to_string(), "Sonnet 5".to_string()),
+            ]
+        );
+
+        // grouped by provider: the group is not a model, its rows are
+        let grouped = serde_json::json!({
+            "configOptions": [{
+                "id": "model",
+                "currentValue": "haiku",
+                "options": [
+                    { "name": "Anthropic", "options": [
+                        { "value": "haiku", "name": "Haiku 5" },
+                        { "value": "opus", "name": "Opus 5" }
+                    ]}
+                ]
+            }]
+        });
+        let (list, current) = model_config(&grouped).expect("a model option");
+        assert_eq!(current, "haiku");
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].0, "haiku");
+
+        // an answer with no model option, and one whose list is empty
+        assert!(model_config(&serde_json::json!({ "sessionId": "s1" })).is_none());
+        let empty = serde_json::json!({
+            "configOptions": [{ "id": "model", "currentValue": "x", "options": [] }]
+        });
+        assert!(model_config(&empty).is_none());
     }
 
     /// Decoding undoes encoding for every length, including the two that pad.

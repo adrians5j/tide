@@ -9884,6 +9884,13 @@ struct Storm {
     palette_gen: u64,
     /// Command names, most recently used first. Read when the palette opens.
     palette_recent: Vec<String>,
+    /// The models the agent session offers, as `(id, name)`, and the id of
+    /// the one it is on. Empty until the adapter says, which it does as part
+    /// of opening the session.
+    models: Vec<(String, String)>,
+    model_now: String,
+    /// Whether the picker over the composer is open.
+    model_open: bool,
     // merge-conflicts dialog
     mc_open: bool,
     mc_focus: FocusHandle,
@@ -10683,6 +10690,9 @@ impl Storm {
             palette_results: Vec::new(),
             palette_gen: 0,
             palette_recent: load_palette_recent(),
+            models: Vec::new(),
+            model_now: String::new(),
+            model_open: false,
             mc_open: false,
             mc_focus: cx.focus_handle(),
             mc_files: Vec::new(),
@@ -29118,6 +29128,12 @@ impl Storm {
         match ev {
             Ready => {} // session ready; input was already accepting text
             Usage { used, size } => self.agent_ctx = Some((used, size)),
+            // the models this session can run on. Sent when it opens, and
+            // again as the answer to a switch, which is what moves the chip
+            Models { list, current } => {
+                self.models = list;
+                self.model_now = current;
+            }
             // a replayed turn from session/load
             User(t) => {
                 let text = strip_briefing(&t).to_string();
@@ -29424,6 +29440,9 @@ impl Storm {
         }
         match ks.key.as_str() {
             // the `@` list owns these keys while it's up
+            "escape" if self.model_open => {
+                self.model_open = false;
+            }
             "escape" if self.at_open => {
                 self.at_open = false;
                 self.at_items.clear();
@@ -32297,6 +32316,142 @@ impl Storm {
         }
     }
 
+    /// The model this session runs on, as a chip by the composer, and the
+    /// list of the others when it is pressed.
+    ///
+    /// A question about a stop of a tour, a "what next?", a one-line fix: most
+    /// of what gets typed here does not need the model that writes the code,
+    /// and the only way to say so was the adapter's own default. The adapter
+    /// reports what this session can run on; this picks one, and the session
+    /// runs on it from the next turn.
+    fn model_chip(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if self.models.len() < 2 {
+            return None;
+        }
+        let now = self
+            .models
+            .iter()
+            .find(|(id, _)| *id == self.model_now)
+            .map(|(_, name)| name.clone())
+            .unwrap_or_else(|| "Model".to_string());
+        let open = self.model_open;
+        Some(
+            div()
+                .id("agent-model-chip")
+                .relative()
+                .flex_shrink_0()
+                .mr_2()
+                // a list left open over the composer is in the way of the
+                // thing it sits on top of
+                .on_mouse_down_out(cx.listener(|this, _e: &MouseDownEvent, _w, cx| {
+                    if this.model_open {
+                        this.model_open = false;
+                        cx.notify();
+                    }
+                }))
+                .child(
+                    div()
+                        .id("agent-model")
+                        .px_1p5()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_size(px(11.))
+                        .border_1()
+                        .border_color(rgb(if open { ACCENT } else { BORDER }))
+                        .text_color(rgb(if open { TEXT } else { MUTED }))
+                        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+                        .child(now)
+                        .tooltip(tip(
+                            "The model this session runs on. A switch takes effect from \
+                             the next turn; the conversation stays where it is",
+                        ))
+                        .on_click(cx.listener(|this, _e, _w, cx| {
+                            this.model_open = !this.model_open;
+                            cx.notify();
+                        })),
+                )
+                .when(open, |d| d.child(self.model_list(cx))),
+        )
+    }
+
+    /// The models to pick from, growing upwards out of the chip.
+    fn model_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut panel = div()
+            .absolute()
+            .right_0()
+            .bottom(relative(1.))
+            .mb_1()
+            .w(px(220.))
+            .overflow_hidden()
+            .bg(rgb(POPUP_BG))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .rounded_md()
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .py_1();
+        for (i, (id, name)) in self.models.iter().enumerate() {
+            let on = *id == self.model_now;
+            let pick = id.clone();
+            let said = name.clone();
+            panel = panel.child(
+                div()
+                    .id(("agent-model-row", i))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_0p5()
+                    .cursor_pointer()
+                    .when(on, |d| d.bg(rgb(SELECTED_BG)))
+                    .hover(|s| s.bg(rgb(if on { SELECTED_BG } else { HOVER })))
+                    .child(
+                        div()
+                            .w(px(10.))
+                            .flex_shrink_0()
+                            .text_size(px(10.))
+                            .text_color(rgb(ACCENT))
+                            .child(if on { "\u{2713}" } else { "" }),
+                    )
+                    .child(
+                        div()
+                            .flex_grow(1.0)
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(12.))
+                            .text_color(rgb(if on { SEL_TEXT } else { TEXT }))
+                            .child(name.clone()),
+                    )
+                    .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                        this.pick_model(pick.clone(), &said, cx);
+                        cx.notify();
+                    })),
+            );
+        }
+        panel
+    }
+
+    /// Run this session on `id` from the next turn.
+    fn pick_model(&mut self, id: String, name: &str, cx: &mut Context<Self>) {
+        self.model_open = false;
+        if id == self.model_now {
+            return;
+        }
+        let Some(acp) = self.acp.clone() else {
+            self.show_flash("No agent session to switch", cx);
+            return;
+        };
+        acp.set_model(&id);
+        // the adapter answers with the session's config, which is what moves
+        // the chip; this is only so the press reads as having done something
+        self.model_now = id;
+        self.note_step(&format!("Switched the agent to {name}"));
+        self.show_flash(&format!("{name} from the next turn"), cx);
+    }
+
     /// The `@` list, sitting on top of the composer. Rows are clickable, ↑/↓
     /// move, ⇥ or ↩ takes the highlighted one.
     fn render_mentions(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -34393,6 +34548,7 @@ impl Storm {
                         cx,
                     ))
                     .child(div().flex_grow(1.0))
+                    .children(self.model_chip(cx))
                     // pending review comments are usually written while reading an
                     // answer right here — the send button belongs next to the box
                     // you're already looking at, not only in the review pane
