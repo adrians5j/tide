@@ -27827,9 +27827,15 @@ impl Storm {
                 )
                 // the same cells the panel draws, so the two are one bar in
                 // two places. Hidden while the card is a line, where there is
-                // only room for the number
+                // only room for the number.
+                //
+                // The track is SEPARATOR because the card sits on POPUP_BG,
+                // which BORDER is the same colour as: the cells still to come
+                // were being drawn in the background's own colour, so the bar
+                // stopped where progress stopped and said nothing about how
+                // much was left.
                 .when(!min, |d| {
-                    d.child(segmented_bar_on(pct, progress_color(pct), 3., BORDER))
+                    d.child(segmented_bar_on(pct, progress_color(pct), 4., SEPARATOR))
                 })
                 .child(
                     div()
