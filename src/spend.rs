@@ -124,8 +124,15 @@ pub fn measure(mark: &Mark) -> Use {
     if mark.from > 0 && f.seek(SeekFrom::Start(mark.from)).is_err() {
         return u;
     }
+    // one reply is written as one line per content block, each repeating the
+    // reply's usage: count the first and skip the rest
+    let mut last = String::new();
     for line in BufReader::with_capacity(1 << 16, f).lines().map_while(Result::ok) {
-        if let Some((_, _, used)) = tokens::read_line(&line) {
+        if let Some((_, _, id, used)) = tokens::read_line(&line) {
+            if !id.is_empty() && id == last {
+                continue;
+            }
+            last = id;
             u.add(&used);
         }
     }
@@ -452,7 +459,7 @@ mod tests {
         let mut f = std::fs::File::open(&path).unwrap();
         f.seek(SeekFrom::Start(from)).unwrap();
         for l in BufReader::new(f).lines().map_while(Result::ok) {
-            if let Some((_, _, used)) = tokens::read_line(&l) {
+            if let Some((_, _, _, used)) = tokens::read_line(&l) {
                 u.add(&used);
             }
         }

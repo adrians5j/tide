@@ -90,6 +90,10 @@ pub struct Session {
     /// Unix seconds at the top of the hour, and what that hour cost. Sorted.
     pub hours: Vec<(i64, Use)>,
     pub total: Use,
+    /// The assistant message id last counted, so the response it belongs to is
+    /// counted once. See `read_into`. Kept across scans because a response's
+    /// lines can straddle the point the last scan stopped at.
+    pub last_id: String,
 }
 
 impl Session {
@@ -202,11 +206,17 @@ fn sorted(it: impl Iterator<Item = (String, Use)>) -> Vec<(String, Use)> {
     v
 }
 
-/// The usage out of one assistant line, with the time it happened.
+/// The usage out of one assistant line: when, the working directory, the
+/// assistant message id, and the numbers.
 ///
 /// Every other line in the file (user turns, tool results, queue operations)
 /// has no usage on it and is skipped by the caller before this is reached.
-pub fn read_line(line: &str) -> Option<(i64, String, Use)> {
+///
+/// The id matters because Claude Code writes one line per content block, not
+/// one per response: a reply that thought and then called a tool is two lines,
+/// both carrying the same `message.id` and the same usage. Counting lines
+/// counted that reply twice, which over a day of logs read 74% high.
+pub fn read_line(line: &str) -> Option<(i64, String, String, Use)> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
         return None;
@@ -215,7 +225,14 @@ pub fn read_line(line: &str) -> Option<(i64, String, Use)> {
     let n = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
     let when = epoch(v.get("timestamp")?.as_str()?)?;
     let root = v.get("cwd").and_then(|c| c.as_str()).unwrap_or_default().to_string();
-    Some((when, root, Use {
+    let id = v
+        .get("message")
+        .and_then(|m| m.get("id"))
+        .and_then(|i| i.as_str())
+        .or_else(|| v.get("requestId").and_then(|r| r.as_str()))
+        .unwrap_or_default()
+        .to_string();
+    Some((when, root, id, Use {
         input: n("input_tokens"),
         cache_write: n("cache_creation_input_tokens"),
         cache_read: n("cache_read_input_tokens"),
@@ -409,7 +426,7 @@ fn last_context(path: &Path) -> Option<u64> {
             break;
         }
         if has_usage(&raw) {
-            if let Some((_, _, u)) = read_line(&String::from_utf8_lossy(&raw)) {
+            if let Some((_, _, _, u)) = read_line(&String::from_utf8_lossy(&raw)) {
                 found = Some(u.context());
             }
         }
@@ -425,6 +442,10 @@ fn logs_dir() -> Option<PathBuf> {
 fn cache_path() -> Option<PathBuf> {
     Some(PathBuf::from(std::env::var("HOME").ok()?).join(".config/tide/token-scan.json"))
 }
+
+/// How the scan counts. Raised when that changes, which throws the cache away:
+/// 2 counts one reply once, where 1 counted it once per content block.
+const SCAN_V: u64 = 2;
 
 /// What the last scan read of one file, so the next one starts where it stopped.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -450,21 +471,30 @@ fn to_json(map: &HashMap<String, Cached>) -> String {
                 "size": c.size,
                 "id": c.session.id,
                 "root": c.session.root,
+                "last": c.session.last_id,
                 "hours": hours,
             })
         })
         .collect();
-    serde_json::to_string(&serde_json::json!({ "files": files })).unwrap_or_else(|_| "{}".into())
+    serde_json::to_string(&serde_json::json!({ "v": SCAN_V, "files": files }))
+        .unwrap_or_else(|_| "{}".into())
 }
 
 fn from_json(body: &str) -> HashMap<String, Cached> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else { return HashMap::new() };
+    // a cache counted by an older rule is wrong, not stale: the scan only ever
+    // reads what a file has grown since, so a bad total would never be
+    // corrected. Dropping it costs one full rescan.
+    if v.get("v").and_then(|v| v.as_u64()).unwrap_or(0) != SCAN_V {
+        return HashMap::new();
+    }
     let mut out = HashMap::new();
     for f in v.get("files").and_then(|f| f.as_array()).into_iter().flatten() {
         let Some(path) = f.get("path").and_then(|p| p.as_str()) else { continue };
         let mut session = Session {
             id: f.get("id").and_then(|i| i.as_str()).unwrap_or_default().to_string(),
             root: f.get("root").and_then(|r| r.as_str()).unwrap_or_default().to_string(),
+            last_id: f.get("last").and_then(|l| l.as_str()).unwrap_or_default().to_string(),
             ..Session::default()
         };
         for h in f.get("hours").and_then(|h| h.as_array()).into_iter().flatten() {
@@ -575,7 +605,11 @@ pub fn scan(keep: i64) -> Report {
     Report { sessions, files, bytes, at }
 }
 
-/// Add every usage line from `offset` to the end of `path` into `session`.
+/// Add every response from `offset` to the end of `path` into `session`.
+///
+/// A response is counted once however many lines it was written as: the blocks
+/// of one reply repeat its usage, and `session.last_id` is what remembers which
+/// reply was last counted.
 fn read_into(path: &Path, offset: u64, session: &mut Session) {
     let Ok(mut f) = std::fs::File::open(path) else { return };
     if offset > 0 && f.seek(SeekFrom::Start(offset)).is_err() {
@@ -599,7 +633,13 @@ fn read_into(path: &Path, offset: u64, session: &mut Session) {
             continue;
         }
         line.push_str(&String::from_utf8_lossy(&raw));
-        if let Some((when, root, u)) = read_line(&line) {
+        if let Some((when, root, id, u)) = read_line(&line) {
+            // one response, one request: its blocks are written as separate
+            // lines that repeat the same usage
+            if !id.is_empty() && id == session.last_id {
+                continue;
+            }
+            session.last_id = id;
             if session.root.is_empty() {
                 session.root = root;
             }
@@ -626,11 +666,12 @@ fn now() -> i64 {
 mod tests {
     use super::*;
 
-    const LINE: &str = r#"{"type":"assistant","timestamp":"2026-11-05T11:16:01.291Z","sessionId":"abc","cwd":"/Users/a/dev/wby-next9","isSidechain":false,"message":{"model":"claude-opus-5-5","usage":{"input_tokens":2,"cache_creation_input_tokens":27756,"cache_read_input_tokens":13398,"output_tokens":174}}}"#;
+    const LINE: &str = r#"{"type":"assistant","timestamp":"2026-11-05T11:16:01.291Z","sessionId":"abc","cwd":"/Users/a/dev/wby-next9","isSidechain":false,"message":{"id":"msg_01abc","model":"claude-opus-5-5","usage":{"input_tokens":2,"cache_creation_input_tokens":27756,"cache_read_input_tokens":13398,"output_tokens":174}}}"#;
 
     #[test]
     fn a_usage_line_gives_up_its_numbers() {
-        let (when, root, u) = read_line(LINE).expect("usage");
+        let (when, root, id, u) = read_line(LINE).expect("usage");
+        assert_eq!(id, "msg_01abc");
         assert_eq!(root, "/Users/a/dev/wby-next9");
         assert_eq!(when, 1793877361);
         assert_eq!(u.input, 2);
@@ -642,6 +683,38 @@ mod tests {
         assert!(read_line(r#"{"type":"user","message":{"content":"hi"}}"#).is_none());
         assert!(read_line(r#"{"type":"queue-operation","operation":"enqueue"}"#).is_none());
         assert!(read_line("not json").is_none());
+    }
+
+    /// Claude Code writes one line per content block. A reply that thought and
+    /// then called a tool is two lines carrying the same id and the same usage,
+    /// and counting both read the day 74% high.
+    #[test]
+    fn a_reply_written_as_two_lines_is_one_request() {
+        let dir = std::env::temp_dir().join(format!("tide-tok-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("s.jsonl");
+        let other = LINE.replace("msg_01abc", "msg_01def");
+        std::fs::write(&path, format!("{LINE}\n{LINE}\n{other}\n")).unwrap();
+        let mut session = Session::default();
+        read_into(&path, 0, &mut session);
+        assert_eq!(session.total.calls, 2, "three lines, two replies");
+        assert_eq!(session.total.output, 348);
+
+        // and a reply split across the point the last scan stopped at is still
+        // one reply: the id survives in the session
+        let grows = dir.join("grows.jsonl");
+        let half = format!("{LINE}\n");
+        std::fs::write(&grows, half.as_bytes()).unwrap();
+        let mut split = Session::default();
+        read_into(&grows, 0, &mut split);
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&grows).unwrap();
+            f.write_all(half.as_bytes()).unwrap();
+        }
+        read_into(&grows, half.len() as u64, &mut split);
+        assert_eq!(split.total.calls, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
