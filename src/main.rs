@@ -5838,7 +5838,12 @@ fn tour_request(about: Option<&str>, answer: Option<&str>) -> String {
          stop leans on something an earlier stop was about, say so in the \
          sentence — \"the `rejectsToken()` we walked through earlier\" — \
          rather than using the name as if I had it in hand. Don't number the \
-         stop; TIDE puts the number on it.\n\n\
+         stop; TIDE puts the number on it.\n\
+         When you point at another stop, use the words TIDE makes a link of: \
+         \"the stop above\", \"the previous stop\", \"the next stop\", \
+         \"the stop below\", or a count of them, \"two stops back\". The \
+         phrase is clickable in the card, so the reader lands on the stop \
+         instead of counting backwards to find it.\n\n\
          Where the tour moves from one stretch of the work to another, name \
          the stretch with `group` on each stop in it (\"The AWS side\", \
          \"Standalone\") — consecutive stops sharing one become a section with \
@@ -8541,6 +8546,127 @@ fn looks_like_a_name(tok: &str) -> bool {
     }
     // camelCase, PascalCase with a second word, snake_case, or a call
     bare.chars().skip(1).any(|c| c.is_ascii_uppercase() || c == '_') || tok.ends_with("()")
+}
+
+/// Words of `text`, lowercased, with where each one sits in the original. The
+/// case fold is ASCII, so a byte offset still means the same byte.
+fn word_spans(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
+    let mut out = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in text.char_indices() {
+        match (c.is_alphanumeric() || c == '#', start) {
+            (true, None) => start = Some(i),
+            (false, Some(a)) => {
+                out.push((a..i, text[a..i].to_ascii_lowercase()));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(a) = start {
+        out.push((a..text.len(), text[a..].to_ascii_lowercase()));
+    }
+    out
+}
+
+/// Words that point back through the tour, and words that point forward.
+const STOP_BACK: &[&str] = &["above", "before", "earlier", "back", "previous", "preceding"];
+const STOP_FWD: &[&str] = &["below", "after", "next", "later", "following"];
+
+/// "two" and "2" are both two.
+fn small_number(w: &str) -> Option<usize> {
+    Some(match w {
+        "one" | "1" => 1,
+        "two" | "2" => 2,
+        "three" | "3" => 3,
+        "four" | "4" => 4,
+        "five" | "5" => 5,
+        _ => return None,
+    })
+}
+
+/// The stop the card numbers `n`, if there is one. That number counts the
+/// main route, so an appendix stop is not what "stop 4" means.
+fn stop_numbered(stops: &[Stop], n: usize) -> Option<usize> {
+    (0..stops.len()).find(|&j| {
+        let (no, _, extra) = tour_place(stops, j);
+        !extra && no == n
+    })
+}
+
+/// Phrases in a stop's prose that point at another stop, and which stop each
+/// one points at.
+///
+/// "the use case short-circuits guarded models in the stop above" is a
+/// sentence with a destination in it, and following it meant counting
+/// backwards and pressing the arrows to find out whether the count was right.
+/// The phrase itself is the link.
+///
+/// What counts: the stop either side of this one ("the stop above", "the
+/// previous stop", "the next stop"), a count of them ("two stops back"), and
+/// a stop named by its number ("stop 4"). The count and the article that open
+/// the phrase are part of it, so the whole thing underlines as one word.
+fn stop_refs(text: &str, at: usize, stops: &[Stop]) -> Vec<(std::ops::Range<usize>, usize)> {
+    let words = word_spans(text);
+    let dir = |w: &str| match (STOP_BACK.contains(&w), STOP_FWD.contains(&w)) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    };
+    // the word before byte `b`, and whether nothing but space stands between
+    let earlier = |b: usize| words.iter().filter(|(r, _)| r.end <= b).next_back();
+    let mut out: Vec<(std::ops::Range<usize>, usize)> = Vec::new();
+    for (i, (span, w)) in words.iter().enumerate() {
+        if w != "stop" && w != "stops" {
+            continue;
+        }
+        let after = words.get(i + 1);
+        // "stop 4" names a stop; the number is not a count of them
+        if w == "stop" {
+            if let Some(j) = after
+                .map(|(_, a)| a.trim_start_matches('#').to_string())
+                .and_then(|a| a.parse::<usize>().ok())
+                .and_then(|n| stop_numbered(stops, n))
+            {
+                if j != at {
+                    out.push((span.start..words[i + 1].0.end, j));
+                }
+                continue;
+            }
+        }
+        // "the stop above" and "two stops back", or "the previous stop"
+        let before = i.checked_sub(1).and_then(|j| words.get(j));
+        let (back, mut start, end) =
+            match (after.and_then(|(_, a)| dir(a)), before.and_then(|(_, b)| dir(b))) {
+                (Some(back), _) => (back, span.start, words[i + 1].0.end),
+                (_, Some(back)) => (back, words[i - 1].0.start, span.end),
+                _ => continue,
+            };
+        let mut step = 1;
+        if let Some((r, word)) = earlier(start) {
+            if text[r.end..start].trim().is_empty() {
+                if let Some(n) = small_number(word) {
+                    step = n;
+                    start = r.start;
+                }
+            }
+        }
+        if let Some((r, word)) = earlier(start) {
+            if text[r.end..start].trim().is_empty() && (word == "the" || word == "a") {
+                start = r.start;
+            }
+        }
+        let target = match back {
+            true => at.checked_sub(step),
+            false => (at + step < stops.len()).then_some(at + step),
+        };
+        if let Some(j) = target.filter(|j| *j != at) {
+            out.push((start..end, j));
+        }
+    }
+    out.sort_by_key(|(r, _)| r.start);
+    out.dedup_by(|b, a| b.0.start < a.0.end);
+    out
 }
 
 /// What this stop leans on that an earlier stop already covered, as
@@ -30587,6 +30713,15 @@ impl Storm {
         md_span_text(text, self.md_sel?)
     }
 
+    /// Where this row's prose points, when it points at another stop of the
+    /// tour being walked.
+    fn stop_jumps(&self, text: &str) -> Vec<(std::ops::Range<usize>, usize)> {
+        match &self.walk {
+            Some(w) => stop_refs(text, w.at, &w.stops),
+            None => Vec::new(),
+        }
+    }
+
     /// Prose on the tour card, drawn as rows you can select in: drag for a
     /// range, double-click for the word under the pointer, triple for the
     /// line. `block` keeps one block's rows apart from another's, so the
@@ -30616,13 +30751,34 @@ impl Storm {
         };
         let mut col = div().flex().flex_col().min_w(px(0.)).text_color(rgb(TEXT));
         for (i, row) in rows.iter().enumerate() {
+            // "the stop above" is a destination, so it is drawn as a link.
+            // The selection highlight rides on the same styled text, so a row
+            // can be both read and dragged over
+            let jumps = self.stop_jumps(&row.text);
             let mut layout: Option<gpui::TextLayout> = None;
-            let inner = match md_row_text(row, selected(i)) {
-                Some(t) => {
+            let inner = match (md_row_text(row, selected(i)), jumps.is_empty()) {
+                (Some(t), true) => {
                     layout = Some(t.layout().clone());
                     md_hang(row, t.into_any_element())
                 }
-                None => md_row_el(row, selected(i)),
+                (Some(_), false) => {
+                    let ranges: Vec<std::ops::Range<usize>> =
+                        jumps.iter().map(|(r, _)| r.clone()).collect();
+                    let targets: Vec<usize> = jumps.iter().map(|(_, j)| *j).collect();
+                    let styled = md_styled_links(row, row.heading, selected(i), &ranges);
+                    layout = Some(styled.layout().clone());
+                    let me = cx.entity().downgrade();
+                    let el =
+                        gpui::InteractiveText::new(("card-stop-link", block * 1_000 + i), styled)
+                            .on_click(ranges, move |ix, window, cx| {
+                                if let (Some(&j), Some(me)) = (targets.get(ix), me.upgrade()) {
+                                    me.update(cx, |this, cx| this.goto_walk_stop(j, window, cx));
+                                }
+                            })
+                            .into_any_element();
+                    md_hang(row, el)
+                }
+                (None, _) => md_row_el(row, selected(i)),
             };
             // `index_for_position` answers in bytes; `Err` is "past the end of
             // the line", which is where a drag off the right edge lands
@@ -46765,6 +46921,26 @@ mod code_tour_tests {
         assert!(tour.contains("say how many and where"), "{tour}");
         // and a name the tour has already been through is said to be one
         assert!(tour.contains("we walked through earlier"), "{tour}");
+        // the words that become a link, so a stop points with them
+        assert!(tour.contains("\"the stop above\""), "{tour}");
+        assert!(tour.contains("\"two stops back\""), "{tour}");
+        let stops: Vec<Stop> = (0..12)
+            .map(|i| Stop {
+                path: format!("f{i}.ts"),
+                line: 1,
+                end: 2,
+                title: String::new(),
+                group: String::new(),
+                said: String::new(),
+                flag: String::new(),
+            })
+            .collect();
+        for phrase in ["the stop above", "the previous stop", "the next stop", "two stops back"] {
+            assert!(
+                !stop_refs(phrase, 5, &stops).is_empty(),
+                "the prompt tells the agent to write {phrase:?}, so it has to be a link"
+            );
+        }
         assert!(brief.contains("a list you waved at rather than wrote"), "{brief}");
     }
 
@@ -46972,6 +47148,87 @@ mod evidence_tests {
         // and both say what to do when there is no proof to be had
         assert!(brief.contains("cannot prove"), "{brief}");
         assert!(PROVE_IT_PROMPT.contains("can't be proved"));
+    }
+}
+
+#[cfg(test)]
+mod stop_ref_tests {
+    use super::*;
+
+    fn tour(n: usize) -> Vec<Stop> {
+        (0..n)
+            .map(|i| Stop {
+                path: format!("f{i}.ts"),
+                line: 1,
+                end: 2,
+                title: format!("Stop {i}"),
+                group: String::new(),
+                said: String::new(),
+                flag: String::new(),
+            })
+            .collect()
+    }
+
+    /// The phrase, and the whole of it: the article opens the link so it
+    /// underlines as one word rather than three.
+    fn found(text: &str, at: usize, n: usize) -> Vec<(String, usize)> {
+        stop_refs(text, at, &tour(n))
+            .into_iter()
+            .map(|(r, j)| (text[r].to_string(), j))
+            .collect()
+    }
+
+    /// The sentence that started this: a stop that says "the stop above" and
+    /// leaves you counting.
+    #[test]
+    fn the_stop_above_points_one_back() {
+        assert_eq!(
+            found("guarded models in the stop above.", 6, 12),
+            vec![("the stop above".to_string(), 5)]
+        );
+        // and said the other way round
+        assert_eq!(
+            found("as the previous stop showed", 6, 12),
+            vec![("the previous stop".to_string(), 5)]
+        );
+    }
+
+    /// Forward, and only as far as there are stops to go to.
+    #[test]
+    fn the_next_stop_points_one_on() {
+        assert_eq!(found("the next stop wires it up", 6, 12), vec![("the next stop".into(), 7)]);
+        assert_eq!(found("the stop below has the rest", 6, 12), vec![("the stop below".into(), 7)]);
+        // nothing after the last one, and nothing before the first
+        assert!(found("the next stop", 11, 12).is_empty());
+        assert!(found("the stop above", 0, 12).is_empty());
+    }
+
+    /// A counted hop, with the count inside the link.
+    #[test]
+    fn a_count_of_stops_is_counted() {
+        assert_eq!(found("two stops back", 6, 12), vec![("two stops back".to_string(), 4)]);
+        assert_eq!(found("3 stops below", 2, 12), vec![("3 stops below".to_string(), 5)]);
+        // past either end is no link rather than a wrong one
+        assert!(found("five stops back", 2, 12).is_empty());
+    }
+
+    /// A stop named by the number the card gives it.
+    #[test]
+    fn a_numbered_stop_is_the_one_the_card_numbers() {
+        assert_eq!(found("checked in stop 4", 6, 12), vec![("stop 4".to_string(), 3)]);
+        assert_eq!(found("checked in stop #4", 6, 12), vec![("stop #4".to_string(), 3)]);
+        // a number no stop has, and the stop you are standing on
+        assert!(found("stop 40", 6, 12).is_empty());
+        assert!(found("stop 7", 6, 12).is_empty());
+    }
+
+    /// "stop" is an ordinary word. Only the phrases that name a destination
+    /// become links, or every sentence about stopping something is one.
+    #[test]
+    fn an_ordinary_stop_is_not_a_link() {
+        assert!(found("the guard stops the request", 6, 12).is_empty());
+        assert!(found("it stopped before the check", 6, 12).is_empty());
+        assert!(found("a full stop", 6, 12).is_empty());
     }
 }
 
