@@ -5827,10 +5827,12 @@ fn tour_request(about: Option<&str>, answer: Option<&str>) -> String {
          rather than using the name as if I had it in hand. Don't number the \
          stop; TIDE puts the number on it.\n\
          When you point at another stop, use the words TIDE makes a link of: \
-         \"the stop above\", \"the previous stop\", \"the next stop\", \
-         \"the stop below\", or a count of them, \"two stops back\". The \
+         \"the stop before\", \"the previous stop\", \"the next stop\", \
+         \"the stop after\", or a count of them, \"two stops back\". The \
          phrase is clickable in the card, so the reader lands on the stop \
-         instead of counting backwards to find it.\n\n\
+         instead of counting backwards to find it. Say before and after \
+         rather than above and below. A stop is a place in the order, and \
+         there is nothing on screen above or below it to look at.\n\n\
          Where the tour moves from one stretch of the work to another, name \
          the stretch with `group` on each stop in it (\"The AWS side\", \
          \"Standalone\") — consecutive stops sharing one become a section with \
@@ -8595,15 +8597,18 @@ fn stop_numbered(stops: &[Stop], n: usize) -> Option<usize> {
 /// Phrases in a stop's prose that point at another stop, and which stop each
 /// one points at.
 ///
-/// "the use case short-circuits guarded models in the stop above" is a
+/// "the use case short-circuits guarded models in the stop before" is a
 /// sentence with a destination in it, and following it meant counting
 /// backwards and pressing the arrows to find out whether the count was right.
 /// The phrase itself is the link.
 ///
-/// What counts: the stop either side of this one ("the stop above", "the
+/// What counts: the stop either side of this one ("the stop before", "the
 /// previous stop", "the next stop"), a count of them ("two stops back"), and
 /// a stop named by its number ("stop 4"). The count and the article that open
 /// the phrase are part of it, so the whole thing underlines as one word.
+///
+/// "above" and "below" are read too, because tours written before TIDE asked
+/// for before/after are full of them.
 fn stop_refs(text: &str, at: usize, stops: &[Stop]) -> Vec<(std::ops::Range<usize>, usize)> {
     let words = word_spans(text);
     let dir = |w: &str| match (STOP_BACK.contains(&w), STOP_FWD.contains(&w)) {
@@ -8632,7 +8637,7 @@ fn stop_refs(text: &str, at: usize, stops: &[Stop]) -> Vec<(std::ops::Range<usiz
                 continue;
             }
         }
-        // "the stop above" and "two stops back", or "the previous stop"
+        // "the stop before" and "two stops back", or "the previous stop"
         let before = i.checked_sub(1).and_then(|j| words.get(j));
         let (back, mut start, end) =
             match (after.and_then(|(_, a)| dir(a)), before.and_then(|(_, b)| dir(b))) {
@@ -30753,7 +30758,7 @@ impl Storm {
     }
 
     /// What a link to another stop says on hover: the number the card gives
-    /// that stop and what it is called. "the stop above" is a direction, not
+    /// that stop and what it is called. "the stop before" is a direction, not
     /// a destination, and the point of following it is to find out which stop
     /// it was.
     fn stop_tip(&self, j: usize) -> String {
@@ -30801,7 +30806,7 @@ impl Storm {
         };
         let mut col = div().flex().flex_col().min_w(px(0.)).text_color(rgb(TEXT));
         for (i, row) in rows.iter().enumerate() {
-            // "the stop above" is a destination, so it is drawn as a link.
+            // "the stop before" is a destination, so it is drawn as a link.
             // The selection highlight rides on the same styled text, so a row
             // can be both read and dragged over
             let jumps = self.stop_jumps(&row.text);
@@ -47216,7 +47221,9 @@ mod code_tour_tests {
         // and a name the tour has already been through is said to be one
         assert!(tour.contains("we walked through earlier"), "{tour}");
         // the words that become a link, so a stop points with them
-        assert!(tour.contains("\"the stop above\""), "{tour}");
+        assert!(tour.contains("\"the stop before\""), "{tour}");
+        // and said, in so many words, not to reach for above and below
+        assert!(tour.contains("rather than above and below"), "{tour}");
         assert!(tour.contains("\"two stops back\""), "{tour}");
         let stops: Vec<Stop> = (0..12)
             .map(|i| Stop {
@@ -47229,7 +47236,16 @@ mod code_tour_tests {
                 flag: String::new(),
             })
             .collect();
-        for phrase in ["the stop above", "the previous stop", "the next stop", "two stops back"] {
+        for phrase in [
+            "the stop before",
+            "the stop after",
+            "the previous stop",
+            "the next stop",
+            "two stops back",
+            // still read, for the tours that already say it this way
+            "the stop above",
+            "the stop below",
+        ] {
             assert!(
                 !stop_refs(phrase, 5, &stops).is_empty(),
                 "the prompt tells the agent to write {phrase:?}, so it has to be a link"
@@ -47472,10 +47488,15 @@ mod stop_ref_tests {
             .collect()
     }
 
-    /// The sentence that started this: a stop that says "the stop above" and
+    /// The sentence that started this: a stop that says "the stop before" and
     /// leaves you counting.
     #[test]
-    fn the_stop_above_points_one_back() {
+    fn the_stop_before_points_one_back() {
+        assert_eq!(
+            found("guarded models in the stop before.", 6, 12),
+            vec![("the stop before".to_string(), 5)]
+        );
+        // the wording tours used to be written in still reads
         assert_eq!(
             found("guarded models in the stop above.", 6, 12),
             vec![("the stop above".to_string(), 5)]
@@ -47491,6 +47512,7 @@ mod stop_ref_tests {
     #[test]
     fn the_next_stop_points_one_on() {
         assert_eq!(found("the next stop wires it up", 6, 12), vec![("the next stop".into(), 7)]);
+        assert_eq!(found("the stop after has the rest", 6, 12), vec![("the stop after".into(), 7)]);
         assert_eq!(found("the stop below has the rest", 6, 12), vec![("the stop below".into(), 7)]);
         // nothing after the last one, and nothing before the first
         assert!(found("the next stop", 11, 12).is_empty());
