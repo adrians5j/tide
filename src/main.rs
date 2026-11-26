@@ -7035,6 +7035,8 @@ enum Cmd {
     Reviewers,
     Todo,
     Steps,
+    Tour,
+    TourRestart,
     OpenRepository,
     OpenPrNumber,
     SendOnPaste,
@@ -7088,6 +7090,8 @@ const PALETTE: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::ResetWorkspaceClose, "Reset Workspace & Close", IC_HOME, ""),
     (Cmd::ResetWorkspacePause, "Reset Workspace & Pause", IC_HOME, ""),
     (Cmd::Steps, "Timeline…  (every step taken in this workspace)", IC_HISTORY, ""),
+    (Cmd::Tour, "Code Tour  (walk it, or build one of this PR)", IC_TOUR, "⌥]"),
+    (Cmd::TourRestart, "Code Tour from the First Stop", IC_TOUR, ""),
     (Cmd::WorkspaceHistory, "Workspace History…  (every folder, and what it was for)", IC_HISTORY, "⌘⇧E"),
     (Cmd::TogglePause, "Pause / Resume Workspace  (⌥Tab skips paused)", IC_HOME, ""),
     (Cmd::SendOnPaste, "Send Dictation on Paste (no ↩)", IC_HOME, ""),
@@ -17430,6 +17434,10 @@ impl Storm {
             // mid-turn, and that is worth reading before taking the app down
             Cmd::RestartApp => cx.emit(ProjectNav::Restart),
             Cmd::Steps => self.open_steps(window, cx),
+            // the tour had no way in of its own: it was reached through the
+            // brief, which meant opening a deck to get at the thing beside it
+            Cmd::Tour => self.walk_the_tour(false, cx),
+            Cmd::TourRestart => self.walk_the_tour(true, cx),
             Cmd::WorkspaceHistory => self.open_ws_history(window, cx),
             Cmd::OpenPrNumber => self.open_prnum_prompt(window, cx),
             Cmd::TogglePause => self.toggle_pause(cx),
@@ -31486,7 +31494,15 @@ impl Storm {
         cx.notify();
     }
 
+    /// ⌥] steps forward, and with no walk open it starts one: the tour
+    /// this workspace has, picked up where it was left. It was otherwise a
+    /// key that only worked once the tour was already on screen, and the only
+    /// way to get it there was through the brief.
     fn act_walk_next(&mut self, _: &WalkNext, window: &mut Window, cx: &mut Context<Self>) {
+        if self.walk.is_none() && self.tour.is_some() {
+            self.open_tour(false, cx);
+            return;
+        }
         self.step_walk(1, window, cx);
     }
 
@@ -31575,6 +31591,24 @@ impl Storm {
     /// already happening.
     fn pr_reading_building(&self, number: u64) -> Option<String> {
         pr_reading_jobs(number).into_iter().find(|job| self.job_in_flight(job))
+    }
+
+    /// Walk the tour in hand, from the palette. With none in hand, the tour
+    /// of this branch's pull request is what was meant, so it is asked for.
+    ///
+    /// `restart` goes back to the first stop; without it the walk picks up
+    /// where it was left, which over a long tour is the usual want.
+    fn walk_the_tour(&mut self, restart: bool, cx: &mut Context<Self>) {
+        if self.tour.is_some() {
+            self.open_tour(restart, cx);
+            return;
+        }
+        let Some((number, ..)) = self.pr_link.clone() else {
+            self.show_flash("No tour here, and no pull request to build one from", cx);
+            return;
+        };
+        let base = self.pr_base.clone();
+        self.ask_pr_tour(number, base, false, cx);
     }
 
     /// Walk the tour of a pull request: the one already built if there is
@@ -46042,6 +46076,19 @@ mod palette_recent_tests {
         let long: String = (0..PALETTE_RECENT + 20).map(|i| format!("c{i}\n")).collect();
         assert_eq!(palette_recent_from_text(&long).len(), PALETTE_RECENT);
         assert!(palette_recent_from_text("").is_empty());
+    }
+
+    /// Typing "tour" finds the tour. It was reachable only through the brief,
+    /// which meant opening a deck to get at the thing next to it.
+    #[test]
+    fn the_palette_is_a_way_into_the_tour() {
+        let found: Vec<&str> = PALETTE
+            .iter()
+            .filter(|(_, label, ..)| fuzzy_score("tour", label).is_some())
+            .map(|(_, label, ..)| *label)
+            .collect();
+        assert!(found.iter().any(|l| l.starts_with("Code Tour  (")), "{found:?}");
+        assert!(found.iter().any(|l| l.contains("First Stop")), "{found:?}");
     }
 
     /// A command that has never been run ranks behind every one that has.
