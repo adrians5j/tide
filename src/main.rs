@@ -4100,6 +4100,65 @@ fn flag_pulse(t: f32) -> f32 {
     (t * std::f32::consts::PI * 5.).sin().max(0.) * (1. - 0.75 * t)
 }
 
+/// How lit a dot is as the pulse reaches it, over one turn of the cycle.
+///
+/// A narrow triangle on a wrapping axis, so the three dots read as one light
+/// travelling along them rather than three lights blinking together. Wide
+/// enough that two neighbours overlap a little, which is what makes it look
+/// like movement and not like a chase of separate flashes.
+fn dot_pulse(t: f32) -> f32 {
+    const PEAK: f32 = 0.18; // where in the cycle this dot is brightest
+    const WIDTH: f32 = 0.3;
+    let d = (t - PEAK).abs();
+    let d = d.min(1.0 - d); // the cycle wraps, so 0.95 is 0.05 away from 0
+    (1.0 - d / WIDTH).max(0.0)
+}
+
+/// How long one pass of the light takes, and how far apart the dots are in it.
+const THINK_MS: u64 = 1_100;
+const THINK_SHIFT: f32 = 0.14;
+
+/// The agent has been asked something and nothing has come back yet: three
+/// dots with one light travelling along them.
+///
+/// It stands exactly where the answer will be drawn and is one line of the
+/// card's prose tall, so nothing under it moves when the words arrive. Each
+/// dot sits in a box of its own at the size of the brightest it will get, so
+/// the growing doesn't shunt its neighbours sideways.
+fn thinking_dots(key: usize, accent: u32) -> AnyElement {
+    const REST: f32 = 5.0;
+    const LIT: f32 = 8.0;
+    div()
+        .h(px(TOUR_LINE_H))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(4.))
+        .children((0..3).map(|i| {
+            let shift = i as f32 * THINK_SHIFT;
+            div().size(px(LIT)).flex().items_center().justify_center().child(
+                div()
+                    .size(px(REST))
+                    .rounded_full()
+                    .bg(rgb(SEPARATOR))
+                    .with_animation(
+                        ("thinking-dot", key * 8 + i),
+                        Animation::new(Duration::from_millis(THINK_MS))
+                            .repeat()
+                            // the same cycle in each dot, the left one first,
+                            // so the light travels the way the words will
+                            .with_easing(move |t| (t - shift).rem_euclid(1.0)),
+                        move |d, t| {
+                            let p = dot_pulse(t);
+                            d.size(px(REST + (LIT - REST) * p))
+                                .bg(rgb(blend(SEPARATOR, accent, p)))
+                        },
+                    ),
+            )
+        }))
+        .into_any_element()
+}
+
 /// A stop that wants something from you, as a tag beside its title.
 ///
 /// Three words and no others, so the tag means something: a tour where every
@@ -27588,11 +27647,14 @@ impl Storm {
         let ask_empty = self.tour_ask.is_empty();
         let asking = self.tour_ask_focus.is_focused(window);
         let caret = self.caret();
-        let mut thread: Vec<(bool, String)> = self
+        // (mine, text, still being written). The last of the three is what
+        // draws the thinking dots, and only a question asked here can set it:
+        // a note whose reply happens to be empty is empty, not pending.
+        let mut thread: Vec<(bool, String, bool)> = self
             .stop_thread(stop)
             .map(|c| {
-                let mut t = vec![(true, c.text.clone())];
-                t.extend(c.replies.iter().map(|r| (r.who == "you", r.text.clone())));
+                let mut t = vec![(true, c.text.clone(), false)];
+                t.extend(c.replies.iter().map(|r| (r.who == "you", r.text.clone(), false)));
                 t
             })
             .unwrap_or_default();
@@ -27600,14 +27662,10 @@ impl Storm {
         // own box is the other, and on the card they read as one conversation
         if let Some(asked) = self.stop_asks.get(&(w.id.clone().unwrap_or_default(), w.at)) {
             for turn in &asked.turns {
-                thread.push((true, turn.q.clone()));
-                thread.push((
-                    false,
-                    match turn.answer.trim() {
-                        "" => "…".to_string(),
-                        a => a.to_string(),
-                    },
-                ));
+                thread.push((true, turn.q.clone(), false));
+                let answer = turn.answer.trim().to_string();
+                let pending = answer.is_empty();
+                thread.push((false, answer, pending));
             }
         }
         let has_thread = !thread.is_empty();
@@ -27615,10 +27673,16 @@ impl Storm {
         // one expression, and each block needs the entity to hang its mouse
         // handlers on. Block 0 is the stop's own text, the turns follow it.
         let said_body = self.card_text_sel(&said, 0, 13., cx);
-        let thread_bodies: Vec<(bool, Div)> = thread
+        let thread_bodies: Vec<(bool, AnyElement)> = thread
             .iter()
             .enumerate()
-            .map(|(i, (mine, text))| (*mine, self.card_text_sel(text, i + 1, 13., cx)))
+            .map(|(i, (mine, text, pending))| {
+                let body = match pending {
+                    true => thinking_dots(i, accent),
+                    false => self.card_text_sel(text, i + 1, 13., cx).into_any_element(),
+                };
+                (*mine, body)
+            })
             .collect();
         // what the questions asked at this stop have cost between them
         let thread_cost = cost_chip(
@@ -48649,5 +48713,44 @@ mod kill_tree_tests {
         for p in tree {
             assert!(!pid_alive(p), "{p} outlived the tree it was in");
         }
+    }
+}
+
+#[cfg(test)]
+mod thinking_dot_tests {
+    use super::*;
+
+    /// One light travelling left to right, with a short dark beat between
+    /// passes. Three dots blinking together would say the same thing and look
+    /// like a stall.
+    #[test]
+    fn the_light_travels_and_then_rests() {
+        assert_eq!(dot_pulse(0.18), 1.0, "the peak");
+        assert_eq!(dot_pulse(0.18 + 0.3), 0.0, "and the far side of it");
+        // the cycle wraps, so the end of it is on the way up to the next peak
+        assert!(dot_pulse(0.99) > dot_pulse(0.6));
+
+        // where each dot is brightest, in the order they light
+        let lit_at = |i: usize| {
+            let shift = i as f32 * THINK_SHIFT;
+            (0..1000)
+                .map(|k| k as f32 / 1000.)
+                .max_by(|a, b| {
+                    let p = |t: f32| dot_pulse((t - shift).rem_euclid(1.0));
+                    p(*a).total_cmp(&p(*b))
+                })
+                .unwrap()
+        };
+        assert!(lit_at(0) < lit_at(1) && lit_at(1) < lit_at(2), "left to right");
+
+        // and the beat between passes is a beat, not a pause anyone sits through
+        let dark = (0..1000)
+            .filter(|k| {
+                let t = *k as f32 / 1000.;
+                (0..3).all(|i| dot_pulse((t - i as f32 * THINK_SHIFT).rem_euclid(1.0)) < 0.05)
+            })
+            .count();
+        let ms = dark as u64 * THINK_MS / 1000;
+        assert!((40..260).contains(&ms), "the row rests for {ms}ms between passes");
     }
 }
