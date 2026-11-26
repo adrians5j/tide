@@ -11026,7 +11026,7 @@ impl Storm {
                 } else if up && ours {
                     "up — click to stop it, ⌥click for its log"
                 } else if up {
-                    "the project is up, but it wasn't started from TIDE"
+                    "up, started outside TIDE — click to stop it anyway"
                 } else {
                     run_tip
                 };
@@ -11034,8 +11034,12 @@ impl Storm {
             })
             .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
                 match (running, ev.modifiers().alt) {
-                    // no pane of ours to stop or show: it was started elsewhere
-                    (true, _) if !ours => this.show_flash("It wasn't started from TIDE", cx),
+                    // started elsewhere, so there is no pane of ours to show —
+                    // but portless knows the pid, which is enough to stop it
+                    (true, true) if !ours => {
+                        this.show_flash("Started outside TIDE, so its log is in that terminal", cx)
+                    }
+                    (true, false) if !ours => this.stop_outside_app(cx),
                     (true, true) => this.show_admin_log(window, cx),
                     (true, false) => this.stop_admin(cx),
                     _ => this.start_admin(window, cx),
@@ -11308,6 +11312,40 @@ impl Storm {
         self.admin_autoopen = false; // a stop cancels the pending browser open
         self.show_flash("Stopped the local app", cx);
         cx.notify();
+    }
+
+    /// Stop the local app when TIDE didn't start it.
+    ///
+    /// The old answer here was a flash saying it wasn't ours, which left no way
+    /// to stop a dev server except finding the terminal it came up in. Portless
+    /// writes the pid of whatever registered the route, and `portless_route`
+    /// only hands back a pid whose working directory is inside this checkout,
+    /// so the thing being killed is this workspace's server and not somebody
+    /// else's.
+    fn stop_outside_app(&mut self, cx: &mut Context<Self>) {
+        let root = self.root.clone();
+        let Some((host, pid)) = portless_route(&root) else {
+            self.show_flash("Nothing in portless is serving this checkout", cx);
+            return;
+        };
+        self.admin_autoopen = false; // a stop cancels the pending browser open
+        self.show_flash(&format!("Stopping {host} (pid {pid})"), cx);
+        cx.spawn(async move |this, cx| {
+            let forced = cx.background_executor().spawn(async move { kill_tree(pid) }).await;
+            this.update(cx, |this, cx| {
+                this.admin_up = Some(false);
+                let said = match forced {
+                    0 => format!("Stopped {host}"),
+                    1 => format!("Stopped {host}, after killing one stuck process"),
+                    n => format!("Stopped {host}, after killing {n} stuck processes"),
+                };
+                this.show_flash(&said, cx);
+                this.check_admin_now(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Re-check admin health now (used by the summary Refresh button). Re-reads
@@ -36106,6 +36144,16 @@ fn admin_url(root: &Path, legacy: bool) -> Option<String> {
 /// None when nothing is serving for this checkout, which is also the honest
 /// answer: there is no URL to open.
 fn portless_url(root: &Path) -> Option<String> {
+    portless_route(root).map(|(host, _)| format!("https://{host}"))
+}
+
+/// The portless route serving this checkout: the host it registered and the
+/// process that registered it.
+///
+/// The pid is the point. It is the one handle TIDE has on a dev server it did
+/// not start, and without it the only way to stop one is to go and find the
+/// terminal it is running in.
+fn portless_route(root: &Path) -> Option<(String, u32)> {
     let home = std::env::var("HOME").ok()?;
     let raw = std::fs::read_to_string(Path::new(&home).join(".portless/routes.json")).ok()?;
     let routes: serde_json::Value = serde_json::from_str(&raw).ok()?;
@@ -36114,8 +36162,89 @@ fn portless_url(root: &Path) -> Option<String> {
         let pid = r.get("pid")?.as_u64()?;
         // the server may run from a subdirectory of the checkout, so anything
         // under the root counts as this workspace's
-        pid_cwd(pid)?.starts_with(root).then(|| format!("https://{host}"))
+        pid_cwd(pid)?
+            .starts_with(root)
+            .then(|| (host.to_string(), u32::try_from(pid).unwrap_or(0)))
+            .filter(|(_, pid)| *pid > 1)
     })
+}
+
+/// A process and everything under it, parents before children.
+///
+/// There is no one process group to signal. `portless` puts its child in a
+/// group of its own, so `kill -INT -<pgid>` on the portless process leaves the
+/// `yarn ... watch` underneath it running and still holding the port. The tree
+/// is walked instead, `pgrep -P` a level at a time, capped so a cycle in what
+/// `pgrep` reports can't spin here.
+fn proc_tree(pid: u32) -> Vec<u32> {
+    let mut out = vec![pid];
+    let mut i = 0;
+    while i < out.len() && out.len() < 200 {
+        let parent = out[i];
+        i += 1;
+        let Ok(o) = Command::new("pgrep").args(["-P", &parent.to_string()]).output() else {
+            continue;
+        };
+        for kid in String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| l.trim().parse().ok())
+        {
+            if kid > 1 && !out.contains(&kid) {
+                out.push(kid);
+            }
+        }
+    }
+    out
+}
+
+/// Is this process still there?
+fn pid_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Stop a process and everything under it the way a terminal would: SIGINT
+/// first, so a watch gets to clean up after itself, SIGTERM a second later,
+/// and SIGKILL for whatever is still standing after that. Returns how many
+/// needed the last one.
+///
+/// All three steps are needed. A watch started in the foreground of an
+/// interactive shell stops on the SIGINT, which is the Ctrl-C it was waiting
+/// for; one started as a background job of a non-interactive shell has SIGINT
+/// set to ignore before it ever ran, and nothing TIDE sends changes that.
+///
+/// Blocking, so it belongs on the background executor.
+fn kill_tree(pid: u32) -> usize {
+    let tree = proc_tree(pid);
+    let signal = |sig: &str, pids: &[u32]| {
+        if pids.is_empty() {
+            return;
+        }
+        let mut args = vec![sig.to_string()];
+        args.extend(pids.iter().map(|p| p.to_string()));
+        let _ = Command::new("kill").args(&args).output();
+    };
+    let left = |t: &[u32]| -> Vec<u32> { t.iter().copied().filter(|p| pid_alive(*p)).collect() };
+    let settle = |t: &[u32], ticks: usize| -> Vec<u32> {
+        for _ in 0..ticks {
+            let still = left(t);
+            if still.is_empty() {
+                return still;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        left(t)
+    };
+    signal("-INT", &tree);
+    let still = settle(&tree, 10);
+    if still.is_empty() {
+        return 0;
+    }
+    signal("-TERM", &still);
+    let stuck = settle(&still, 15);
+    signal("-KILL", &stuck);
+    stuck.len()
 }
 
 /// Working directory of a running process. `lsof -Fn` prints `n<path>` for the
@@ -48448,5 +48577,46 @@ mod flag_chip_tests {
         // halfway is between the two on every channel
         let mid = blend(0x000000, 0xffffff, 0.5);
         assert_eq!(mid, 0x808080);
+    }
+}
+
+#[cfg(test)]
+mod kill_tree_tests {
+    use super::*;
+
+    /// A dev server is a tree, so stopping one has to be. `portless` starts its
+    /// child in a process group of its own, which is why signalling the group
+    /// isn't enough and the tree is walked instead.
+    ///
+    /// The shell under test is started detached (`sh -c '... &'`, whose own
+    /// parent exits at once) so this process isn't its parent: a child we
+    /// never reap stays a zombie, and a zombie still answers `kill -0`.
+    #[test]
+    fn a_process_tree_is_walked_and_stopped() {
+        let out = Command::new("sh")
+            .args(["-c", "sh -c 'sleep 30 & wait' >/dev/null 2>&1 & echo $!"])
+            .output()
+            .expect("sh");
+        let pid: u32 =
+            String::from_utf8_lossy(&out.stdout).trim().parse().expect("the detached pid");
+        // the shell has to get as far as forking its background sleep
+        let mut tree = Vec::new();
+        for _ in 0..100 {
+            tree = proc_tree(pid);
+            if tree.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(tree.first(), Some(&pid), "the root comes first: {tree:?}");
+        assert!(tree.len() >= 2, "the sleep under it is part of the tree: {tree:?}");
+
+        // whatever it takes, the tree goes. This one is a background job of a
+        // non-interactive shell, so it was handed SIGINT already ignored and
+        // the later signals are what end it
+        assert!(kill_tree(pid) <= tree.len());
+        for p in tree {
+            assert!(!pid_alive(p), "{p} outlived the tree it was in");
+        }
     }
 }

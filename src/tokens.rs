@@ -690,7 +690,10 @@ mod tests {
     /// and counting both read the day 74% high.
     #[test]
     fn a_reply_written_as_two_lines_is_one_request() {
-        let dir = std::env::temp_dir().join(format!("tide-tok-{}", std::process::id()));
+        // named for this test, not just for the process: tests run in
+        // parallel, and two of them sharing a directory meant one could delete
+        // the other's files out from under it
+        let dir = std::env::temp_dir().join(format!("tide-tok-once-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("s.jsonl");
         let other = LINE.replace("msg_01abc", "msg_01def");
@@ -846,7 +849,7 @@ mod tests {
     /// not the first's and not the sum of them.
     #[test]
     fn the_live_context_is_the_last_request_in_the_log() {
-        let dir = std::env::temp_dir().join(format!("tide-tok-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tide-tok-live-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("live.jsonl");
         let line = |cr: u64| {
