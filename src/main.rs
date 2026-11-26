@@ -4272,19 +4272,6 @@ fn running_cmds(shell_pids: &[u32]) -> HashMap<u32, String> {
     out
 }
 
-/// Resident memory of our own process, in MB (via `ps`).
-fn process_mem_mb() -> u64 {
-    let pid = std::process::id().to_string();
-    Command::new("ps")
-        .args(["-o", "rss=", "-p", &pid])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .map(|kb| kb / 1024)
-        .unwrap_or(0)
-}
-
 /// Contents of a file at HEAD (empty for untracked/new files).
 fn git_show_head(root: &Path, rel: &str) -> String {
     git_show(root, "HEAD", rel)
@@ -9751,7 +9738,6 @@ struct Storm {
     // how far this branch trails its base on the remote, and what a merge would
     // break. Re-checked whenever the PR status is.
     base_sync: Option<BaseSync>,
-    mem_mb: u64,
     read_only: bool, // when on, editors block manual edits (nav/select/copy still work)
     left_view: LeftView,
     show_left: bool,
@@ -10600,7 +10586,6 @@ impl Storm {
             pr_show_new: false,
             pr_link_branch: String::new(),
             base_sync: None,
-            mem_mb: 0,
             read_only: true, // read-only by default
             left_view: LeftView::Files,
             show_left: true,
@@ -12769,7 +12754,8 @@ impl Storm {
         cx.notify();
     }
 
-    /// Refresh git status, branch, and memory every 5s on a background thread.
+    /// Refresh git status, branch and the workspace's flags every 5s on a
+    /// background thread.
     fn start_git_poll(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| loop {
             let Some((root, prev_pr_branch)) =
@@ -12778,13 +12764,12 @@ impl Storm {
                 break;
             };
             let root2 = root.clone();
-            let (status, branch, mem, ignored, (idle, paused), head_oid) = cx
+            let (status, branch, ignored, (idle, paused), head_oid) = cx
                 .background_executor()
                 .spawn(async move {
                     (
                         compute_git(&root2),
                         git_branch(&root2),
-                        process_mem_mb(),
                         git_ignored_paths(&root2),
                         // another TIDE instance (or a script) may have marked this
                         // workspace idle or paused since the last tick
@@ -12817,7 +12802,6 @@ impl Storm {
                     if moved {
                         this.note_history();
                     }
-                    this.mem_mb = mem;
                     this.ws_idle = idle;
                     this.ws_paused = paused;
                     // one stat every five seconds, rather than one per frame:
@@ -20096,8 +20080,6 @@ impl Storm {
                     d.child(div().w(px(1.)).h(px(14.)).bg(rgb(SEPARATOR)))
                 })
                 .children(self.render_ws_tally(cx))
-                .children(self.render_todo_chip(cx))
-                .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(format!("{} MB", self.mem_mb)))
                 // last item in the bar, hard against the right edge
                 .child({
                     let ro = self.read_only;
@@ -20928,34 +20910,6 @@ impl Storm {
     /// single workspace open — there's nothing to compare.
     /// Open todos, in the topbar. Absent when there are none — an empty list is
     /// not news, and the shortcut still opens it.
-    fn render_todo_chip(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let n = todo::open_count(&self.todos);
-        if n == 0 {
-            return None;
-        }
-        Some(
-            div()
-                .id("todo-chip")
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_1()
-                .px_1()
-                .rounded_md()
-                .cursor_pointer()
-                .text_size(px(11.))
-                .text_color(rgb(MUTED))
-                .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
-                .child(div().font_family(ICON_FONT).text_size(px(10.)).child(IC_CHECK))
-                .child(format!("{n}"))
-                .tooltip(tip("Todo list  ·  ⌘⇧L writes one"))
-                .on_click(cx.listener(|this, _e, _w, cx| {
-                    this.left_view = LeftView::Todos;
-                    this.show_left = true;
-                    cx.notify();
-                })),
-        )
-    }
 
     fn render_ws_tally(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         if self.ws_states.len() < 2 {
