@@ -122,10 +122,10 @@ pub fn recall(sent: &str) -> Option<Shown> {
 pub fn guess(sent: &str) -> Option<Shown> {
     let (label, job) = if sent.starts_with("Write me a brief of #") {
         let n = pr_number(sent, "Write me a brief of #")?;
-        // Explain PR is the brief prompt with the tour prompt after it, so the
-        // longer of the two has to be ruled out first
+        // the Brief button sends the brief prompt with the tour prompt after it,
+        // so the longer of the two has to be ruled out first
         match sent.contains(&format!("build the code tour of #{n} as well")) {
-            true => (format!("Asked for a brief and a code tour of #{n}"), format!("Explain #{n}")),
+            true => (format!("Asked for a brief and a code tour of #{n}"), format!("Brief and tour of #{n}")),
             false => (format!("Asked for a brief of #{n}"), format!("Brief of #{n}")),
         }
     } else if let Some(n) = pr_number(sent, "Take me on a code tour of #") {
@@ -255,13 +255,13 @@ mod tests {
             "Asked for a brief of #6176",
             "Brief of #6176",
         ));
-        // the same opening, with the tour half after it, is Explain PR
+        // the same opening, with the tour half after it, is both at once
         let explain = guess(
             "Write me a brief of #6176 — what it does and why…\n---\n\nin the same turn, \
              build the code tour of #6176 as well.\n",
         )
         .unwrap();
-        assert_eq!(explain.job, "Explain #6176");
+        assert_eq!(explain.job, "Brief and tour of #6176");
         let tour =
             guess("Take me on a code tour of #6176 — what it changes…").unwrap();
         assert_eq!(tour.job, "Code tour of #6176");

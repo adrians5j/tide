@@ -146,7 +146,7 @@ enum AgentMsg {
     },
 }
 
-/// A turn TIDE started as a named job: Explain PR, a brief, a tour, a question
+/// A turn TIDE started as a named job: a brief, a tour, both at once, a question
 /// asked under a slide. It draws a line above the turn saying what the job is
 /// and how it is going, and the turn itself reads like any other: the prompt
 /// behind it is a page of instructions written for the agent, so that line
@@ -6105,10 +6105,10 @@ fn pr_body_check(number: u64, base: &str, update: bool) -> String {
     )
 }
 
-/// Explain PR wants both halves, and they are written from the same diff. One
+/// The Brief button wants both halves, and they are written from the same diff. One
 /// prompt is one turn and one row in the transcript; two were two of each, and
 /// the agent read the change twice to answer them.
-fn pr_explain_request(number: u64, base: &str, brief_read: &str, tour_read: &str) -> String {
+fn pr_brief_tour_request(number: u64, base: &str, brief_read: &str, tour_read: &str) -> String {
     format!(
         "{brief}\n\
          ---\n\n\
@@ -8425,9 +8425,9 @@ impl PrReading {
     /// has moved past it.
     fn verb(self) -> &'static str {
         if self.brief_stale {
-            "explanation outdated"
+            "brief outdated"
         } else {
-            "Explain PR"
+            "Brief"
         }
     }
 }
@@ -10191,7 +10191,7 @@ struct Storm {
     /// The pull request TIDE last asked for a tour of, so the tour that comes
     /// back can be stamped with it.
     pending_tour_pr: Option<u64>,
-    /// A tour asked for as half of an explanation: it is kept when it
+    /// A tour asked for as the second half of a brief: it is kept when it
     /// lands, not walked. The brief is what you are reading, and the deck
     /// links on to the tour at the end of it.
     tour_waits: bool,
@@ -16470,7 +16470,7 @@ impl Storm {
     /// `/reviewers` call) doesn't get a second round, and a pull request whose
     /// brief is already on disk isn't written again.
     ///
-    /// Order matters: the explanation is queued behind whatever turn opened the
+    /// Order matters: the brief is queued behind whatever turn opened the
     /// pull request, and `send_agent_prompt_by` refuses to send while the
     /// reviewers are reading, so it has to go first.
     fn on_pr_opened(&mut self, number: u64, cx: &mut Context<Self>) {
@@ -16480,7 +16480,7 @@ impl Storm {
         // which branch it is against
         let base = self.review_base();
         if brief_cached(number).is_none() {
-            self.explain_pr(number, base, false, cx);
+            self.brief_pr(number, base, false, cx);
         }
         self.reviewed = reviewed_all(&self.root);
         if self.reviewed_branch(&self.branch.clone()).is_none() {
@@ -19772,7 +19772,7 @@ impl Storm {
                                 ),
                         )
                     })
-                    // the number, its refresh, its explanation and the note
+                    // the number, its refresh, its brief and the note
                     // that says there is no pull request yet are one group:
                     // four children of a gap_3 row read as four unrelated
                     // things, and they were pulled back together with
@@ -19870,7 +19870,7 @@ impl Storm {
                                 let (colour, hint) = if building {
                                     (
                                         LINE_NUMBER,
-                                        format!("The agent is writing the explanation of #{num} now"),
+                                        format!("The agent is writing the brief of #{num} now"),
                                     )
                                 } else if stale {
                                     (
@@ -19899,7 +19899,7 @@ impl Storm {
                                 };
                                 d.child(
                                     div()
-                                        .id("pr-explain")
+                                        .id("pr-brief")
                                         .flex()
                                         .flex_row()
                                         .items_center()
@@ -19909,7 +19909,7 @@ impl Storm {
                                         .when(!building, |d| d.cursor_pointer())
                                         .text_size(px(11.))
                                         .text_color(rgb(colour))
-                                        // an outdated explanation is drawn as the
+                                        // an outdated brief is drawn as the
                                         // warning it is, in the same amber outline
                                         // as "2 behind next" beside it
                                         .when(stale && !building, |d| {
@@ -19929,13 +19929,13 @@ impl Storm {
                                                 }),
                                         )
                                         .child(match building {
-                                            true => "writing the explanation…",
+                                            true => "writing the brief…",
                                             false => reading.verb(),
                                         })
                                         .tooltip(tip_owned(hint))
                                         .on_click(cx.listener(
                                             move |this, e: &gpui::ClickEvent, _w, cx| {
-                                                this.explain_pr(
+                                                this.brief_pr(
                                                     num,
                                                     base.clone(),
                                                     e.modifiers().alt,
@@ -31651,7 +31651,7 @@ impl Storm {
     /// The reading of this pull request already being built, if one is.
     ///
     /// A tour goes out under three of these names: on its own, as a rebuild,
-    /// and as the tour half of Explain, which writes the brief in the same
+    /// and as the tour half of the Brief button, which writes the brief in the same
     /// turn. Which button was pressed first doesn't matter. Pressing any of
     /// them while one of the others is still working asks for work that is
     /// already happening.
@@ -31679,7 +31679,7 @@ impl Storm {
 
     /// Walk the tour of a pull request: the one already built if there is
     /// one, otherwise ask for it. The brief ends with this, which is the only
-    /// place the two halves of an explanation meet.
+    /// place the brief and the tour meet.
     fn walk_pr_tour(&mut self, number: u64, base: String, cx: &mut Context<Self>) {
         match self.tour_of(number).is_some() {
             true => self.open_tour(false, cx),
@@ -31687,7 +31687,7 @@ impl Storm {
         }
     }
 
-    /// Explain this pull request: the brief for what it does. It writes one
+    /// The brief of this pull request: what the change does. It writes one
     /// when there is none or the branch has moved past the one there is, and
     /// opens it either way, so a press always ends with something to read.
     ///
@@ -31696,7 +31696,7 @@ impl Storm {
     /// and a turn of work that starts because you opened something to read is
     /// a turn nobody asked for. ⌥click writes both, which is the one place
     /// asking for the tour is a decision.
-    fn explain_pr(&mut self, number: u64, base: String, force: bool, cx: &mut Context<Self>) {
+    fn brief_pr(&mut self, number: u64, base: String, force: bool, cx: &mut Context<Self>) {
         // the halves guard themselves, but this sends two of them and would
         // otherwise say it twice
         if let Some(job) = self.pr_reading_building(number) {
@@ -31716,7 +31716,7 @@ impl Storm {
         // asking for them separately read the change twice and left two rows
         // in the transcript for one press
         match (brief, tour) {
-            (true, true) => self.ask_pr_explain(number, base, cx),
+            (true, true) => self.ask_brief_and_tour(number, base, cx),
             (true, false) => self.ask_pr_brief(number, base, true, cx),
             (false, true) => self.ask_pr_tour(number, base, true, cx),
             (false, false) => {}
@@ -31740,8 +31740,8 @@ impl Storm {
         cx.notify();
     }
 
-    /// Both halves of Explain PR in one turn, drawn as one line in the pane.
-    fn ask_pr_explain(&mut self, number: u64, base: String, cx: &mut Context<Self>) {
+    /// Both halves in one turn, drawn as one line in the pane.
+    fn ask_brief_and_tour(&mut self, number: u64, base: String, cx: &mut Context<Self>) {
         if let Some(job) = self.pr_reading_building(number) {
             self.show_flash(&format!("{job} is already being built"), cx);
             return;
@@ -31761,7 +31761,7 @@ impl Storm {
         self.spend_tag = Some(format!("brief:{number}"));
         self.agent_open = true;
         self.ask_fresh_by(
-            pr_explain_request(number, &base, &brief_read, &tour_read),
+            pr_brief_tour_request(number, &base, &brief_read, &tour_read),
             Some(label),
             Sender::Tide,
             cx,
@@ -39646,7 +39646,7 @@ impl Storm {
             // the two questions worth asking about a PR you are looking at
             .when(pr.state == PrState::Open || pr.state == PrState::Draft, |d| {
                 let (number, base) = (pr.number, pr.base.clone());
-                let explain_base = base.clone();
+                let brief_base = base.clone();
                 // each of these sends one turn, and each stops being a button
                 // while that turn is still running
                 let checking = self.job_in_flight(&format!("Description of #{number}"));
@@ -39681,7 +39681,7 @@ impl Storm {
                 // what the change does and the tour for where, wanted together
                 .child(
                     div()
-                        .id("pr-doc-explain")
+                        .id("pr-doc-brief")
                         .px_1p5()
                         .py(px(1.))
                         .rounded_md()
@@ -39695,15 +39695,15 @@ impl Storm {
                         })
                         .child(match building {
                             true => "Writing it…",
-                            false => "Explain",
+                            false => "Brief",
                         })
                         .tooltip(tip(match building {
-                            true => "The agent is writing the explanation now",
+                            true => "The agent is writing the brief now",
                             false => "The brief for what this change does and the tour for \
                                       where  ·  ⌥click to write them again",
                         }))
                         .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _w, cx| {
-                            this.explain_pr(number, explain_base.clone(), e.modifiers().alt, cx)
+                            this.brief_pr(number, brief_base.clone(), e.modifiers().alt, cx)
                         })),
                 )
             })
@@ -46744,11 +46744,11 @@ mod code_tour_tests {
         assert!(q.contains("Don't rebuild the tour"), "{q}");
     }
 
-    /// Explain PR is one prompt: both halves, in the order they are read, and
+    /// The two halves go out as one prompt, in the order they are read, and
     /// the brief's "stop and don't repeat the slides" doesn't end the turn.
     #[test]
-    fn explain_pr_asks_for_both_halves_at_once() {
-        let q = pr_explain_request(6127, "next", "", "");
+    fn the_brief_and_tour_go_out_as_one_prompt() {
+        let q = pr_brief_tour_request(6127, "next", "", "");
         assert!(q.contains("Write me a brief of #6127"), "{q}");
         assert!(q.contains("$TIDE_RPC/brief"), "{q}");
         assert!(q.contains("$TIDE_RPC/tour"), "{q}");
@@ -46813,13 +46813,13 @@ mod code_tour_tests {
         let both = PrReading { has_brief: true, has_tour: true, ..Default::default() };
         assert_eq!(both.wanted(false), (false, false), "nothing to do");
         assert_eq!(both.wanted(true), (true, true), "⌥click writes them again anyway");
-        assert_eq!(both.verb(), "Explain PR");
+        assert_eq!(both.verb(), "Brief");
 
         // the branch moved under the brief but not the tour: only the brief
         // is written again, and the chip says something is out of date
         let half = PrReading { brief_stale: true, ..both };
         assert_eq!(half.wanted(false), (true, false));
-        assert_eq!(half.verb(), "explanation outdated", "it reads as the warning it is");
+        assert_eq!(half.verb(), "brief outdated", "it reads as the warning it is");
 
         // a tour of this change but no brief yet
         let tour_only = PrReading { has_tour: true, ..Default::default() };
@@ -46828,7 +46828,7 @@ mod code_tour_tests {
         // a tour the branch has moved past is the tour panel's business: the
         // chip is about the brief, because a press writes the brief
         let old_tour = PrReading { tour_stale: true, ..both };
-        assert_eq!(old_tour.verb(), "Explain PR");
+        assert_eq!(old_tour.verb(), "Brief");
         // and a plain press of it asks for nothing at all
         assert_eq!(old_tour.wanted(false).0, false);
     }
@@ -47179,12 +47179,12 @@ mod code_tour_tests {
     }
 
     /// A brief is read by somebody who has not read the code, so both halves
-    /// of an explanation are told to pay for the words that only mean
+    /// of a reading are told to pay for the words that only mean
     /// something in this repository. A slide that says "a send runs in
     /// whichever process did the work" without saying what a send is costs a
     /// question, which is the thing a brief exists to save.
     #[test]
-    fn an_explanation_pays_for_its_own_vocabulary() {
+    fn a_brief_pays_for_its_own_vocabulary() {
         let brief = brief_request(6110, "origin/next", "");
         assert!(brief.contains("only means something inside this repository"), "{brief}");
         assert!(brief.contains("in the same sentence"), "{brief}");
@@ -47912,7 +47912,7 @@ fn pr_reading_jobs(number: u64) -> [String; 4] {
         format!("Code tour of #{number}"),
         format!("Rebuild the tour of #{number}"),
         format!("Brief of #{number}"),
-        format!("Explain #{number}"),
+        format!("Brief and tour of #{number}"),
     ]
 }
 
@@ -48117,8 +48117,8 @@ mod job_guess_tests {
         assert_eq!(brief.job, "Brief of #6176");
         assert_eq!(brief.label, "Asked for a brief of #6176");
 
-        let explain = jobs::guess(&pr_explain_request(6176, "next", "", "")).unwrap();
-        assert_eq!(explain.job, "Explain #6176");
+        let explain = jobs::guess(&pr_brief_tour_request(6176, "next", "", "")).unwrap();
+        assert_eq!(explain.job, "Brief and tour of #6176");
 
         let tour = jobs::guess(&pr_tour_request(6176, "next", "")).unwrap();
         assert_eq!(tour.job, "Code tour of #6176");
