@@ -29885,6 +29885,22 @@ impl Storm {
          answer. Also read what the review bots left on the PR — Slop Cop and \
          CodeRabbit — and report what they flagged alongside the check results. \
          A green tick with an unread bot review is not a passing PR.\n\n\
+         Bringing a Webiny project up to look at it is `wdev`, always, unless \
+         I say otherwise. It is `portless --force wby<N> yarn \
+         webiny-standalone watch`: api and admin behind one URL at \
+         https://wby<N>.localhost, where the folder wby-next6 is wby6. None of \
+         it touches AWS, and it is what to use to check your own work. It runs \
+         until it is stopped, so start it in the background and wait for the \
+         URL to answer rather than waiting on the command.\n\
+         Deploying is only for when I ask for AWS in so many words. `wd` is \
+         `yarn webiny deploy`, and it deploys a real environment. When I do \
+         ask, deploy the apps the work needs rather than the whole project: \
+         `wd core`, or `wd core api`. Then bring admin up locally against what \
+         you deployed, with `admin` (`portless --force admin<N> yarn webiny \
+         watch admin`, https://admin<N>.localhost). That is much faster than \
+         deploying admin too.\n\
+         `wdev`, `wd` and `admin` come from the interactive shell. If yours \
+         doesn't have them, run what they expand to.\n\n\
          You can drive a real browser and show me what you saw. `agent-browser` \
          is installed (`agent-browser skills get core` for its own guide): open \
          a page, click through it, then\n\
@@ -46320,6 +46336,19 @@ mod briefing_tests {
         assert!(b.contains("A list is a list."), "three of anything is bullets, not commas");
         // and no line of it ran into the next one
         assert!(!b.contains("post.drafted\",         "), "{b}");
+    }
+
+    /// Local first: `wdev` to look at the work, `wd` only when AWS was asked
+    /// for by name, and a part of the project rather than all of it when it is.
+    #[test]
+    fn webiny_comes_up_locally_unless_aws_was_asked_for() {
+        let b = Storm::tide_briefing_body();
+        assert!(b.contains("is `wdev`, always, unless"), "the default");
+        assert!(b.contains("yarn webiny-standalone watch"), "what wdev is");
+        assert!(b.contains("https://wby<N>.localhost"), "where it serves");
+        assert!(b.contains("only for when I ask for AWS"), "when to deploy at all");
+        assert!(b.contains("`wd core`, or `wd core api`"), "and only the apps needed");
+        assert!(b.contains("yarn webiny watch admin"), "admin runs locally against it");
     }
 
     /// Round trips are what a day costs: 96% of replies in a week of logs
