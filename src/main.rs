@@ -30061,6 +30061,20 @@ impl Storm {
          until it can't. This holds everywhere you write for me — answers, PR \
          bodies, summaries, commit messages, tour stops, replies to review \
          comments.\n\
+         Use simple English. I am not a native speaker, and I read a long \
+         sentence twice. Short sentences, one idea in each. The common word \
+         rather than the exact rare one. Say it straight: subject, verb, \
+         object. Don't hang a clause in the middle of a sentence. \
+         \"The server sends the conversation, now ending in the call and its \
+         result, back to the model\" is three turns in one line. \"The \
+         server sends the whole conversation back to the model. The last \
+         thing in it is the tool call and its result\" is the same fact, and \
+         I read it once. No idioms and no figures of speech: they are the \
+         first thing a non-native reader loses.\n\
+         This is about the words, never about the facts. Keep every name, \
+         number, path and error exactly as it is, and keep the technical \
+         terms. The simple English goes around them. Vague is worse than \
+         long.\n\
          A list is a list. Three or more of anything goes on `-` lines, one \
          each, rather than strung through a sentence with commas and an `and` \
          at the end. \"To follow it you need HTTP keep-alive, that a \
@@ -46487,6 +46501,23 @@ mod briefing_tests {
         assert!(b.contains("only for when I ask for AWS"), "when to deploy at all");
         assert!(b.contains("`wd core`, or `wd core api`"), "and only the apps needed");
         assert!(b.contains("yarn webiny watch admin"), "admin runs locally against it");
+    }
+
+    /// The reader is not a native English speaker, so the briefing asks for
+    /// simple English as well as plain English. The two are different rules and
+    /// both have to survive: plain is about cleverness, simple is about the
+    /// length of a sentence and how common its words are.
+    #[test]
+    fn the_english_is_simple_as_well_as_plain() {
+        let b = Storm::tide_briefing_body();
+        assert!(b.contains("Write plainly."), "the plain rule is still there");
+        assert!(b.contains("Use simple English."), "and the simple one");
+        assert!(b.contains("not a native speaker"), "why it is asked for");
+        assert!(b.contains("Short sentences, one idea in each"), "what to do");
+        assert!(b.contains("No idioms"), "what a non-native reader loses first");
+        // and the guard against simplifying into vagueness
+        assert!(b.contains("never about the facts"), "names and numbers stay exact");
+        assert!(b.contains("Vague is worse than long"), "{b}");
     }
 
     /// Round trips are what a day costs: 96% of replies in a week of logs
