@@ -29646,6 +29646,18 @@ impl Storm {
          Treat what it returns as read: do not re-check it with grep. The one \
          exception is the staleness banner, which names the files to read \
          directly. Without a `.codegraph` directory, ignore all of this.\n\n\
+         Every tool call is a request, and every request re-sends the whole \
+         conversation. A session carrying 180k pays about 18k before the \
+         command it is making runs, whatever that command is, and nine tool \
+         results in ten come back under 1,500 tokens. The round trips are the \
+         bill, not what they return. So when commands don't depend on each \
+         other, send them in one message: the three greps, the status and the \
+         diff, the build and the test list. When one command answers what two \
+         would, write it as one: `sed -n '1,40p;120,160p' file`, \
+         `git log --stat -3`, a grep with `-A 20` rather than a grep and then \
+         a read. This is about the calls that are genuinely independent — \
+         reading a file, editing it and running the test are three steps and \
+         stay three.\n\n\
          After anything that changes what TIDE shows about this branch — opening \
          a pull request, rewriting its title or body, pushing, switching or \
          creating a branch — \
@@ -34034,10 +34046,12 @@ impl Storm {
                     .when_some(self.agent_context, |d, ctx| {
                         let text = format!(
                             "This session carries {} into every request.\n\
-                             A turn costs about that whatever it asks, because every \
-                             request re-sends the conversation.\n\
+                             At the token panel's prices that is about {} a turn \
+                             before it asks anything, because every request \
+                             re-sends the conversation.\n\
                              \u{21ba} New session starts again at nothing.",
                             usage::short(ctx),
+                            usage::short(ctx / 10),
                         );
                         d.child(
                             div()
@@ -46306,6 +46320,20 @@ mod briefing_tests {
         assert!(b.contains("A list is a list."), "three of anything is bullets, not commas");
         // and no line of it ran into the next one
         assert!(!b.contains("post.drafted\",         "), "{b}");
+    }
+
+    /// Round trips are what a day costs: 96% of replies in a week of logs
+    /// made exactly one tool call, and 90% of tool results came back under
+    /// 1,500 tokens. The rule that says so has to survive an edit of the
+    /// briefing around it.
+    #[test]
+    fn independent_commands_go_out_together() {
+        let b = Storm::tide_briefing_body();
+        assert!(b.contains("Every tool call is a request"), "the rule itself");
+        assert!(b.contains("send them in one message"), "what to do about it");
+        assert!(b.contains("sed -n '1,40p;120,160p' file"), "and the example survived");
+        // the exception matters as much: three dependent steps stay three
+        assert!(b.contains("stay three"), "{b}");
     }
 
     /// A diagram is drawn and posted as a picture, dark, never typed out as
