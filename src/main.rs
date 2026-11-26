@@ -30736,6 +30736,26 @@ impl Storm {
         }
     }
 
+    /// What a link to another stop says on hover: the number the card gives
+    /// that stop and what it is called. "the stop above" is a direction, not
+    /// a destination, and the point of following it is to find out which stop
+    /// it was.
+    fn stop_tip(&self, j: usize) -> String {
+        let Some(w) = self.walk.as_ref() else { return String::new() };
+        let Some(stop) = w.stops.get(j) else { return String::new() };
+        let name = match stop.title.trim() {
+            "" => stop.path.clone(),
+            t => t.to_string(),
+        };
+        let (no, _, extra) = tour_place(&w.stops, j);
+        match extra {
+            // an appendix stop is numbered inside its own part, so the part
+            // is what says where it is
+            true => format!("{}  ·  {name}", stop.group.trim()),
+            false => format!("Stop {no}  ·  {name}"),
+        }
+    }
+
     /// Prose on the tour card, drawn as rows you can select in: drag for a
     /// range, double-click for the word under the pointer, triple for the
     /// line. `block` keeps one block's rows apart from another's, so the
@@ -30782,8 +30802,24 @@ impl Storm {
                     let styled = md_styled_links(row, row.heading, selected(i), &ranges);
                     layout = Some(styled.layout().clone());
                     let me = cx.entity().downgrade();
+                    // which stop the phrase lands on, read before the click
+                    let tips: Vec<String> = targets.iter().map(|j| self.stop_tip(*j)).collect();
+                    // the hover position comes back as a character index, and
+                    // a link is a range of bytes
+                    let tip_ranges: Vec<std::ops::Range<usize>> = ranges
+                        .iter()
+                        .map(|r| {
+                            let a = row.text[..r.start].chars().count();
+                            a..a + row.text[r.clone()].chars().count()
+                        })
+                        .collect();
                     let el =
                         gpui::InteractiveText::new(("card-stop-link", block * 1_000 + i), styled)
+                            .tooltip(move |at, _w, cx| {
+                                let hit = tip_ranges.iter().position(|r| r.contains(&at))?;
+                                let text = tips.get(hit).filter(|t| !t.is_empty())?.clone();
+                                Some(cx.new(|_| TooltipView { text: text.into() }).into())
+                            })
                             .on_click(ranges, move |ix, window, cx| {
                                 if let (Some(&j), Some(me)) = (targets.get(ix), me.upgrade()) {
                                     me.update(cx, |this, cx| this.goto_walk_stop(j, window, cx));
