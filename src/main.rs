@@ -29769,6 +29769,23 @@ impl Storm {
          a read. This is about the calls that are genuinely independent — \
          reading a file, editing it and running the test are three steps and \
          stay three.\n\n\
+         Commit and push when a piece of work stands on its own. Don't ask \
+         first and don't wait to be told. A fix with its test passing is a \
+         commit. A refactor that builds is a commit. Don't end a turn with \
+         the work sitting only on disk, and don't save it all up for one \
+         commit at the end: one commit per piece of work, not one per file \
+         and not one per session.\n\
+         Push to the branch you are on. If a pull request is open for it, \
+         pushing is how I read the work, so push as soon as there is \
+         something to read. Write the message the way this briefing asks you \
+         to write everything else: what changed and why, in plain words.\n\
+         Two things stop a commit. Failing tests: say so, and leave the work \
+         uncommitted. And anything in the diff that looks like a credential, \
+         a token, a password, a `.env` file: say that too. Read the diff \
+         before you push, because some of these repos are public.\n\
+         On the repo's default branch, do what the repo does. Some of mine \
+         commit straight to it, and `git log` says so in a line. Where the \
+         history goes through pull requests, make a branch first.\n\n\
          After anything that changes what TIDE shows about this branch — opening \
          a pull request, rewriting its title or body, pushing, switching or \
          creating a branch — \
@@ -46565,6 +46582,22 @@ mod briefing_tests {
         assert!(b.contains("only for when I ask for AWS"), "when to deploy at all");
         assert!(b.contains("`wd core`, or `wd core api`"), "and only the apps needed");
         assert!(b.contains("yarn webiny watch admin"), "admin runs locally against it");
+    }
+
+    /// Committing is the agent's job, not something to be asked for each
+    /// time. The rule that says so has to survive an edit of the briefing
+    /// around it, and so do the two cases that stop a commit.
+    #[test]
+    fn finished_work_is_committed_without_being_asked() {
+        let b = Storm::tide_briefing_body();
+        assert!(b.contains("Don't ask first and don't wait to be told"), "the rule itself");
+        assert!(b.contains("one commit per piece of work"), "the cadence");
+        assert!(b.contains("pushing is how I read the work"), "why it has to go out");
+        assert!(b.contains("Failing tests: say so"), "what stops one");
+        assert!(b.contains("looks like a credential"), "and what else stops one");
+        assert!(b.contains("do what the repo does"), "the default branch");
+        // and it doesn't undo the rule that the merge button isn't the agent's
+        assert!(b.contains("Never merge a pull request into its base"), "{b}");
     }
 
     /// The reader is not a native English speaker, so the briefing asks for
