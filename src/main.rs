@@ -28623,16 +28623,20 @@ impl Storm {
 }
 
 impl Render for TooltipView {
+    /// Built like a card on the tour map: same padding, same corner, and a
+    /// border that can actually be seen. `BORDER` is the same colour as
+    /// `POPUP_BG`, so the old one drew an edge nobody could make out and the
+    /// tooltip read as a smear of grey over whatever was behind it.
     fn render(&mut self, _w: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .px_2()
-            .py_1()
+            .py_1p5()
             .bg(rgb(POPUP_BG))
             .border_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(SEPARATOR))
             .rounded_md()
             .shadow_lg()
-            .text_size(px(11.))
+            .text_size(px(12.))
             .text_color(rgb(POPUP_FG))
             .child(self.text.clone())
     }
