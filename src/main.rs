@@ -29779,6 +29779,10 @@ impl Storm {
          pushing is how I read the work, so push as soon as there is \
          something to read. Write the message the way this briefing asks you \
          to write everything else: what changed and why, in plain words.\n\
+         Offering me the choice is still asking. \"The fix is committed but \
+         not pushed. Do you want to push it yourself, or should I push it and \
+         open the PR?\" stops the work on a question whose answer never \
+         changes. Push it, open it, and tell me what you did.\n\
          Two things stop a commit. Failing tests: say so, and leave the work \
          uncommitted. And anything in the diff that looks like a credential, \
          a token, a password, a `.env` file: say that too. Read the diff \
@@ -29892,7 +29896,7 @@ impl Storm {
          itself is down the curl fails outright; say so instead of reporting \
          posts that went nowhere. Which days to use is mine to decide: if I \
          haven't said, ask before you publish.\n\n\
-                  Open the pull request yourself when the work is worth one — a feature \
+         Open the pull request yourself when the work is worth one — a feature \
          that holds together, a fix with its tests, a round of changes you'd be \
          happy to have reviewed. Don't stop to ask whether I want a PR; I'd \
          rather close one than wait for it. Push the branch and open it, say so, \
@@ -46596,6 +46600,12 @@ mod briefing_tests {
         assert!(b.contains("Failing tests: say so"), "what stops one");
         assert!(b.contains("looks like a credential"), "and what else stops one");
         assert!(b.contains("do what the repo does"), "the default branch");
+        // and the shape it actually came back in: a choice offered, not a
+        // question asked, which reads as helpful and stops the work just the same
+        assert!(b.contains("Offering me the choice is still asking"), "{b}");
+        assert!(b.contains("Push it, open it, and tell me what you did"), "{b}");
+        // the older half of the same rule, which the agent had and ignored
+        assert!(b.contains("Don't stop to ask whether I want a PR"), "{b}");
         // and it doesn't undo the rule that the merge button isn't the agent's
         assert!(b.contains("Never merge a pull request into its base"), "{b}");
     }
